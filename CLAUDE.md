@@ -122,9 +122,14 @@ locally.
 - **Say what does not work yet.** A README, a changelog entry or a release note that
   lists only what works is overclaiming. The limits are what stop someone filing a bug
   against a documented gap.
-- **ClickMonk has no visual identity yet. Do not invent one** — no logo, palette, favicon
-  or social card. When one exists it will arrive as generated assets with usage rules
-  beside them.
+- **ClickMonk has a visual identity. Do not invent one.** It is in `brand/`, and the
+  rules are in `BRANDING.md`; read that before adding a README header, favicon, social
+  card, docs theme or UI colour. The two rules that are invisible until they are
+  expensive: there is **no single brand hex** (the accent is a different value per
+  mode), and **red is status only** (blocked and error), never the brand. Contrast is
+  measured in `brand/contrast-report.txt`, never estimated.
+- **`brand/` is generated output. Do not hand-edit it.** The generator is not in this
+  repo, and a rebuild overwrites every file there. Say so rather than patching an asset.
 - Commit and PR titles are `<area>: <lowercase phrase>`, no trailing period. The area is
   the surface touched, not the package.
 

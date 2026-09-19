@@ -1,0 +1,72 @@
+  PASS  verdigris ramp monotone in L
+  PASS  neutral ramp monotone in L
+
+=== light ===
+  PASS  18.18:1  (min 4.5)  body on surface                      #101111 on #F8FBFB
+  PASS  18.91:1  (min 4.5)  body on raised                       #101111 on #FFFFFF
+  PASS  17.22:1  (min 4.5)  body on sunken                       #101111 on #F1F5F5
+  PASS  15.97:1  (min 4.5)  body on inset                        #101111 on #E7EDED
+  PASS  17.10:1  (min 4.5)  body on accent tint                  #101111 on #EAF6F4
+  PASS   6.49:1  (min 4.5)  muted on surface                     #555D5D on #F8FBFB
+  PASS   6.75:1  (min 4.5)  muted on raised                      #555D5D on #FFFFFF
+  PASS   6.15:1  (min 4.5)  muted on sunken                      #555D5D on #F1F5F5
+  PASS   4.07:1  (min 3.0)  subtle on surface (non-essential)    #737D7D on #F8FBFB
+  PASS   6.24:1  (min 4.5)  accent text on surface               #006A61 on #F8FBFB
+  PASS   6.49:1  (min 4.5)  accent text on raised                #006A61 on #FFFFFF
+  PASS   5.87:1  (min 4.5)  accent text on accent tint           #006A61 on #EAF6F4
+  PASS   6.24:1  (min 4.5)  label on accent fill                 #F8FBFB on #006A61
+  PASS   7.16:1  (min 4.5)  label on destructive fill            #F8FBFB on #A12623
+  PASS   7.16:1  (min 4.5)  blocked / error text on surface      #A12623 on #F8FBFB
+  PASS   7.45:1  (min 4.5)  blocked / error text on raised       #A12623 on #FFFFFF
+  PASS   6.69:1  (min 4.5)  flagged text on surface              #7B5100 on #F8FBFB
+  PASS   6.96:1  (min 4.5)  flagged text on raised               #7B5100 on #FFFFFF
+  PASS   4.07:1  (min 3.0)  control border (WCAG 1.4.11)         #737D7D on #F8FBFB
+  PASS   4.24:1  (min 3.0)  control border on raised             #737D7D on #FFFFFF
+  PASS   6.24:1  (min 3.0)  accent as graphic (the mark)         #006A61 on #F8FBFB
+  PASS   5.91:1  (min 3.0)  focus ring / bar fill on sunken      #006A61 on #F1F5F5
+  PASS  18.18:1  (min 3.0)  ink as graphic (the mark)            #101111 on #F8FBFB
+  -- status colours on #F8FBFB --
+  PASS   6.29:1  (min 4.5)  success                              #36692A
+  PASS  hue gap  44.8deg (min 35)  success vs accent
+  PASS   6.69:1  (min 4.5)  warning                              #7B5100
+  PASS  hue gap 110.1deg (min 35)  warning vs accent
+  PASS   7.16:1  (min 4.5)  danger                               #A12623
+  PASS  hue gap 157.7deg (min 35)  danger vs accent
+  PASS   6.51:1  (min 4.5)  info                                 #295E90
+  PASS  hue gap  64.9deg (min 35)  info vs accent
+
+=== dark ===
+  PASS  16.62:1  (min 4.5)  body on surface                      #EDF1F1 on #101111
+  PASS  15.23:1  (min 4.5)  body on raised                       #EDF1F1 on #181B1B
+  PASS  17.42:1  (min 4.5)  body on sunken                       #EDF1F1 on #090A0A
+  PASS  12.74:1  (min 4.5)  body on inset                        #EDF1F1 on #262A2B
+  PASS  14.29:1  (min 4.5)  body on accent tint                  #EDF1F1 on #0D2421
+  PASS   7.59:1  (min 4.5)  muted on surface                     #9CA6A7 on #101111
+  PASS   6.96:1  (min 4.5)  muted on raised                      #9CA6A7 on #181B1B
+  PASS   7.95:1  (min 4.5)  muted on sunken                      #9CA6A7 on #090A0A
+  PASS   4.47:1  (min 3.0)  subtle on surface (non-essential)    #737D7D on #101111
+  PASS   8.81:1  (min 4.5)  accent text on surface               #6EBFB5 on #101111
+  PASS   8.08:1  (min 4.5)  accent text on raised                #6EBFB5 on #181B1B
+  PASS   7.58:1  (min 4.5)  accent text on accent tint           #6EBFB5 on #0D2421
+  PASS   8.81:1  (min 4.5)  label on accent fill                 #101111 on #6EBFB5
+  PASS   9.04:1  (min 4.5)  label on destructive fill            #101111 on #F69B94
+  PASS   9.04:1  (min 4.5)  blocked / error text on surface      #F69B94 on #101111
+  PASS   8.28:1  (min 4.5)  blocked / error text on raised       #F69B94 on #181B1B
+  PASS  10.71:1  (min 4.5)  flagged text on surface              #EDBB64 on #101111
+  PASS   9.82:1  (min 4.5)  flagged text on raised               #EDBB64 on #181B1B
+  PASS   4.47:1  (min 3.0)  control border (WCAG 1.4.11)         #737D7D on #101111
+  PASS   4.09:1  (min 3.0)  control border on raised             #737D7D on #181B1B
+  PASS   8.81:1  (min 3.0)  accent as graphic (the mark)         #6EBFB5 on #101111
+  PASS   9.23:1  (min 3.0)  focus ring / bar fill on sunken      #6EBFB5 on #090A0A
+  PASS  16.62:1  (min 3.0)  ink as graphic (the mark)            #EDF1F1 on #101111
+  -- status colours on #101111 --
+  PASS  10.56:1  (min 4.5)  success                              #94D186
+  PASS  hue gap  45.6deg (min 35)  success vs accent
+  PASS  10.71:1  (min 4.5)  warning                              #EDBB64
+  PASS  hue gap 105.8deg (min 35)  warning vs accent
+  PASS   9.04:1  (min 4.5)  danger                               #F69B94
+  PASS  hue gap 160.8deg (min 35)  danger vs accent
+  PASS  10.17:1  (min 4.5)  info                                 #97C2F0
+  PASS  hue gap  65.1deg (min 35)  info vs accent
+
+ALL PASS

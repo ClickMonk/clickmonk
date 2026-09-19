@@ -1,4 +1,9 @@
-# ClickMonk
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="brand/lockup-dark.svg">
+    <img src="brand/lockup-light.svg" alt="ClickMonk" width="220">
+  </picture>
+</h1>
 
 Self-hosted link tracking and reporting for affiliate and digital marketers. You run it
 on your own infrastructure, and your click data stays yours.
