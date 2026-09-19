@@ -1,0 +1,61 @@
+name: CI
+
+# There is no product code yet, so there is no build or test job. The first
+# package adds a `test` job here that runs the same gate CLAUDE.md prescribes
+# locally, in the same order, and branch protection then requires it beside
+# `boundary`.
+on:
+  push: { branches: [main] }
+  pull_request:
+  workflow_dispatch:
+
+# A pull request groups by PR number, so a new push cancels the run for the
+# commit it replaced. Everything else falls back to `run_id`, which is unique
+# per run, so a run on `main` is never cancelled or queued behind another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # This is a public repository and its history is permanent. This job checks
+  # the mechanical half of what must never be committed here. It cannot judge
+  # business material; that stays a judgement made before committing.
+  boundary:
+    runs-on: ubuntu-latest
+    # Every job carries a timeout. Without one a job inherits GitHub's
+    # 360-minute default, and a hung step runs until somebody notices.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The whole history, because the secret scan below reads every
+          # commit. A secret removed by a later commit is still published.
+          fetch-depth: 0
+
+      - name: No local-only files are tracked
+        # .gitignore already excludes all of these. This catches the ways past
+        # it: `git add -f`, a file committed before the ignore rule existed, and
+        # a clone where the rule was edited away.
+        run: |
+          bad="$(git ls-files | grep -E \
+            -e '(^|/)\.env$' \
+            -e '(^|/)\.env\.' \
+            -e '(^|/)\.(claude|superpowers|remember)/' \
+            -e '\.(pem|key)$' \
+            -e '(^|/)docker-compose\.override\.yml$' \
+            | grep -vE '(^|/)\.env\.example$' || true)"
+          if [ -n "$bad" ]; then
+            echo "These files must not be tracked in a public repository:"
+            echo "$bad"
+            exit 1
+          fi
+
+      - name: No secrets anywhere in history
+        # Pinned to a version, not `latest`, so the rule set cannot change
+        # under a PR that did not change it.
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            git /repo --redact --verbose --exit-code 1

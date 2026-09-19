@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+vendor/
+
+# Build output
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs
+logs/
+*.log
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Test coverage
+coverage/
+
+# Session tooling (local only). Ignored by the repository itself rather than by
+# any contributor's personal global gitignore: these directories hold
+# machine-local paths and scratch artifacts, and this is a public repository
+# where a single `git add -A` on a fresh clone would publish them permanently.
+.remember/
+.claude/
+.superpowers/
+
+# Local Compose overrides, for the same reason. Compose merges
+# docker-compose.override.yml automatically, so it is where a machine's own
+# resource limits, ports and mounts end up: details about someone's hardware or
+# network that do not belong in a public repository.
+docker-compose.override.yml

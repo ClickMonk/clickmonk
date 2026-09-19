@@ -1,0 +1,4 @@
+# Every path needs the maintainer's review. Branch protection on `main`
+# requires a code-owner approval, and without this file that rule has no owner
+# to ask.
+* @cemhurturk
