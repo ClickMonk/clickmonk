@@ -151,6 +151,12 @@ describe('SnapshotStore', () => {
     const store = make(join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json'))
     await store.start()
     expect(store.current()?.link(domainId, 'new')).toBeNull()
+    // Wait for the listener to be connected, and past its own catch-up
+    // reload, so this change is picked up by the NOTIFY path, not by the
+    // catch-up: a change made before the catch-up lands is picked up by the
+    // catch-up, not the notification, and would pass this test either way.
+    await until(() => (store as unknown as { listener: unknown }).listener !== null)
+    await new Promise((r) => setTimeout(r, 200))
     const l = await pool.query<{ id: string }>(
       "INSERT INTO links (domain_id, slug) VALUES ($1, 'new') RETURNING id",
       [domainId],
@@ -160,6 +166,69 @@ describe('SnapshotStore', () => {
       [l.rows[0]?.id],
     )
     await until(() => (store.current()?.link(domainId, 'new') ?? null) !== null)
+  })
+
+  it('reloads what changed while the listener was down, once it connects', async () => {
+    const { domainId } = await seed()
+    const path = join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json')
+    // A real pool (so the initial load, and the eventual reload, succeed) but
+    // an unreachable pgUrl (so LISTEN never connects until it is pointed at
+    // the real database below).
+    const store = new SnapshotStore({
+      pgUrl: 'postgres://clickmonk:clickmonk@127.0.0.1:1/none',
+      pool,
+      filePath: path,
+      debounceMs: 20,
+      retryMs: 50,
+      log: () => {},
+    })
+    stores.push(store)
+    await store.start()
+    expect(store.current()?.source).toBe('postgres')
+    const l = await pool.query<{ id: string }>(
+      "INSERT INTO links (domain_id, slug) VALUES ($1, 'late') RETURNING id",
+      [domainId],
+    )
+    await pool.query(
+      "INSERT INTO link_targets (link_id, url, weight, position) VALUES ($1, 'https://example.com/late', 100, 0)",
+      [l.rows[0]?.id],
+    )
+    await new Promise((r) => setTimeout(r, 200))
+    expect(store.current()?.link(domainId, 'late')).toBeNull()
+    // The worker (a stand-in) becomes reachable: the listener can now
+    // connect, and on connecting, its catch-up reload picks up what changed
+    // while it was down. Nothing NOTIFIES for this change: the listener was
+    // never up to hear it.
+    ;(store as unknown as { o: { pgUrl: string } }).o.pgUrl = TEST_PG_URL
+    await until(() => (store.current()?.link(domainId, 'late') ?? null) !== null)
+  })
+
+  it('keeps the previous snapshot when a reload fails', async () => {
+    const { domainId } = await seed()
+    const path = join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json')
+    const store = new SnapshotStore({
+      pgUrl: TEST_PG_URL,
+      pool,
+      filePath: path,
+      debounceMs: 20,
+      retryMs: 50,
+      reloadIntervalMs: 50,
+      log: () => {},
+    })
+    stores.push(store)
+    await store.start()
+    expect(store.current()?.link(domainId, 'spring')).not.toBeNull()
+    const { createPgPool } = await import('@clickmonk/db')
+    const dead = createPgPool('postgres://clickmonk:clickmonk@127.0.0.1:1/none', {
+      connectTimeoutMs: 200,
+    })
+    ;(store as unknown as { o: { pool: unknown } }).o.pool = dead
+    // The 50 ms interval fires several times against the dead pool while we
+    // wait; none of those failures may clear what is already loaded.
+    await new Promise((r) => setTimeout(r, 500))
+    expect(store.current()?.link(domainId, 'spring') ?? null).not.toBeNull()
+    await store.stop()
+    await dead.end()
   })
 
   it('writes the snapshot file on every successful load', async () => {

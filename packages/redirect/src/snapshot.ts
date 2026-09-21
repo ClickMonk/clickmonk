@@ -60,58 +60,78 @@ interface LinkRow {
   targets: { id: string; url: string; weight: number }[] | null
 }
 
+/**
+ * One REPEATABLE READ READ ONLY transaction on one connection, so the count,
+ * the domains and the links are all a consistent view of the same instant.
+ * Three queries on separate pool connections could each see a different
+ * commit in between (a target inserted after the count, say), producing a
+ * snapshot that never existed in Postgres.
+ */
 export async function loadFromPostgres(pool: Pool, maxLinks = 2_000_000): Promise<Snapshot> {
-  const count = await pool.query<{ n: string }>('SELECT count(*) AS n FROM links')
-  const n = Number(count.rows[0]?.n ?? 0)
-  if (n > maxLinks) throw new SnapshotTooLargeError(n, maxLinks)
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
+    try {
+      const count = await client.query<{ n: string }>('SELECT count(*) AS n FROM links')
+      const n = Number(count.rows[0]?.n ?? 0)
+      if (n > maxLinks) throw new SnapshotTooLargeError(n, maxLinks)
 
-  const domains = await pool.query<{
-    id: string
-    host: string
-    verified: boolean
-    root_url: string | null
-    not_found_url: string | null
-  }>('SELECT id, host, verified, root_url, not_found_url FROM domains')
+      const domains = await client.query<{
+        id: string
+        host: string
+        verified: boolean
+        root_url: string | null
+        not_found_url: string | null
+      }>('SELECT id, host, verified, root_url, not_found_url FROM domains')
 
-  // Targets aggregated per link in position order. A link with no targets is
-  // dropped: the evaluator cannot choose a destination for it.
-  const links = await pool.query<LinkRow>(`
-    SELECT l.id, l.domain_id, l.slug, l.enabled, l.backup_url, l.device_urls, l.returning_url,
-           l.countries, l.click_cap, l.expires_at, l.passthrough,
-           json_agg(json_build_object('id', t.id, 'url', t.url, 'weight', t.weight)
-                    ORDER BY t.position) FILTER (WHERE t.id IS NOT NULL) AS targets
-      FROM links l
-      LEFT JOIN link_targets t ON t.link_id = l.id
-     GROUP BY l.id`)
+      // Targets aggregated per link in position order. A link with no targets is
+      // dropped: the evaluator cannot choose a destination for it.
+      const links = await client.query<LinkRow>(`
+        SELECT l.id, l.domain_id, l.slug, l.enabled, l.backup_url, l.device_urls, l.returning_url,
+               l.countries, l.click_cap, l.expires_at, l.passthrough,
+               json_agg(json_build_object('id', t.id, 'url', t.url, 'weight', t.weight)
+                        ORDER BY t.position) FILTER (WHERE t.id IS NOT NULL) AS targets
+          FROM links l
+          LEFT JOIN link_targets t ON t.link_id = l.id
+         GROUP BY l.id`)
 
-  return new Snapshot(
-    domains.rows.map((d) => ({
-      id: d.id,
-      host: d.host,
-      verified: d.verified,
-      rootUrl: d.root_url,
-      notFoundUrl: d.not_found_url,
-    })),
-    links.rows
-      .filter((r) => r.targets !== null && r.targets.length > 0)
-      .map((r) => ({
-        id: r.id,
-        domainId: r.domain_id,
-        slug: r.slug,
-        enabled: r.enabled,
-        targets: r.targets ?? [],
-        backupUrl: r.backup_url,
-        deviceUrls: r.device_urls,
-        returningUrl: r.returning_url,
-        countries: r.countries,
-        // bigint arrives as a string from pg.
-        clickCap: r.click_cap === null ? null : Number(r.click_cap),
-        expiresAt: r.expires_at,
-        passthrough: r.passthrough,
-      })),
-    new Date(),
-    'postgres',
-  )
+      await client.query('COMMIT')
+
+      return new Snapshot(
+        domains.rows.map((d) => ({
+          id: d.id,
+          host: d.host,
+          verified: d.verified,
+          rootUrl: d.root_url,
+          notFoundUrl: d.not_found_url,
+        })),
+        links.rows
+          .filter((r) => r.targets !== null && r.targets.length > 0)
+          .map((r) => ({
+            id: r.id,
+            domainId: r.domain_id,
+            slug: r.slug,
+            enabled: r.enabled,
+            targets: r.targets ?? [],
+            backupUrl: r.backup_url,
+            deviceUrls: r.device_urls,
+            returningUrl: r.returning_url,
+            countries: r.countries,
+            // bigint arrives as a string from pg.
+            clickCap: r.click_cap === null ? null : Number(r.click_cap),
+            expiresAt: r.expires_at,
+            passthrough: r.passthrough,
+          })),
+        new Date(),
+        'postgres',
+      )
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw err
+    }
+  } finally {
+    client.release()
+  }
 }
 
 export function serializeSnapshot(s: Snapshot): string {
@@ -174,6 +194,11 @@ export class SnapshotStore {
   private timers = new Set<NodeJS.Timeout>()
   private debounce: NodeJS.Timeout | null = null
   private stopped = false
+  // Bumped at the start of every reload; a reload only assigns its result if
+  // no newer reload has started since (interval, debounce and the fast retry
+  // can all fire independently, and Postgres gives no ordering guarantee on
+  // when each of their queries returns).
+  private reloadGen = 0
   private readonly o: Required<SnapshotStoreOptions>
 
   constructor(opts: SnapshotStoreOptions) {
@@ -238,13 +263,19 @@ export class SnapshotStore {
 
   /** True on success. Never rejects. */
   private async reload(): Promise<boolean> {
+    const gen = ++this.reloadGen
     try {
       const next = await loadFromPostgres(this.o.pool)
-      this.snapshot = next
-      try {
-        writeSnapshotFile(this.o.filePath, next)
-      } catch (err) {
-        this.o.log('could not write the snapshot file', err)
+      // A newer reload already started while this one was in flight: its
+      // result, whenever it lands, is the current one. Applying this older
+      // result now would overwrite it with stale data.
+      if (gen === this.reloadGen) {
+        this.snapshot = next
+        try {
+          writeSnapshotFile(this.o.filePath, next)
+        } catch (err) {
+          this.o.log('could not write the snapshot file', err)
+        }
       }
       return true
     } catch (err) {
@@ -256,6 +287,7 @@ export class SnapshotStore {
   private schedule(): void {
     if (this.debounce) clearTimeout(this.debounce)
     this.debounce = setTimeout(() => void this.reload(), this.o.debounceMs)
+    this.debounce.unref()
   }
 
   /** LISTEN on a dedicated connection; reconnect with a delay when it drops. Never rejects. */
