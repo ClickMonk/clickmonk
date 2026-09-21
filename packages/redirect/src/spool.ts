@@ -49,12 +49,14 @@ export class SpoolWriter {
   private timer: NodeJS.Timeout | null = null
   private closed = false
   /**
-   * Path of a segment that was written, fsynced and closed, but whose
-   * rename to its sealed name failed. Retried on the next tick rather than
-   * left as an orphaned `.part` file, invisible to the worker and to
+   * Paths of segments that were written, fsynced and closed, but whose
+   * rename to their sealed name failed. A set, not a single slot: a second
+   * failure while a first is still pending must not forget the first.
+   * Every entry is retried on each tick until it succeeds, rather than
+   * being left as an orphaned `.part` file, invisible to the worker and to
    * `measureSealed`, until the next `start()`.
    */
-  private pendingSeal: string | null = null
+  private readonly pendingSeals = new Set<string>()
 
   constructor(opts: SpoolOptions) {
     this.dir = opts.dir
@@ -126,8 +128,8 @@ export class SpoolWriter {
     this.closed = true
     if (this.timer) clearInterval(this.timer)
     this.timer = null
+    this.retryPendingSeals()
     try {
-      if (this.pendingSeal) this.retryPendingSeal()
       if (this.fd !== null) this.seal()
     } catch (err) {
       this.onError(err)
@@ -136,7 +138,7 @@ export class SpoolWriter {
 
   private tick(): void {
     try {
-      if (this.pendingSeal) this.retryPendingSeal()
+      this.retryPendingSeals()
       if (this.fd !== null && this.dirty) {
         fsyncSync(this.fd)
         this.dirty = false
@@ -181,15 +183,25 @@ export class SpoolWriter {
       }
       this.renameToSealed(path)
     } catch (err) {
-      this.pendingSeal = path
+      this.pendingSeals.add(path)
       throw err
     }
   }
 
-  private retryPendingSeal(): void {
-    const path = this.pendingSeal as string
-    this.renameToSealed(path)
-    this.pendingSeal = null
+  /**
+   * Retries every pending rename, not only the most recent one. Each is its
+   * own try/catch: one still-failing rename must not stop the others from
+   * being retried, and only a rename that succeeds is removed from the set.
+   */
+  private retryPendingSeals(): void {
+    for (const path of [...this.pendingSeals]) {
+      try {
+        this.renameToSealed(path)
+        this.pendingSeals.delete(path)
+      } catch (err) {
+        this.onError(err)
+      }
+    }
   }
 
   private renameToSealed(path: string): void {
@@ -206,9 +218,9 @@ export class SpoolWriter {
         // Deleted by the worker between readdir and stat.
       }
     }
-    if (this.pendingSeal) {
+    for (const path of this.pendingSeals) {
       try {
-        total += statSync(this.pendingSeal).size
+        total += statSync(path).size
       } catch {
         // Renamed by a retry, or removed, between check and stat.
       }

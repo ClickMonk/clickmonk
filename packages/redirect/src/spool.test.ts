@@ -205,4 +205,30 @@ describe('SpoolWriter', () => {
     expect(sealed(dir)).toHaveLength(1)
     expect(lines(dir)).toHaveLength(1)
   })
+
+  it('retries every pending seal, not only the most recent, after two rename failures', async () => {
+    const dir = tmp()
+    const onError = vi.fn()
+    const w = writer(dir, { maxSegmentBytes: 1, fsyncIntervalMs: 20, onError })
+    renameHook.impl = () => {
+      throw new Error('simulated rename failure')
+    }
+    // Two appends, each crossing the 1-byte segment bound, each triggering
+    // its own failed seal. Both happen synchronously, one after the other,
+    // before any tick gets a chance to retry either — so a single pending
+    // slot would be overwritten by the second before it is ever retried.
+    expect(w.append(rec(1))).toBe(true)
+    expect(w.append(rec(2))).toBe(true)
+    expect(w.stats().dropped).toBe(0)
+    expect(onError).toHaveBeenCalledTimes(2)
+    expect(readdirSync(dir).filter((f) => f.endsWith('.part'))).toHaveLength(2)
+    expect(sealed(dir)).toHaveLength(0)
+
+    // Let the next tick's retries use the real rename.
+    renameHook.impl = null
+    await new Promise((r) => setTimeout(r, 200))
+    expect(sealed(dir)).toHaveLength(2)
+    expect(lines(dir)).toHaveLength(2)
+    expect(readdirSync(dir).some((f) => f.endsWith('.part'))).toBe(false)
+  })
 })
