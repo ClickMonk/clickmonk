@@ -31,7 +31,7 @@ export class SchemaTooNewError extends Error {
 }
 
 // Allows underscores in the name so `<version>_<name>.sql` authors can write
-// `003_api_keys.sql` rather than being forced into `003_api-keys.sql`.
+// `003_widget_types.sql` rather than being forced into `003_widget-types.sql`.
 const FILENAME = /^(\d+)_([a-z0-9_-]+)\.sql$/
 
 /**
@@ -205,7 +205,7 @@ function loadStore(rootDir: string, store: Store): MigrationFile[] {
     const m = FILENAME.exec(file)
     if (!m) {
       throw new Error(
-        `Migration file "${file}" in ${dir} does not match the required <version>_<name>.sql pattern (e.g. "001_projects.sql"). Rename or remove it — silently skipping an unrecognised migration file would boot the app against an incomplete schema.`,
+        `Migration file "${file}" in ${dir} does not match the required <version>_<name>.sql pattern (e.g. "001_core.sql"). Rename or remove it — silently skipping an unrecognised migration file would boot the app against an incomplete schema.`,
       )
     }
 

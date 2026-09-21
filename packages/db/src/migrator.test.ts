@@ -71,9 +71,9 @@ describe('loadMigrations', () => {
 
   it('allows underscores in the migration name', () => {
     const root = emptyMigrationsRoot()
-    writeFileSync(join(root, 'postgres', '003_api_keys.sql'), 'SELECT 1;')
+    writeFileSync(join(root, 'postgres', '003_gizmos.sql'), 'SELECT 1;')
     const found = loadMigrations(root)
-    expect(found).toEqual([{ version: 3, name: 'api_keys', store: 'postgres', sql: 'SELECT 1;' }])
+    expect(found).toEqual([{ version: 3, name: 'gizmos', store: 'postgres', sql: 'SELECT 1;' }])
   })
 
   it('ignores non-.sql files in a migrations directory (e.g. .gitkeep)', () => {
@@ -112,11 +112,12 @@ describe('loadMigrations', () => {
   it('throws — rather than reporting an empty migration set — when a store directory cannot be read', () => {
     // A plain file where a directory is expected makes readdirSync fail with
     // ENOTDIR, standing in for the real cases (bad permissions, a migrations
-    // directory left out of the image). The old bare `catch { return [] }`
-    // swallowed all of them, so migrate() reported success against a schema
-    // it had never created — silent at boot, visible only later as missing
-    // tables. Deleting the `if (isMissingDirectory(err))` guard makes this
-    // pass again, which is the mutation it catches.
+    // directory left out of the image). A catch that returns `[]` for any
+    // error, not just ENOENT, would swallow all of them, so migrate() would
+    // report success against a schema it never created — silent at boot,
+    // visible only later as missing tables. Deleting the
+    // `if (isMissingDirectory(err))` guard makes this pass again, which is
+    // the mutation it catches.
     const root = mkdtempSync(join(tmpdir(), 'clickmonk-mig-'))
     mkdirSync(join(root, 'clickhouse'), { recursive: true })
     writeFileSync(join(root, 'postgres'), 'this is a file, not a directory')
@@ -187,48 +188,49 @@ describe('migrate', () => {
     it('does not silently drop a ClickHouse migration that starts with a header comment', async () => {
       const root = emptyMigrationsRoot()
       writeFileSync(
-        join(root, 'clickhouse', '002_events_raw.sql'),
-        '-- 002_events_raw: raw ingest table\nCREATE TABLE IF NOT EXISTS events_raw (id UInt32) ENGINE = MergeTree ORDER BY id;',
+        join(root, 'clickhouse', '002_gadgets_raw.sql'),
+        '-- 002_gadgets_raw: raw ingest table\nCREATE TABLE IF NOT EXISTS gadgets_raw (id UInt32) ENGINE = MergeTree ORDER BY id;',
       )
-      await ch.command({ query: 'DROP TABLE IF EXISTS events_raw' })
+      await ch.command({ query: 'DROP TABLE IF EXISTS gadgets_raw' })
 
       const migrations = loadMigrations(root)
       const { applied } = await migrate({ pg, ch, migrations, appSchemaVersion: 2 })
-      // Before the fix: applied === [2] too, but the table was never created —
-      // the version was burned with nothing to show for it. The real
-      // assertion is the table's existence below, not just `applied`.
+      // `applied` alone would also read [2] if the header comment had
+      // truncated the statement: the version burned with nothing to show
+      // for it. The real assertion is the table's existence below, not
+      // just `applied`.
       expect(applied).toEqual([2])
 
       const result = await ch.query({
-        query: "SELECT count() AS cnt FROM system.tables WHERE name = 'events_raw'",
+        query: "SELECT count() AS cnt FROM system.tables WHERE name = 'gadgets_raw'",
         format: 'JSONEachRow',
       })
       const rows = await result.json<{ cnt: string }>()
       expect(Number(rows[0]?.cnt)).toBe(1)
 
-      await ch.command({ query: 'DROP TABLE IF EXISTS events_raw' })
+      await ch.command({ query: 'DROP TABLE IF EXISTS gadgets_raw' })
     })
 
     it('keeps every statement in a Postgres migration that starts with a header comment', async () => {
       const root = emptyMigrationsRoot()
       writeFileSync(
-        join(root, 'postgres', '001_projects.sql'),
-        '-- 001_projects: core tenant tables\nCREATE TABLE projects_x (id int primary key);\nCREATE INDEX idx_projects_x_id ON projects_x (id);',
+        join(root, 'postgres', '001_widgets.sql'),
+        '-- 001_widgets: core tenant tables\nCREATE TABLE widgets_x (id int primary key);\nCREATE INDEX idx_widgets_x_id ON widgets_x (id);',
       )
-      await pg.query('DROP TABLE IF EXISTS projects_x')
+      await pg.query('DROP TABLE IF EXISTS widgets_x')
 
       const migrations = loadMigrations(root)
       const { applied } = await migrate({ pg, ch, migrations, appSchemaVersion: 1 })
       expect(applied).toEqual([1])
 
-      const table = await pg.query("SELECT to_regclass('public.projects_x') AS t")
-      expect(table.rows[0].t).toBe('projects_x')
+      const table = await pg.query("SELECT to_regclass('public.widgets_x') AS t")
+      expect(table.rows[0].t).toBe('widgets_x')
       const index = await pg.query(
-        "SELECT indexname FROM pg_indexes WHERE indexname = 'idx_projects_x_id'",
+        "SELECT indexname FROM pg_indexes WHERE indexname = 'idx_widgets_x_id'",
       )
       expect(index.rows).toHaveLength(1)
 
-      await pg.query('DROP TABLE IF EXISTS projects_x')
+      await pg.query('DROP TABLE IF EXISTS widgets_x')
     })
 
     it('does not shatter a statement on a semicolon inside a string literal', async () => {
@@ -313,11 +315,10 @@ describe('migrate', () => {
 // Deliberately a sibling of `describe('migrate', ...)` above, not nested
 // inside it: every test here uses a fake `pg` client and never touches the
 // real database, so it must not inherit that describe's real-DB-cleanup
-// `beforeEach` — a prior version of this file had it nested, which meant the
-// real `schema_migrations` table got dropped before these fake-client tests
-// too and was never recreated after them, leaving it missing for whichever
-// database-backed test file vitest ran next in the shared,
-// `fileParallelism: false` suite.
+// `beforeEach`. Nesting it there would drop the real `schema_migrations`
+// table before these fake-client tests too, and never recreate it
+// afterward, leaving it missing for whichever database-backed test file
+// vitest runs next in the shared, `fileParallelism: false` suite.
 describe('connection lifecycle regression', () => {
   it('releases the connection exactly once even when the advisory-unlock query fails', async () => {
     const { query, release } = createFakeClient((text) => {
