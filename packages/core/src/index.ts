@@ -5,6 +5,7 @@
 export const SCHEMA_VERSION = 2
 
 export * from './click-id.js'
+export * from './click-record.js'
 export * from './device.js'
 export * from './evaluate.js'
 export * from './link.js'
