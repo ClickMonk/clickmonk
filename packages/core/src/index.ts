@@ -3,3 +3,5 @@
  * it; `migrate()` refuses to run against a database whose ledger is newer.
  */
 export const SCHEMA_VERSION = 0
+
+export * from './link.js'
