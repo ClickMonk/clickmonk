@@ -45,8 +45,16 @@ export class SpoolWriter {
   private dirty = false
   private sealedBytes = 0
   private dropped = 0
-  private ticks = 0
+  private lastMeasureAt = 0
   private timer: NodeJS.Timeout | null = null
+  private closed = false
+  /**
+   * Path of a segment that was written, fsynced and closed, but whose
+   * rename to its sealed name failed. Retried on the next tick rather than
+   * left as an orphaned `.part` file, invisible to the worker and to
+   * `measureSealed`, until the next `start()`.
+   */
+  private pendingSeal: string | null = null
 
   constructor(opts: SpoolOptions) {
     this.dir = opts.dir
@@ -65,12 +73,17 @@ export class SpoolWriter {
       if (f.endsWith('.part')) this.renameToSealed(join(this.dir, f))
     }
     this.sealedBytes = this.measureSealed()
+    this.lastMeasureAt = Date.now()
     this.timer = setInterval(() => this.tick(), this.fsyncIntervalMs)
     this.timer.unref()
   }
 
   /** True when the record is written. Never throws. */
   append(record: ClickRecord): boolean {
+    if (this.closed) {
+      this.dropped++
+      return false
+    }
     try {
       const line = `${JSON.stringify(record)}\n`
       const n = Buffer.byteLength(line)
@@ -82,7 +95,16 @@ export class SpoolWriter {
       writeSync(this.fd as number, line)
       this.segBytes += n
       this.dirty = true
-      if (this.segBytes >= this.maxSegmentBytes) this.seal()
+      // The record is accepted from here on: it is on disk. A failure
+      // sealing the segment (fsync, close or rename) is reported through
+      // onError, never by dropping this record or returning false for it.
+      if (this.segBytes >= this.maxSegmentBytes) {
+        try {
+          this.seal()
+        } catch (err) {
+          this.onError(err)
+        }
+      }
       return true
     } catch (err) {
       this.dropped++
@@ -95,11 +117,17 @@ export class SpoolWriter {
     return { dropped: this.dropped, pendingBytes: this.sealedBytes + this.segBytes }
   }
 
-  /** Stops the timer and seals the open segment. Call on shutdown, after the server stops accepting. */
+  /**
+   * Stops the timer and seals the open segment. Call on shutdown, after the
+   * server stops accepting. After this, `append` returns false and counts a
+   * drop, rather than opening a segment no timer is left to seal.
+   */
   close(): void {
+    this.closed = true
     if (this.timer) clearInterval(this.timer)
     this.timer = null
     try {
+      if (this.pendingSeal) this.retryPendingSeal()
       if (this.fd !== null) this.seal()
     } catch (err) {
       this.onError(err)
@@ -108,16 +136,18 @@ export class SpoolWriter {
 
   private tick(): void {
     try {
+      if (this.pendingSeal) this.retryPendingSeal()
       if (this.fd !== null && this.dirty) {
         fsyncSync(this.fd)
         this.dirty = false
       }
       if (this.fd !== null && Date.now() - this.segOpenedAt >= this.maxSegmentAgeMs) this.seal()
-      // The worker deletes shipped segments; re-measure about once a second so
-      // a full spool starts accepting again after it drains.
-      this.ticks++
-      if (this.ticks * this.fsyncIntervalMs >= 1000) {
-        this.ticks = 0
+      // The worker deletes shipped segments; re-measure roughly once a
+      // second, by elapsed time rather than a count of ticks, so a timer
+      // that runs late or drifts under load still re-measures promptly
+      // instead of needing an exact number of ticks to land.
+      if (Date.now() - this.lastMeasureAt >= 1000) {
+        this.lastMeasureAt = Date.now()
         this.sealedBytes = this.measureSealed()
       }
     } catch (err) {
@@ -134,16 +164,32 @@ export class SpoolWriter {
 
   private seal(): void {
     const fd = this.fd as number
+    const path = this.openPath
+    const bytes = this.segBytes
     this.fd = null
-    try {
-      fsyncSync(fd)
-    } finally {
-      closeSync(fd)
-    }
     this.dirty = false
-    this.renameToSealed(this.openPath)
-    this.sealedBytes += this.segBytes
     this.segBytes = 0
+    // The bytes are on disk and count toward the total from here regardless
+    // of what happens next; only the name, and so the worker's visibility
+    // of the segment, is at risk below.
+    this.sealedBytes += bytes
+    try {
+      try {
+        fsyncSync(fd)
+      } finally {
+        closeSync(fd)
+      }
+      this.renameToSealed(path)
+    } catch (err) {
+      this.pendingSeal = path
+      throw err
+    }
+  }
+
+  private retryPendingSeal(): void {
+    const path = this.pendingSeal as string
+    this.renameToSealed(path)
+    this.pendingSeal = null
   }
 
   private renameToSealed(path: string): void {
@@ -158,6 +204,13 @@ export class SpoolWriter {
         total += statSync(join(this.dir, f)).size
       } catch {
         // Deleted by the worker between readdir and stat.
+      }
+    }
+    if (this.pendingSeal) {
+      try {
+        total += statSync(this.pendingSeal).size
+      } catch {
+        // Renamed by a retry, or removed, between check and stat.
       }
     }
     return total

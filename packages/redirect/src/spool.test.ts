@@ -1,9 +1,26 @@
-import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { type ClickRecord, ZERO_UUID } from '@clickmonk/core'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SpoolWriter } from './spool.js'
+
+// A real `node:fs` module namespace can't be spied on directly under ESM
+// ("Module namespace is not configurable"), so `renameSync` is routed
+// through a swappable hook instead. Every other export, and `renameSync`
+// itself outside the one test that sets the hook, stays the real
+// implementation used against real temp directories.
+const renameHook = vi.hoisted(() => ({ impl: null as ((from: string, to: string) => void) | null }))
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>()
+  return {
+    ...actual,
+    renameSync: (from: string, to: string) => {
+      if (renameHook.impl) return renameHook.impl(from, to)
+      return actual.renameSync(from, to)
+    },
+  }
+})
 
 const rec = (n: number): ClickRecord => ({
   v: 1,
@@ -37,6 +54,7 @@ function writer(dir: string, opts: Partial<ConstructorParameters<typeof SpoolWri
 }
 afterEach(() => {
   for (const w of writers.splice(0)) w.close()
+  renameHook.impl = null
 })
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'clickmonk-spool-'))
@@ -100,6 +118,20 @@ describe('SpoolWriter', () => {
     expect(w.stats().dropped).toBe(2)
   })
 
+  it('counts the open segment toward the total bound, not just sealed bytes', () => {
+    const dir = tmp()
+    const one = `${JSON.stringify(rec(0))}\n`.length
+    // A segment bound far larger than anything written here, so nothing
+    // seals during the test: every byte stays in the open segment, and the
+    // total-bound check has to add segBytes in, not just sealedBytes (which
+    // stays 0 throughout).
+    const w = writer(dir, { maxTotalBytes: one * 3, maxSegmentBytes: one * 100 })
+    const results = Array.from({ length: 5 }, (_, i) => w.append(rec(i)))
+    expect(results).toEqual([true, true, true, false, false])
+    expect(w.stats().dropped).toBe(2)
+    expect(sealed(dir)).toHaveLength(0)
+  })
+
   it('accepts writes again once the worker has drained the spool', async () => {
     const dir = tmp()
     const one = `${JSON.stringify(rec(0))}\n`.length
@@ -107,18 +139,70 @@ describe('SpoolWriter', () => {
     w.append(rec(0))
     w.append(rec(1))
     expect(w.append(rec(2))).toBe(false)
-    const { rmSync } = await import('node:fs')
     for (const f of sealed(dir)) rmSync(join(dir, f))
-    await new Promise((r) => setTimeout(r, 1200))
+    // The re-measure fires on elapsed time (~1000ms), not a fixed tick
+    // count, so it lands regardless of timer jitter; the extra margin here
+    // is slack for a slow CI box, not a dependency on exact tick timing.
+    await new Promise((r) => setTimeout(r, 1500))
     expect(w.append(rec(3))).toBe(true)
   })
 
-  it('never throws from append, even when the directory is gone', async () => {
+  it('never throws from append, even when the directory is gone, and reports false with the error', () => {
     const dir = tmp()
-    const w = writer(dir, { maxSegmentBytes: 1 })
-    const { rmSync } = await import('node:fs')
+    const onError = vi.fn()
+    const w = writer(dir, { maxSegmentBytes: 1, onError })
     rmSync(dir, { recursive: true, force: true })
-    expect(() => w.append(rec(1))).not.toThrow()
+    let result: boolean | undefined
+    expect(() => {
+      result = w.append(rec(1))
+    }).not.toThrow()
+    expect(result).toBe(false)
     expect(w.stats().dropped).toBeGreaterThan(0)
+    expect(onError).toHaveBeenCalledTimes(1)
+    expect(onError.mock.calls[0]?.[0]).toBeInstanceOf(Error)
+  })
+
+  it('drops instead of writing after close, opening no new segment', () => {
+    const dir = tmp()
+    const w = writer(dir)
+    w.append(rec(1))
+    w.close()
+    expect(w.append(rec(2))).toBe(false)
+    expect(w.stats().dropped).toBe(1)
+    expect(readdirSync(dir).some((f) => f.endsWith('.part'))).toBe(false)
+  })
+
+  it('tick catches its own errors, so a re-measure against a missing directory never crashes the process', async () => {
+    const dir = tmp()
+    const onError = vi.fn()
+    writer(dir, { fsyncIntervalMs: 20, onError }).append(rec(1))
+    rmSync(dir, { recursive: true, force: true })
+    // Past the ~1000ms elapsed-time re-measure mark; a real, uncaught
+    // exception from inside the timer callback would fail this test run.
+    await new Promise((r) => setTimeout(r, 1500))
+    expect(onError).toHaveBeenCalled()
+  })
+
+  it('keeps a seal pending and retries its rename on the next tick, without dropping the write', async () => {
+    const dir = tmp()
+    const onError = vi.fn()
+    const w = writer(dir, { maxSegmentBytes: 1, fsyncIntervalMs: 20, onError })
+    renameHook.impl = () => {
+      throw new Error('simulated rename failure')
+    }
+    // The write itself succeeds; only the seal that follows (triggered by
+    // the 1-byte segment bound) fails to rename.
+    expect(w.append(rec(1))).toBe(true)
+    expect(w.stats().dropped).toBe(0)
+    expect(onError).toHaveBeenCalledTimes(1)
+    expect(onError.mock.calls[0]?.[0]).toBeInstanceOf(Error)
+    expect(readdirSync(dir).some((f) => f.endsWith('.part'))).toBe(true)
+    expect(sealed(dir)).toHaveLength(0)
+
+    // Let the next tick's retry use the real rename.
+    renameHook.impl = null
+    await new Promise((r) => setTimeout(r, 200))
+    expect(sealed(dir)).toHaveLength(1)
+    expect(lines(dir)).toHaveLength(1)
   })
 })
