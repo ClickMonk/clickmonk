@@ -1,9 +1,8 @@
 name: CI
 
-# There is no product code yet, so there is no build or test job. The first
-# package adds a `test` job here that runs the same gate CLAUDE.md prescribes
-# locally, in the same order, and branch protection then requires it beside
-# `boundary`.
+# `boundary` checks what the public repository must never contain. `test` is
+# the gate CLAUDE.md prescribes locally, in the same order: the cheap checks
+# first, so a lint error fails in seconds rather than after a build.
 on:
   push: { branches: [main] }
   pull_request:
@@ -59,3 +58,22 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.30.1 \
             git /repo --redact --verbose --exit-code 1
+
+  test:
+    runs-on: ubuntu-latest
+    # Every job carries a timeout. Without one a job inherits GitHub's
+    # 360-minute default.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      # No `version:` here: package.json pins `packageManager`, and the
+      # action reads it from there, so the two can never disagree.
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm build
+      - run: docker compose -f docker-compose.test.yml up -d --wait
+      - run: pnpm test

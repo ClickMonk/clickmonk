@@ -46,20 +46,59 @@ product, no install and no API yet. Do not write documentation that implies othe
 
 ## Stack and layout
 
-**Not decided yet.** When it is, this section gets the package layout, the commands to
-build, lint, typecheck and test, and the order CI runs them in — and the local gate is
-that same order, so local red means CI red.
+A pnpm workspace of TypeScript packages, Node 22, ESM throughout. TypeScript is `strict`
+with `noUncheckedIndexedAccess`; avoid `any`, and justify it inline on the rare occasion
+it is unavoidable. Biome handles lint and format. Vitest runs the tests. Two stores:
+**Postgres** for domains, links, counters and the single migration ledger; **ClickHouse**
+for click events.
 
-Three properties of the product are already fixed and shape every stack choice:
+```
+packages/core/      pure logic, no I/O: link schemas (zod), the redirect evaluator,
+                    device detection, destination tokens, passthrough, rotation,
+                    click IDs, the click record. Owns SCHEMA_VERSION.
+packages/db/        Postgres and ClickHouse clients and the migrator. Migrations live
+                    in packages/db/migrations/{postgres,clickhouse} as one shared
+                    version sequence.
+packages/redirect/  the service that answers link domains: an in-memory snapshot,
+                    the spool writer, the click-cap counter.
+packages/worker/    ships the spool into ClickHouse; runs migrations on boot.
+packages/cli/       `clickmonk migrate | domain add | link add`.
+```
 
-- **The redirect path is the product.** A click that fails to redirect is lost revenue
-  for the person who paid for the traffic, and it cannot be replayed. It must stay up and
-  answer fast when everything behind it (reporting, the admin UI, the database the
-  reports read) is slow or down.
+Three properties of the product shape every change:
+
+- **The redirect path is the product.** It must keep answering when ClickHouse, the
+  worker or Postgres is down. It never queries ClickHouse and never waits on reporting.
 - **Custom domains are first-class.** Every customer domain needs TLS, issued and renewed
   without anyone touching a certificate.
 - **The redirect endpoint is public and unauthenticated by nature.** Anything reachable
-  from it is reachable by anyone on the internet.
+  from it is reachable by anyone on the internet, so all of it is bounded.
+
+## Running the tests
+
+```sh
+corepack enable
+pnpm install
+docker compose -f docker-compose.test.yml up -d --wait   # Postgres + ClickHouse
+pnpm build        # required before the first `pnpm test`
+pnpm test
+```
+
+**Build before the first test run, and after changing `core` or `db`.** Packages import
+each other by name, which resolves to the *built* `dist/`, and `dist/` is not committed.
+A test in `packages/redirect` exercising a change in `packages/core` runs against the
+last build until you rebuild; it stays green and the green means nothing.
+
+**While iterating, run the focused test files for what you touched.** Before opening a
+pull request, run the full gate in CI's order, so local red means CI red:
+
+```sh
+pnpm lint && pnpm typecheck && pnpm build && pnpm test
+```
+
+**Run one test suite at a time.** Every database-backed test resets the shared test
+databases in `beforeAll`; two runs at once delete each other's fixtures. A mass failure
+across files you did not touch is a second test run until proven otherwise.
 
 ## License and its consequences
 

@@ -21,7 +21,15 @@ Thanks for your interest. ClickMonk has no code yet, so the most useful contribu
 
 ## Development setup
 
-The technology stack has not been decided yet. Setup instructions will land here together with the first packages.
+You need Node 22, Docker with Compose v2, and `corepack` (it ships with Node). Then:
+
+    corepack enable
+    pnpm install
+    docker compose -f docker-compose.test.yml up -d --wait
+    pnpm build
+    pnpm test
+
+`CLAUDE.md` explains why the build comes before the tests, and the order CI runs checks in.
 
 ## Code of conduct
 

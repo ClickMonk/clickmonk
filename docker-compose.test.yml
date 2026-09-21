@@ -1,0 +1,39 @@
+# Distinct project name so a local stack (project "clickmonk") cannot stop or
+# replace the containers tests are talking to.
+name: clickmonk-test
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    ports: ["8123:8123"]
+    environment:
+      CLICKHOUSE_DB: clickmonk_test
+      CLICKHOUSE_USER: clickmonk
+      CLICKHOUSE_PASSWORD: clickmonk
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      # Probed on the container's hostname, not loopback: the image's
+      # init-phase server also answers on loopback and would report healthy
+      # before the real server is listening.
+      test: ["CMD-SHELL", "wget -qO- \"http://$$(hostname):8123/ping\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+  postgres:
+    image: postgres:17-alpine
+    ports: ["5433:5432"]
+    environment:
+      POSTGRES_DB: clickmonk_test
+      POSTGRES_USER: clickmonk
+      POSTGRES_PASSWORD: clickmonk
+    healthcheck:
+      # -h forces the probe onto the hostname so the entrypoint's socket-only
+      # init server cannot answer it.
+      test: ["CMD-SHELL", "pg_isready -U clickmonk -d clickmonk_test -h \"$$(hostname)\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
