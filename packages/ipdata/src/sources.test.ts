@@ -17,6 +17,16 @@ const LIMITS = { max32: 100, max128: 100 }
 const n4 = (s: string) => (parseIp(s) as { n: number }).n
 const w6 = (s: string) => (parseIp(s) as { w: readonly [number, number, number, number] }).w
 
+/** The error a throwing `fn` raised, so a test can check both its class and its message. */
+function thrown(fn: () => unknown): unknown {
+  try {
+    fn()
+  } catch (e) {
+    return e
+  }
+  throw new Error('expected to throw')
+}
+
 describe('parseDbIpCountry', () => {
   const csv = [
     '192.0.2.0,192.0.2.255,DE',
@@ -44,7 +54,33 @@ describe('parseDbIpCountry', () => {
   })
 
   it('stops at the bound rather than reading on', () => {
-    expect(() => parseDbIpCountry(csv, { max32: 1, max128: 100 })).toThrow(SourceError)
+    // The message (not just the error class) tells the early, in-loop guard
+    // apart from the table's own bound check, which only fires after every
+    // entry has been read: both are SourceError since the fix that wraps
+    // the table's own TableError, so the message is what pins this guard.
+    const e = thrown(() => parseDbIpCountry(csv, { max32: 1, max128: 100 }))
+    expect(e).toBeInstanceOf(SourceError)
+    expect((e as Error).message).toMatch(/more entries than the bound/)
+  })
+
+  it('wraps an overlapping range as SourceError, never a bare TableError', () => {
+    const overlapping = '192.0.2.0,192.0.2.10,DE\n192.0.2.5,192.0.2.20,FR\n'
+    const e = thrown(() => parseDbIpCountry(overlapping, LIMITS))
+    expect(e).toBeInstanceOf(SourceError)
+  })
+
+  it('refuses a text of more lines than its bound allows, without reading them all', () => {
+    // A tiny injected limit keeps the line cap, and so the fixture, small.
+    const tinyLimits = { max32: 1, max128: 1 }
+    const manyBlankLines = '\n'.repeat(10_000)
+    const e = thrown(() => parseDbIpCountry(manyBlankLines, tinyLimits))
+    expect(e).toBeInstanceOf(SourceError)
+    expect((e as Error).message).toMatch(/more lines than the bound/)
+  })
+
+  it('strips a leading UTF-8 BOM before parsing', () => {
+    const t = parseDbIpCountry('﻿192.0.2.0,192.0.2.255,DE\n', LIMITS)
+    expect(t.get32(n4('192.0.2.7'))).toBe(packCountry('DE'))
   })
 })
 
@@ -86,6 +122,41 @@ describe('parseBadAsnList', () => {
   it('refuses a line that does not start with an ASN', () => {
     expect(() => parseBadAsnList('ASN,Entity\nhosting,64500\n', LIMITS)).toThrow(/line 2/)
   })
+
+  it('refuses ASN 0', () => {
+    expect(() => parseBadAsnList('ASN,Entity\n0,Example\n', LIMITS)).toThrow(/line 2/)
+  })
+
+  it('refuses a header line that is not "ASN,Entity"', () => {
+    expect(() => parseBadAsnList('Number,Owner\n64500,Example\n', LIMITS)).toThrow(/line 1/)
+  })
+
+  it('refuses a body that does not end with a newline', () => {
+    const e = thrown(() => parseBadAsnList('ASN,Entity\n64500,Example', LIMITS))
+    expect(e).toBeInstanceOf(SourceError)
+  })
+
+  it('refuses more ASNs than the bound, without reading past it', () => {
+    const tinyLimits = { max32: 1, max128: 0 }
+    const e = thrown(() =>
+      parseBadAsnList('ASN,Entity\n64500,Example\n64501,Example\n', tinyLimits),
+    )
+    expect(e).toBeInstanceOf(SourceError)
+    expect((e as Error).message).toMatch(/more entries than the bound/)
+  })
+
+  it('refuses a text of more lines than its bound allows, without reading them all', () => {
+    const tinyLimits = { max32: 1, max128: 0 }
+    const manyBlankLines = `ASN,Entity\n${'\n'.repeat(10_000)}`
+    const e = thrown(() => parseBadAsnList(manyBlankLines, tinyLimits))
+    expect(e).toBeInstanceOf(SourceError)
+    expect((e as Error).message).toMatch(/more lines than the bound/)
+  })
+
+  it('strips a leading UTF-8 BOM before parsing', () => {
+    const t = parseBadAsnList('﻿ASN,Entity\n64500,Example\n', LIMITS)
+    expect(t.get32(64500)).toBe(1)
+  })
 })
 
 describe('parseOnionoo', () => {
@@ -112,6 +183,37 @@ describe('parseOnionoo', () => {
     expect(() => parseOnionoo('{"relays":[{"exit_addresses":["nope"]}]}', LIMITS)).toThrow(
       /not an address/,
     )
+  })
+
+  it.each([
+    ['null', 'null'],
+    ['an empty array', '[]'],
+    ['a null relay', '{"relays":[null]}'],
+    ['a non-array exit_addresses', '{"relays":[{"exit_addresses":5}]}'],
+  ])('refuses %s with SourceError, never a bare TypeError', (_label, badDoc) => {
+    expect(() => parseOnionoo(badDoc, LIMITS)).toThrow(SourceError)
+  })
+
+  it('refuses an unmatched "[" in an address', () => {
+    const badDoc = JSON.stringify({ relays: [{ or_addresses: ['[2001:db8::1'] }] })
+    expect(() => parseOnionoo(badDoc, LIMITS)).toThrow(SourceError)
+  })
+
+  it('leaves an unbracketed address with more than one colon intact', () => {
+    // ::ffff:192.0.2.1 is an IPv4-mapped IPv6 address, not a host:port pair;
+    // stripping at its last colon would silently turn it into a different,
+    // wrong address instead of the one it actually names.
+    const mapped = JSON.stringify({ relays: [{ or_addresses: ['::ffff:192.0.2.1'] }] })
+    const t = parseOnionoo(mapped, LIMITS)
+    expect(t.get32(n4('192.0.2.1'))).toBe(1)
+  })
+
+  it('refuses more addresses than the bound, without reading past it', () => {
+    const tinyLimits = { max32: 1, max128: 100 }
+    const badDoc = JSON.stringify({ relays: [{ exit_addresses: ['192.0.2.1', '192.0.2.2'] }] })
+    const e = thrown(() => parseOnionoo(badDoc, tinyLimits))
+    expect(e).toBeInstanceOf(SourceError)
+    expect((e as Error).message).toMatch(/more entries than the bound/)
   })
 })
 

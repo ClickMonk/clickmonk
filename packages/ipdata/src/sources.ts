@@ -4,6 +4,7 @@ import {
   type Range32,
   type Range128,
   RangeTable,
+  TableError,
   type TableKind,
   type TableLimits,
   packCountry,
@@ -54,6 +55,48 @@ export class SourceError extends Error {
 const HOUR = 3_600_000
 const MB = 1024 * 1024
 
+/** A UTF-8 BOM some tools prepend to a CSV export, decoded as U+FEFF. */
+function stripBom(text: string): string {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text
+}
+
+/**
+ * Lines a text may hold before it could still fit within a source's entry
+ * bound. Checked one line at a time (see `forEachLine`), so a text made
+ * mostly of blank or refused lines is refused within a bounded number of
+ * lines rather than after every line has been read into memory.
+ */
+const LINE_CAP_FACTOR = 20
+function lineCap(limits: TableLimits): number {
+  return (limits.max32 + limits.max128 + 1) * LINE_CAP_FACTOR
+}
+
+/**
+ * Walks `text` line by line without splitting it into an array of every
+ * line first: a text of nothing but newlines would otherwise size that
+ * array to the text's own length before a single entry is read. `cap`
+ * bounds the total lines walked, counting blank and skipped ones.
+ */
+function forEachLine(
+  text: string,
+  cap: number,
+  kind: string,
+  fn: (raw: string, line: number) => void,
+): void {
+  const len = text.length
+  let pos = 0
+  let line = 0
+  while (pos <= len) {
+    line++
+    if (line > cap) throw new SourceError(`${kind}: more lines than the bound of ${cap}`)
+    const nl = text.indexOf('\n', pos)
+    const end = nl < 0 ? len : nl
+    fn(text.slice(pos, end), line)
+    if (nl < 0) break
+    pos = nl + 1
+  }
+}
+
 type Parsed4or6 = { v: 4; start: number; end: number } | { v: 6; start: Words; end: Words }
 
 function parseRange(startText: string, endText: string, line: number): Parsed4or6 {
@@ -74,6 +117,28 @@ function guardCount(r32: unknown[], r128: unknown[], limits: TableLimits, what: 
 }
 
 /**
+ * Wraps a `TableError` from `RangeTable.build` — an overlapping or reversed
+ * range, or a bound this source's own guard did not already catch — as a
+ * `SourceError`, so every refusal from a parser carries the same error
+ * type. The message already carries the table kind; a line number is not
+ * available here, because ranges have already been sorted for the overlap
+ * check by the time it can fail.
+ */
+function buildTable(
+  kind: TableKind,
+  r32: Range32[],
+  r128: Range128[],
+  limits: TableLimits,
+): RangeTable {
+  try {
+    return RangeTable.build(kind, r32, r128, limits)
+  } catch (e) {
+    if (e instanceof TableError) throw new SourceError(e.message)
+    throw e
+  }
+}
+
+/**
  * DB-IP Lite CSV, one range per line: `start,end,value[,more]`. Fields after
  * the third (the ASN edition's quoted organisation name) are ignored.
  * `toValue` returns null for a line to skip, such as the country `ZZ`
@@ -87,22 +152,20 @@ function parseDbIpCsv(
 ): RangeTable {
   const r32: Range32[] = []
   const r128: Range128[] = []
-  let line = 0
-  for (const raw of text.split('\n')) {
-    line++
-    if (raw.length === 0) continue
+  forEachLine(stripBom(text), lineCap(limits), kind, (raw, line) => {
+    if (raw.length === 0) return
     const c1 = raw.indexOf(',')
     const c2 = raw.indexOf(',', c1 + 1)
     if (c1 < 0 || c2 < 0) throw new SourceError(`line ${line}: expected start,end,value`)
     const c3 = raw.indexOf(',', c2 + 1)
     const value = toValue(raw.slice(c2 + 1, c3 < 0 ? undefined : c3).trim(), line)
-    if (value === null) continue
+    if (value === null) return
     const r = parseRange(raw.slice(0, c1), raw.slice(c1 + 1, c2), line)
     if (r.v === 4) r32.push({ start: r.start, end: r.end, value })
     else r128.push({ start: r.start, end: r.end, value })
     guardCount(r32, r128, limits, kind)
-  }
-  return RangeTable.build(kind, r32, r128, limits)
+  })
+  return buildTable(kind, r32, r128, limits)
 }
 
 export function parseDbIpCountry(text: string, limits: TableLimits): RangeTable {
@@ -122,7 +185,11 @@ export function parseDbIpAsn(text: string, limits: TableLimits): RangeTable {
   })
 }
 
-/** Distinct 32-bit keys as single-key ranges, for a set table. */
+/**
+ * Distinct 32-bit keys as single-key ranges, for a set table. The caller
+ * has already bounded `keys32`/`keys128` while building them, so this does
+ * not check the bound again; `buildTable` still refuses anything it missed.
+ */
 function keySet(
   kind: TableKind,
   keys32: Set<number>,
@@ -131,36 +198,69 @@ function keySet(
 ): RangeTable {
   const r32 = [...keys32].map((k) => ({ start: k, end: k, value: 1 }))
   const r128 = [...keys128.values()].map((w) => ({ start: w, end: w, value: 1 }))
-  guardCount(r32, r128, limits, kind)
-  return RangeTable.build(kind, r32, r128, limits)
+  return buildTable(kind, r32, r128, limits)
 }
 
 /** `bad-asn-list.csv`: a header line, then `ASN,Entity` per line. The entity is ignored. */
 export function parseBadAsnList(text: string, limits: TableLimits): RangeTable {
+  // A BOM only ever lands on line 1, and the header comparison below trims
+  // that line first: `.trim()` treats U+FEFF as whitespace, so a leading
+  // BOM is already gone by the time it matters. No explicit strip needed.
+  const body = text
+  // A body cut mid-download most often loses its trailing newline; a cut
+  // last line would otherwise be read as a different, shorter ASN.
+  if (!body.endsWith('\n')) {
+    throw new SourceError('datacenter: text does not end with a newline')
+  }
   const asns = new Set<number>()
-  let line = 0
-  for (const raw of text.split('\n')) {
-    line++
+  forEachLine(body, lineCap(limits), 'datacenter', (raw, line) => {
     const trimmed = raw.trim()
-    if (trimmed.length === 0 || line === 1) continue
-    const field = trimmed
-      .slice(0, trimmed.indexOf(',') < 0 ? undefined : trimmed.indexOf(','))
-      .replace(/"/g, '')
+    if (line === 1) {
+      if (trimmed !== 'ASN,Entity') throw new SourceError(`line 1: expected header "ASN,Entity"`)
+      return
+    }
+    if (trimmed.length === 0) return
+    const comma = trimmed.indexOf(',')
+    const field = trimmed.slice(0, comma < 0 ? undefined : comma).replace(/"/g, '')
     if (!/^\d{1,10}$/.test(field) || Number(field) > 0xffffffff || Number(field) === 0) {
       throw new SourceError(`line ${line}: not an ASN`)
     }
     asns.add(Number(field))
-    if (asns.size > limits.max32)
+    if (asns.size > limits.max32) {
       throw new SourceError(`datacenter: more entries than the bound of ${limits.max32}`)
-  }
+    }
+  })
   return keySet('datacenter', asns, new Map(), limits)
 }
 
-/** `203.0.113.5:443` or `[2001:db8::5]:443` to the address alone. */
+/**
+ * `203.0.113.5:443` or `[2001:db8::5]:443` to the address alone. An
+ * unbracketed address with anything other than exactly one colon is
+ * returned unchanged: an unbracketed IPv6 address, mapped or not, carries
+ * several colons of its own and is never followed by a port here.
+ */
 function stripPort(s: string): string {
-  if (s.startsWith('[')) return s.slice(1, s.indexOf(']'))
-  const colon = s.lastIndexOf(':')
-  return s.includes('.') && colon > 0 ? s.slice(0, colon) : s
+  if (s.startsWith('[')) {
+    const close = s.indexOf(']')
+    if (close < 0) throw new SourceError(`not an address: ${s.slice(0, 60)}`)
+    return s.slice(1, close)
+  }
+  const first = s.indexOf(':')
+  return first >= 0 && first === s.lastIndexOf(':') ? s.slice(0, first) : s
+}
+
+function isObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null
+}
+
+/** `v` as an array of strings; `undefined` (the field absent) is an empty array. Throws otherwise. */
+function stringArray(v: unknown, label: string): string[] {
+  if (v === undefined) return []
+  if (!Array.isArray(v)) throw new SourceError(`${label}: not an array of strings`)
+  for (const x of v) {
+    if (typeof x !== 'string') throw new SourceError(`${label}: not an array of strings`)
+  }
+  return v as string[]
 }
 
 /**
@@ -175,19 +275,19 @@ export function parseOnionoo(text: string, limits: TableLimits): RangeTable {
   } catch {
     throw new SourceError('not JSON')
   }
-  const relays = (doc as { relays?: unknown }).relays
+  if (!isObject(doc)) throw new SourceError('not an object')
+  const relays = doc.relays
   if (!Array.isArray(relays)) throw new SourceError('no relays array')
   const v4 = new Set<number>()
   const v6 = new Map<string, Words>()
   for (const relay of relays) {
-    const r = relay as { exit_addresses?: unknown; or_addresses?: unknown }
-    const addresses = [
-      ...(Array.isArray(r.exit_addresses) ? r.exit_addresses : []),
-      ...(Array.isArray(r.or_addresses) ? r.or_addresses.map((a) => stripPort(String(a))) : []),
-    ]
+    if (!isObject(relay)) throw new SourceError('a relay is not an object')
+    const exitAddrs = stringArray(relay.exit_addresses, 'exit_addresses')
+    const orAddrs = stringArray(relay.or_addresses, 'or_addresses')
+    const addresses = [...exitAddrs, ...orAddrs.map(stripPort)]
     for (const a of addresses) {
-      const ip = parseIp(String(a))
-      if (!ip) throw new SourceError(`not an address: ${String(a).slice(0, 60)}`)
+      const ip = parseIp(a)
+      if (!ip) throw new SourceError(`not an address: ${a.slice(0, 60)}`)
       if (ip.v === 4) v4.add(ip.n)
       else v6.set(ip.w.join(':'), ip.w)
     }
@@ -200,7 +300,10 @@ export function parseOnionoo(text: string, limits: TableLimits): RangeTable {
   return keySet('tor', v4, v6, limits)
 }
 
-/** Throws unless the table holds at least the source's minimum, about a fifth of a real download. */
+/**
+ * Throws unless the table holds at least the source's minimum, set at
+ * roughly 5-15% of a real download (see each entry in `SOURCES`).
+ */
 export function checkMinimum(id: SourceId, table: RangeTable, minimum: Minimum): void {
   const { k32, k128 } = table.size
   if (k32 < minimum.k32 || k128 < minimum.k128) {
@@ -231,7 +334,7 @@ const DBIP_ATTRIBUTION =
  * Every source the updater knows. Adding one is adding an entry here: its
  * licence must be stated and compatible, and its attribution shown.
  * Sizes are set from what each source held when this was written: the
- * limits at a few times that, the minimums at a fifth of it.
+ * limits at a few times that, the minimums at roughly 5-15% of it.
  */
 export const SOURCES: Record<SourceId, SourceDef> = {
   country: {
