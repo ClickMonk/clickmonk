@@ -109,6 +109,7 @@ export interface UpdateOptions {
   timeoutMs?: number
   /** Aborts the download in flight and starts no other; the lock is still released. */
   signal?: AbortSignal
+  log?: (msg: string) => void
 }
 
 /**
@@ -194,7 +195,7 @@ export async function runUpdate(opts: UpdateOptions): Promise<SourceResult[] | '
     timeoutMs: opts.timeoutMs ?? DOWNLOAD_TIMEOUT_MS,
     ...(opts.signal ? { signal: opts.signal } : {}),
   }
-  if (!takeLock(opts.dir, now.getTime())) return 'busy'
+  if (!takeLock(opts.dir, now.getTime(), opts.log ? { log: opts.log } : {})) return 'busy'
   try {
     // An I/O error reading the manifest aborts the run before any download,
     // the same split commitTables makes. A manifest that reads but is not
@@ -270,6 +271,7 @@ export function startUpdater(opts: {
           dir: opts.dir,
           checked,
           signal: abort.signal,
+          log,
           ...(opts.fetch ? { fetch: opts.fetch } : {}),
           ...(opts.sources ? { sources: opts.sources } : {}),
         })

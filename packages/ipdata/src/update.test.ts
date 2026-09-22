@@ -339,6 +339,59 @@ describe('runUpdate', () => {
     })
   })
 
+  it("keeps last month's edition installed while this month's is refused, and says why", async () => {
+    const dir = tmp()
+    const now = new Date()
+    const refuseThisMonth = () =>
+      fakeFetch({
+        body: (u) =>
+          u.includes(`country-lite-${edition(now, 0)}`) ? gzipSync('not,a csv\n') : undefined,
+      })
+    await runUpdate({ dir, now: () => now, fetch: refuseThisMonth().fetch, sources: small() })
+    const again = refuseThisMonth()
+    const r = await runUpdate({
+      dir,
+      now: () => now,
+      fetch: again.fetch,
+      sources: small(),
+      force: true,
+    })
+    expect(r).toContainEqual({
+      id: 'country',
+      outcome: 'unchanged',
+      version: edition(now, 1),
+      refused: expect.stringMatching(new RegExp(`^${edition(now, 0)} refused: `)),
+    })
+    // Last month's is the one installed: it is not downloaded again.
+    expect(again.calls.filter((u) => u.includes(`country-lite-${edition(now, 1)}`))).toEqual([])
+    // The worker reports the refusal on each check, not only the first.
+    const m = readManifest(dir)
+    const old = new Date(now.getTime() - SOURCES.country.refreshMs - 60_000).toISOString()
+    if (m?.sources.country) m.sources.country.fetchedAt = old
+    writeFileSync(join(dir, 'manifest.json'), JSON.stringify(m))
+    const lines: string[] = []
+    let passed: () => void = () => {}
+    const firstPass = new Promise<void>((res) => {
+      passed = res
+    })
+    const u = startUpdater({
+      dir,
+      fetch: refuseThisMonth().fetch,
+      sources: small(),
+      log: (msg) => {
+        lines.push(msg)
+        if (msg.startsWith('IP data country')) passed()
+      },
+    })
+    await firstPass
+    await u.stop()
+    expect(lines).toEqual([
+      expect.stringMatching(
+        new RegExp(`^IP data country: ${edition(now, 0)} refused: .*; using ${edition(now, 1)}$`),
+      ),
+    ])
+  })
+
   it('fails a source when every published edition is refused', async () => {
     const dir = tmp()
     const now = new Date()
@@ -427,10 +480,63 @@ describe('takeLock', () => {
     const theirs = JSON.stringify({ pid: 2, at: Date.now() })
     // Between this call reading the stale lock and renaming it, another
     // process replaced it with its own: the file renamed is that live lock.
-    const took = takeLock(dir, Date.now(), (renamed) => writeFileSync(renamed, theirs))
+    const took = takeLock(dir, Date.now(), {
+      afterRename: (renamed) => writeFileSync(renamed, theirs),
+    })
     expect(took).toBe(false)
     expect(readFileSync(join(dir, LOCK_FILE), 'utf8')).toBe(theirs)
     expect(readdirSync(dir)).toEqual([LOCK_FILE])
+  })
+
+  it('backs off, and leaves the newest lock in place, when a third took the name meanwhile', () => {
+    const dir = tmp()
+    writeFileSync(join(dir, LOCK_FILE), stale())
+    const theirs = JSON.stringify({ pid: 2, at: Date.now() })
+    const newest = JSON.stringify({ pid: 3, at: Date.now() })
+    const took = takeLock(dir, Date.now(), {
+      afterRename: (renamed) => {
+        writeFileSync(renamed, theirs)
+        // By the time the renamed lock would go back, a newer one holds the name.
+        writeFileSync(join(dir, LOCK_FILE), newest)
+      },
+    })
+    expect(took).toBe(false)
+    expect(readFileSync(join(dir, LOCK_FILE), 'utf8')).toBe(newest)
+    expect(readdirSync(dir)).toEqual([LOCK_FILE])
+  })
+
+  it('does not take a lock with no time for stale while its file is new', () => {
+    const dir = tmp()
+    // As a lock created in place looks before its content is written.
+    writeFileSync(join(dir, LOCK_FILE), '')
+    expect(takeLock(dir, Date.now())).toBe(false)
+  })
+
+  it('creates the lock in place where the filesystem has no hard links, and says so once', () => {
+    const dir = tmp()
+    const lines: string[] = []
+    const link = () => {
+      throw Object.assign(new Error('operation not supported'), { code: 'ENOTSUP' })
+    }
+    const now = Date.now()
+    expect(takeLock(dir, now, { link, log: (m) => lines.push(m) })).toBe(true)
+    expect(JSON.parse(readFileSync(join(dir, LOCK_FILE), 'utf8'))).toEqual({
+      pid: process.pid,
+      at: now,
+    })
+    expect(readdirSync(dir)).toEqual([LOCK_FILE])
+    // Held: a second call stands aside.
+    expect(takeLock(dir, now, { link, log: (m) => lines.push(m) })).toBe(false)
+    expect(lines).toEqual([expect.stringMatching(/has no hard links/)])
+  })
+
+  it('still refuses any other link error', () => {
+    const dir = tmp()
+    const link = () => {
+      throw Object.assign(new Error('i/o error'), { code: 'EIO' })
+    }
+    expect(() => takeLock(dir, Date.now(), { link })).toThrow(/i\/o error/)
+    expect(readdirSync(dir)).toEqual([])
   })
 })
 
@@ -578,6 +684,11 @@ describe('fetchBounded', () => {
         return res.writeHead(301, { location: `https://127.0.0.1:${port}/ok` }).end()
       }
       if (req.url === '/no-location') return res.writeHead(302).end()
+      if (req.url === '/nested/start')
+        return res.writeHead(302, { location: '/nested/dir/rel' }).end()
+      // No leading slash: relative to this hop's own path, not the first one's.
+      if (req.url === '/nested/dir/rel') return res.writeHead(302, { location: 'ok' }).end()
+      if (req.url === '/nested/dir/ok') return res.end('nested')
       // /slow: never answers.
     })
     await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
@@ -604,6 +715,11 @@ describe('fetchBounded', () => {
   it('refuses a body over the bound, declared or streamed', async () => {
     await expect(get('/declared-big')).rejects.toThrow(/declares 100 bytes/)
     await expect(get('/streamed-big')).rejects.toThrow(/larger than 50/)
+  })
+
+  it('resolves a relative location against the hop that sent it', async () => {
+    const r = await get('/nested/start')
+    expect(r.status === 'ok' && Buffer.from(r.body).toString()).toBe('nested')
   })
 
   it('follows a redirect to the same scheme, up to its bound', async () => {
