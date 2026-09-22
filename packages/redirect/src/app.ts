@@ -17,7 +17,7 @@ import {
   uuidv7,
 } from '@clickmonk/core'
 import type { Pool } from '@clickmonk/db'
-import { type IpLookup, addressOnly } from '@clickmonk/ipdata'
+import { type IpLookup, addressOnly, canonicalIp } from '@clickmonk/ipdata'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { checkCap, tryConsumeCap } from './cap.js'
 import type { RateCounter } from './rate.js'
@@ -106,9 +106,10 @@ export function buildRedirectApp(
     // once too rather than trusted to stay untouched across an await.
     const userAgent = (req.headers['user-agent'] ?? '').slice(0, MAX_UA_LENGTH)
     const referrer = String(req.headers.referer ?? '').slice(0, MAX_REFERRER_LENGTH)
-    // A proxy can name the client as `[2001:db8::1]:443` or `192.0.2.1:8080`:
-    // the lookup, the rate count and the record all take the address alone.
-    const ip = addressOnly(req.ip ?? '').slice(0, 45)
+    // A proxy can name the client as `[2001:db8::1]:443` or `192.0.2.1:8080`,
+    // or an IPv4 client as `::ffff:192.0.2.1`: the lookup, the rate count and
+    // the record all take the address alone, in one form per address.
+    const ip = canonicalIp(addressOnly(req.ip ?? '').slice(0, 45))
     const visitor = readVisitor(req.headers.cookie, deps.secret)
     const clickId = uuidv7()
     const at = now()

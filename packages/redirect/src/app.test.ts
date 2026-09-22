@@ -877,6 +877,28 @@ describe('traffic classification', () => {
     expect(records.map((r) => r.trafficClass)).toEqual(['human', 'abuser'])
   })
 
+  it('records an IPv4-mapped address as IPv4, and counts it with the plain form', async () => {
+    const { app, records } = harness([link()], {
+      ipdata: IPDATA,
+      settings: { ...DEFAULT_TRAFFIC_SETTINGS, abuserThreshold: 1 },
+      rate: new RateCounter(),
+    })
+    await app.inject({ method: 'GET', url: '/spring', headers: from('::ffff:198.51.100.7') })
+    await app.inject({ method: 'GET', url: '/spring', headers: from('198.51.100.7') })
+    expect(records.map((r) => [r.ip, r.country, r.trafficClass])).toEqual([
+      ['198.51.100.7', 'FR', 'datacenter'],
+      ['198.51.100.7', 'FR', 'abuser'],
+    ])
+  })
+
+  it('records an IPv6 address in one form however the proxy writes it', async () => {
+    const { app, records } = harness([link()], { ipdata: IPDATA })
+    for (const ip of ['2001:DB8:0:0:0:0:0:7', '[2001:0db8::0007]:443']) {
+      await app.inject({ method: 'GET', url: '/spring', headers: from(ip) })
+    }
+    expect(records.map((r) => r.ip)).toEqual(['2001:db8::7', '2001:db8::7'])
+  })
+
   it('counts requests on a clock that never steps back, whatever the wall clock does', async () => {
     // The wall clock steps back an hour before every request; the count carries on.
     let wall = Date.now()

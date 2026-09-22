@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { addressOnly, parseIp } from './ip.js'
+import { addressOnly, canonicalIp, parseIp } from './ip.js'
 
 describe('parseIp', () => {
   it.each([
@@ -58,5 +58,27 @@ describe('addressOnly', () => {
     ['[2001:db8::5', '[2001:db8::5'],
   ])('%s -> %s', (s, want) => {
     expect(addressOnly(s)).toBe(want)
+  })
+})
+
+describe('canonicalIp', () => {
+  it.each([
+    ['192.0.2.1', '192.0.2.1'],
+    ['::ffff:198.51.100.7', '198.51.100.7'],
+    ['::FFFF:C633:6407', '198.51.100.7'],
+    ['2001:DB8:0:0:0:0:0:1', '2001:db8::1'],
+    ['2001:0db8::0001', '2001:db8::1'],
+    ['2001:db8:0:0:1:0:0:1', '2001:db8::1:0:0:1'],
+    ['2001:db8:0:1:0:0:0:1', '2001:db8:0:1::1'],
+    ['2001:db8:0:1:1:1:1:1', '2001:db8:0:1:1:1:1:1'],
+    ['2001:db8::', '2001:db8::'],
+    ['::', '::'],
+    ['::1', '::1'],
+    ['2001:db8::192.0.2.1', '2001:db8::c000:201'],
+    // Not an address: returned as it is.
+    ['not-an-address', 'not-an-address'],
+    ['', ''],
+  ])('%s -> %s', (s, want) => {
+    expect(canonicalIp(s)).toBe(want)
   })
 })

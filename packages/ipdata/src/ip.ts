@@ -101,3 +101,39 @@ export function addressOnly(s: string): string {
   const colon = s.indexOf(':')
   return colon >= 0 && colon === s.lastIndexOf(':') ? s.slice(0, colon) : s
 }
+
+/** An IPv6 address in its RFC 5952 text form: lower case, no leading zeros, the longest run of two or more zero groups as `::`. */
+function formatV6(w: Words): string {
+  const groups = w.flatMap((x) => [x >>> 16, x & 0xffff])
+  let best = -1
+  let bestLen = 1
+  for (let i = 0; i < 8; ) {
+    if (groups[i] !== 0) {
+      i++
+      continue
+    }
+    let j = i
+    while (j < 8 && groups[j] === 0) j++
+    if (j - i > bestLen) {
+      best = i
+      bestLen = j - i
+    }
+    i = j
+  }
+  const hex = (a: number[]) => a.map((g) => g.toString(16)).join(':')
+  if (best < 0) return hex(groups)
+  return `${hex(groups.slice(0, best))}::${hex(groups.slice(best + bestLen))}`
+}
+
+/**
+ * One text form per address, so that one visitor is recorded under one
+ * string: an IPv4-mapped IPv6 address as the IPv4 address it carries, and
+ * IPv6 in its RFC 5952 form. A string that is not an address is returned
+ * unchanged.
+ */
+export function canonicalIp(s: string): string {
+  const p = parseIp(s)
+  if (!p) return s
+  if (p.v === 4) return [p.n >>> 24, (p.n >>> 16) & 0xff, (p.n >>> 8) & 0xff, p.n & 0xff].join('.')
+  return formatV6(p.w)
+}
