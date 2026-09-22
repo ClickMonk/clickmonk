@@ -22,6 +22,7 @@ services:
     environment:
       CLICKMONK_POSTGRES_URL: postgres://clickmonk:${POSTGRES_PASSWORD:?set it in .env}@postgres:5432/clickmonk
       CLICKMONK_SECRET: ${CLICKMONK_SECRET:?set it in .env}
+      CLICKMONK_TRUSTED_PROXIES: ${CLICKMONK_TRUSTED_PROXIES:-127.0.0.1}
     ports: ["8080:8080"]
     volumes:
       - spool:/var/lib/clickmonk/spool

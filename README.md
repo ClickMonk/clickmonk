@@ -72,6 +72,17 @@ the redirect's memory, and each has a fixed ceiling. The address looked up is th
 connection's, or the one `X-Forwarded-For` names when the connection comes from an
 address in `CLICKMONK_TRUSTED_PROXIES` (default `127.0.0.1`).
 
+Behind a reverse proxy, set `CLICKMONK_TRUSTED_PROXIES` in `.env` to the proxy's address
+as the redirect's container sees it: comma-separated addresses, ranges such as
+`172.17.0.0/16`, or `loopback`, `linklocal` and `uniquelocal`. For a proxy on the Docker
+host, that is the gateway of the stack's Docker network, such as `172.17.0.1` or
+`172.18.0.1` (`docker network inspect clickmonk_default` shows it), or that network's
+subnet, not `127.0.0.1`. A range ending in `/0` is refused, since it would let every visitor
+name its own address, and the redirect does not start with a value it cannot read. Left
+unset behind a proxy, every visitor arrives from the proxy's one address: they share
+one request count, so all of them are classed as abusers once it passes the threshold,
+and the country looked up is the proxy's rather than the visitor's.
+
 | Data | Source | Licence | Checked for updates |
 | --- | --- | --- | --- |
 | Country | [DB-IP](https://db-ip.com) IP to Country Lite | CC BY 4.0 | daily; DB-IP publishes monthly |
