@@ -112,6 +112,11 @@ describe('RangeTable.build', () => {
       expect(() => RangeTable.build('country', [bad], [], LIMITS)).toThrow(TableError)
     }
   })
+
+  it('refuses a 128-bit start or end word that is not an integer in 0..2^32-1', () => {
+    const bad: Range128 = { start: [0, 0, 0, 1.5], end: [0, 0, 0, 2], value: packCountry('DE') }
+    expect(() => RangeTable.build('country', [], [bad], LIMITS)).toThrow(TableError)
+  })
 })
 
 describe('RangeTable.build range boundaries', () => {

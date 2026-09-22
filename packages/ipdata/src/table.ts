@@ -122,6 +122,10 @@ export class RangeTable {
       assertU32(kind, 'start', r.start)
       assertU32(kind, 'end', r.end)
     }
+    for (const r of r128) {
+      for (const w of r.start) assertU32(kind, 'start word', w)
+      for (const w of r.end) assertU32(kind, 'end word', w)
+    }
     const a = [...r32].sort((x, y) => x.start - y.start)
     const b = [...r128].sort((x, y) => cmpWords(x.start, y.start))
     const s32 = new Uint32Array(a.length)
