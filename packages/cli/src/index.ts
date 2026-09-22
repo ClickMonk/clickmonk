@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 import { formatConfigError } from '@clickmonk/core'
 import { type ClickHouseClient, createChClient, createPgPool } from '@clickmonk/db'
+import { DEFAULT_IPDATA_DIR } from '@clickmonk/ipdata'
 import { z } from 'zod'
 import { runCli } from './commands.js'
 
-// Postgres serves every command. ClickHouse serves only `migrate`, so its
-// variables are checked when migrate asks for the client, not up front.
+// Every command but `ipdata` needs Postgres, and its URL is required up front
+// all the same: the CLI runs where the worker runs, which always has it, and
+// a pool opens no connection until its first query. ClickHouse serves only
+// `migrate`, so its variables are checked when migrate asks for the client.
 const PgEnv = z.object({ CLICKMONK_POSTGRES_URL: z.string().url() })
 const ChEnv = z.object({
   CLICKMONK_CLICKHOUSE_URL: z.string().url(),
@@ -34,7 +37,12 @@ async function main(): Promise<number> {
     return opened.ch
   }
   try {
-    return await runCli(process.argv.slice(2), { pg, ch, out: (s) => console.log(s) })
+    return await runCli(process.argv.slice(2), {
+      pg,
+      ch,
+      out: (s) => console.log(s),
+      ipdata: { dir: process.env.CLICKMONK_IPDATA_DIR || DEFAULT_IPDATA_DIR },
+    })
   } finally {
     await Promise.allSettled([pg.end(), opened.ch?.close()])
   }

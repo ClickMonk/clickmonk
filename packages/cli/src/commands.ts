@@ -1,6 +1,14 @@
 import { parseArgs } from 'node:util'
 import { isDomainUrl, normaliseHost, parseLinkInput } from '@clickmonk/core'
 import { type ClickHouseClient, type Pool, migrateToLatest } from '@clickmonk/db'
+import {
+  type Fetcher,
+  SOURCES,
+  SOURCE_IDS,
+  type SourceDef,
+  readManifest,
+  runUpdate,
+} from '@clickmonk/ipdata'
 import type { ZodError } from 'zod'
 
 export interface CliDeps {
@@ -8,13 +16,17 @@ export interface CliDeps {
   /** Called only by `migrate`: the other commands need no ClickHouse configuration. */
   ch: () => ClickHouseClient
   out: (s: string) => void
+  /** Where the IP data lives; `fetch` and `sources` are seams for tests. */
+  ipdata: { dir: string; fetch?: Fetcher; sources?: SourceDef[] }
 }
 
 const USAGE = `usage:
   clickmonk migrate
   clickmonk domain add <host> [--root-url <url>] [--not-found-url <url>]
   clickmonk link add <host> <slug> --target [<weight>=]<url> ... [--backup <url>]
-                     [--cap <n>] [--expires <iso-8601>] [--no-passthrough]`
+                     [--cap <n>] [--expires <iso-8601>] [--no-passthrough]
+  clickmonk ipdata update
+  clickmonk ipdata status`
 
 class Rejected extends Error {}
 
@@ -116,7 +128,49 @@ async function linkAdd(args: string[], d: CliDeps): Promise<void> {
   }
 }
 
-/** Returns the process exit code: 0 ok, 1 usage, 2 rejected input. */
+/**
+ * Downloads every IP data source now, however recently it was fetched, and
+ * installs what passes validation. The worker does the same on a schedule.
+ */
+async function ipdataUpdate(d: CliDeps): Promise<boolean> {
+  const r = await runUpdate({
+    dir: d.ipdata.dir,
+    force: true,
+    ...(d.ipdata.fetch ? { fetch: d.ipdata.fetch } : {}),
+    ...(d.ipdata.sources ? { sources: d.ipdata.sources } : {}),
+  })
+  if (r === 'busy') {
+    d.out('another IP data update is running; try again when it finishes')
+    return false
+  }
+  for (const s of r) {
+    d.out(
+      `${s.id}: ${s.outcome}${s.version ? ` ${s.version}` : ''}${s.error ? ` (${s.error})` : ''}`,
+    )
+  }
+  return r.every((s) => s.outcome !== 'failed')
+}
+
+function ipdataStatus(d: CliDeps): void {
+  const m = readManifest(d.ipdata.dir)
+  for (const id of SOURCE_IDS) {
+    const e = m?.sources[id]
+    const name = SOURCES[id].name
+    d.out(
+      e
+        ? `${id}: ${name} ${e.version}, fetched ${e.fetchedAt}, ${e.entries.k32} + ${e.entries.k128} entries`
+        : `${id}: ${name}, not downloaded yet`,
+    )
+  }
+  // One line per attribution: the two DB-IP editions share theirs.
+  const attributions = new Set(
+    SOURCE_IDS.filter((id) => m?.sources[id]).map((id) => SOURCES[id].attribution),
+  )
+  if (attributions.size > 0) d.out('')
+  for (const a of attributions) d.out(a)
+}
+
+/** Returns the process exit code: 0 ok, 1 usage, 2 rejected input, 4 an IP data source failed to update. */
 export async function runCli(argv: string[], d: CliDeps): Promise<number> {
   const [cmd, sub, ...rest] = argv
   try {
@@ -131,6 +185,13 @@ export async function runCli(argv: string[], d: CliDeps): Promise<number> {
     }
     if (cmd === 'link' && sub === 'add') {
       await linkAdd(rest, d)
+      return 0
+    }
+    if (cmd === 'ipdata' && sub === 'update' && rest.length === 0) {
+      return (await ipdataUpdate(d)) ? 0 : 4
+    }
+    if (cmd === 'ipdata' && sub === 'status' && rest.length === 0) {
+      ipdataStatus(d)
       return 0
     }
     d.out(USAGE)

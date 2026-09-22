@@ -1,11 +1,18 @@
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { gzipSync } from 'node:zlib'
 import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
+import { type Fetcher, SOURCES, SOURCE_IDS } from '@clickmonk/ipdata'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { runCli } from './commands.js'
 
 const pg = testPg()
 const ch = testCh()
 const lines: string[] = []
-const run = (...argv: string[]) => runCli(argv, { pg, ch: () => ch, out: (s) => lines.push(s) })
+const ipdataDir = mkdtempSync(join(tmpdir(), 'clickmonk-cli-ipdata-'))
+const run = (...argv: string[]) =>
+  runCli(argv, { pg, ch: () => ch, out: (s) => lines.push(s), ipdata: { dir: ipdataDir } })
 
 beforeAll(async () => {
   await resetDatabases(pg, ch)
@@ -133,6 +140,7 @@ describe('clickmonk cli', () => {
       pg,
       ch: noCh,
       out: () => {},
+      ipdata: { dir: ipdataDir },
     })
     expect(code).toBe(0)
   })
@@ -141,5 +149,60 @@ describe('clickmonk cli', () => {
     lines.length = 0
     expect(await run('frobnicate')).toBe(1)
     expect(lines.join('\n')).toMatch(/usage/i)
+  })
+})
+
+describe('clickmonk ipdata', () => {
+  // Made-up data on the documentation ranges and ASNs, with minimums cut to fit.
+  const bodies: Record<string, Uint8Array> = {
+    country: gzipSync('192.0.2.0,192.0.2.255,DE\n'),
+    asn: gzipSync('192.0.2.0,192.0.2.255,64500,"Example"\n'),
+    datacenter: new TextEncoder().encode('ASN,Entity\n64501,Example Hosting\n'),
+    tor: new TextEncoder().encode('{"relays":[{"exit_addresses":["198.51.100.9"]}]}'),
+  }
+  const sources = SOURCE_IDS.map((id) => ({ ...SOURCES[id], minimum: { k32: 1, k128: 0 } }))
+  const fetchAll =
+    (failTor = false): Fetcher =>
+    async (url) => {
+      if (failTor && url.includes('onionoo')) throw new Error('connection refused')
+      const id = url.includes('country')
+        ? 'country'
+        : url.includes('asn-lite')
+          ? 'asn'
+          : url.includes('bad-asn')
+            ? 'datacenter'
+            : 'tor'
+      return { status: 'ok', body: bodies[id] as Uint8Array }
+    }
+  const ip = (dir: string, fetch: Fetcher, ...argv: string[]) =>
+    runCli(argv, { pg, ch: () => ch, out: (s) => lines.push(s), ipdata: { dir, fetch, sources } })
+
+  it('says what is missing before the first update', async () => {
+    lines.length = 0
+    expect(await run('ipdata', 'status')).toBe(0)
+    expect(lines).toContain('country: dbip-country-lite, not downloaded yet')
+  })
+
+  it('downloads every source, then reports each with its attribution', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clickmonk-cli-ipdata-'))
+    lines.length = 0
+    expect(await ip(dir, fetchAll(), 'ipdata', 'update')).toBe(0)
+    expect(lines.filter((l) => /: updated /.test(l))).toHaveLength(4)
+    lines.length = 0
+    expect(await ip(dir, fetchAll(), 'ipdata', 'status')).toBe(0)
+    expect(lines.join('\n')).toMatch(
+      /^country: dbip-country-lite \d{4}-\d{2}, fetched .+, 1 \+ 0 entries$/m,
+    )
+    expect(
+      lines.filter((l) => l.startsWith('IP Geolocation by DB-IP (https://db-ip.com)')),
+    ).toHaveLength(1)
+  })
+
+  it('exits 4 when a source fails, and still installs the others', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clickmonk-cli-ipdata-'))
+    lines.length = 0
+    expect(await ip(dir, fetchAll(true), 'ipdata', 'update')).toBe(4)
+    expect(lines).toContain('tor: failed (connection refused)')
+    expect(lines.filter((l) => /: updated /.test(l))).toHaveLength(3)
   })
 })

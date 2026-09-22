@@ -12,13 +12,13 @@ RUN pnpm install --frozen-lockfile && pnpm build:image
 # compiler, test runner or linter ships in the image.
 FROM node:22-alpine AS runtime
 WORKDIR /app
-# The spool and state directories are created here, owned by the runtime
-# user, because Docker copies a directory's ownership into a named volume the
-# first time it is mounted. Without this the volumes are root-owned and the
-# redirect cannot write a single click.
+# The spool, state and IP data directories are created here, owned by the
+# runtime user, because Docker copies a directory's ownership into a named
+# volume the first time it is mounted. Without this the volumes are
+# root-owned and the redirect cannot write a single click.
 RUN corepack enable \
  && addgroup -S clickmonk && adduser -S clickmonk -G clickmonk \
- && mkdir -p /var/lib/clickmonk/spool /var/lib/clickmonk/state \
+ && mkdir -p /var/lib/clickmonk/spool /var/lib/clickmonk/state /var/lib/clickmonk/ipdata \
  && chown -R clickmonk:clickmonk /var/lib/clickmonk
 COPY pnpm-workspace.yaml package.json pnpm-lock.yaml ./
 COPY packages/core/package.json packages/core/

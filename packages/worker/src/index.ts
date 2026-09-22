@@ -1,5 +1,6 @@
 import { mkdirSync } from 'node:fs'
 import { createChClient, createPgPool, migrateToLatest } from '@clickmonk/db'
+import { startUpdater } from '@clickmonk/ipdata'
 import { loadConfig } from './config.js'
 import { startShipper } from './shipper.js'
 
@@ -10,11 +11,12 @@ const log = (msg: string, err?: unknown) => console.error(`worker: ${msg}`, err 
 
 let stopping = false
 let shipper: { stop(): Promise<void> } | null = null
+let updater: { stop(): Promise<void> } | null = null
 
 async function shutdown(): Promise<void> {
   if (stopping) return
   stopping = true
-  await shipper?.stop()
+  await Promise.all([shipper?.stop(), updater?.stop()])
   await Promise.allSettled([pg.end(), ch.close()])
 }
 process.on('SIGTERM', () => void shutdown())
@@ -37,4 +39,11 @@ if (!stopping) {
   mkdirSync(config.spoolDir, { recursive: true })
   shipper = startShipper({ dir: config.spoolDir, ch, log })
   log(`shipping ${config.spoolDir}`)
+  mkdirSync(config.ipdataDir, { recursive: true })
+  if (config.ipdataUpdate) {
+    updater = startUpdater({ dir: config.ipdataDir, log })
+    log(`updating IP data in ${config.ipdataDir}`)
+  } else {
+    log('IP data updates are off: countries stay unknown and the IP checks do not run')
+  }
 }

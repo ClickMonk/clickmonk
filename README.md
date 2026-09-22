@@ -46,6 +46,53 @@ What does not work yet:
 If link tracking is a problem you have today, [open an issue](../../issues) describing
 it. That is the most useful contribution at this stage.
 
+## IP data
+
+The worker downloads four lists to your server, and `clickmonk ipdata update` fetches
+them on demand. Nothing uses them to route or classify clicks yet.
+
+| Data | Source | Licence | Checked for updates |
+| --- | --- | --- | --- |
+| Country | [DB-IP](https://db-ip.com) IP to Country Lite | CC BY 4.0 | daily; DB-IP publishes monthly |
+| Network (ASN) | [DB-IP](https://db-ip.com) IP to ASN Lite | CC BY 4.0 | daily; DB-IP publishes monthly |
+| Hosting networks | [bad-asn-list](https://github.com/brianhama/bad-asn-list) | MIT, notice below | weekly |
+| Tor exit relays | the Tor Project's [Onionoo](https://metrics.torproject.org/onionoo.html) service | CC0 1.0 | every 6 hours |
+
+IP Geolocation by [DB-IP](https://db-ip.com), licensed under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). ClickMonk converts it to its
+own lookup format.
+
+A download replaces the list in use only when it parses whole and holds at least a
+minimum number of entries (about a fifth of a current edition; for country, half the
+IPv4 space); otherwise the previous one stays. `clickmonk ipdata status` shows each
+list's version and when it was fetched, and `clickmonk ipdata update` fetches them now.
+
+On a server without internet access, set `CLICKMONK_IPDATA_UPDATE=off`.
+
+bad-asn-list's licence:
+
+    MIT License
+
+    Copyright (c) 2025 Brian Hamachek
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
 ## License
 
 Fair-code, under the [Sustainable Use License](LICENSE.md): free to use, self-host and
