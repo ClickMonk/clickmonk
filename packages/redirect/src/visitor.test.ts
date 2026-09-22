@@ -54,6 +54,21 @@ describe('visitor cookies', () => {
     )
     expect(readVisitor(forged, SECRET).seen).toEqual([])
     expect(readVisitor(header, 'another-secret-that-is-long-enough-00').seen).toEqual([])
+
+    // A genuine tag moved onto a different payload must not verify: the
+    // signature has to cover the payload, not just a constant label.
+    const genuineTag = header.match(/cm_seen=[^.]+\.([^;]+)/)?.[1]
+    const swappedPayload = header.replace(
+      /cm_seen=[^;]+/,
+      `cm_seen=${Buffer.from(ID_B).toString('base64url')}.${genuineTag}`,
+    )
+    expect(readVisitor(swappedPayload, SECRET).seen).toEqual([])
+
+    // A same-length (16-byte) but wrong tag must fail the byte comparison
+    // itself, not only a length check.
+    const zeroTag = Buffer.alloc(16).toString('base64url')
+    const zeroTagged = header.replace(/(cm_seen=[^.;]+\.)[^;]+/, `$1${zeroTag}`)
+    expect(readVisitor(zeroTagged, SECRET).seen).toEqual([])
   })
 
   it('rejects a malformed visitor id and mints a new one', () => {
