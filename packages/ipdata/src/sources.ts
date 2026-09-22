@@ -267,6 +267,12 @@ function stringArray(v: unknown, label: string): string[] {
  * Onionoo's details document, fetched for running exit relays with only the
  * address fields. Every exit address and every onion-routing address of an
  * exit relay is an address Tor traffic may leave from.
+ *
+ * Unlike the line-walking CSV parsers above, this reads the whole body with
+ * `JSON.parse` before a single address is checked, so its peak memory is
+ * bounded by the source's `maxTextBytes` times whatever multiple
+ * `JSON.parse` itself allocates for a document shaped like this one, not by
+ * anything this function does (see `SOURCES.tor.maxTextBytes`).
  */
 export function parseOnionoo(text: string, limits: TableLimits): RangeTable {
   let doc: unknown
@@ -290,11 +296,14 @@ export function parseOnionoo(text: string, limits: TableLimits): RangeTable {
       if (!ip) throw new SourceError(`not an address: ${a.slice(0, 60)}`)
       if (ip.v === 4) v4.add(ip.n)
       else v6.set(ip.w.join(':'), ip.w)
-    }
-    if (v4.size > limits.max32 || v6.size > limits.max128) {
-      throw new SourceError(
-        `tor: more entries than the bound of ${limits.max32} + ${limits.max128}`,
-      )
+      // Checked per address, not once per relay: a single relay with far
+      // more addresses than the bound would otherwise grow the set past it
+      // before this ever fires.
+      if (v4.size > limits.max32 || v6.size > limits.max128) {
+        throw new SourceError(
+          `tor: more entries than the bound of ${limits.max32} + ${limits.max128}`,
+        )
+      }
     }
   }
   return keySet('tor', v4, v6, limits)
@@ -407,7 +416,10 @@ export const SOURCES: Record<SourceId, SourceDef> = {
     refreshMs: 6 * HOUR,
     gzip: false,
     maxDownloadBytes: 16 * MB,
-    maxTextBytes: 16 * MB,
+    // JSON.parse costs far more than the CSV parsers' own line walk: about
+    // 35x the input for a document shaped like this one. Measured body was
+    // 328,224 bytes on 2026-09-22; this is roughly 4x that, rounded up.
+    maxTextBytes: 2 * MB,
     limits: { max32: 50_000, max128: 50_000 },
     minimum: { k32: 100, k128: 0 },
     candidates: () => [

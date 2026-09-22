@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { parseIp } from './ip.js'
 import {
   SOURCES,
@@ -190,6 +190,7 @@ describe('parseOnionoo', () => {
     ['an empty array', '[]'],
     ['a null relay', '{"relays":[null]}'],
     ['a non-array exit_addresses', '{"relays":[{"exit_addresses":5}]}'],
+    ['a non-string address', '{"relays":[{"exit_addresses":[5]}]}'],
   ])('refuses %s with SourceError, never a bare TypeError', (_label, badDoc) => {
     expect(() => parseOnionoo(badDoc, LIMITS)).toThrow(SourceError)
   })
@@ -214,6 +215,27 @@ describe('parseOnionoo', () => {
     const e = thrown(() => parseOnionoo(badDoc, tinyLimits))
     expect(e).toBeInstanceOf(SourceError)
     expect((e as Error).message).toMatch(/more entries than the bound/)
+  })
+
+  it('checks the bound after each address, so one relay with many addresses cannot overfill the set past it', () => {
+    // One relay's own address list, all distinct, well over a tiny bound:
+    // 712 addresses across the three documentation /24s.
+    const pool: string[] = []
+    for (let a = 0; a < 256; a++) pool.push(`192.0.2.${a}`)
+    for (let a = 0; a < 256; a++) pool.push(`198.51.100.${a}`)
+    for (let a = 0; a < 200; a++) pool.push(`203.0.113.${a}`)
+    const tinyLimits = { max32: 5, max128: 0 }
+    const badDoc = JSON.stringify({ relays: [{ exit_addresses: pool }] })
+    const addSpy = vi.spyOn(Set.prototype, 'add')
+    try {
+      const e = thrown(() => parseOnionoo(badDoc, tinyLimits))
+      expect(e).toBeInstanceOf(SourceError)
+      // Checked per address: stops within one of the bound, not after all
+      // 712 of this single relay's addresses have been added to the set.
+      expect(addSpy.mock.calls.length).toBeLessThanOrEqual(tinyLimits.max32 + 1)
+    } finally {
+      addSpy.mockRestore()
+    }
   })
 })
 
