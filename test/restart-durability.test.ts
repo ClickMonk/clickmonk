@@ -91,11 +91,21 @@ beforeAll(async () => {
     'https://example.com/landing',
   )
   // The redirect picks the link up through config_changed.
-  while ((await click()) !== 302) await sleep(250)
+  const linkDeadline = Date.now() + 60_000
+  while ((await click()) !== 302) {
+    if (Date.now() > linkDeadline)
+      throw new Error('the redirect never answered the new link with a 302')
+    await sleep(250)
+  }
 }, 600_000)
+
+// Set by the test's last line. Anything short of that leaves the stack's
+// logs in the output before `down -v` removes the containers that hold them.
+let passed = false
 
 afterAll(async () => {
   await ch.close()
+  if (!passed) console.error(composeSync('logs', '--no-color', '--tail', '300'))
   composeSync('down', '-v')
 })
 
@@ -142,7 +152,7 @@ describe('restart durability', () => {
       recorded = await recordedTargets()
     }
 
-    // The task report and the PR quote these three numbers.
+    // Printed before the assertions so a failing run still shows the counts.
     console.log(JSON.stringify({ accepted, recorded, errored }))
     expect(accepted).toBeGreaterThan(200)
     // Nothing the client was told about is missing.
@@ -150,5 +160,6 @@ describe('restart durability', () => {
     // Anything extra is a request that reached the spool and then lost its
     // response on the way back; there can be no more of those than errors.
     expect(recorded).toBeLessThanOrEqual(accepted + errored)
+    passed = true
   })
 })

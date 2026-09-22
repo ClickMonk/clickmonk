@@ -17,7 +17,7 @@ services:
     environment:
       <<: *db
       CLICKMONK_SECRET: ci-secret-ci-secret-ci-secret-ci-secret
-    ports: ["8080:8080"]
+    ports: ["127.0.0.1:8080:8080"]
     volumes:
       - spool:/var/lib/clickmonk/spool
       - state:/var/lib/clickmonk/state
@@ -58,7 +58,7 @@ services:
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     ulimits:
       nofile: { soft: 262144, hard: 262144 }
-    ports: ["8123:8123"]
+    ports: ["127.0.0.1:8123:8123"]
     # Named volume so a restart keeps the clicks already shipped; the test
     # restarts this container mid-load.
     volumes: ["clickhouse-data:/var/lib/clickhouse"]
