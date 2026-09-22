@@ -1,19 +1,26 @@
 import {
   type ClickRecord,
   type Decision,
+  type IpFacts,
   MAX_PATH_LENGTH,
   MAX_REFERRER_LENGTH,
   MAX_UA_LENGTH,
+  NO_IP_FACTS,
   ZERO_UUID,
   classifyDevice,
+  classifyTraffic,
   evaluate,
   normaliseHost,
+  parseBrowser,
+  parseOs,
   slugFromPath,
   uuidv7,
 } from '@clickmonk/core'
 import type { Pool } from '@clickmonk/db'
+import { type IpLookup, addressOnly, canonicalIp } from '@clickmonk/ipdata'
 import Fastify, { type FastifyInstance } from 'fastify'
-import { tryConsumeCap } from './cap.js'
+import { checkCap, tryConsumeCap } from './cap.js'
+import type { RateCounter } from './rate.js'
 import type { Snapshot } from './snapshot.js'
 import type { SpoolWriter } from './spool.js'
 import { readVisitor, visitorCookies } from './visitor.js'
@@ -23,6 +30,10 @@ export interface RedirectDeps {
   spool: Pick<SpoolWriter, 'append'>
   capPool: Pool
   secret: string
+  /** The loaded IP data, or null while there is none. Omitted: none. */
+  ipdata?: () => IpLookup | null
+  /** Requests per address, for the abuser class; the one `/health` reports. */
+  rate: RateCounter
   now?: () => Date
   random?: () => number
   /** `false` silences Fastify's logger (tests); omitted, it logs. */
@@ -35,6 +46,18 @@ const BODIES: Record<number, string> = {
   403: 'This link is not available here.\n',
   404: 'Not found.\n',
   410: 'This link has expired.\n',
+}
+
+/**
+ * The IP data never throws on a lookup; if a defect ever made it, the
+ * click is served and recorded without IP facts rather than lost to a 500.
+ */
+function lookupIp(ipdata: RedirectDeps['ipdata'], ip: string): IpFacts {
+  try {
+    return ipdata?.()?.lookup(ip) ?? NO_IP_FACTS
+  } catch {
+    return NO_IP_FACTS
+  }
 }
 
 export function buildRedirectApp(
@@ -83,31 +106,51 @@ export function buildRedirectApp(
     // once too rather than trusted to stay untouched across an await.
     const userAgent = (req.headers['user-agent'] ?? '').slice(0, MAX_UA_LENGTH)
     const referrer = String(req.headers.referer ?? '').slice(0, MAX_REFERRER_LENGTH)
-    const ip = (req.ip ?? '').slice(0, 45)
+    // A proxy can name the client as `[2001:db8::1]:443` or `192.0.2.1:8080`,
+    // or an IPv4 client as `::ffff:192.0.2.1`: the lookup, the rate count and
+    // the record all take the address alone, in one form per address.
+    const ip = canonicalIp(addressOnly(req.ip ?? '').slice(0, 45))
     const visitor = readVisitor(req.headers.cookie, deps.secret)
     const clickId = uuidv7()
     const at = now()
+
+    // In memory, synchronous and bounded: no lookup waits on the network.
+    const ipFacts = lookupIp(deps.ipdata, ip)
+    const traffic = classifyTraffic({
+      userAgent,
+      head: req.method === 'HEAD',
+      // A monotonic clock: a wall clock stepped back would restart every count.
+      clicksThisMinute: deps.rate.hit(ip, performance.now()),
+      abuserThreshold: snapshot.settings.abuserThreshold,
+      ip: ipFacts,
+    })
 
     const facts = {
       path,
       query,
       now: at,
       device: classifyDevice(userAgent),
-      country: null, // No IP-to-country lookup yet.
+      country: ipFacts.country,
       seenLink: link !== null && visitor.seen.includes(link.id),
       clickId,
       random: random(),
     }
-    let decision: Decision = evaluate({ facts, domain, link, capExhausted: false })
+    const input = { facts, domain, link, traffic, settings: snapshot.settings }
+    let decision: Decision = evaluate({ ...input, capExhausted: false })
     let capUnchecked = false
-    if (decision.counted && link?.clickCap) {
-      const cap = await tryConsumeCap(deps.capPool, link.id, link.clickCap)
-      if (cap === 'exhausted') decision = evaluate({ facts, domain, link, capExhausted: true })
+    // A used-up cap closes the link to every click that would reach a
+    // destination. A counted click consumes one; a flagged click or a HEAD
+    // request only reads the counter. Each call is bounded and fails open.
+    if (decision.reached && link?.clickCap) {
+      const cap = decision.counted
+        ? await tryConsumeCap(deps.capPool, link.id, link.clickCap)
+        : await checkCap(deps.capPool, link.id, link.clickCap)
+      if (cap === 'exhausted') decision = evaluate({ ...input, capExhausted: true })
       if (cap === 'unchecked') capUnchecked = true
     }
 
     const record: ClickRecord = {
-      v: 1,
+      v: 2,
       clickId,
       time: at.toISOString(),
       host,
@@ -127,6 +170,13 @@ export function buildRedirectApp(
       referrer,
       ip,
       capUnchecked,
+      trafficClass: traffic.class,
+      signals: traffic.signals,
+      action: decision.action,
+      os: parseOs(userAgent),
+      browser: parseBrowser(userAgent),
+      asn: ipFacts.asn,
+      geoSource: ipFacts.geoSource,
     }
     // Accepted here: the line is written before the response. A refused
     // append (spool full, disk error) is counted by the spool and the
@@ -136,7 +186,7 @@ export function buildRedirectApp(
     if (domain?.verified) {
       reply.header(
         'set-cookie',
-        visitorCookies(visitor, decision.counted && link ? link.id : null, deps.secret),
+        visitorCookies(visitor, decision.reached && link ? link.id : null, deps.secret),
       )
     }
     reply.header('cache-control', NO_STORE)

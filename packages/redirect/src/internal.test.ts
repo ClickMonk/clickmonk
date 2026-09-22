@@ -35,6 +35,33 @@ describe('internal port', () => {
     expect((await app.inject('/ask?domain=go.example.test')).statusCode).toBe(404)
   })
 
+  it('reports the IP data loaded and the rate counter', async () => {
+    const source = {
+      id: 'country' as const,
+      version: '2026-01',
+      fetchedAt: new Date().toISOString(),
+      entries: { k32: 2, k128: 1 },
+    }
+    const app = buildInternalApp({
+      snapshot: () => snap,
+      spool,
+      ipdata: () => [source],
+      rate: { stats: () => ({ addresses: 3, untracked: 0 }) },
+    })
+    expect((await app.inject('/health')).json()).toMatchObject({
+      ipdata: [source],
+      rate: { addresses: 3, untracked: 0 },
+    })
+  })
+
+  it('reports no IP data as an empty list, and no rate counter as null', async () => {
+    const none = buildInternalApp({ snapshot: () => snap, spool, ipdata: () => [] })
+    expect((await none.inject('/health')).json().ipdata).toEqual([])
+    // Without the dependencies at all, as a caller that predates them builds it.
+    const omitted = buildInternalApp({ snapshot: () => snap, spool })
+    expect((await omitted.inject('/health')).json()).toMatchObject({ ipdata: [], rate: null })
+  })
+
   it('reports health with the snapshot source and the spool', async () => {
     const app = buildInternalApp({ snapshot: () => snap, spool })
     const res = await app.inject('/health')

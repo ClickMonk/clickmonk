@@ -1,17 +1,20 @@
 import { existsSync, mkdtempSync, readFileSync, writeFileSync, writeSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DEFAULT_TRAFFIC_SETTINGS, type TrafficSettings } from '@clickmonk/core'
 import type { Pool } from '@clickmonk/db'
 import { TEST_PG_URL, resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import {
   Snapshot,
   SnapshotStore,
   SnapshotTooLargeError,
   deserializeSnapshot,
+  linkActionsFromRow,
   loadFromPostgres,
   readSnapshotFile,
   serializeSnapshot,
+  settingsFromRow,
   writeSnapshotFile,
 } from './snapshot.js'
 
@@ -90,6 +93,91 @@ describe('loadFromPostgres', () => {
     ])
   })
 
+  it("loads the install's traffic settings and each link's overrides", async () => {
+    const { domainId } = await seed()
+    await pool.query(
+      `UPDATE settings SET traffic_actions = '{"bot":"block","abuser":"flag","anonymous":"safe","datacenter":"nothing"}',
+                           safe_url = 'https://example.com/safe', abuser_threshold = 30`,
+    )
+    await pool.query(`UPDATE links SET traffic_actions = '{"bot":"nothing"}' WHERE slug = 'spring'`)
+    try {
+      const s = await loadFromPostgres(pool)
+      expect(s.settings).toEqual({
+        actions: { bot: 'block', abuser: 'flag', anonymous: 'safe', datacenter: 'nothing' },
+        safeUrl: 'https://example.com/safe',
+        abuserThreshold: 30,
+      })
+      expect(s.link(domainId, 'spring')?.trafficActions).toEqual({ bot: 'nothing' })
+    } finally {
+      await pool.query(
+        'UPDATE settings SET traffic_actions = DEFAULT, safe_url = NULL, abuser_threshold = DEFAULT',
+      )
+    }
+  })
+
+  it('uses the default settings when the settings row is missing, and says so', async () => {
+    await seed()
+    await pool.query('TRUNCATE settings')
+    const logs: string[] = []
+    try {
+      const s = await loadFromPostgres(pool, undefined, (m) => logs.push(m))
+      expect(s.settings).toEqual(DEFAULT_TRAFFIC_SETTINGS)
+      expect(logs).toEqual(['traffic settings: the settings row is missing; using the defaults'])
+    } finally {
+      await pool.query('INSERT INTO settings DEFAULT VALUES ON CONFLICT DO NOTHING')
+    }
+  })
+
+  it('uses the default settings when the row passes the database checks but not the schema', async () => {
+    await seed()
+    // The database check allows any printable http(s) URL; core also refuses a token in the host.
+    await pool.query(
+      `UPDATE settings SET traffic_actions = '{"bot":"safe","abuser":"flag","anonymous":"flag","datacenter":"flag"}',
+                           safe_url = 'https://{click_id}.example.com/'`,
+    )
+    const logs: string[] = []
+    try {
+      const s = await loadFromPostgres(pool, undefined, (m) => logs.push(m))
+      expect(s.settings).toEqual(DEFAULT_TRAFFIC_SETTINGS)
+      expect(logs).toHaveLength(1)
+      expect(logs[0]).toMatch(
+        /^traffic settings: the settings row is invalid \(safeUrl: .+\); using the defaults$/,
+      )
+    } finally {
+      await pool.query(
+        'UPDATE settings SET traffic_actions = DEFAULT, safe_url = NULL, abuser_threshold = DEFAULT',
+      )
+    }
+  })
+
+  it('ignores an invalid link override, keeps the link, and says so once', async () => {
+    const { domainId, linkId } = await seed()
+    // The database check refuses every override core refuses, so it is lifted
+    // for this test alone to stand in for a row written before it existed.
+    await pool.query('ALTER TABLE links DROP CONSTRAINT links_traffic_actions_check')
+    const logs: string[] = []
+    try {
+      await pool.query(`UPDATE links SET traffic_actions = '{"human":"block"}' WHERE id = $1`, [
+        linkId,
+      ])
+      const s = await loadFromPostgres(pool, undefined, (m) => logs.push(m))
+      expect(s.link(domainId, 'spring')?.trafficActions).toEqual({})
+      expect(logs).toEqual(['traffic action overrides of 1 link(s) are invalid and ignored'])
+    } finally {
+      await pool.query("UPDATE links SET traffic_actions = '{}'")
+      await pool.query(
+        'ALTER TABLE links ADD CONSTRAINT links_traffic_actions_check CHECK (valid_traffic_actions(traffic_actions, false))',
+      )
+    }
+  })
+
+  it('logs nothing when the settings and overrides are valid', async () => {
+    await seed()
+    const logs: string[] = []
+    await loadFromPostgres(pool, undefined, (m) => logs.push(m))
+    expect(logs).toEqual([])
+  })
+
   it('omits a link with no targets rather than serving it', async () => {
     const { domainId } = await seed()
     await pool.query("INSERT INTO links (domain_id, slug) VALUES ($1, 'empty')", [domainId])
@@ -118,6 +206,97 @@ describe('snapshot file', () => {
     expect(back.source).toBe('file')
   })
 
+  it('round-trips the traffic settings', () => {
+    const settings: TrafficSettings = {
+      actions: { bot: 'block', abuser: 'flag', anonymous: 'safe', datacenter: 'nothing' },
+      safeUrl: 'https://example.com/safe',
+      abuserThreshold: 30,
+    }
+    const s = new Snapshot([], [], new Date(), 'postgres', settings)
+    expect(deserializeSnapshot(serializeSnapshot(s)).settings).toEqual(settings)
+  })
+
+  it("refuses a version 2 file's settings and overrides that core refuses, and says so", () => {
+    const link = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      domainId: '00000000-0000-4000-8000-0000000000d1',
+      slug: 'spring',
+      enabled: true,
+      targets: [
+        { id: '00000000-0000-4000-8000-0000000000f1', url: 'https://example.com/', weight: 100 },
+      ],
+      backupUrl: null,
+      deviceUrls: {},
+      returningUrl: null,
+      countries: { mode: 'all' },
+      clickCap: null,
+      expiresAt: null,
+      passthrough: true,
+      trafficActions: { human: 'block' },
+    }
+    const v2 = JSON.stringify({
+      v: 2,
+      loadedAt: new Date().toISOString(),
+      settings: {
+        actions: { bot: 'safe', abuser: 'flag', anonymous: 'flag', datacenter: 'flag' },
+        safeUrl: null,
+        abuserThreshold: 60,
+      },
+      domains: [],
+      links: [link],
+    })
+    const logs: string[] = []
+    const s = deserializeSnapshot(v2, (m) => logs.push(m))
+    expect(s.settings).toEqual(DEFAULT_TRAFFIC_SETTINGS)
+    expect(s.link(link.domainId, 'spring')?.trafficActions).toEqual({})
+    expect(logs).toHaveLength(2)
+    expect(logs[0]).toMatch(
+      /^traffic settings: the snapshot file settings is invalid \(actions\.bot: .+\); using the defaults$/,
+    )
+    expect(logs[1]).toBe('traffic action overrides of 1 link(s) are invalid and ignored')
+  })
+
+  it('reads a version 1 file as the defaults and no link overrides', () => {
+    const v1 = JSON.stringify({
+      v: 1,
+      loadedAt: new Date().toISOString(),
+      domains: [
+        {
+          id: '00000000-0000-4000-8000-0000000000d1',
+          host: 'go.example.test',
+          verified: true,
+          rootUrl: null,
+          notFoundUrl: null,
+        },
+      ],
+      links: [
+        {
+          id: '00000000-0000-4000-8000-0000000000a1',
+          domainId: '00000000-0000-4000-8000-0000000000d1',
+          slug: 'spring',
+          enabled: true,
+          targets: [
+            {
+              id: '00000000-0000-4000-8000-0000000000f1',
+              url: 'https://example.com/',
+              weight: 100,
+            },
+          ],
+          backupUrl: null,
+          deviceUrls: {},
+          returningUrl: null,
+          countries: { mode: 'all' },
+          clickCap: null,
+          expiresAt: null,
+          passthrough: true,
+        },
+      ],
+    })
+    const s = deserializeSnapshot(v1)
+    expect(s.settings).toEqual(DEFAULT_TRAFFIC_SETTINGS)
+    expect(s.link('00000000-0000-4000-8000-0000000000d1', 'spring')?.trafficActions).toEqual({})
+  })
+
   it('writes atomically and reads back; a corrupt file reads as null', async () => {
     await seed()
     const dir = mkdtempSync(join(tmpdir(), 'clickmonk-snap-'))
@@ -127,6 +306,47 @@ describe('snapshot file', () => {
     writeFileSync(path, '{not json')
     expect(readSnapshotFile(path)).toBeNull()
     expect(readSnapshotFile(join(dir, 'missing.json'))).toBeNull()
+  })
+})
+
+describe('row parsers', () => {
+  it('reads a valid settings row as it is', () => {
+    expect(
+      settingsFromRow({
+        traffic_actions: { bot: 'block', abuser: 'flag', anonymous: 'flag', datacenter: 'nothing' },
+        safe_url: null,
+        abuser_threshold: 30,
+      }),
+    ).toEqual({
+      settings: {
+        actions: { bot: 'block', abuser: 'flag', anonymous: 'flag', datacenter: 'nothing' },
+        safeUrl: null,
+        abuserThreshold: 30,
+      },
+      problem: null,
+    })
+  })
+
+  it('refuses a settings row core refuses, and says why', () => {
+    const r = settingsFromRow({
+      traffic_actions: { bot: 'flag', abuser: 'flag', anonymous: 'flag', datacenter: 'flag' },
+      safe_url: null,
+      abuser_threshold: 0,
+    })
+    expect(r.settings).toEqual(DEFAULT_TRAFFIC_SETTINGS)
+    expect(r.problem).toMatch(/^the settings row is invalid \(abuserThreshold: .+\)$/)
+  })
+
+  it('keeps a valid link override and ignores an invalid one, saying why', () => {
+    expect(linkActionsFromRow({ bot: 'block' })).toEqual({
+      actions: { bot: 'block' },
+      problem: null,
+    })
+    for (const bad of [{ human: 'block' }, { bot: 'drop' }, [], 'block', null]) {
+      const r = linkActionsFromRow(bad)
+      expect(r.actions).toEqual({})
+      expect(r.problem).not.toBeNull()
+    }
   })
 })
 
@@ -173,9 +393,13 @@ describe('writeSnapshotFile', () => {
 })
 
 describe('SnapshotStore', () => {
+  // Every store is stopped when its own test ends. A store left running
+  // reloads on the next test's writes, and its reload holds locks on links
+  // while it waits for domains: the next test's TRUNCATE takes them in the
+  // opposite order, and Postgres aborts one of the two as a deadlock.
   const stores: SnapshotStore[] = []
-  afterAll(async () => {
-    for (const s of stores) await s.stop()
+  afterEach(async () => {
+    await Promise.all(stores.splice(0).map((s) => s.stop()))
   })
   const make = (filePath: string, pgUrl = TEST_PG_URL, p = pool) => {
     const s = new SnapshotStore({
@@ -189,6 +413,43 @@ describe('SnapshotStore', () => {
     stores.push(s)
     return s
   }
+
+  it('passes its log to the loader, so an invalid settings row is reported', async () => {
+    await seed()
+    await pool.query('TRUNCATE settings')
+    const logs: string[] = []
+    const store = new SnapshotStore({
+      pgUrl: TEST_PG_URL,
+      pool,
+      filePath: join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json'),
+      log: (m) => logs.push(m),
+    })
+    stores.push(store)
+    try {
+      await store.start()
+      expect(logs).toContain('traffic settings: the settings row is missing; using the defaults')
+    } finally {
+      await store.stop()
+      await pool.query('INSERT INTO settings DEFAULT VALUES ON CONFLICT DO NOTHING')
+    }
+  })
+
+  it('reloads when the settings change', async () => {
+    await seed()
+    const store = make(join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json'))
+    await store.start()
+    expect(store.current()?.settings.abuserThreshold).toBe(60)
+    // As for links below: past the listener's catch-up reload, so only the
+    // notification can pick this change up.
+    await until(() => (store as unknown as { listener: unknown }).listener !== null)
+    await new Promise((r) => setTimeout(r, 200))
+    await pool.query('UPDATE settings SET abuser_threshold = 30')
+    try {
+      await until(() => store.current()?.settings.abuserThreshold === 30)
+    } finally {
+      await pool.query('UPDATE settings SET abuser_threshold = DEFAULT')
+    }
+  })
 
   it('reloads when a link changes', async () => {
     const { domainId } = await seed()
@@ -288,6 +549,7 @@ describe('SnapshotStore', () => {
       filePath: join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json'),
       log: () => {},
     })
+    stores.push(store)
     // Driven directly rather than through start(), so no timer or
     // notification starts a third reload in between.
     const reload = () => (store as unknown as { reload(): Promise<boolean> }).reload()
@@ -308,6 +570,102 @@ describe('SnapshotStore', () => {
     release()
     expect(await older).toBe(true)
     expect(store.current()?.link(domainId, 'newer') ?? null).not.toBeNull()
+  })
+
+  it('waits for a reload in flight before stop() resolves', async () => {
+    await seed()
+    // The store's reload is held after its first query, inside its
+    // transaction, as a slow Postgres would hold it.
+    let release = () => {}
+    const gate = new Promise<void>((r) => {
+      release = r
+    })
+    let parked = () => {}
+    const isParked = new Promise<void>((r) => {
+      parked = r
+    })
+    const held = {
+      connect: async () => {
+        const client = await pool.connect()
+        const query = client.query.bind(client) as (...a: unknown[]) => Promise<unknown>
+        return {
+          query: async (...args: unknown[]) => {
+            const result = await query(...args)
+            if (String(args[0]).startsWith('SELECT count')) {
+              parked()
+              await gate
+            }
+            return result
+          },
+          release: () => client.release(),
+        }
+      },
+    } as unknown as Pool
+    const store = new SnapshotStore({
+      pgUrl: TEST_PG_URL,
+      pool: held,
+      filePath: join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json'),
+      log: () => {},
+    })
+    stores.push(store)
+    const reloaded = (store as unknown as { reload(): Promise<boolean> }).reload()
+    await isParked
+    let stopped = false
+    const stopping = store.stop().then(() => {
+      stopped = true
+    })
+    try {
+      await new Promise((r) => setTimeout(r, 100))
+      expect(stopped).toBe(false)
+    } finally {
+      // Released even on a failed expectation: the parked reload is holding a
+      // pool connection, and every later test would wait for it.
+      release()
+    }
+    await stopping
+    expect(await reloaded).toBe(true)
+  })
+
+  it('stops within the bound when a reload never finishes', async () => {
+    // A pool whose connect() never settles: the reload can never finish, as
+    // one blocked behind a long lock holder cannot.
+    const never = { connect: () => new Promise(() => {}) } as unknown as Pool
+    const store = new SnapshotStore({
+      pgUrl: TEST_PG_URL,
+      pool: never,
+      filePath: join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json'),
+      log: () => {},
+    })
+    stores.push(store)
+    ;(store as unknown as { stopWaitMs: number }).stopWaitMs = 100
+    void (store as unknown as { reload(): Promise<boolean> }).reload()
+    await new Promise((r) => setTimeout(r, 20))
+    const started = Date.now()
+    await store.stop()
+    const took = Date.now() - started
+    expect(took).toBeGreaterThanOrEqual(50)
+    expect(took).toBeLessThan(2000)
+  })
+
+  it('starts no reload once stopped', async () => {
+    let connects = 0
+    const counting = {
+      connect: async () => {
+        connects++
+        return pool.connect()
+      },
+    } as unknown as Pool
+    const store = new SnapshotStore({
+      pgUrl: TEST_PG_URL,
+      pool: counting,
+      filePath: join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json'),
+      log: () => {},
+    })
+    stores.push(store)
+    await store.stop()
+    // A notification or timer that fires during or after stop() lands here.
+    expect(await (store as unknown as { reload(): Promise<boolean> }).reload()).toBe(false)
+    expect(connects).toBe(0)
   })
 
   it('keeps the previous snapshot when a reload fails', async () => {
@@ -359,6 +717,43 @@ describe('SnapshotStore', () => {
     expect(store.current()?.link(domainId, 'spring')).not.toBeNull()
     await store.stop()
     await deadPool.end()
+  })
+
+  it('reports settings in the file that core refuses when it boots from the file', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json')
+    writeFileSync(
+      path,
+      JSON.stringify({
+        v: 2,
+        loadedAt: new Date().toISOString(),
+        settings: { actions: {}, safeUrl: null, abuserThreshold: 60 },
+        domains: [],
+        links: [],
+      }),
+    )
+    const { createPgPool } = await import('@clickmonk/db')
+    const dead = 'postgres://clickmonk:clickmonk@127.0.0.1:1/none'
+    const deadPool = createPgPool(dead, { connectTimeoutMs: 200 })
+    const logs: string[] = []
+    const store = new SnapshotStore({
+      pgUrl: dead,
+      pool: deadPool,
+      filePath: path,
+      retryMs: 50,
+      log: (m) => logs.push(m),
+    })
+    stores.push(store)
+    try {
+      await store.start()
+      expect(store.current()?.source).toBe('file')
+      expect(store.current()?.settings).toEqual(DEFAULT_TRAFFIC_SETTINGS)
+      expect(
+        logs.some((m) => m.startsWith('traffic settings: the snapshot file settings is invalid')),
+      ).toBe(true)
+    } finally {
+      await store.stop()
+      await deadPool.end()
+    }
   })
 
   it('picks Postgres up within retryMs once it becomes reachable, without a notification', async () => {

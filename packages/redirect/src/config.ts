@@ -1,5 +1,46 @@
+import { isIP } from 'node:net'
 import { DEFAULT_SPOOL_DIR, formatConfigError } from '@clickmonk/core'
+import { DEFAULT_IPDATA_DIR } from '@clickmonk/ipdata'
 import { z } from 'zod'
+
+/** The names Fastify's proxy matcher expands to address ranges. */
+const PROXY_RANGE_NAMES = new Set(['loopback', 'linklocal', 'uniquelocal'])
+
+/**
+ * One trusted proxy: an address, a CIDR range, or a named range. A /0 is
+ * refused: it trusts every client to name its own address. The matcher
+ * would also throw on it at start, in a trace that names no variable.
+ */
+function isProxyEntry(entry: string): boolean {
+  if (PROXY_RANGE_NAMES.has(entry)) return true
+  const slash = entry.indexOf('/')
+  if (slash < 0) return isIP(entry) !== 0
+  const family = isIP(entry.slice(0, slash))
+  const bits = entry.slice(slash + 1)
+  if (family === 0 || !/^\d{1,3}$/.test(bits)) return false
+  const n = Number(bits)
+  return n >= 1 && n <= (family === 4 ? 32 : 128)
+}
+
+const TrustedProxies = z
+  .string()
+  .default('127.0.0.1')
+  .transform((s) =>
+    s
+      .split(',')
+      .map((e) => e.trim())
+      .filter(Boolean),
+  )
+  .superRefine((entries, ctx) => {
+    for (const e of entries) {
+      if (!isProxyEntry(e)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `not an address, a range with a prefix of 1 or more, loopback, linklocal or uniquelocal: ${e}`,
+        })
+      }
+    }
+  })
 
 const Schema = z.object({
   CLICKMONK_POSTGRES_URL: z.string().url(),
@@ -9,7 +50,8 @@ const Schema = z.object({
   CLICKMONK_SPOOL_DIR: z.string().min(1).default(DEFAULT_SPOOL_DIR),
   CLICKMONK_SPOOL_MAX_BYTES: z.coerce.number().int().min(1_048_576).default(5_368_709_120),
   CLICKMONK_SNAPSHOT_PATH: z.string().min(1).default('/var/lib/clickmonk/state/snapshot.json'),
-  CLICKMONK_TRUSTED_PROXIES: z.string().default('127.0.0.1'),
+  CLICKMONK_TRUSTED_PROXIES: TrustedProxies,
+  CLICKMONK_IPDATA_DIR: z.string().min(1).default(DEFAULT_IPDATA_DIR),
 })
 
 export interface RedirectConfig {
@@ -21,6 +63,7 @@ export interface RedirectConfig {
   spoolMaxBytes: number
   snapshotPath: string
   trustedProxies: string[]
+  ipdataDir: string
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv): RedirectConfig {
@@ -35,8 +78,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): RedirectConfig {
     spoolDir: e.CLICKMONK_SPOOL_DIR,
     spoolMaxBytes: e.CLICKMONK_SPOOL_MAX_BYTES,
     snapshotPath: e.CLICKMONK_SNAPSHOT_PATH,
-    trustedProxies: e.CLICKMONK_TRUSTED_PROXIES.split(',')
-      .map((s) => s.trim())
-      .filter(Boolean),
+    trustedProxies: e.CLICKMONK_TRUSTED_PROXIES,
+    ipdataDir: e.CLICKMONK_IPDATA_DIR,
   }
 }

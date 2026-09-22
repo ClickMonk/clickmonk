@@ -85,10 +85,10 @@ describe('postgres schema 001', () => {
   })
 })
 
-type ConfigTable = 'domains' | 'links' | 'link_targets'
+type ConfigTable = 'domains' | 'links' | 'link_targets' | 'settings'
 type ConfigEvent = 'INSERT' | 'UPDATE' | 'DELETE' | 'TRUNCATE'
 
-const CONFIG_TABLES: ConfigTable[] = ['domains', 'links', 'link_targets']
+const CONFIG_TABLES: ConfigTable[] = ['domains', 'links', 'link_targets', 'settings']
 const CONFIG_EVENTS: ConfigEvent[] = ['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE']
 
 // A column every row already has, self-assigned: the UPDATE below never
@@ -99,6 +99,7 @@ const TOUCH_COLUMN: Record<ConfigTable, string> = {
   domains: 'verified',
   links: 'enabled',
   link_targets: 'weight',
+  settings: 'abuser_threshold',
 }
 
 // Postgres refuses to TRUNCATE a table that something else still has a
@@ -110,6 +111,7 @@ const TRUNCATE_STATEMENT: Record<ConfigTable, string> = {
   domains: 'TRUNCATE domains, links, link_targets, link_counters',
   links: 'TRUNCATE links, link_targets, link_counters',
   link_targets: 'TRUNCATE link_targets',
+  settings: 'TRUNCATE settings',
 }
 
 async function ensureDomainForNotify(): Promise<string> {
@@ -134,6 +136,11 @@ async function ensureLinkForNotify(): Promise<string> {
 // regardless of whether any row exists or matches (see "notifies
 // config_changed" below).
 async function insertRowFor(table: ConfigTable): Promise<void> {
+  if (table === 'settings') {
+    // One row at most; the statement trigger fires whether or not it inserts.
+    await pool.query('INSERT INTO settings DEFAULT VALUES ON CONFLICT DO NOTHING')
+    return
+  }
   if (table === 'domains') {
     await pool.query('INSERT INTO domains (host) VALUES ($1)', [
       `notify-${randomUUID()}.example.test`,

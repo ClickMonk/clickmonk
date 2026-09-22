@@ -15,6 +15,7 @@ describe('parseLinkInput', () => {
     expect(l.enabled).toBe(true)
     expect(l.passthrough).toBe(true)
     expect(l.countries).toEqual({ mode: 'all' })
+    expect(l.trafficActions).toEqual({})
     expect(l.targets).toEqual([{ url: 'https://example.com/offer', weight: 100 }])
     expect(l.clickCap).toBeNull()
     expect(l.expiresAt).toBeNull()
@@ -130,4 +131,14 @@ describe('normaliseHost', () => {
     'rejects %j',
     (h) => expect(normaliseHost(h)).toBeNull(),
   )
+})
+
+describe('traffic action overrides', () => {
+  it('takes any subset of the classes, and nothing else', () => {
+    expect(parseLinkInput({ ...base, trafficActions: { bot: 'block' } }).trafficActions).toEqual({
+      bot: 'block',
+    })
+    expect(() => parseLinkInput({ ...base, trafficActions: { human: 'block' } })).toThrow()
+    expect(() => parseLinkInput({ ...base, trafficActions: { bot: 'drop' } })).toThrow()
+  })
 })

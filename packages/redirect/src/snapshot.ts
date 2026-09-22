@@ -7,7 +7,17 @@ import {
   rmSync,
   writeSync,
 } from 'node:fs'
-import type { CountryRule, Device, Domain, Link } from '@clickmonk/core'
+import {
+  type CountryRule,
+  DEFAULT_TRAFFIC_SETTINGS,
+  type Device,
+  type Domain,
+  type Link,
+  type LinkTrafficActions,
+  LinkTrafficActionsSchema,
+  type TrafficSettings,
+  TrafficSettingsSchema,
+} from '@clickmonk/core'
 import type { Pool } from '@clickmonk/db'
 import pg from 'pg'
 import { type WriteFn, writeAll } from './write-all.js'
@@ -31,6 +41,8 @@ export class Snapshot {
     links: Link[],
     readonly loadedAt: Date,
     readonly source: 'postgres' | 'file',
+    /** The install-wide traffic settings; the defaults until Postgres has any. */
+    readonly settings: TrafficSettings = DEFAULT_TRAFFIC_SETTINGS,
   ) {
     this.byHost = new Map(domains.map((d) => [d.host, d]))
     this.bySlug = new Map(links.map((l) => [`${l.domainId}/${l.slug}`, l]))
@@ -66,17 +78,72 @@ interface LinkRow {
   click_cap: string | null
   expires_at: Date | null
   passthrough: boolean
+  traffic_actions: unknown
   targets: { id: string; url: string; weight: number }[] | null
+}
+
+export interface SettingsRow {
+  traffic_actions: unknown
+  safe_url: string | null
+  abuser_threshold: number
+}
+
+type Log = (msg: string, err?: unknown) => void
+
+const issues = (e: { issues: { path: (string | number)[]; message: string }[] }): string =>
+  e.issues.map((i) => `${i.path.join('.') || 'value'}: ${i.message}`).join('; ')
+
+/**
+ * The settings row, read through core's schema rather than trusted: the
+ * database checks are looser than core in places (a token in the safe URL's
+ * host, say). Missing or refused, the defaults apply and `problem` says why.
+ */
+export function settingsFromRow(row: SettingsRow | undefined): {
+  settings: TrafficSettings
+  problem: string | null
+} {
+  if (!row) return { settings: DEFAULT_TRAFFIC_SETTINGS, problem: 'the settings row is missing' }
+  return validSettings(
+    { actions: row.traffic_actions, safeUrl: row.safe_url, abuserThreshold: row.abuser_threshold },
+    'the settings row',
+  )
+}
+
+function validSettings(
+  value: unknown,
+  what: string,
+): { settings: TrafficSettings; problem: string | null } {
+  const r = TrafficSettingsSchema.safeParse(value)
+  return r.success
+    ? { settings: r.data, problem: null }
+    : { settings: DEFAULT_TRAFFIC_SETTINGS, problem: `${what} is invalid (${issues(r.error)})` }
+}
+
+const refusedOverrides = (n: number): string =>
+  `traffic action overrides of ${n} link(s) are invalid and ignored`
+
+/** A link's overrides through core's schema. Refused, the link keeps none and `problem` says why. */
+export function linkActionsFromRow(raw: unknown): {
+  actions: LinkTrafficActions
+  problem: string | null
+} {
+  const r = LinkTrafficActionsSchema.safeParse(raw)
+  return r.success ? { actions: r.data, problem: null } : { actions: {}, problem: issues(r.error) }
 }
 
 /**
  * One REPEATABLE READ READ ONLY transaction on one connection, so the count,
- * the domains and the links are all a consistent view of the same instant.
+ * the settings, the domains and the links are all a consistent view of the
+ * same instant.
  * Three queries on separate pool connections could each see a different
  * commit in between (a target inserted after the count, say), producing a
  * snapshot that never existed in Postgres.
  */
-export async function loadFromPostgres(pool: Pool, maxLinks = 2_000_000): Promise<Snapshot> {
+export async function loadFromPostgres(
+  pool: Pool,
+  maxLinks = 2_000_000,
+  log: Log = () => {},
+): Promise<Snapshot> {
   const client = await pool.connect()
   try {
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
@@ -84,6 +151,13 @@ export async function loadFromPostgres(pool: Pool, maxLinks = 2_000_000): Promis
       const count = await client.query<{ n: string }>('SELECT count(*) AS n FROM links')
       const n = Number(count.rows[0]?.n ?? 0)
       if (n > maxLinks) throw new SnapshotTooLargeError(n, maxLinks)
+
+      // One row by construction, but it can be deleted by hand.
+      const settingsRow = await client.query<SettingsRow>(
+        'SELECT traffic_actions, safe_url, abuser_threshold FROM settings',
+      )
+      const { settings, problem } = settingsFromRow(settingsRow.rows[0])
+      if (problem) log(`traffic settings: ${problem}; using the defaults`)
 
       const domains = await client.query<{
         id: string
@@ -97,7 +171,7 @@ export async function loadFromPostgres(pool: Pool, maxLinks = 2_000_000): Promis
       // dropped: the evaluator cannot choose a destination for it.
       const links = await client.query<LinkRow>(`
         SELECT l.id, l.domain_id, l.slug, l.enabled, l.backup_url, l.device_urls, l.returning_url,
-               l.countries, l.click_cap, l.expires_at, l.passthrough,
+               l.countries, l.click_cap, l.expires_at, l.passthrough, l.traffic_actions,
                json_agg(json_build_object('id', t.id, 'url', t.url, 'weight', t.weight)
                         ORDER BY t.position) FILTER (WHERE t.id IS NOT NULL) AS targets
           FROM links l
@@ -106,7 +180,15 @@ export async function loadFromPostgres(pool: Pool, maxLinks = 2_000_000): Promis
 
       await client.query('COMMIT')
 
-      return new Snapshot(
+      // One line per load however many links are affected.
+      let refused = 0
+      const actionsOf = (r: LinkRow): LinkTrafficActions => {
+        const a = linkActionsFromRow(r.traffic_actions)
+        if (a.problem) refused++
+        return a.actions
+      }
+
+      const snapshot = new Snapshot(
         domains.rows.map((d) => ({
           id: d.id,
           host: d.host,
@@ -130,10 +212,14 @@ export async function loadFromPostgres(pool: Pool, maxLinks = 2_000_000): Promis
             clickCap: r.click_cap === null ? null : Number(r.click_cap),
             expiresAt: r.expires_at,
             passthrough: r.passthrough,
+            trafficActions: actionsOf(r),
           })),
         new Date(),
         'postgres',
+        settings,
       )
+      if (refused > 0) log(refusedOverrides(refused))
+      return snapshot
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {})
       throw err
@@ -144,26 +230,51 @@ export async function loadFromPostgres(pool: Pool, maxLinks = 2_000_000): Promis
 }
 
 export function serializeSnapshot(s: Snapshot): string {
-  return JSON.stringify({ v: 1, loadedAt: s.loadedAt.toISOString(), ...s.entries() })
+  return JSON.stringify({
+    v: 2,
+    loadedAt: s.loadedAt.toISOString(),
+    settings: s.settings,
+    ...s.entries(),
+  })
 }
 
-export function deserializeSnapshot(text: string): Snapshot {
+/**
+ * Reads version 2, and version 1 as written before traffic settings existed:
+ * the defaults and no link overrides, which is what Postgres held then too.
+ * A redirect upgraded while Postgres is down still serves its last snapshot.
+ * A version 2 file's settings and overrides pass core's schemas as they do
+ * from Postgres; refused, the defaults and no overrides apply, with a log.
+ */
+export function deserializeSnapshot(text: string, log: Log = () => {}): Snapshot {
   const raw = JSON.parse(text) as {
     v: number
     loadedAt: string
+    settings?: unknown
     domains: Domain[]
-    links: (Omit<Link, 'expiresAt'> & { expiresAt: string | null })[]
+    links: (Omit<Link, 'expiresAt' | 'trafficActions'> & {
+      expiresAt: string | null
+      trafficActions?: unknown
+    })[]
   }
-  if (raw.v !== 1) throw new Error(`unknown snapshot version ${raw.v}`)
-  return new Snapshot(
-    raw.domains,
-    raw.links.map((l) => ({
+  if (raw.v !== 1 && raw.v !== 2) throw new Error(`unknown snapshot version ${raw.v}`)
+  let settings = DEFAULT_TRAFFIC_SETTINGS
+  if (raw.v === 2) {
+    const r = validSettings(raw.settings, 'the snapshot file settings')
+    if (r.problem) log(`traffic settings: ${r.problem}; using the defaults`)
+    settings = r.settings
+  }
+  let refused = 0
+  const links = raw.links.map((l) => {
+    const a = linkActionsFromRow(l.trafficActions ?? {})
+    if (a.problem) refused++
+    return {
       ...l,
       expiresAt: l.expiresAt === null ? null : new Date(l.expiresAt),
-    })),
-    new Date(raw.loadedAt),
-    'file',
-  )
+      trafficActions: a.actions,
+    }
+  })
+  if (refused > 0) log(refusedOverrides(refused))
+  return new Snapshot(raw.domains, links, new Date(raw.loadedAt), 'file', settings)
 }
 
 /**
@@ -189,13 +300,20 @@ export function writeSnapshotFile(path: string, s: Snapshot, write: WriteFn = wr
   }
 }
 
-export function readSnapshotFile(path: string): Snapshot | null {
+export function readSnapshotFile(path: string, log: Log = () => {}): Snapshot | null {
   try {
-    return deserializeSnapshot(readFileSync(path, 'utf8'))
+    return deserializeSnapshot(readFileSync(path, 'utf8'), log)
   } catch {
     return null
   }
 }
+
+/**
+ * How long stop() waits for a reload already in flight. A reload blocked on
+ * a lock (a long DDL holder, say) must not hold the drain open: past this,
+ * stopping continues and ending the pool drops the abandoned reload.
+ */
+export const RELOAD_STOP_WAIT_MS = 5_000
 
 export interface SnapshotStoreOptions {
   pgUrl: string
@@ -218,6 +336,10 @@ export class SnapshotStore {
   // can all fire independently, and Postgres gives no ordering guarantee on
   // when each of their queries returns).
   private reloadGen = 0
+  // Reloads that have started and not finished; stop() waits for them.
+  private inflight = new Set<Promise<boolean>>()
+  // The one seam a test uses to shorten the bound below.
+  private stopWaitMs = RELOAD_STOP_WAIT_MS
   private readonly o: Required<SnapshotStoreOptions>
 
   constructor(opts: SnapshotStoreOptions) {
@@ -236,7 +358,7 @@ export class SnapshotStore {
 
   async start(): Promise<void> {
     if (!(await this.reload())) {
-      this.snapshot = readSnapshotFile(this.o.filePath)
+      this.snapshot = readSnapshotFile(this.o.filePath, this.o.log)
       this.o.log(
         this.snapshot
           ? 'serving the last snapshot file; Postgres unreachable'
@@ -278,13 +400,38 @@ export class SnapshotStore {
         // already gone
       }
     }
+    // Once stop() resolves, no reload will start, and one in flight has
+    // either finished — so the caller may end the pool, or change the
+    // tables, without a reload still holding locks on them — or run past the
+    // bound, in which case stopping continues without it.
+    let waited: NodeJS.Timeout | undefined
+    await Promise.race([
+      Promise.all(this.inflight),
+      new Promise<void>((resolve) => {
+        waited = setTimeout(resolve, this.stopWaitMs)
+        waited.unref()
+      }),
+    ])
+    clearTimeout(waited)
   }
 
-  /** True on success. Never rejects. */
+  /** True on success. Never rejects. False, without loading, once stopped. */
   private async reload(): Promise<boolean> {
+    // A notification or timer can still fire while stop() is in progress.
+    if (this.stopped) return false
+    const run = this.load()
+    this.inflight.add(run)
+    try {
+      return await run
+    } finally {
+      this.inflight.delete(run)
+    }
+  }
+
+  private async load(): Promise<boolean> {
     const gen = ++this.reloadGen
     try {
-      const next = await loadFromPostgres(this.o.pool)
+      const next = await loadFromPostgres(this.o.pool, undefined, this.o.log)
       // A newer reload already started while this one was in flight: its
       // result, whenever it lands, is the current one. Applying this older
       // result now would overwrite it with stale data.

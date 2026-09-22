@@ -32,12 +32,18 @@ importers:
       '@clickmonk/db':
         specifier: workspace:*
         version: link:../db
+      '@clickmonk/ipdata':
+        specifier: workspace:*
+        version: link:../ipdata
       zod:
         specifier: ^3.25.0
         version: 3.25.76
 
   packages/core:
     dependencies:
+      isbot:
+        specifier: ^5.2.2
+        version: 5.2.2
       zod:
         specifier: ^3.25.0
         version: 3.25.76
@@ -58,6 +64,15 @@ importers:
         specifier: ^8.23.1
         version: 8.23.1
 
+  packages/ipdata:
+    dependencies:
+      '@clickmonk/core':
+        specifier: workspace:*
+        version: link:../core
+      zod:
+        specifier: ^3.25.0
+        version: 3.25.76
+
   packages/redirect:
     dependencies:
       '@clickmonk/core':
@@ -66,6 +81,9 @@ importers:
       '@clickmonk/db':
         specifier: workspace:*
         version: link:../db
+      '@clickmonk/ipdata':
+        specifier: workspace:*
+        version: link:../ipdata
       fastify:
         specifier: ^5.12.5
         version: 5.12.5
@@ -91,6 +109,9 @@ importers:
       '@clickmonk/db':
         specifier: workspace:*
         version: link:../db
+      '@clickmonk/ipdata':
+        specifier: workspace:*
+        version: link:../ipdata
       zod:
         specifier: ^3.25.0
         version: 3.25.76
@@ -420,6 +441,10 @@ packages:
   ipaddr.js@2.5.0:
     resolution: {integrity: sha512-aq+t5NAc+cS6rZQQVWC2x98CPqGtKKTMDd4Gaodv0wShnItdKg/51djkGJ1hqH+Oy0ivDftCbSLCQob8zso01w==}
     engines: {node: '>= 10'}
+
+  isbot@5.2.2:
+    resolution: {integrity: sha512-iQcBXcd+Rv/pkubRyGh2utW2j1oPG5hZY6TUhVPpqK4G+o3IbxpJNx04hgksjc/N7GK5pEorUxDeg31cFgEk/w==}
+    engines: {node: '>=18'}
 
   json-schema-ref-resolver@3.0.0:
     resolution: {integrity: sha512-hOrZIVL5jyYFjzk7+y7n5JDzGlU8rfWDuYyHwGa2WA8/pcmMHezp2xsVwxrebD/Q9t8Nc5DboieySDpCp4WG4A==}
@@ -1066,6 +1091,8 @@ snapshots:
     optional: true
 
   ipaddr.js@2.5.0: {}
+
+  isbot@5.2.2: {}
 
   json-schema-ref-resolver@3.0.0:
     dependencies:

@@ -1,11 +1,16 @@
 import { normaliseHost } from '@clickmonk/core'
+import type { SourceStatus } from '@clickmonk/ipdata'
 import Fastify, { type FastifyInstance } from 'fastify'
+import type { RateCounter } from './rate.js'
 import type { Snapshot } from './snapshot.js'
 import type { SpoolWriter } from './spool.js'
 
 export function buildInternalApp(deps: {
   snapshot: () => Snapshot | null
   spool: Pick<SpoolWriter, 'stats'>
+  /** Each IP data source loaded, with its version and age; empty while there is none. */
+  ipdata?: () => SourceStatus[]
+  rate?: Pick<RateCounter, 'stats'>
 }): FastifyInstance {
   const app = Fastify({ logger: false })
 
@@ -19,6 +24,8 @@ export function buildInternalApp(deps: {
       status: s ? 'ok' : 'starting',
       snapshot: s ? { source: s.source, loadedAt: s.loadedAt.toISOString(), ...s.size } : null,
       spool: deps.spool.stats(),
+      ipdata: deps.ipdata?.() ?? [],
+      rate: deps.rate?.stats() ?? null,
     }
   })
 

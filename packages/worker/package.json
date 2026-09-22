@@ -10,6 +10,7 @@
     "@clickhouse/client": "^1.23.1",
     "@clickmonk/core": "workspace:*",
     "@clickmonk/db": "workspace:*",
+    "@clickmonk/ipdata": "workspace:*",
     "zod": "^3.25.0"
   }
 }

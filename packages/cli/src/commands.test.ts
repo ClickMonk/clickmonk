@@ -1,11 +1,18 @@
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { gzipSync } from 'node:zlib'
 import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
+import { type Fetcher, SOURCES, SOURCE_IDS } from '@clickmonk/ipdata'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { runCli } from './commands.js'
 
 const pg = testPg()
 const ch = testCh()
 const lines: string[] = []
-const run = (...argv: string[]) => runCli(argv, { pg, ch: () => ch, out: (s) => lines.push(s) })
+const ipdataDir = mkdtempSync(join(tmpdir(), 'clickmonk-cli-ipdata-'))
+const run = (...argv: string[]) =>
+  runCli(argv, { pg, ch: () => ch, out: (s) => lines.push(s), ipdata: { dir: ipdataDir } })
 
 beforeAll(async () => {
   await resetDatabases(pg, ch)
@@ -133,6 +140,7 @@ describe('clickmonk cli', () => {
       pg,
       ch: noCh,
       out: () => {},
+      ipdata: { dir: ipdataDir },
     })
     expect(code).toBe(0)
   })
@@ -141,5 +149,273 @@ describe('clickmonk cli', () => {
     lines.length = 0
     expect(await run('frobnicate')).toBe(1)
     expect(lines.join('\n')).toMatch(/usage/i)
+  })
+})
+
+describe('clickmonk settings', () => {
+  const settings = async () =>
+    (await pg.query('SELECT traffic_actions, safe_url, abuser_threshold FROM settings')).rows[0]
+
+  it('shows the defaults', async () => {
+    lines.length = 0
+    expect(await run('settings', 'show')).toBe(0)
+    expect(lines).toEqual([
+      'bot: flag',
+      'abuser: flag',
+      'anonymous: flag',
+      'datacenter: flag',
+      'safe url: (none)',
+      'abuser threshold: 60 clicks a minute from one address',
+    ])
+  })
+
+  it('changes only what it is given', async () => {
+    expect(
+      await run(
+        'settings',
+        'set',
+        '--action',
+        'bot=block',
+        '--action',
+        'datacenter=safe',
+        '--safe-url',
+        'https://example.com/safe?c={click_id}',
+        '--abuser-threshold',
+        '30',
+      ),
+    ).toBe(0)
+    expect(await settings()).toEqual({
+      traffic_actions: { bot: 'block', abuser: 'flag', anonymous: 'flag', datacenter: 'safe' },
+      safe_url: 'https://example.com/safe?c={click_id}',
+      abuser_threshold: 30,
+    })
+    expect(await run('settings', 'set', '--action', 'bot=flag')).toBe(0)
+    expect(await settings()).toMatchObject({
+      traffic_actions: { bot: 'flag', datacenter: 'safe' },
+      abuser_threshold: 30,
+    })
+  })
+
+  it('refuses to leave the safe action without a safe URL, and writes nothing', async () => {
+    const before = await settings()
+    expect(await run('settings', 'set', '--no-safe-url')).toBe(2)
+    expect(await settings()).toEqual(before)
+  })
+
+  it.each([
+    ['a malformed pair', ['--action', 'bot']],
+    ['an unknown class', ['--action', 'human=block']],
+    ['an unknown action', ['--action', 'bot=drop']],
+    ['a threshold out of range', ['--abuser-threshold', '0']],
+    ['both safe URL flags', ['--safe-url', 'https://example.com/', '--no-safe-url']],
+  ])('refuses %s', async (_label, args) => {
+    const before = await settings()
+    expect(await run('settings', 'set', ...args)).toBe(2)
+    expect(await settings()).toEqual(before)
+  })
+
+  it('shows the defaults, and says why, when core refuses the stored row', async () => {
+    // The database check allows a token in the safe URL's host; core does not.
+    await pg.query(
+      `UPDATE settings SET traffic_actions = '{"bot":"block","abuser":"flag","anonymous":"flag","datacenter":"flag"}',
+                           safe_url = 'https://{click_id}.example.com/'`,
+    )
+    lines.length = 0
+    expect(await run('settings', 'show')).toBe(0)
+    expect(lines[0]).toMatch(
+      /^note: the stored settings are invalid \(safeUrl: .+\); the defaults apply$/,
+    )
+    expect(lines.slice(1)).toEqual([
+      'bot: flag',
+      'abuser: flag',
+      'anonymous: flag',
+      'datacenter: flag',
+      'safe url: (none)',
+      'abuser threshold: 60 clicks a minute from one address',
+    ])
+  })
+
+  it('shows the defaults, and says so, when the settings row is missing', async () => {
+    await pg.query('DELETE FROM settings')
+    lines.length = 0
+    expect(await run('settings', 'show')).toBe(0)
+    expect(lines).toEqual([
+      'note: no settings are stored; the defaults apply',
+      'bot: flag',
+      'abuser: flag',
+      'anonymous: flag',
+      'datacenter: flag',
+      'safe url: (none)',
+      'abuser threshold: 60 clicks a minute from one address',
+    ])
+  })
+
+  it('writes the row back when it is missing, starting from the defaults', async () => {
+    await pg.query('DELETE FROM settings')
+    expect(await run('settings', 'set', '--action', 'bot=block')).toBe(0)
+    expect(await settings()).toEqual({
+      traffic_actions: { bot: 'block', abuser: 'flag', anonymous: 'flag', datacenter: 'flag' },
+      safe_url: null,
+      abuser_threshold: 60,
+    })
+  })
+
+  it('stores a link override', async () => {
+    lines.length = 0
+    expect(
+      await run(
+        'link',
+        'add',
+        'go.example.test',
+        'guarded',
+        '--target',
+        'https://example.com/',
+        '--action',
+        'datacenter=block',
+      ),
+    ).toBe(0)
+    const r = await pg.query("SELECT traffic_actions FROM links WHERE slug = 'guarded'")
+    expect(r.rows[0]?.traffic_actions).toEqual({ datacenter: 'block' })
+    expect(lines.some((l) => l.startsWith('note:'))).toBe(false)
+    expect(
+      await run(
+        'link',
+        'add',
+        'go.example.test',
+        'bad-override',
+        '--target',
+        'https://example.com/',
+        '--action',
+        'human=block',
+      ),
+    ).toBe(2)
+  })
+
+  it('stores a safe override without a safe URL, and says it will flag until one is set', async () => {
+    await pg.query('UPDATE settings SET safe_url = NULL')
+    lines.length = 0
+    expect(
+      await run(
+        'link',
+        'add',
+        'go.example.test',
+        'safe-unset',
+        '--target',
+        'https://example.com/',
+        '--action',
+        'bot=safe',
+        '--action',
+        'datacenter=safe',
+      ),
+    ).toBe(0)
+    const r = await pg.query("SELECT traffic_actions FROM links WHERE slug = 'safe-unset'")
+    expect(r.rows[0]?.traffic_actions).toEqual({ bot: 'safe', datacenter: 'safe' })
+    expect(lines.slice(1)).toEqual([
+      'note: bot, datacenter set to safe, but no safe URL is set, so those clicks are flagged until one is (clickmonk settings set --safe-url <url>)',
+    ])
+  })
+
+  it('says nothing more for a safe override when a safe URL is set', async () => {
+    expect(await run('settings', 'set', '--safe-url', 'https://example.com/safe')).toBe(0)
+    lines.length = 0
+    expect(
+      await run(
+        'link',
+        'add',
+        'go.example.test',
+        'safe-set',
+        '--target',
+        'https://example.com/',
+        '--action',
+        'bot=safe',
+      ),
+    ).toBe(0)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatch(/^link go\.example\.test\/safe-set /)
+  })
+})
+
+describe('clickmonk ipdata', () => {
+  // Made-up data on the documentation ranges and ASNs, with minimums cut to fit.
+  const bodies: Record<string, Uint8Array> = {
+    country: gzipSync('192.0.2.0,192.0.2.255,DE\n'),
+    asn: gzipSync('192.0.2.0,192.0.2.255,64500,"Example"\n'),
+    datacenter: new TextEncoder().encode('ASN,Entity\n64501,Example Hosting\n'),
+    tor: new TextEncoder().encode('{"relays":[{"exit_addresses":["198.51.100.9"]}]}'),
+  }
+  const sources = SOURCE_IDS.map((id) => ({ ...SOURCES[id], minimum: { k32: 1, k128: 0 } }))
+  const fetchAll =
+    (failTor = false): Fetcher =>
+    async (url) => {
+      if (failTor && url.includes('onionoo')) throw new Error('connection refused')
+      const id = url.includes('country')
+        ? 'country'
+        : url.includes('asn-lite')
+          ? 'asn'
+          : url.includes('bad-asn')
+            ? 'datacenter'
+            : 'tor'
+      return { status: 'ok', body: bodies[id] as Uint8Array }
+    }
+  const ip = (dir: string, fetch: Fetcher, ...argv: string[]) =>
+    runCli(argv, { pg, ch: () => ch, out: (s) => lines.push(s), ipdata: { dir, fetch, sources } })
+
+  it('says what is missing before the first update', async () => {
+    lines.length = 0
+    expect(await run('ipdata', 'status')).toBe(0)
+    expect(lines).toContain('country: dbip-country-lite, not downloaded yet')
+    expect(lines.some((l) => l.includes('https://'))).toBe(false)
+  })
+
+  it('downloads every source, then reports each with its attribution', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clickmonk-cli-ipdata-'))
+    lines.length = 0
+    expect(await ip(dir, fetchAll(), 'ipdata', 'update')).toBe(0)
+    expect(lines.filter((l) => /: updated /.test(l))).toHaveLength(4)
+    lines.length = 0
+    expect(await ip(dir, fetchAll(), 'ipdata', 'status')).toBe(0)
+    expect(lines.join('\n')).toMatch(
+      /^country: dbip-country-lite \d{4}-\d{2}, fetched .+, 1 \+ 0 entries$/m,
+    )
+    expect(
+      lines.filter((l) => l.startsWith('IP Geolocation by DB-IP (https://db-ip.com)')),
+    ).toHaveLength(1)
+    // Run again at once: the update is forced, so no source is skipped as not due.
+    lines.length = 0
+    expect(await ip(dir, fetchAll(), 'ipdata', 'update')).toBe(0)
+    expect(lines).toHaveLength(4)
+    expect(lines.filter((l) => /not_due/.test(l))).toEqual([])
+  })
+
+  it('exits 4 when a source fails, and still installs the others', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clickmonk-cli-ipdata-'))
+    lines.length = 0
+    expect(await ip(dir, fetchAll(true), 'ipdata', 'update')).toBe(4)
+    expect(lines).toContain('tor: failed (connection refused)')
+    expect(lines.filter((l) => /: updated /.test(l))).toHaveLength(3)
+  })
+
+  it('exits 4 while another update holds the lock', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clickmonk-cli-ipdata-'))
+    writeFileSync(join(dir, 'update.lock'), JSON.stringify({ at: Date.now() }))
+    lines.length = 0
+    expect(await ip(dir, fetchAll(), 'ipdata', 'update')).toBe(4)
+    expect(lines).toEqual(['another IP data update is running; try again when it finishes'])
+  })
+
+  it('says why a newer edition was refused when it keeps the one before', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clickmonk-cli-ipdata-'))
+    const all = fetchAll()
+    // The first country download is this month's edition; it does not parse.
+    let countryFetches = 0
+    const fetch: Fetcher = async (url, o) => {
+      if (url.includes('country') && countryFetches++ === 0) {
+        return { status: 'ok', body: gzipSync('not,a,range\n') }
+      }
+      return all(url, o)
+    }
+    lines.length = 0
+    expect(await ip(dir, fetch, 'ipdata', 'update')).toBe(0)
+    expect(lines.join('\n')).toMatch(/^country: updated \S+; \S+ refused: .+$/m)
   })
 })

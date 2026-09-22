@@ -22,10 +22,13 @@ services:
     environment:
       CLICKMONK_POSTGRES_URL: postgres://clickmonk:${POSTGRES_PASSWORD:?set it in .env}@postgres:5432/clickmonk
       CLICKMONK_SECRET: ${CLICKMONK_SECRET:?set it in .env}
+      CLICKMONK_TRUSTED_PROXIES: ${CLICKMONK_TRUSTED_PROXIES:-127.0.0.1}
     ports: ["8080:8080"]
     volumes:
       - spool:/var/lib/clickmonk/spool
       - state:/var/lib/clickmonk/state
+      # Written by the worker; the redirect only reads it.
+      - ipdata:/var/lib/clickmonk/ipdata:ro
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9091/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 5s
@@ -45,8 +48,10 @@ services:
       CLICKMONK_CLICKHOUSE_USER: clickmonk
       CLICKMONK_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set it in .env}
       CLICKMONK_CLICKHOUSE_DB: clickmonk
+      CLICKMONK_IPDATA_UPDATE: ${CLICKMONK_IPDATA_UPDATE:-on}
     volumes:
       - spool:/var/lib/clickmonk/spool
+      - ipdata:/var/lib/clickmonk/ipdata
 
   postgres:
     image: postgres:17-alpine
@@ -84,5 +89,6 @@ services:
 volumes:
   spool:
   state:
+  ipdata:
   postgres-data:
   clickhouse-data:
