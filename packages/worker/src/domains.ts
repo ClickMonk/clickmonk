@@ -36,9 +36,15 @@ export interface DomainResolver {
  */
 export function isResolverAddress(entry: string): boolean {
   const bracketed = /^\[([0-9A-Fa-f:.]+)\]:(\d{1,5})$/.exec(entry)
-  if (bracketed) return isIP(bracketed[1] as string) === 6 && Number(bracketed[2]) <= 65535
+  if (bracketed) {
+    const port = Number(bracketed[2])
+    return isIP(bracketed[1] as string) === 6 && port >= 1 && port <= 65535
+  }
   const withPort = /^([0-9.]+):(\d{1,5})$/.exec(entry)
-  if (withPort) return isIP(withPort[1] as string) === 4 && Number(withPort[2]) <= 65535
+  if (withPort) {
+    const port = Number(withPort[2])
+    return isIP(withPort[1] as string) === 4 && port >= 1 && port <= 65535
+  }
   return isIP(entry) !== 0
 }
 
@@ -71,12 +77,29 @@ function errorCode(err: unknown): string {
 
 const cut = (s: string): string => (s.length <= MAX_DETAIL ? s : `${s.slice(0, MAX_DETAIL - 1)}…`)
 
-/** Never rejects: an address lookup that fails is an empty list, not a failed check. */
-async function addressesOf(resolver: DomainResolver, host: string): Promise<string[]> {
+interface AddressLookup {
+  addresses: string[]
+  /**
+   * Codes from a lookup that failed for a reason other than "there is no
+   * such record" — the resolver couldn't say, not that there's nothing
+   * there. Reuses `ABSENT`, the same distinction the TXT lookup makes.
+   */
+  failed: string[]
+}
+
+/** Never rejects: an address lookup that fails is an empty list or a failure code, never a thrown error. */
+async function addressesOf(resolver: DomainResolver, host: string): Promise<AddressLookup> {
   const [v4, v6] = await Promise.allSettled([resolver.resolve4(host), resolver.resolve6(host)])
-  const out: string[] = []
-  for (const r of [v4, v6]) if (r.status === 'fulfilled') out.push(...r.value)
-  return out
+  const addresses: string[] = []
+  const failed: string[] = []
+  for (const r of [v4, v6]) {
+    if (r.status === 'fulfilled') addresses.push(...r.value)
+    else {
+      const code = errorCode(r.reason)
+      if (!ABSENT.has(code)) failed.push(code)
+    }
+  }
+  return { addresses, failed }
 }
 
 /**
@@ -107,18 +130,20 @@ export async function checkDomain(
       detail: cut(`${name} has ${records.length} TXT record(s), none of them this install's token`),
     }
   }
-  const addresses = await addressesOf(resolver, host)
+  const { addresses, failed } = await addressesOf(resolver, host)
   const shown = addresses.slice(0, MAX_ADDRESSES).join(', ')
   const more =
     addresses.length > MAX_ADDRESSES ? ` and ${addresses.length - MAX_ADDRESSES} more` : ''
-  return {
-    status: 'verified',
-    detail: cut(
-      addresses.length === 0
-        ? `token found; ${host} has no A or AAAA record, so nothing reaches this install yet`
-        : `token found; ${host} resolves to ${shown}${more}`,
-    ),
-  }
+  // A lookup that failed is reported as failed, not folded into "no record":
+  // stating "no A or AAAA record" as fact during a resolver outage would
+  // tell the operator something this install never actually learned.
+  const detail =
+    addresses.length > 0
+      ? `token found; ${host} resolves to ${shown}${more}`
+      : failed.length > 0
+        ? `token found; ${host}'s address could not be looked up (${failed.join(', ')})`
+        : `token found; ${host} has no A or AAAA record, so nothing reaches this install yet`
+  return { status: 'verified', detail: cut(detail) }
 }
 
 export interface DomainRow {
@@ -126,6 +151,8 @@ export interface DomainRow {
   host: string
   verification_token: string
   verified: boolean
+  /** The status this domain's last check recorded, or `null` if it has never been checked. */
+  previous_status: DomainDnsStatus | null
 }
 
 export interface DomainCheckRun {
@@ -160,7 +187,7 @@ export async function runDomainChecks(o: {
   const now = (o.now ?? (() => new Date()))()
   const limit = o.limit ?? DEFAULT_CHECK_LIMIT
   const rows = await o.pg.query<DomainRow>(
-    `SELECT d.id, d.host, d.verification_token, d.verified
+    `SELECT d.id, d.host, d.verification_token, d.verified, c.status AS previous_status
        FROM domains d
        LEFT JOIN domain_dns_checks c ON c.domain_id = d.id
       ORDER BY c.checked_at ASC NULLS FIRST, d.host ASC
@@ -184,15 +211,26 @@ export async function runDomainChecks(o: {
          SET status = EXCLUDED.status, detail = EXCLUDED.detail, checked_at = EXCLUDED.checked_at`,
       [row.id, result.status, result.detail, now],
     )
+    // Logged only on a real change: the first check for a domain, or a
+    // status different from last pass's. An unbroken run of the same status
+    // would otherwise write one line per failing domain every pass for as
+    // long as an outage or a removed record lasts.
+    if (result.status !== row.previous_status) {
+      o.log?.(
+        result.status === 'verified'
+          ? `domain ${row.host} verified: ${result.detail}`
+          : `domain ${row.host} not verified (${result.status}): ${result.detail}`,
+      )
+    }
     if (result.status === 'verified' && !row.verified) {
       await o.pg.query('UPDATE domains SET verified = true, updated_at = $2 WHERE id = $1', [
         row.id,
         now,
       ])
-      o.log?.(`domain ${row.host} verified: ${result.detail}`)
-    } else if (result.status !== 'verified') {
-      o.log?.(`domain ${row.host} not verified: ${result.detail}`)
     }
+  }
+  if (o.log && run.checked > 0) {
+    o.log(`domain check: checked ${run.checked}, verified ${run.verified}, failed ${run.failed}`)
   }
   return run
 }
@@ -225,14 +263,15 @@ export function startDomainChecker(o: {
   const loop = (async () => {
     while (!stopped) {
       try {
-        const r = await runDomainChecks({
+        // The summary and any transitions are already logged inside
+        // runDomainChecks itself, forwarded through this same log().
+        await runDomainChecks({
           pg: o.pg,
           resolver: o.resolver,
           signal: abort.signal,
           log: (m) => log(m),
           ...(o.limit === undefined ? {} : { limit: o.limit }),
         })
-        if (r.verified > 0) log(`domain check: ${r.verified} newly verified`)
       } catch (err) {
         log('domain check failed', err)
       }

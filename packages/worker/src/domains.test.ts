@@ -4,8 +4,10 @@ import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import {
   type DomainResolver,
+  MAX_ADDRESSES,
   MAX_DETAIL,
   checkDomain,
+  isResolverAddress,
   runDomainChecks,
   startDomainChecker,
 } from './domains.js'
@@ -83,6 +85,26 @@ describe('checkDomain', () => {
     expect(r.detail).toContain('no A or AAAA record')
   })
 
+  it('says the address could not be looked up, when the resolver could not answer, never that there is none', async () => {
+    const resolver: DomainResolver = {
+      async resolveTxt() {
+        return [[verificationRecordValue(TOKEN)]]
+      },
+      async resolve4() {
+        throw Object.assign(new Error('a lookup failed'), { code: 'ESERVFAIL' })
+      },
+      async resolve6() {
+        throw Object.assign(new Error('aaaa lookup failed'), { code: 'ESERVFAIL' })
+      },
+      cancel() {},
+    }
+    const r = await checkDomain(resolver, 'go.example.test', TOKEN)
+    expect(r.status).toBe('verified')
+    expect(r.detail).toContain('could not be looked up')
+    expect(r.detail).toContain('ESERVFAIL')
+    expect(r.detail).not.toContain('no A or AAAA record')
+  })
+
   it('reports a missing name and a name without the token as missing, not as an error', async () => {
     const absent = await checkDomain(fakeResolver({}), 'go.example.test', TOKEN)
     expect(absent).toEqual({ status: 'missing_token', detail: `no TXT record at ${NAME}` })
@@ -107,7 +129,7 @@ describe('checkDomain', () => {
     }
   })
 
-  it('cuts a detail that would not fit the column', async () => {
+  it('names at most MAX_ADDRESSES addresses and says how many more, whatever the resolver returns', async () => {
     const many = Array.from({ length: 400 }, (_, i) => `192.0.2.${i % 256}`)
     const r = await checkDomain(
       fakeResolver({
@@ -118,6 +140,12 @@ describe('checkDomain', () => {
       TOKEN,
     )
     expect(r.status).toBe('verified')
+    for (const addr of many.slice(0, MAX_ADDRESSES)) expect(r.detail).toContain(addr)
+    // The 9th distinct address in the list (192.0.2.8) is not among the
+    // first MAX_ADDRESSES shown, and does not recur until the list wraps
+    // past index 256 — well beyond what any correct implementation writes.
+    expect(r.detail).not.toContain('192.0.2.8')
+    expect(r.detail).toContain(`and ${many.length - MAX_ADDRESSES} more`)
     expect(r.detail.length).toBeLessThanOrEqual(MAX_DETAIL)
   })
 
@@ -142,6 +170,34 @@ describe('checkDomain', () => {
     const r = await checkDomain(resolver, 'go.example.test', TOKEN)
     expect(r.status).toBe('error')
     expect(r.detail.length).toBeLessThanOrEqual(MAX_DETAIL)
+  })
+})
+
+describe('isResolverAddress', () => {
+  it('accepts a bare address, IPv4 or IPv6', () => {
+    expect(isResolverAddress('192.0.2.1')).toBe(true)
+    expect(isResolverAddress('2001:db8::1')).toBe(true)
+  })
+
+  it('accepts an address with a port', () => {
+    expect(isResolverAddress('192.0.2.1:5353')).toBe(true)
+    expect(isResolverAddress('[2001:db8::1]:5353')).toBe(true)
+  })
+
+  it('refuses port 0: not a usable destination port', () => {
+    expect(isResolverAddress('192.0.2.1:0')).toBe(false)
+    expect(isResolverAddress('[2001:db8::1]:0')).toBe(false)
+  })
+
+  it('refuses a port past 65535', () => {
+    expect(isResolverAddress('192.0.2.1:70000')).toBe(false)
+    expect(isResolverAddress('[2001:db8::1]:70000')).toBe(false)
+  })
+
+  it('refuses anything that is not an address', () => {
+    expect(isResolverAddress('resolver.example.test')).toBe(false)
+    expect(isResolverAddress('')).toBe(false)
+    expect(isResolverAddress('192.0.2.1:')).toBe(false)
   })
 })
 
@@ -219,6 +275,41 @@ describe('runDomainChecks', () => {
     expect((await checkOf(d.id))?.status).toBe('missing_token')
   })
 
+  it('records nothing for a check whose signal was aborted mid-flight, and leaves what was there alone', async () => {
+    // a has no prior row (sorts first, NULLS FIRST) and checks cleanly. b
+    // already has a good row from an earlier pass; the abort lands while
+    // b's own lookup is still in flight, simulating a shutdown that catches
+    // a check mid-air rather than between domains.
+    const a = await addDomain('a.example.test')
+    const b = await addDomain('b.example.test', true)
+    const before = new Date(Date.now() - 60_000)
+    await pool.query(
+      "INSERT INTO domain_dns_checks (domain_id, status, detail, checked_at) VALUES ($1, 'verified', 'previously fine', $2)",
+      [b.id, before],
+    )
+    const abort = new AbortController()
+    const base = fakeResolver({
+      txt: { '_clickmonk.a.example.test': [[verificationRecordValue(a.token)]] },
+    })
+    const resolver: DomainResolver = {
+      resolveTxt: async (name) => {
+        if (name === '_clickmonk.b.example.test') abort.abort()
+        return base.resolveTxt(name)
+      },
+      resolve4: (h) => base.resolve4(h),
+      resolve6: (h) => base.resolve6(h),
+      cancel: () => base.cancel(),
+    }
+    const run = await runDomainChecks({ pg: pool, resolver, signal: abort.signal })
+    expect(run).toEqual({ checked: 1, verified: 1, failed: 0 })
+    expect((await checkOf(a.id))?.status).toBe('verified')
+    const bCheck = await checkOf(b.id)
+    expect(bCheck?.status).toBe('verified')
+    expect(bCheck?.detail).toBe('previously fine')
+    expect(bCheck?.checked_at.getTime()).toBe(before.getTime())
+    expect(await verifiedOf(b.id)).toBe(true)
+  })
+
   it('takes the least recently checked first, so every domain comes round', async () => {
     const a = await addDomain('a.example.test')
     const b = await addDomain('b.example.test')
@@ -229,6 +320,15 @@ describe('runDomainChecks', () => {
     expect(await checkOf(b.id)).toBeUndefined()
     await runDomainChecks({ pg: pool, resolver, limit: 1, now: () => new Date(now.getTime() + 1) })
     expect(await checkOf(b.id)).toBeDefined()
+    // Both domains now have a row: a's is the older one (now < now+1), so a
+    // third pass must pick a again — rotation past the first round, not
+    // just past the initial NULLS-FIRST ordering — and its checked_at must
+    // actually advance, or a would look "due" forever and b would never be
+    // revisited.
+    const third = new Date(now.getTime() + 2)
+    await runDomainChecks({ pg: pool, resolver, limit: 1, now: () => third })
+    expect((await checkOf(a.id))?.checked_at.getTime()).toBe(third.getTime())
+    expect((await checkOf(b.id))?.checked_at.getTime()).toBe(now.getTime() + 1)
   })
 
   it('notifies the redirect only when a domain actually becomes verified', async () => {
@@ -253,6 +353,46 @@ describe('runDomainChecks', () => {
     } finally {
       listener.release(true)
     }
+  })
+
+  it('logs a transition once, not every pass it stays the same, and always logs the pass summary', async () => {
+    const d = await addDomain('go.example.test')
+    const resolver = fakeResolver({}) // no TXT answer at all: stays missing_token every pass
+    let logged: string[] = []
+    const log = (m: string) => logged.push(m)
+
+    await runDomainChecks({ pg: pool, resolver, log })
+    // The very first check is a transition (never checked before): one line
+    // naming the domain, plus the pass summary.
+    expect(logged.filter((l) => l.includes('go.example.test'))).toHaveLength(1)
+    expect(logged.some((l) => l.startsWith('domain check:'))).toBe(true)
+
+    logged = []
+    await runDomainChecks({ pg: pool, resolver, log })
+    // Still missing_token, unchanged from last pass: no per-domain line —
+    // an outage or a removed record must not write one of these every pass
+    // for as long as it lasts — but the pass summary still appears.
+    expect(logged.filter((l) => l.includes('go.example.test'))).toHaveLength(0)
+    expect(logged.some((l) => l.startsWith('domain check:'))).toBe(true)
+  })
+
+  it('accepts a detail of exactly MAX_DETAIL; the migration’s column refuses one byte more', async () => {
+    // Nothing ties the MAX_DETAIL constant to the column's own CHECK
+    // constraint but this: if either moves without the other, one half of
+    // this test fails.
+    const ok = await addDomain('ok.example.test')
+    const long = await addDomain('long.example.test')
+    await pool.query(
+      "INSERT INTO domain_dns_checks (domain_id, status, detail) VALUES ($1, 'verified', $2)",
+      [ok.id, 'x'.repeat(MAX_DETAIL)],
+    )
+    expect((await checkOf(ok.id))?.detail.length).toBe(MAX_DETAIL)
+    await expect(
+      pool.query(
+        "INSERT INTO domain_dns_checks (domain_id, status, detail) VALUES ($1, 'verified', $2)",
+        [long.id, 'x'.repeat(MAX_DETAIL + 1)],
+      ),
+    ).rejects.toThrow()
   })
 })
 
