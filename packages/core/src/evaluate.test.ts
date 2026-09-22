@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import { type EvalInput, evaluate, slugFromPath } from './evaluate.js'
 import type { CountryRule, Domain, Link } from './link.js'
 import { MAX_DESTINATION_LENGTH } from './passthrough.js'
+import { DEFAULT_TRAFFIC_SETTINGS, type TrafficSettings } from './settings.js'
+import type { Traffic } from './traffic.js'
 
 const domain: Domain = {
   id: '00000000-0000-4000-8000-00000000000d',
@@ -32,10 +34,29 @@ function link(over: Partial<Link> = {}): Link {
   }
 }
 
+const HUMAN: Traffic = { class: 'human', ruleClass: 'human', signals: [] }
+const traffic = (cls: Traffic['class'], signals: Traffic['signals'] = []): Traffic => ({
+  class: cls,
+  ruleClass: cls,
+  signals,
+})
+/** A HEAD request that nothing else marks as non-human, as classifyTraffic returns it. */
+const HEAD: Traffic = { class: 'bot', ruleClass: 'human', signals: ['head'] }
+const settings = (
+  over: Partial<TrafficSettings['actions']> = {},
+  safeUrl: string | null = null,
+) => ({
+  ...DEFAULT_TRAFFIC_SETTINGS,
+  actions: { ...DEFAULT_TRAFFIC_SETTINGS.actions, ...over },
+  safeUrl,
+})
+
 function input(over: Partial<EvalInput> = {}, facts: Partial<EvalInput['facts']> = {}): EvalInput {
   return {
     domain,
     link: link(),
+    traffic: HUMAN,
+    settings: DEFAULT_TRAFFIC_SETTINGS,
     capExhausted: false,
     ...over,
     facts: {
@@ -287,6 +308,188 @@ describe('order', () => {
     ]) {
       expect(d.counted).toBe(false)
     }
+  })
+})
+
+describe('classify', () => {
+  it('blocks a class set to block, with 403 and no destination', () => {
+    expect(
+      evaluate(
+        input({ traffic: traffic('bot', ['ua_bot']), settings: settings({ bot: 'block' }) }),
+      ),
+    ).toMatchObject({
+      status: 403,
+      location: null,
+      outcome: 'blocked',
+      step: 'classify',
+      action: 'block',
+      counted: false,
+      reached: false,
+    })
+  })
+
+  it('sends a class set to safe to the safe URL, tokens and passthrough applied', () => {
+    const d = evaluate(
+      input(
+        {
+          traffic: traffic('datacenter', ['datacenter']),
+          settings: settings({ datacenter: 'safe' }, 'https://example.com/safe?c={click_id}'),
+        },
+        { query: new URLSearchParams('s=1') },
+      ),
+    )
+    expect(d).toMatchObject({
+      status: 302,
+      location: 'https://example.com/safe?c=01920000-0000-7000-8000-000000000001&s=1',
+      outcome: 'safe',
+      step: 'classify',
+      action: 'safe',
+      counted: false,
+      reached: false,
+    })
+  })
+
+  it('flags instead when the safe action has no safe URL', () => {
+    const l = link({ trafficActions: { datacenter: 'safe' } })
+    expect(
+      evaluate(input({ link: l, traffic: traffic('datacenter', ['datacenter']) })),
+    ).toMatchObject({
+      outcome: 'target',
+      action: 'flag',
+      counted: false,
+    })
+  })
+
+  it("takes the link's override over the install-wide action", () => {
+    const l = link({ trafficActions: { bot: 'nothing' } })
+    const d = evaluate(
+      input({ link: l, traffic: traffic('bot', ['ua_bot']), settings: settings({ bot: 'block' }) }),
+    )
+    expect(d).toMatchObject({ outcome: 'target', action: 'nothing', counted: true })
+  })
+
+  it('sends a flagged click on, marks the link seen, and does not count it', () => {
+    expect(evaluate(input({ traffic: traffic('abuser', ['rate']) }))).toMatchObject({
+      status: 302,
+      outcome: 'target',
+      action: 'flag',
+      counted: false,
+      reached: true,
+    })
+  })
+
+  it('counts a click whose class is set to nothing', () => {
+    expect(
+      evaluate(
+        input({
+          traffic: traffic('anonymous', ['tor']),
+          settings: settings({ anonymous: 'nothing' }),
+        }),
+      ),
+    ).toMatchObject({ outcome: 'target', action: 'nothing', counted: true, reached: true })
+  })
+
+  it('applies no action to a human or unknown click, and counts it', () => {
+    const all = settings({ bot: 'block', abuser: 'block', anonymous: 'block', datacenter: 'block' })
+    for (const t of [HUMAN, traffic('unknown')]) {
+      expect(evaluate(input({ traffic: t, settings: all }))).toMatchObject({
+        outcome: 'target',
+        action: null,
+        counted: true,
+        reached: true,
+      })
+    }
+  })
+
+  it('answers a HEAD request as the same GET, records the action nothing, and never counts it', () => {
+    const d = evaluate(input({ traffic: HEAD, settings: settings({ bot: 'block' }) }))
+    expect(d).toMatchObject({
+      status: 302,
+      outcome: 'target',
+      action: 'nothing',
+      counted: false,
+      reached: true,
+    })
+  })
+
+  it('does not count a HEAD request even when its class is set to nothing', () => {
+    const t: Traffic = {
+      class: 'datacenter',
+      ruleClass: 'datacenter',
+      signals: ['head', 'datacenter'],
+    }
+    expect(
+      evaluate(input({ traffic: t, settings: settings({ datacenter: 'nothing' }) })),
+    ).toMatchObject({
+      outcome: 'target',
+      counted: false,
+    })
+  })
+
+  it('blocks a HEAD request when the same GET would be blocked', () => {
+    const t: Traffic = {
+      class: 'datacenter',
+      ruleClass: 'datacenter',
+      signals: ['head', 'datacenter'],
+    }
+    expect(
+      evaluate(input({ traffic: t, settings: settings({ datacenter: 'block' }) })).outcome,
+    ).toBe('blocked')
+  })
+
+  it('sends a flagged click and a HEAD request past an exhausted cap to the backup, or 410', () => {
+    // Neither consumes the cap, but a reached cap closes the link to them too.
+    const withBackup = link({ clickCap: 1, backupUrl: 'https://example.com/backup' })
+    for (const t of [traffic('bot', ['ua_bot']), HEAD]) {
+      expect(evaluate(input({ link: withBackup, traffic: t, capExhausted: true }))).toMatchObject({
+        status: 302,
+        location: 'https://example.com/backup',
+        outcome: 'capped',
+        counted: false,
+        reached: false,
+      })
+      expect(
+        evaluate(input({ link: link({ clickCap: 1 }), traffic: t, capExhausted: true })),
+      ).toMatchObject({ status: 410, outcome: 'capped' })
+    }
+  })
+
+  it('records no action for a click that stopped at resolve', () => {
+    expect(evaluate(input({ link: null, traffic: traffic('bot', ['ua_bot']) })).action).toBeNull()
+  })
+})
+
+describe('classify, in order', () => {
+  const past = new Date(Date.now() - HOUR)
+  const blockBot = { traffic: traffic('bot', ['ua_bot']), settings: settings({ bot: 'block' }) }
+
+  it('resolves before it classifies', () => {
+    expect(evaluate(input({ ...blockBot, link: null })).outcome).toBe('not_found')
+    expect(evaluate(input({ ...blockBot, link: link({ enabled: false }) })).outcome).toBe(
+      'not_found',
+    )
+  })
+
+  it('classifies before the limits and the country', () => {
+    expect(evaluate(input({ ...blockBot, link: link({ expiresAt: past }) })).outcome).toBe(
+      'blocked',
+    )
+    expect(evaluate(input({ ...blockBot, capExhausted: true })).outcome).toBe('blocked')
+    expect(
+      evaluate(input({ ...blockBot, link: link({ countries: { mode: 'block', list: ['DE'] } }) }))
+        .outcome,
+    ).toBe('blocked')
+  })
+
+  it('carries the action through the steps after it', () => {
+    const flagged = { traffic: traffic('bot', ['ua_bot']) }
+    expect(evaluate(input({ ...flagged, link: link({ expiresAt: past }) }))).toMatchObject({
+      outcome: 'expired',
+      action: 'flag',
+    })
+    expect(
+      evaluate(input({ ...flagged, link: link({ countries: { mode: 'allow', list: ['FR'] } }) })),
+    ).toMatchObject({ outcome: 'country_blocked', action: 'flag' })
   })
 })
 

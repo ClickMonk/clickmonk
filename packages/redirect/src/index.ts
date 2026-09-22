@@ -1,16 +1,18 @@
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { createPgPool } from '@clickmonk/db'
+import { IpDataStore } from '@clickmonk/ipdata'
 import { buildRedirectApp } from './app.js'
 import { loadConfig } from './config.js'
 import { buildInternalApp } from './internal.js'
+import { RateCounter } from './rate.js'
 import { SnapshotStore } from './snapshot.js'
 import { SpoolWriter } from './spool.js'
 
 const config = loadConfig(process.env)
 
 // Two pools: one for snapshot loads, one for the cap counter on the request
-// path. tryConsumeCap bounds each call at 150 ms; the pool's own timeouts
+// path. tryConsumeCap and checkCap bound each call at 150 ms; the pool's own timeouts
 // only stop a connection or query it abandoned from lingering.
 const configPool = createPgPool(config.postgresUrl, { max: 2 })
 const capPool = createPgPool(config.postgresUrl, {
@@ -35,11 +37,34 @@ const store = new SnapshotStore({
 })
 await store.start()
 
+// Written by the worker; read here, whole, into memory, at start and when
+// the manifest changes, never inside a request. Not awaited: the redirect
+// answers while the tables load, and without them it still serves:
+// countries are unknown and the IP checks do not run.
+const ipdata = new IpDataStore({
+  dir: config.ipdataDir,
+  log: (msg, err) => console.error(`ipdata: ${msg}`, err ?? ''),
+})
+const ipdataStarted = ipdata.start()
+const rate = new RateCounter()
+
 const app = buildRedirectApp(
-  { snapshot: () => store.current(), spool, capPool, secret: config.secret },
+  {
+    snapshot: () => store.current(),
+    spool,
+    capPool,
+    secret: config.secret,
+    ipdata: () => ipdata.current(),
+    rate,
+  },
   { trustProxy: config.trustedProxies },
 )
-const internal = buildInternalApp({ snapshot: () => store.current(), spool })
+const internal = buildInternalApp({
+  snapshot: () => store.current(),
+  spool,
+  ipdata: () => ipdata.status(),
+  rate,
+})
 
 await internal.listen({ host: '0.0.0.0', port: config.internalPort })
 await app.listen({ host: '0.0.0.0', port: config.port })
@@ -56,6 +81,9 @@ async function shutdown(signal: string): Promise<void> {
     spool.close()
     await internal.close()
     await store.stop()
+    // A start still loading would set its poll timer after a stop.
+    await ipdataStarted
+    ipdata.stop()
     await Promise.allSettled([configPool.end(), capPool.end()])
   } catch (err) {
     console.error('shutdown error', err)

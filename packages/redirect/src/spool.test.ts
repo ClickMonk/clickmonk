@@ -32,7 +32,7 @@ vi.mock('node:fs', async (importOriginal) => {
 })
 
 const rec = (n: number): ClickRecord => ({
-  v: 1,
+  v: 2,
   clickId: `01920000-0000-7000-8000-${String(n).padStart(12, '0')}`,
   time: new Date().toISOString(),
   host: 'go.example.test',
@@ -52,6 +52,13 @@ const rec = (n: number): ClickRecord => ({
   referrer: '',
   ip: '192.0.2.1',
   capUnchecked: false,
+  trafficClass: 'unknown',
+  signals: [],
+  action: null,
+  os: 'other',
+  browser: 'other',
+  asn: null,
+  geoSource: '',
 })
 
 const writers: SpoolWriter[] = []

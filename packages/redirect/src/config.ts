@@ -1,4 +1,5 @@
 import { DEFAULT_SPOOL_DIR, formatConfigError } from '@clickmonk/core'
+import { DEFAULT_IPDATA_DIR } from '@clickmonk/ipdata'
 import { z } from 'zod'
 
 const Schema = z.object({
@@ -10,6 +11,7 @@ const Schema = z.object({
   CLICKMONK_SPOOL_MAX_BYTES: z.coerce.number().int().min(1_048_576).default(5_368_709_120),
   CLICKMONK_SNAPSHOT_PATH: z.string().min(1).default('/var/lib/clickmonk/state/snapshot.json'),
   CLICKMONK_TRUSTED_PROXIES: z.string().default('127.0.0.1'),
+  CLICKMONK_IPDATA_DIR: z.string().min(1).default(DEFAULT_IPDATA_DIR),
 })
 
 export interface RedirectConfig {
@@ -21,6 +23,7 @@ export interface RedirectConfig {
   spoolMaxBytes: number
   snapshotPath: string
   trustedProxies: string[]
+  ipdataDir: string
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv): RedirectConfig {
@@ -38,5 +41,6 @@ export function loadConfig(env: NodeJS.ProcessEnv): RedirectConfig {
     trustedProxies: e.CLICKMONK_TRUSTED_PROXIES.split(',')
       .map((s) => s.trim())
       .filter(Boolean),
+    ipdataDir: e.CLICKMONK_IPDATA_DIR,
   }
 }

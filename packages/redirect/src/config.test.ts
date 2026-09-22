@@ -15,6 +15,7 @@ describe('loadConfig', () => {
       spoolMaxBytes: 5_368_709_120,
       snapshotPath: '/var/lib/clickmonk/state/snapshot.json',
       trustedProxies: ['127.0.0.1'],
+      ipdataDir: '/var/lib/clickmonk/ipdata',
     })
   })
 

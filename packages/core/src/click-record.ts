@@ -102,7 +102,7 @@ export type ClickRecordV2 = z.infer<typeof ClickRecordV2Schema>
 export type SpoolRecord = z.infer<typeof SpoolRecordSchema>
 
 /** The version the redirect writes. */
-export const ClickRecordSchema = ClickRecordV1Schema
+export const ClickRecordSchema = ClickRecordV2Schema
 export type ClickRecord = z.infer<typeof ClickRecordSchema>
 
 /**

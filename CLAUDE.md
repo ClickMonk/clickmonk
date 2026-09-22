@@ -42,9 +42,10 @@ run it on their own infrastructure; their click data stays theirs.
 ## Current status
 
 **Early, unreleased, not for production.** What exists: the redirect (in-memory snapshot,
-spool before response, click caps), the worker (spool to ClickHouse, migrations on
-boot), the CLI (`migrate`, `domain add`, `link add`), a Compose stack, and the restart
-durability suite.
+spool before response, click caps, traffic classification and actions, country rules
+from an in-memory IP lookup), the worker (spool to ClickHouse, migrations on boot, IP
+data updates), the CLI (`migrate`, `domain add`, `link add`, `settings show|set`,
+`ipdata status|update`), a Compose stack, and the restart durability suite.
 
 What does not exist yet, and must not be implied by any documentation:
 
@@ -53,15 +54,23 @@ What does not exist yet, and must not be implied by any documentation:
 - **Admin API and UI.** Links and domains are added with the CLI. `domain add` marks a
   domain verified without a DNS check.
 - **Most link settings in the CLI.** `link add` takes `--target`, `--backup`, `--cap`,
-  `--expires` and `--no-passthrough` only. The evaluator supports device URLs, a
-  returning URL, country rules, a name and the disabled state; the CLI cannot set them
-  yet, so they need hand-written SQL.
+  `--expires`, `--no-passthrough` and `--action` only, and no command changes a link
+  after `link add`. `settings set` sets the install-wide traffic actions, the safe URL
+  and the abuser threshold. The evaluator supports device URLs, a returning URL,
+  country rules, a name and the disabled state; the CLI cannot set them yet, so they
+  need hand-written SQL.
 - **Reporting.** Clicks reach ClickHouse; there are no reports or exports.
-- **IP lookup and traffic classification.** The country is always empty, so an
-  allow-list link sends everyone to its backup URL.
+- **Proxy/VPN detection beyond Tor exits, cloud providers' published ranges, and region
+  or city.** No licensed VPN or proxy list has been found; datacenter traffic is
+  recognised by ASN only, since no cloud provider's range file states a licence.
 - **Password links, backup and restore.**
 - Segments ClickHouse rejects are set aside as `.bad` files, and nothing reports them.
 - One redirect process per spool directory.
+
+**Upgrade the worker before the redirect.** A worker never deletes or sets aside a spool
+segment whose record version is newer than it reads: segments from a newer redirect wait
+in the spool, counting toward its size bound, until the worker is upgraded. Support for
+reading a record version ships no later than writing it.
 
 ## Stack and layout
 
@@ -73,15 +82,21 @@ for click events.
 
 ```
 packages/core/      pure logic, no I/O: link schemas (zod), the redirect evaluator,
-                    device detection, destination tokens, passthrough, rotation,
-                    click IDs, the click record. Owns SCHEMA_VERSION.
+                    device, OS and browser detection, traffic classification,
+                    destination tokens, passthrough, rotation, click IDs, the click
+                    record. Owns SCHEMA_VERSION.
 packages/db/        Postgres and ClickHouse clients and the migrator. Migrations live
                     in packages/db/migrations/{postgres,clickhouse} as one shared
                     version sequence.
+packages/ipdata/    IP data: the compact range-table format, the source parsers
+                    and their licences, the manifest the redirect loads, and the
+                    updater the worker runs.
 packages/redirect/  the service that answers link domains: an in-memory snapshot,
-                    the spool writer, the click-cap counter.
-packages/worker/    ships the spool into ClickHouse; runs migrations on boot.
-packages/cli/       `clickmonk migrate | domain add | link add`.
+                    the IP data and the per-address rate counter, the spool
+                    writer, the click-cap counter.
+packages/worker/    ships the spool into ClickHouse; runs migrations on boot;
+                    updates the IP data.
+packages/cli/       `clickmonk migrate | domain add | link add | settings | ipdata`.
 ```
 
 Three properties of the product shape every change:
@@ -103,8 +118,9 @@ pnpm build        # required before the first `pnpm test`
 pnpm test
 ```
 
-**Build before the first test run, and after changing `core` or `db`.** Packages import
-each other by name, which resolves to the *built* `dist/`, and `dist/` is not committed.
+**Build before the first test run, and after changing `core`, `db` or `ipdata`.**
+Packages import each other by name, which resolves to the *built* `dist/`, and `dist/`
+is not committed.
 A test in `packages/redirect` exercising a change in `packages/core` runs against the
 last build until you rebuild; it stays green and the green means nothing.
 
