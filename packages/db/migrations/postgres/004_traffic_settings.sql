@@ -24,9 +24,15 @@ CREATE TABLE settings (
   traffic_actions  jsonb       NOT NULL
                    DEFAULT '{"bot":"flag","abuser":"flag","anonymous":"flag","datacenter":"flag"}'::jsonb
                    CHECK (valid_traffic_actions(traffic_actions, true)),
-  safe_url         text        CHECK (safe_url IS NULL OR length(safe_url) <= 2048),
+  safe_url         text,
   abuser_threshold integer     NOT NULL DEFAULT 60 CHECK (abuser_threshold BETWEEN 1 AND 100000),
   updated_at       timestamptz NOT NULL DEFAULT now(),
+  -- Same shape core's isDestinationUrl requires: an absolute http(s) URL of
+  -- printable ASCII, at most 2048 characters. Without this, hand-written SQL
+  -- could set safe_url to '' or a javascript: URL and the redirect would
+  -- send flagged traffic there.
+  CONSTRAINT settings_safe_url_valid
+    CHECK (safe_url IS NULL OR (length(safe_url) <= 2048 AND safe_url ~ '^https?://[\x21-\x7e]+$')),
   -- The safe action needs somewhere to send the click.
   CONSTRAINT settings_safe_needs_url
     CHECK (safe_url IS NOT NULL OR NOT traffic_actions @? '$.* ? (@ == "safe")')

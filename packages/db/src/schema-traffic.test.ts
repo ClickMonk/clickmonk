@@ -43,7 +43,7 @@ describe('postgres schema 004: settings', () => {
     ['an action that is not a string', { ...ALL_FLAG, bot: 1 }],
     ['an array', ['flag']],
   ])('refuses %s', async (_label, actions) => {
-    await expect(setActions(actions)).rejects.toThrow()
+    await expect(setActions(actions)).rejects.toThrow(/violates check constraint/)
   })
 
   it('refuses the safe action without a safe URL, and takes it with one', async () => {
@@ -54,6 +54,18 @@ describe('postgres schema 004: settings', () => {
     await expect(pool.query('UPDATE settings SET safe_url = NULL')).rejects.toThrow(
       /settings_safe_needs_url/,
     )
+  })
+
+  it.each([
+    ['an empty string', ''],
+    ['a javascript: URL', 'javascript:alert(1)'],
+    ['a non-ASCII URL', 'https://example.com/café'],
+  ])('refuses %s as the safe URL', async (_label, safeUrl) => {
+    await expect(setActions(ALL_FLAG, safeUrl)).rejects.toThrow(/settings_safe_url_valid/)
+  })
+
+  it('accepts a valid https URL as the safe URL', async () => {
+    await setActions(ALL_FLAG, 'https://example.com/safe')
   })
 
   it('bounds the abuser threshold', async () => {
@@ -82,7 +94,7 @@ describe('postgres schema 004: link overrides', () => {
   })
 
   it('refuses an unknown class or action', async () => {
-    await expect(link({ human: 'block' })).rejects.toThrow()
-    await expect(link({ bot: 'drop' })).rejects.toThrow()
+    await expect(link({ human: 'block' })).rejects.toThrow(/violates check constraint/)
+    await expect(link({ bot: 'drop' })).rejects.toThrow(/violates check constraint/)
   })
 })
