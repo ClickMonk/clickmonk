@@ -141,10 +141,14 @@ describe('checkDomain', () => {
     )
     expect(r.status).toBe('verified')
     for (const addr of many.slice(0, MAX_ADDRESSES)) expect(r.detail).toContain(addr)
-    // The 9th distinct address in the list (192.0.2.8) is not among the
-    // first MAX_ADDRESSES shown, and does not recur until the list wraps
-    // past index 256 — well beyond what any correct implementation writes.
-    expect(r.detail).not.toContain('192.0.2.8')
+    // The first address past the shown ones, whatever MAX_ADDRESSES is —
+    // derived from it rather than written out, so the two halves of this
+    // test cannot quietly disagree if the bound ever changes. It does not
+    // recur until the list wraps past index 256 — well beyond what any
+    // correct implementation writes.
+    const firstOmitted = many[MAX_ADDRESSES]
+    if (!firstOmitted) throw new Error('fixture too short for MAX_ADDRESSES')
+    expect(r.detail).not.toContain(firstOmitted)
     expect(r.detail).toContain(`and ${many.length - MAX_ADDRESSES} more`)
     expect(r.detail.length).toBeLessThanOrEqual(MAX_DETAIL)
   })
@@ -310,6 +314,31 @@ describe('runDomainChecks', () => {
     expect(await verifiedOf(b.id)).toBe(true)
   })
 
+  it('never queries the resolver once the signal is already aborted', async () => {
+    await addDomain('a.example.test')
+    const abort = new AbortController()
+    abort.abort()
+    let queried = false
+    const resolver: DomainResolver = {
+      resolveTxt: async () => {
+        queried = true
+        throw new Error('should not have been called')
+      },
+      resolve4: async () => {
+        queried = true
+        throw new Error('should not have been called')
+      },
+      resolve6: async () => {
+        queried = true
+        throw new Error('should not have been called')
+      },
+      cancel() {},
+    }
+    const run = await runDomainChecks({ pg: pool, resolver, signal: abort.signal })
+    expect(run).toEqual({ checked: 0, verified: 0, failed: 0 })
+    expect(queried).toBe(false)
+  })
+
   it('takes the least recently checked first, so every domain comes round', async () => {
     const a = await addDomain('a.example.test')
     const b = await addDomain('b.example.test')
@@ -355,25 +384,52 @@ describe('runDomainChecks', () => {
     }
   })
 
-  it('logs a transition once, not every pass it stays the same, and always logs the pass summary', async () => {
-    const d = await addDomain('go.example.test')
+  it('logs a transition once, not every pass it stays the same', async () => {
+    await addDomain('go.example.test')
     const resolver = fakeResolver({}) // no TXT answer at all: stays missing_token every pass
     let logged: string[] = []
     const log = (m: string) => logged.push(m)
 
     await runDomainChecks({ pg: pool, resolver, log })
-    // The very first check is a transition (never checked before): one line
-    // naming the domain, plus the pass summary.
+    // The very first check is a transition (never checked before).
     expect(logged.filter((l) => l.includes('go.example.test'))).toHaveLength(1)
-    expect(logged.some((l) => l.startsWith('domain check:'))).toBe(true)
 
     logged = []
     await runDomainChecks({ pg: pool, resolver, log })
     // Still missing_token, unchanged from last pass: no per-domain line —
     // an outage or a removed record must not write one of these every pass
-    // for as long as it lasts — but the pass summary still appears.
+    // for as long as it lasts.
     expect(logged.filter((l) => l.includes('go.example.test'))).toHaveLength(0)
-    expect(logged.some((l) => l.startsWith('domain check:'))).toBe(true)
+  })
+
+  it('logs exactly one pass summary line, however many domains it checked', async () => {
+    // Two domains: a summary written once per domain, instead of once per
+    // pass, would produce two lines here and one would never tell.
+    await addDomain('a.example.test')
+    await addDomain('b.example.test')
+    const resolver = fakeResolver({})
+    const logged: string[] = []
+    await runDomainChecks({ pg: pool, resolver, log: (m) => logged.push(m) })
+    expect(logged.filter((l) => l.startsWith('domain check:'))).toHaveLength(1)
+  })
+
+  it('with logEvery, logs every domain checked, whatever its transition — for a command someone just ran', async () => {
+    await addDomain('go.example.test')
+    const resolver = fakeResolver({}) // stays missing_token every pass, same as the transition-only case above
+    let logged: string[] = []
+    const log = (m: string) => logged.push(m)
+
+    await runDomainChecks({ pg: pool, resolver, log, logEvery: true })
+    expect(logged.filter((l) => l.includes('go.example.test'))).toHaveLength(1)
+
+    logged = []
+    await runDomainChecks({ pg: pool, resolver, log, logEvery: true })
+    // Unchanged from last pass, but logEvery asked for this domain's line
+    // regardless — an operator who just typed a command wants to see the
+    // domain they asked about, not only a transition.
+    expect(logged.filter((l) => l.includes('go.example.test'))).toHaveLength(1)
+    // Still exactly one summary line, same as the default.
+    expect(logged.filter((l) => l.startsWith('domain check:'))).toHaveLength(1)
   })
 
   it('accepts a detail of exactly MAX_DETAIL; the migration’s column refuses one byte more', async () => {

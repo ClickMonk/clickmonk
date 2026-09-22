@@ -183,6 +183,15 @@ export async function runDomainChecks(o: {
   /** Stopping: the pass ends without recording the result of the check it abandoned. */
   signal?: AbortSignal
   log?: (msg: string) => void
+  /**
+   * True logs one line per domain checked, whatever the transition — for a
+   * command an operator just ran, who asked to see this domain's result
+   * regardless of whether it changed. Default false: only a real change is
+   * logged, for the five-minute background loop, where an unbroken run of
+   * the same status must not write one line per domain every pass. Either
+   * way, exactly one pass-summary line is logged.
+   */
+  logEvery?: boolean
 }): Promise<DomainCheckRun> {
   const now = (o.now ?? (() => new Date()))()
   const limit = o.limit ?? DEFAULT_CHECK_LIMIT
@@ -215,7 +224,7 @@ export async function runDomainChecks(o: {
     // status different from last pass's. An unbroken run of the same status
     // would otherwise write one line per failing domain every pass for as
     // long as an outage or a removed record lasts.
-    if (result.status !== row.previous_status) {
+    if (o.logEvery || result.status !== row.previous_status) {
       o.log?.(
         result.status === 'verified'
           ? `domain ${row.host} verified: ${result.detail}`
