@@ -2,6 +2,7 @@
 import { formatConfigError } from '@clickmonk/core'
 import { type ClickHouseClient, createChClient, createPgPool } from '@clickmonk/db'
 import { DEFAULT_IPDATA_DIR } from '@clickmonk/ipdata'
+import { isResolverAddress } from '@clickmonk/worker/domains'
 import { z } from 'zod'
 import { runCli } from './commands.js'
 
@@ -23,6 +24,17 @@ async function main(): Promise<number> {
   const env = PgEnv.safeParse(process.env)
   if (!env.success) throw new ConfigError(formatConfigError(env.error))
   const pg = createPgPool(env.data.CLICKMONK_POSTGRES_URL, { max: 1 })
+  // The same resolvers the worker asks, so `domain verify` and the worker's
+  // own pass can never disagree about what DNS says.
+  const dnsServers = (process.env.CLICKMONK_DNS_SERVERS ?? '')
+    .split(',')
+    .map((e) => e.trim())
+    .filter(Boolean)
+  for (const e of dnsServers) {
+    if (!isResolverAddress(e)) {
+      throw new ConfigError(`CLICKMONK_DNS_SERVERS: not a resolver address: ${e}`)
+    }
+  }
   const opened: { ch: ClickHouseClient | null } = { ch: null }
   const ch = (): ClickHouseClient => {
     if (opened.ch) return opened.ch
@@ -42,6 +54,7 @@ async function main(): Promise<number> {
       ch,
       out: (s) => console.log(s),
       ipdata: { dir: process.env.CLICKMONK_IPDATA_DIR || DEFAULT_IPDATA_DIR },
+      dnsServers,
     })
   } finally {
     await Promise.allSettled([pg.end(), opened.ch?.close()])

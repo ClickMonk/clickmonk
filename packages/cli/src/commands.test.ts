@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { gzipSync } from 'node:zlib'
 import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { type Fetcher, SOURCES, SOURCE_IDS } from '@clickmonk/ipdata'
+import type { DomainResolver } from '@clickmonk/worker/domains'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { runCli } from './commands.js'
 
@@ -29,17 +30,27 @@ describe('clickmonk cli', () => {
     expect(await run('migrate')).toBe(0)
   })
 
-  it('adds a domain, normalised and marked verified, and says why', async () => {
+  it('adds a domain unverified, normalised, and prints the record to publish', async () => {
     lines.length = 0
     expect(
       await run('domain', 'add', 'Go.Example.TEST.', '--root-url', 'https://example.com/'),
     ).toBe(0)
-    const r = await pg.query('SELECT host, verified, root_url FROM domains')
+    const r = await pg.query<{ host: string; verified: boolean; verification_token: string }>(
+      'SELECT host, verified, root_url, verification_token FROM domains',
+    )
     expect(r.rows).toEqual([
-      { host: 'go.example.test', verified: true, root_url: 'https://example.com/' },
+      {
+        host: 'go.example.test',
+        verified: false,
+        root_url: 'https://example.com/',
+        verification_token: expect.stringMatching(/^[0-9a-f]{32}$/),
+      },
     ])
-    expect(lines.join('\n')).toMatch(/^domain go\.example\.test [0-9a-f-]{36}$/m)
-    expect(lines.join('\n')).toMatch(/verified without a DNS check/)
+    const out = lines.join('\n')
+    expect(out).toMatch(/^domain go\.example\.test [0-9a-f-]{36}$/m)
+    expect(out).toContain(
+      `_clickmonk.go.example.test  TXT  "clickmonk-verify=${r.rows[0]?.verification_token}"`,
+    )
   })
 
   it('rejects a bad host and a bad fallback URL', async () => {
@@ -417,5 +428,98 @@ describe('clickmonk ipdata', () => {
     lines.length = 0
     expect(await ip(dir, fetch, 'ipdata', 'update')).toBe(0)
     expect(lines.join('\n')).toMatch(/^country: updated \S+; \S+ refused: .+$/m)
+  })
+})
+
+/** Answers from a table; nothing here touches DNS. */
+function fakeResolver(txt: Record<string, string[][]>): DomainResolver {
+  const absent = (code: string) => Object.assign(new Error(code), { code })
+  return {
+    async resolveTxt(name: string) {
+      const a = txt[name]
+      if (a === undefined) throw absent('ENOTFOUND')
+      return a
+    },
+    async resolve4() {
+      throw absent('ENODATA')
+    },
+    async resolve6() {
+      throw absent('ENODATA')
+    },
+    cancel() {},
+  }
+}
+
+describe('clickmonk domain list and verify', () => {
+  const withResolver = (resolver: DomainResolver, ...argv: string[]) =>
+    runCli(argv, {
+      pg,
+      ch: () => ch,
+      out: (s) => lines.push(s),
+      ipdata: { dir: ipdataDir },
+      resolver,
+    })
+
+  it('adds a verified domain when told to, without asking DNS anything', async () => {
+    lines.length = 0
+    expect(await run('domain', 'add', 'trial.example.test', '--verified')).toBe(0)
+    const r = await pg.query<{ verified: boolean }>(
+      'SELECT verified FROM domains WHERE host = $1',
+      ['trial.example.test'],
+    )
+    expect(r.rows[0]?.verified).toBe(true)
+    expect(lines.join('\n')).toContain('marked verified without a DNS check')
+  })
+
+  it('verifies a domain whose token is published, and exits 0', async () => {
+    lines.length = 0
+    expect(await run('domain', 'add', 'v.example.test')).toBe(0)
+    const r = await pg.query<{ verification_token: string }>(
+      'SELECT verification_token FROM domains WHERE host = $1',
+      ['v.example.test'],
+    )
+    const token = r.rows[0]?.verification_token as string
+    lines.length = 0
+    expect(
+      await withResolver(
+        fakeResolver({ '_clickmonk.v.example.test': [[`clickmonk-verify=${token}`]] }),
+        'domain',
+        'verify',
+        'v.example.test',
+      ),
+    ).toBe(0)
+    expect(lines.join('\n')).toContain('v.example.test: verified')
+    const after = await pg.query<{ verified: boolean }>(
+      'SELECT verified FROM domains WHERE host = $1',
+      ['v.example.test'],
+    )
+    expect(after.rows[0]?.verified).toBe(true)
+  })
+
+  it('exits 5 and reprints the record when the token is not published', async () => {
+    expect(await run('domain', 'add', 'nv.example.test')).toBe(0)
+    lines.length = 0
+    expect(await withResolver(fakeResolver({}), 'domain', 'verify', 'nv.example.test')).toBe(5)
+    const out = lines.join('\n')
+    expect(out).toContain('nv.example.test: missing_token')
+    expect(out).toContain('_clickmonk.nv.example.test  TXT')
+    const after = await pg.query<{ verified: boolean }>(
+      'SELECT verified FROM domains WHERE host = $1',
+      ['nv.example.test'],
+    )
+    expect(after.rows[0]?.verified).toBe(false)
+  })
+
+  it('rejects verifying a domain that was never added', async () => {
+    expect(await withResolver(fakeResolver({}), 'domain', 'verify', 'nope.example.test')).toBe(2)
+  })
+
+  it('lists each domain with its state and, when unverified, the record to publish', async () => {
+    lines.length = 0
+    expect(await run('domain', 'list')).toBe(0)
+    const out = lines.join('\n')
+    expect(out).toContain('trial.example.test: verified')
+    expect(out).toContain('nv.example.test: unverified')
+    expect(out).toContain('_clickmonk.nv.example.test TXT')
   })
 })

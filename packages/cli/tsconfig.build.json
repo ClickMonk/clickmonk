@@ -13,6 +13,9 @@
     },
     {
       "path": "../ipdata/tsconfig.build.json"
+    },
+    {
+      "path": "../worker/tsconfig.build.json"
     }
   ]
 }
