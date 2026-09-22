@@ -261,6 +261,7 @@ describe('clickmonk settings', () => {
   })
 
   it('stores a link override', async () => {
+    lines.length = 0
     expect(
       await run(
         'link',
@@ -275,6 +276,7 @@ describe('clickmonk settings', () => {
     ).toBe(0)
     const r = await pg.query("SELECT traffic_actions FROM links WHERE slug = 'guarded'")
     expect(r.rows[0]?.traffic_actions).toEqual({ datacenter: 'block' })
+    expect(lines.some((l) => l.startsWith('note:'))).toBe(false)
     expect(
       await run(
         'link',
@@ -287,6 +289,49 @@ describe('clickmonk settings', () => {
         'human=block',
       ),
     ).toBe(2)
+  })
+
+  it('stores a safe override without a safe URL, and says it will flag until one is set', async () => {
+    await pg.query('UPDATE settings SET safe_url = NULL')
+    lines.length = 0
+    expect(
+      await run(
+        'link',
+        'add',
+        'go.example.test',
+        'safe-unset',
+        '--target',
+        'https://example.com/',
+        '--action',
+        'bot=safe',
+        '--action',
+        'datacenter=safe',
+      ),
+    ).toBe(0)
+    const r = await pg.query("SELECT traffic_actions FROM links WHERE slug = 'safe-unset'")
+    expect(r.rows[0]?.traffic_actions).toEqual({ bot: 'safe', datacenter: 'safe' })
+    expect(lines.slice(1)).toEqual([
+      'note: bot, datacenter set to safe, but no safe URL is set, so those clicks are flagged until one is (clickmonk settings set --safe-url <url>)',
+    ])
+  })
+
+  it('says nothing more for a safe override when a safe URL is set', async () => {
+    expect(await run('settings', 'set', '--safe-url', 'https://example.com/safe')).toBe(0)
+    lines.length = 0
+    expect(
+      await run(
+        'link',
+        'add',
+        'go.example.test',
+        'safe-set',
+        '--target',
+        'https://example.com/',
+        '--action',
+        'bot=safe',
+      ),
+    ).toBe(0)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatch(/^link go\.example\.test\/safe-set /)
   })
 })
 

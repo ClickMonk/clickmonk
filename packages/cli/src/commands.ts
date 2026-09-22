@@ -156,6 +156,13 @@ async function linkAdd(args: string[], d: CliDeps): Promise<void> {
   } finally {
     client.release()
   }
+
+  const safe = NON_HUMAN_CLASSES.filter((c) => input.trafficActions[c] === 'safe')
+  if (safe.length > 0 && (await servedSettings(d)).settings.safeUrl === null) {
+    d.out(
+      `note: ${safe.join(', ')} set to safe, but no safe URL is set, so those clicks are flagged until one is (clickmonk settings set --safe-url <url>)`,
+    )
+  }
 }
 
 function printSettings(s: TrafficSettings, d: CliDeps): void {
@@ -177,27 +184,34 @@ const toSettings = (r: SettingsRow): TrafficSettings => ({
 })
 
 /**
- * Shows what the redirect serves: a row that is missing (deleted by hand) or
- * that core's schema refuses means the defaults there, so it does here too.
+ * The settings the redirect serves: a row that is missing (deleted by hand)
+ * or that core's schema refuses means the defaults there, so it does here
+ * too, with a note saying why.
  */
-async function settingsShow(d: CliDeps): Promise<void> {
+async function servedSettings(d: CliDeps): Promise<{ settings: TrafficSettings; note?: string }> {
   const r = await d.pg.query<SettingsRow>(
     'SELECT traffic_actions, safe_url, abuser_threshold FROM settings',
   )
   const row = r.rows[0]
   if (!row) {
-    d.out('note: no settings are stored; the defaults apply')
-    printSettings(DEFAULT_TRAFFIC_SETTINGS, d)
-    return
+    return {
+      settings: DEFAULT_TRAFFIC_SETTINGS,
+      note: 'note: no settings are stored; the defaults apply',
+    }
   }
   const parsed = TrafficSettingsSchema.safeParse(toSettings(row))
-  if (parsed.success) {
-    printSettings(parsed.data, d)
-    return
-  }
+  if (parsed.success) return { settings: parsed.data }
   const why = parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')
-  d.out(`note: the stored settings are invalid (${why}); the defaults apply`)
-  printSettings(DEFAULT_TRAFFIC_SETTINGS, d)
+  return {
+    settings: DEFAULT_TRAFFIC_SETTINGS,
+    note: `note: the stored settings are invalid (${why}); the defaults apply`,
+  }
+}
+
+async function settingsShow(d: CliDeps): Promise<void> {
+  const { settings, note } = await servedSettings(d)
+  if (note) d.out(note)
+  printSettings(settings, d)
 }
 
 /**
