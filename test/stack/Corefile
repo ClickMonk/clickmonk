@@ -1,0 +1,11 @@
+# One zone, rewritten by the suite when it publishes a verification record.
+# `reload 2s` makes the file plugin pick the change up, but only when the
+# SOA serial has gone up, which is why the suite bumps it.
+example.test:53 {
+    file /zones/db.example.test example.test {
+        reload 2s
+    }
+}
+. {
+    errors
+}
