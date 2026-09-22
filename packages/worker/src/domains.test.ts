@@ -8,6 +8,7 @@ import {
   MAX_DETAIL,
   checkDomain,
   isResolverAddress,
+  recordDomainCheck,
   runDomainChecks,
   startDomainChecker,
 } from './domains.js'
@@ -229,6 +230,59 @@ const verifiedOf = (id: string) =>
   pool
     .query<{ verified: boolean }>('SELECT verified FROM domains WHERE id = $1', [id])
     .then((r) => r.rows[0]?.verified)
+
+describe('recordDomainCheck', () => {
+  afterEach(async () => {
+    await pool.query('TRUNCATE domains CASCADE')
+  })
+
+  it('writes the check and marks the domain verified the first time its token is found', async () => {
+    const d = await addDomain('go.example.test')
+    await recordDomainCheck(
+      pool,
+      { id: d.id, verified: false },
+      { status: 'verified', detail: 'token found' },
+      new Date(),
+    )
+    expect(await verifiedOf(d.id)).toBe(true)
+    expect((await checkOf(d.id))?.status).toBe('verified')
+    expect((await checkOf(d.id))?.detail).toBe('token found')
+  })
+
+  it('records a failed check without un-verifying a domain that already was', async () => {
+    const d = await addDomain('go.example.test', true)
+    await recordDomainCheck(
+      pool,
+      { id: d.id, verified: true },
+      { status: 'missing_token', detail: 'no TXT record' },
+      new Date(),
+    )
+    expect(await verifiedOf(d.id)).toBe(true)
+    expect((await checkOf(d.id))?.status).toBe('missing_token')
+  })
+
+  it('replaces an existing check row rather than duplicating it', async () => {
+    const d = await addDomain('go.example.test')
+    await recordDomainCheck(
+      pool,
+      { id: d.id, verified: false },
+      { status: 'error', detail: 'first' },
+      new Date(Date.now() - 1000),
+    )
+    await recordDomainCheck(
+      pool,
+      { id: d.id, verified: false },
+      { status: 'missing_token', detail: 'second' },
+      new Date(),
+    )
+    const rows = await pool.query<{ n: number }>(
+      'SELECT count(*)::int AS n FROM domain_dns_checks WHERE domain_id = $1',
+      [d.id],
+    )
+    expect(rows.rows[0]?.n).toBe(1)
+    expect((await checkOf(d.id))?.detail).toBe('second')
+  })
+})
 
 describe('runDomainChecks', () => {
   afterEach(async () => {

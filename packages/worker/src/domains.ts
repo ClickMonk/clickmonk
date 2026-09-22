@@ -165,15 +165,42 @@ export interface DomainCheckRun {
 export const DEFAULT_CHECK_LIMIT = 50
 
 /**
- * Checks the domains whose last check is oldest, writes each result, and
- * marks a domain verified the first time its token is found.
+ * Writes one check's result and marks the domain verified the first time its
+ * token is found. Shared by the worker's own pass and the CLI's `domain
+ * verify`, so the two paths that record a check cannot drift apart by copy.
  *
  * The `UPDATE domains` is issued only when a domain that is not verified just
  * proved itself. `config_changed` is a statement trigger, so it fires even
- * for an update that matches no row: running it every pass would make the
- * redirect reload its whole configuration every few minutes for nothing.
- * A domain is never un-verified here — a resolver outage or a DNS edit must
- * not take live links down or stop a certificate renewing.
+ * for an update that matches no row: running it every time would make the
+ * redirect reload its whole configuration for nothing. A domain is never
+ * un-verified here — a resolver outage or a DNS edit must not take live
+ * links down or stop a certificate renewing.
+ */
+export async function recordDomainCheck(
+  pg: Pool,
+  row: { id: string; verified: boolean },
+  result: DomainCheck,
+  now: Date,
+): Promise<void> {
+  await pg.query(
+    `INSERT INTO domain_dns_checks (domain_id, status, detail, checked_at)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (domain_id) DO UPDATE
+       SET status = EXCLUDED.status, detail = EXCLUDED.detail, checked_at = EXCLUDED.checked_at`,
+    [row.id, result.status, result.detail, now],
+  )
+  if (result.status === 'verified' && !row.verified) {
+    await pg.query('UPDATE domains SET verified = true, updated_at = $2 WHERE id = $1', [
+      row.id,
+      now,
+    ])
+  }
+}
+
+/**
+ * Checks the domains whose last check is oldest, writes each result via
+ * `recordDomainCheck`, and marks a domain verified the first time its token
+ * is found.
  */
 export async function runDomainChecks(o: {
   pg: Pool
@@ -213,13 +240,7 @@ export async function runDomainChecks(o: {
     run.checked++
     if (result.status === 'verified') run.verified++
     else run.failed++
-    await o.pg.query(
-      `INSERT INTO domain_dns_checks (domain_id, status, detail, checked_at)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (domain_id) DO UPDATE
-         SET status = EXCLUDED.status, detail = EXCLUDED.detail, checked_at = EXCLUDED.checked_at`,
-      [row.id, result.status, result.detail, now],
-    )
+    await recordDomainCheck(o.pg, row, result, now)
     // Logged only on a real change: the first check for a domain, or a
     // status different from last pass's. An unbroken run of the same status
     // would otherwise write one line per failing domain every pass for as
@@ -230,12 +251,6 @@ export async function runDomainChecks(o: {
           ? `domain ${row.host} verified: ${result.detail}`
           : `domain ${row.host} not verified (${result.status}): ${result.detail}`,
       )
-    }
-    if (result.status === 'verified' && !row.verified) {
-      await o.pg.query('UPDATE domains SET verified = true, updated_at = $2 WHERE id = $1', [
-        row.id,
-        now,
-      ])
     }
   }
   if (o.log && run.checked > 0) {
