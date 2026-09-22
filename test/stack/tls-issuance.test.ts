@@ -1,9 +1,10 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import {
   CA_MOUNT,
+  WAIT_TIMEOUT,
   cli,
   compose,
   curl,
@@ -30,7 +31,35 @@ function add(host: string): void {
   cli('link', 'add', host, 'd', '--target', 'https://example.com/landing')
 }
 
-let passed = false
+/**
+ * Everything the local certificate authority has logged. It names every host
+ * it was asked about and every endpoint it was called on, so it is the only
+ * direct evidence of what this install did *not* ask for.
+ */
+function acmeLog(): string {
+  return compose('logs', '--no-color', 'pebble')
+}
+
+/**
+ * The authority's newOrder endpoint: the first request any issuance makes, and
+ * the one thing it logs for *every* attempt. The identifier is not usable for
+ * this — an order the authority refuses by policy is logged without ever
+ * naming the host — so counting orders is what catches an attempt for a
+ * second name, and the name is what says which one it was.
+ */
+const NEW_ORDER = '/order-plz'
+
+/** How many certificates this install has asked the authority for, all told. */
+function orderCount(log: string): number {
+  return log.split(NEW_ORDER).length - 1
+}
+
+let setUp = false
+let failures = 0
+
+afterEach((ctx) => {
+  if (ctx.task.result?.state === 'fail') failures++
+})
 
 beforeAll(async () => {
   compose('down', '-v')
@@ -39,17 +68,23 @@ beforeAll(async () => {
   // are about a domain in exactly that state.
   publishZone()
   // --build: the image tag is reused, so without it the suite tests an old build.
-  compose('up', '-d', '--build', '--wait')
+  compose('up', '-d', '--build', '--wait', ...WAIT_TIMEOUT)
   add(VERIFIED)
   add(PENDING)
+  setUp = true
 }, 900_000)
 
 afterAll(() => {
+  // Driven off what actually failed rather than off reaching the end of the
+  // file: running one test with `-t` used to dump every container's log on a
+  // clean pass. Setup failing counts, because then no test ran at all and the
+  // logs are the only evidence of why.
+  //
   // In a finally: the log dump itself can throw — it did, on the run before
   // the compose file existed — and a stack that outlives the suite holds 80,
   // 443 and its volumes against every run after it.
   try {
-    if (!passed) console.error(compose('logs', '--no-color', '--tail', '200'))
+    if (failures > 0 || !setUp) console.error(compose('logs', '--no-color', '--tail', '200'))
   } finally {
     compose('down', '-v')
   }
@@ -71,6 +106,14 @@ describe('a domain that has not proved itself', () => {
     // -k, so this is not the client refusing to trust a certificate: there is
     // no certificate. Caddy asked the redirect, and was told no.
     const r = curl(['-k', '--max-time', '30', `https://${VERIFIED}/d`])
+    // Asserted before the handshake's own result, because this is the property
+    // the suite exists to be evidence for: not merely that no certificate was
+    // installed, but that this install never went to a certificate authority
+    // at all. That is what keeps an outsider away from its rate limits, and a
+    // breach of it should be what this test reports.
+    expect(acmeLog(), 'the authority was asked to issue for an unverified name').not.toContain(
+      NEW_ORDER,
+    )
     expect(r.status).toBe(0)
     // curl's code for a handshake that failed. Without it, the line above
     // also holds for a client that never ran at all.
@@ -81,7 +124,7 @@ describe('a domain that has not proved itself', () => {
 describe('publishing the token', () => {
   it('verifies that domain, and only that domain', async () => {
     publishZone(`_clickmonk.go IN TXT "clickmonk-verify=${tokens[VERIFIED]}"`)
-    await until('the worker to verify go.example.test', 180_000, () =>
+    await until('the worker to verify go.example.test', 90_000, () =>
       cli('domain', 'list').includes(`${VERIFIED}: verified`),
     )
     expect(cli('domain', 'list')).toContain(`${PENDING}: unverified`)
@@ -90,7 +133,7 @@ describe('publishing the token', () => {
   it('makes its links answer', async () => {
     await until(
       'the redirect to serve the verified domain',
-      120_000,
+      90_000,
       () => curl([`http://${VERIFIED}/d`]).status === 302,
     )
   })
@@ -98,7 +141,7 @@ describe('publishing the token', () => {
   it('gets a certificate from the certificate authority, and serves the link over HTTPS', async () => {
     await until(
       'a certificate for go.example.test',
-      180_000,
+      90_000,
       () => curl(['-k', '--max-time', '30', `https://${VERIFIED}/d`]).status === 302,
     )
     // Not -k this time. The chain really is the local authority's, which is
@@ -112,6 +155,20 @@ describe('publishing the token', () => {
   it('leaves the domain that published nothing with neither', () => {
     expect(curl([`http://${PENDING}/d`]).status).toBe(404)
     const r = curl(['-k', '--max-time', '30', `https://${PENDING}/d`])
+    // The sharp one, and again before the handshake's result. The authority has
+    // issued for the verified host by now, so the gate is open for this
+    // install — and still exactly one certificate was ever asked for, and this
+    // name was never one of them. That is what makes the gate per-domain
+    // rather than a switch the first verified domain throws for every host
+    // pointed at the server.
+    const log = acmeLog()
+    expect(log, 'the authority issued nothing at all, so the next lines prove nothing').toContain(
+      NEW_ORDER,
+    )
+    expect(orderCount(log), 'the authority was asked for a certificate it should not have').toBe(1)
+    expect(log, 'the authority was asked about a name that published no token').not.toContain(
+      PENDING,
+    )
     expect(r.status).toBe(0)
     expect(r.exit, r.stderr).toBe(35)
   })
@@ -165,9 +222,5 @@ describe('the caddy healthcheck', () => {
       120_000,
       () => curl(['-k', '--max-time', '30', `https://${VERIFIED}/d`]).status === 302,
     )
-    // The last line of the last test in the file, so that a failure anywhere
-    // above — the healthcheck pair included, where Caddy's own log is the
-    // only evidence — still leaves the containers' logs in the output.
-    passed = true
   }, 300_000)
 })

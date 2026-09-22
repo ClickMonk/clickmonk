@@ -13,6 +13,25 @@ export const PEBBLE_IMAGE = 'ghcr.io/letsencrypt/pebble:2.10.1'
 
 const FILES = ['-f', 'docker-compose.yml', '-f', 'test/stack/docker-compose.tls.yml']
 
+/**
+ * Seconds `up --wait` may spend waiting for containers to become healthy.
+ * Compose waits forever without it, so a container stuck starting hangs the
+ * suite until the whole run is killed and prints nothing to say why. Well
+ * above the ~70s an unhealthy verdict takes, which is a result this suite
+ * asserts rather than a hang.
+ */
+export const WAIT_TIMEOUT = ['--wait-timeout', '240']
+
+/**
+ * Backstops for the synchronous docker calls below, in milliseconds. Each is
+ * far above what the call takes when it works; they exist so that a stalled
+ * pull, a hung daemon or a container that never starts fails with a
+ * diagnostic instead of hanging the suite.
+ */
+const COMPOSE_TIMEOUT = 600_000
+const UP_TIMEOUT = 270_000
+const CLIENT_TIMEOUT = 60_000
+
 /** The stack's own passwords. Public, for a stack that binds nothing but 80 and 443. */
 export const ENV = {
   ...process.env,
@@ -27,6 +46,7 @@ export function compose(...args: string[]): string {
     encoding: 'utf8',
     stdio: 'pipe',
     env: ENV,
+    timeout: COMPOSE_TIMEOUT,
   })
 }
 
@@ -43,6 +63,7 @@ export function upWait(services: string[] = [], extraFiles: string[] = []): stri
     'up',
     '-d',
     '--wait',
+    ...WAIT_TIMEOUT,
     ...services,
   ]
   const r = spawnSync('docker', args, {
@@ -50,7 +71,12 @@ export function upWait(services: string[] = [], extraFiles: string[] = []): stri
     encoding: 'utf8',
     stdio: 'pipe',
     env: ENV,
+    timeout: UP_TIMEOUT,
   })
+  // Docker failing to run at all, or being killed by the backstop above, is
+  // not "compose said no". Without this it returns whatever it managed to
+  // print, and a caller asserting on the reason reads a hang as that reason.
+  if (r.error) throw new Error(`could not run compose up: ${r.error.message}`)
   if (r.status === 0) return undefined
   return `${r.stdout ?? ''}${r.stderr ?? ''}`
 }
@@ -92,7 +118,7 @@ export function curl(args: string[], docker: string[] = []): CurlResult {
       '%{http_code} %{local_ip}',
       ...args,
     ],
-    { encoding: 'utf8', stdio: 'pipe' },
+    { encoding: 'utf8', stdio: 'pipe', timeout: CLIENT_TIMEOUT },
   )
   // 125 is docker's own failure, not the client's. Without this a missing
   // image or a network that is not there reads as "the server refused",
@@ -112,15 +138,18 @@ export function curl(args: string[], docker: string[] = []): CurlResult {
  */
 export function writeAcmeRoot(): void {
   mkdirSync(TMP, { recursive: true })
-  const id = execFileSync('docker', ['create', PEBBLE_IMAGE], { encoding: 'utf8' }).trim()
+  const id = execFileSync('docker', ['create', PEBBLE_IMAGE], {
+    encoding: 'utf8',
+    timeout: CLIENT_TIMEOUT,
+  }).trim()
   try {
-    execFileSync('docker', [
-      'cp',
-      `${id}:/test/certs/pebble.minica.pem`,
-      join(TMP, 'acme-root.pem'),
-    ])
+    execFileSync(
+      'docker',
+      ['cp', `${id}:/test/certs/pebble.minica.pem`, join(TMP, 'acme-root.pem')],
+      { timeout: CLIENT_TIMEOUT },
+    )
   } finally {
-    execFileSync('docker', ['rm', id], { stdio: 'ignore' })
+    execFileSync('docker', ['rm', id], { stdio: 'ignore', timeout: CLIENT_TIMEOUT })
   }
 }
 
@@ -136,7 +165,7 @@ export function writeIssuingRoot(): string {
   const pem = execFileSync(
     'docker',
     ['run', '--rm', '--network', NETWORK, CURL_IMAGE, '-sS', '-k', 'https://pebble:15000/roots/0'],
-    { encoding: 'utf8' },
+    { encoding: 'utf8', timeout: CLIENT_TIMEOUT },
   )
   if (!pem.startsWith('-----BEGIN CERTIFICATE-----')) {
     throw new Error(`the local certificate authority returned no root: ${pem.slice(0, 200)}`)
