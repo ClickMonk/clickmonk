@@ -1,6 +1,6 @@
 name: CLA
 
-# ADR: a signed CLA is required before any external contribution is merged.
+# A signed CLA is required before any external contribution is merged.
 # Without it, contributed code reaches us under the Sustainable Use License
 # only, and cannot be included in a hosted or commercial offering.
 #

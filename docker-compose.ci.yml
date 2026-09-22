@@ -1,0 +1,75 @@
+name: clickmonk-ci
+
+x-app: &app
+  image: clickmonk-ci:local
+  build: .
+  init: true
+  stop_grace_period: 30s
+
+x-db: &db
+  CLICKMONK_POSTGRES_URL: postgres://clickmonk:clickmonk@postgres:5432/clickmonk
+
+services:
+  redirect:
+    <<: *app
+    command: ["node", "packages/redirect/dist/index.js"]
+    depends_on: [postgres]
+    environment:
+      <<: *db
+      CLICKMONK_SECRET: ci-secret-ci-secret-ci-secret-ci-secret
+    ports: ["127.0.0.1:8080:8080"]
+    volumes:
+      - spool:/var/lib/clickmonk/spool
+      - state:/var/lib/clickmonk/state
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9091/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+  worker:
+    <<: *app
+    command: ["node", "packages/worker/dist/index.js"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+    environment:
+      <<: *db
+      CLICKMONK_CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKMONK_CLICKHOUSE_USER: clickmonk
+      CLICKMONK_CLICKHOUSE_PASSWORD: clickmonk
+      CLICKMONK_CLICKHOUSE_DB: clickmonk
+    volumes:
+      - spool:/var/lib/clickmonk/spool
+  postgres:
+    image: postgres:17-alpine
+    environment: { POSTGRES_DB: clickmonk, POSTGRES_USER: clickmonk, POSTGRES_PASSWORD: clickmonk }
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clickmonk -d clickmonk -h \"$$(hostname)\""]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    environment:
+      CLICKHOUSE_DB: clickmonk
+      CLICKHOUSE_USER: clickmonk
+      CLICKHOUSE_PASSWORD: clickmonk
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    ports: ["127.0.0.1:8123:8123"]
+    # Named volume so a restart keeps the clicks already shipped; the test
+    # restarts this container mid-load.
+    volumes: ["clickhouse-data:/var/lib/clickhouse"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- \"http://$$(hostname):8123/ping\""]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  spool:
+  state:
+  postgres-data:
+  clickhouse-data:

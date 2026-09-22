@@ -41,25 +41,104 @@ run it on their own infrastructure; their click data stays theirs.
 
 ## Current status
 
-**Pre-code.** The repository holds the license, the community files and CI. There is no
-product, no install and no API yet. Do not write documentation that implies otherwise.
+**Early, unreleased, not for production.** What exists: the redirect (in-memory snapshot,
+spool before response, click caps), the worker (spool to ClickHouse, migrations on
+boot), the CLI (`migrate`, `domain add`, `link add`), a Compose stack, and the restart
+durability suite.
+
+What does not exist yet, and must not be implied by any documentation:
+
+- **TLS.** The redirect serves plain HTTP on 8080. Visitor cookies are `Secure`, so
+  browsers drop them over HTTP and returning-visitor routing does not work until TLS.
+- **Admin API and UI.** Links and domains are added with the CLI. `domain add` marks a
+  domain verified without a DNS check.
+- **Most link settings in the CLI.** `link add` takes `--target`, `--backup`, `--cap`,
+  `--expires` and `--no-passthrough` only. The evaluator supports device URLs, a
+  returning URL, country rules, a name and the disabled state; the CLI cannot set them
+  yet, so they need hand-written SQL.
+- **Reporting.** Clicks reach ClickHouse; there are no reports or exports.
+- **IP lookup and traffic classification.** The country is always empty, so an
+  allow-list link sends everyone to its backup URL.
+- **Password links, backup and restore.**
+- Segments ClickHouse rejects are set aside as `.bad` files, and nothing reports them.
+- One redirect process per spool directory.
 
 ## Stack and layout
 
-**Not decided yet.** When it is, this section gets the package layout, the commands to
-build, lint, typecheck and test, and the order CI runs them in — and the local gate is
-that same order, so local red means CI red.
+A pnpm workspace of TypeScript packages, Node 22, ESM throughout. TypeScript is `strict`
+with `noUncheckedIndexedAccess`; avoid `any`, and justify it inline on the rare occasion
+it is unavoidable. Biome handles lint and format. Vitest runs the tests. Two stores:
+**Postgres** for domains, links, counters and the single migration ledger; **ClickHouse**
+for click events.
 
-Three properties of the product are already fixed and shape every stack choice:
+```
+packages/core/      pure logic, no I/O: link schemas (zod), the redirect evaluator,
+                    device detection, destination tokens, passthrough, rotation,
+                    click IDs, the click record. Owns SCHEMA_VERSION.
+packages/db/        Postgres and ClickHouse clients and the migrator. Migrations live
+                    in packages/db/migrations/{postgres,clickhouse} as one shared
+                    version sequence.
+packages/redirect/  the service that answers link domains: an in-memory snapshot,
+                    the spool writer, the click-cap counter.
+packages/worker/    ships the spool into ClickHouse; runs migrations on boot.
+packages/cli/       `clickmonk migrate | domain add | link add`.
+```
 
-- **The redirect path is the product.** A click that fails to redirect is lost revenue
-  for the person who paid for the traffic, and it cannot be replayed. It must stay up and
-  answer fast when everything behind it (reporting, the admin UI, the database the
-  reports read) is slow or down.
+Three properties of the product shape every change:
+
+- **The redirect path is the product.** It must keep answering when ClickHouse, the
+  worker or Postgres is down. It never queries ClickHouse and never waits on reporting.
 - **Custom domains are first-class.** Every customer domain needs TLS, issued and renewed
   without anyone touching a certificate.
 - **The redirect endpoint is public and unauthenticated by nature.** Anything reachable
-  from it is reachable by anyone on the internet.
+  from it is reachable by anyone on the internet, so all of it is bounded.
+
+## Running the tests
+
+```sh
+corepack enable
+pnpm install
+docker compose -f docker-compose.test.yml up -d --wait   # Postgres + ClickHouse
+pnpm build        # required before the first `pnpm test`
+pnpm test
+```
+
+**Build before the first test run, and after changing `core` or `db`.** Packages import
+each other by name, which resolves to the *built* `dist/`, and `dist/` is not committed.
+A test in `packages/redirect` exercising a change in `packages/core` runs against the
+last build until you rebuild; it stays green and the green means nothing.
+
+The image is compiled with `pnpm build:image` instead, which uses each package's
+`tsconfig.build.json` to leave out the tests and `packages/db/src/testing.ts`. A new
+test-only file that is not named `*.test.ts` must be excluded there too, or it ships.
+
+**While iterating, run the focused test files for what you touched.** Before opening a
+pull request, run the full gate in CI's order, so local red means CI red:
+
+```sh
+pnpm lint && pnpm typecheck && pnpm build && pnpm test
+```
+
+**Run one test suite at a time.** Every database-backed test resets the shared test
+databases in `beforeAll`; two runs at once delete each other's fixtures. A mass failure
+across files you did not touch is a second test run until proven otherwise.
+
+### The durability suite
+
+```sh
+pnpm build
+pnpm vitest run --config vitest.durability.config.ts   # builds an image; a few minutes
+```
+
+It builds the image, starts the whole stack from `docker-compose.ci.yml`, and restarts
+ClickHouse, the worker and the redirect under continuous traffic, then requires every
+`302` the client received to be a click in ClickHouse. It is excluded from `pnpm test`
+and runs as its own CI job.
+
+The CI stack binds **8080 and 8123**; the test databases bind **8123 and 5433**. Stop the
+test databases before running it, or you get "port is already allocated", which reads
+like a broken test. Bring them back before the next `pnpm test`. The suite runs
+`down -v` on its own project only (`clickmonk-ci`).
 
 ## License and its consequences
 
@@ -109,9 +188,9 @@ That rule is easy to satisfy badly, so:
 
 Anything that runs on an operator's host rather than in a container — an installer,
 backup or restore — targets **bash 3.2**, the version macOS still ships: no associative
-arrays, no `mapfile`. `shellcheck` is pinned in the repo and CI runs the pinned copy,
-never a runner's preinstalled binary, so a lint that fails in CI can be reproduced
-locally.
+arrays, no `mapfile`. There is no such script yet. The first one to land also pins
+`shellcheck` in the repo and has CI run the pinned copy, never a runner's preinstalled
+binary, so a lint that fails in CI can be reproduced locally.
 
 ## Conventions
 

@@ -1,0 +1,21 @@
+{
+  "name": "@clickmonk/db",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./testing": { "types": "./dist/testing.d.ts", "default": "./dist/testing.js" }
+  },
+  "files": ["dist", "migrations"],
+  "engines": { "node": ">=22 <23" },
+  "scripts": { "build": "tsc -b", "build:image": "tsc -b tsconfig.build.json" },
+  "dependencies": {
+    "@clickhouse/client": "^1.23.1",
+    "@clickmonk/core": "workspace:*",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": { "@types/pg": "^8.23.1" }
+}

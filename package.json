@@ -1,0 +1,23 @@
+{
+  "name": "clickmonk",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22 <23" },
+  "packageManager": "pnpm@9.15.9",
+  "scripts": {
+    "build": "pnpm -r build",
+    "build:image": "pnpm -r build:image",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "typecheck": "tsc -b"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@clickmonk/db": "workspace:*",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.11"
+  }
+}
