@@ -81,6 +81,9 @@ importers:
       '@clickmonk/db':
         specifier: workspace:*
         version: link:../db
+      '@clickmonk/ipdata':
+        specifier: workspace:*
+        version: link:../ipdata
       fastify:
         specifier: ^5.12.5
         version: 5.12.5
