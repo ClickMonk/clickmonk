@@ -1,7 +1,12 @@
 import { readFileSync, readdirSync, renameSync, statSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { ClickHouseError } from '@clickhouse/client'
-import { type ClickRecord, ClickRecordSchema, SEALED_SEGMENT_RE } from '@clickmonk/core'
+import {
+  MAX_RECORD_VERSION,
+  SEALED_SEGMENT_RE,
+  type SpoolRecord,
+  SpoolRecordSchema,
+} from '@clickmonk/core'
 import type { ClickHouseClient } from '@clickmonk/db'
 
 /** Segments considered per pass. Also the signal `startShipper` uses to go
@@ -13,7 +18,11 @@ export const MAX_SEGMENTS_PER_PASS = 20
  * the spool by hand, never a segment the writer produced. */
 export const MAX_SEGMENT_BYTES = 64 * 1024 * 1024
 
-export function toClickhouseRow(r: ClickRecord): Record<string, string | number> {
+/**
+ * A version 1 record predates classification: it is stored unclassified
+ * (an empty class, no signals), never as human.
+ */
+export function toClickhouseRow(r: SpoolRecord): Record<string, string | number | string[]> {
   return {
     click_id: r.clickId,
     // DateTime64(3) accepts 'YYYY-MM-DD HH:MM:SS.mmm' in UTC.
@@ -32,12 +41,18 @@ export function toClickhouseRow(r: ClickRecord): Record<string, string | number>
     country: r.country ?? '',
     region: '',
     city: '',
-    geo_source: '',
+    geo_source: r.v === 2 ? r.geoSource : '',
     device: r.device,
     user_agent: r.userAgent,
     referrer: r.referrer,
     ip: r.ip,
     cap_unchecked: r.capUnchecked ? 1 : 0,
+    traffic_class: r.v === 2 ? r.trafficClass : '',
+    signals: r.v === 2 ? r.signals : [],
+    action: r.v === 2 ? (r.action ?? '') : '',
+    os: r.v === 2 ? r.os : '',
+    browser: r.v === 2 ? r.browser : '',
+    asn: r.v === 2 ? (r.asn ?? 0) : 0,
   }
 }
 
@@ -82,7 +97,7 @@ function isDataRejection(err: unknown): boolean {
  * Renames a segment out of the sealed pool so it is never picked up again,
  * without deleting it: `<name>.bad` no longer matches SEALED_SEGMENT_RE. Used
  * for every segment-local failure (not a regular file, oversized, unreadable,
- * an unknown record version, or ClickHouse answering with a rejection), so
+ * or ClickHouse answering with a rejection), so
  * one bad segment never blocks the ones behind it.
  */
 function setAside(path: string, reason: unknown, log: (msg: string, err?: unknown) => void): void {
@@ -96,8 +111,8 @@ function setAside(path: string, reason: unknown, log: (msg: string, err?: unknow
 
 /**
  * Ships up to `maxSegments` sealed segments, oldest first. A segment-local
- * failure (not a regular file, too large, unreadable, an unknown record
- * version, or ClickHouse rejecting the data as malformed — see
+ * failure (not a regular file, too large, unreadable, or ClickHouse
+ * rejecting the data as malformed — see
  * `isDataRejection`) is set aside and shipping continues with the next
  * segment. Every other failure — ClickHouse unreachable, or answering but
  * with a server-state error such as bad credentials or an overloaded server
@@ -108,12 +123,19 @@ function setAside(path: string, reason: unknown, log: (msg: string, err?: unknow
  * remembered in `skipUnlinked` (when given) and left off every later pass,
  * rather than being re-inserted on each retry — `click_id` would still
  * deduplicate it, but there is no reason to pay for it.
+ *
+ * A segment holding a record version newer than this worker knows was
+ * written by a newer redirect. It is neither shipped, set aside nor
+ * deleted: it stays in the spool, under its own name, for the upgraded
+ * worker to ship. It is remembered in `skipNewer` (when given) so this
+ * worker does not read it again on every pass.
  */
 export async function shipOnce(opts: {
   dir: string
   ch: ClickHouseClient
   maxSegments?: number
   skipUnlinked?: Set<string>
+  skipNewer?: Set<string>
   log?: (msg: string, err?: unknown) => void
   /** Filesystem seam for tests: defaults to `fs.unlinkSync`. */
   unlink?: (path: string) => void
@@ -122,7 +144,7 @@ export async function shipOnce(opts: {
   const unlink = opts.unlink ?? unlinkSync
   const skip = opts.skipUnlinked
   const files = readdirSync(opts.dir)
-    .filter((f) => SEALED_SEGMENT_RE.test(f) && !skip?.has(f))
+    .filter((f) => SEALED_SEGMENT_RE.test(f) && !skip?.has(f) && !opts.skipNewer?.has(f))
     .sort()
     .slice(0, opts.maxSegments ?? MAX_SEGMENTS_PER_PASS)
   let rows = 0
@@ -148,8 +170,8 @@ export async function shipOnce(opts: {
       continue
     }
 
-    const values: Record<string, string | number>[] = []
-    let unknownVersion = false
+    const values: Record<string, string | number | string[]>[] = []
+    let newerVersion = false
     for (const line of content.split('\n')) {
       if (line.length === 0) continue
       let parsed: unknown
@@ -159,19 +181,15 @@ export async function shipOnce(opts: {
         malformed++
         continue
       }
-      // A parseable line with a version this build does not understand is
-      // not this line's problem to skip: a newer spool format must not be
-      // read as malformed and thrown away. Set the whole segment aside.
-      if (
-        typeof parsed === 'object' &&
-        parsed !== null &&
-        'v' in parsed &&
-        (parsed as { v: unknown }).v !== 1
-      ) {
-        unknownVersion = true
+      // A version above the newest this build knows comes from a newer
+      // redirect: its lines must not be read as malformed and thrown away.
+      // Anything else that is not a known version is malformed.
+      const v = typeof parsed === 'object' && parsed !== null ? (parsed as { v?: unknown }).v : null
+      if (typeof v === 'number' && Number.isInteger(v) && v > MAX_RECORD_VERSION) {
+        newerVersion = true
         break
       }
-      const r = ClickRecordSchema.safeParse(parsed)
+      const r = SpoolRecordSchema.safeParse(parsed)
       if (!r.success) {
         malformed++
         continue
@@ -179,8 +197,9 @@ export async function shipOnce(opts: {
       values.push(toClickhouseRow(r.data))
     }
 
-    if (unknownVersion) {
-      setAside(path, new Error('segment contains an unknown record version'), log)
+    if (newerVersion) {
+      opts.skipNewer?.add(f)
+      log(`left ${f} in the spool: it holds a record version newer than this worker ships`)
       continue
     }
 
@@ -223,13 +242,15 @@ export function startShipper(opts: {
   // Segments whose rows shipped but whose file could not be deleted: kept
   // off every subsequent pass for the life of this shipper.
   const skipUnlinked = new Set<string>()
+  // Segments from a newer redirect, left for an upgraded worker.
+  const skipNewer = new Set<string>()
 
   const loop = (async () => {
     let backoff = interval
     while (!stopped) {
       let delay = interval
       try {
-        const r = await shipOnce({ dir: opts.dir, ch: opts.ch, skipUnlinked, log })
+        const r = await shipOnce({ dir: opts.dir, ch: opts.ch, skipUnlinked, skipNewer, log })
         if (r.malformed > 0) log(`skipped ${r.malformed} malformed spool lines`)
         // A full pass means more may be waiting: go again at once.
         if (r.segments >= MAX_SEGMENTS_PER_PASS) delay = 0

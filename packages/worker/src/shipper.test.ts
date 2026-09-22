@@ -10,7 +10,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ClickHouseLogLevel } from '@clickhouse/client'
-import { type ClickRecord, ZERO_UUID, segmentName } from '@clickmonk/core'
+import { type ClickRecordV1, type ClickRecordV2, ZERO_UUID, segmentName } from '@clickmonk/core'
 import { createChClient } from '@clickmonk/db'
 import { TEST_CH, resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
@@ -36,8 +36,8 @@ afterAll(async () => {
 })
 
 let n = 0
-const rec = (over: Partial<ClickRecord> = {}): ClickRecord => ({
-  v: 1,
+const rec = (over: Partial<ClickRecordV2> = {}): ClickRecordV2 => ({
+  v: 2,
   clickId: `01920000-0000-7000-8000-${String(++n).padStart(12, '0')}`,
   time: new Date().toISOString(),
   host: 'go.example.test',
@@ -57,8 +57,21 @@ const rec = (over: Partial<ClickRecord> = {}): ClickRecord => ({
   referrer: '',
   ip: '192.0.2.1',
   capUnchecked: false,
+  trafficClass: 'human',
+  signals: [],
+  action: null,
+  os: 'windows',
+  browser: 'chrome',
+  asn: 64500,
+  geoSource: 'dbip-country-lite/2026-01',
   ...over,
 })
+
+/** A record as a redirect from before traffic classification wrote it. */
+const recV1 = (): ClickRecordV1 => {
+  const { trafficClass, signals, action, os, browser, asn, geoSource, ...common } = rec()
+  return { ...common, v: 1, outcome: 'target', step: 'destination' }
+}
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'clickmonk-ship-'))
 let seq = 0
@@ -96,6 +109,24 @@ describe('toClickhouseRow', () => {
       target_id: '',
       region: '',
       city: '',
+      geo_source: 'dbip-country-lite/2026-01',
+      traffic_class: 'human',
+      signals: [],
+      action: '',
+      os: 'windows',
+      browser: 'chrome',
+      asn: 64500,
+    })
+  })
+
+  it('stores a version 1 record unclassified, not as human', () => {
+    expect(toClickhouseRow(recV1())).toMatchObject({
+      traffic_class: '',
+      signals: [],
+      action: '',
+      os: '',
+      browser: '',
+      asn: 0,
       geo_source: '',
     })
   })
@@ -276,13 +307,46 @@ describe('shipOnce', () => {
     expect(await clicks()).toBe(0)
   })
 
-  it('sets aside a segment holding a record with an unrecognized version, instead of dropping just that line', async () => {
+  it('ships version 1 and version 2 segments side by side', async () => {
     const dir = tmp()
-    const name = segment(dir, [JSON.stringify(rec()), JSON.stringify({ ...rec(), v: 2 })])
-    const r = await shipOnce({ dir, ch })
-    expect(r).toMatchObject({ rows: 0, malformed: 0 })
-    expect(readdirSync(dir)).toEqual([`${name}.bad`])
-    expect(await clicks()).toBe(0)
+    segment(dir, [JSON.stringify(recV1())])
+    segment(dir, [
+      JSON.stringify(rec({ trafficClass: 'bot', signals: ['ua_bot'], action: 'flag' })),
+    ])
+    expect(await shipOnce({ dir, ch })).toEqual({ segments: 2, rows: 2, malformed: 0 })
+    const rs = await ch.query({
+      query: 'SELECT traffic_class, signals, action FROM clicks ORDER BY traffic_class',
+      format: 'JSONEachRow',
+    })
+    expect(await rs.json()).toEqual([
+      { traffic_class: '', signals: [], action: '' },
+      { traffic_class: 'bot', signals: ['ua_bot'], action: 'flag' },
+    ])
+  })
+
+  it('leaves a segment from a newer redirect in the spool, untouched, and ships the rest', async () => {
+    const dir = tmp()
+    const newer = segment(dir, [JSON.stringify(rec()), JSON.stringify({ ...rec(), v: 3 })])
+    segment(dir, [JSON.stringify(rec())])
+    const skipNewer = new Set<string>()
+    const r = await shipOnce({ dir, ch, skipNewer })
+    expect(r).toMatchObject({ rows: 1, malformed: 0 })
+    // Not deleted, not renamed to .bad: an upgraded worker ships it as it is.
+    expect(readdirSync(dir)).toEqual([newer])
+    expect(await clicks()).toBe(1)
+    // Not read again by this worker.
+    expect(await shipOnce({ dir, ch, skipNewer })).toMatchObject({ segments: 0 })
+  })
+
+  it('counts a line with a version that is not a newer integer as malformed', async () => {
+    const dir = tmp()
+    segment(dir, [
+      JSON.stringify({ ...rec(), v: 0 }),
+      JSON.stringify({ ...rec(), v: 2.5 }),
+      JSON.stringify(rec()),
+    ])
+    expect(await shipOnce({ dir, ch })).toEqual({ segments: 1, rows: 1, malformed: 2 })
+    expect(readdirSync(dir)).toEqual([])
   })
 
   it('ships the oldest segment first', async () => {
