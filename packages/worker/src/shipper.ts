@@ -127,15 +127,20 @@ function setAside(path: string, reason: unknown, log: (msg: string, err?: unknow
  * A segment holding a record version newer than this worker knows was
  * written by a newer redirect. It is neither shipped, set aside nor
  * deleted: it stays in the spool, under its own name, for the upgraded
- * worker to ship. It is remembered in `skipNewer` (when given) so this
- * worker does not read it again on every pass.
+ * worker to ship. It is remembered in `skipNewer` so this worker does not
+ * read it again on every pass, and it is not counted in `segments` or
+ * `malformed`: a pass that found only such segments did no work, so the
+ * caller waits its interval rather than going around again at once.
  */
 export async function shipOnce(opts: {
   dir: string
   ch: ClickHouseClient
   maxSegments?: number
   skipUnlinked?: Set<string>
-  skipNewer?: Set<string>
+  /** Required so every caller keeps one set for its life: without it, a
+   * run of newer segments at the head of the spool fills every pass and
+   * starves the segments behind it. */
+  skipNewer: Set<string>
   log?: (msg: string, err?: unknown) => void
   /** Filesystem seam for tests: defaults to `fs.unlinkSync`. */
   unlink?: (path: string) => void
@@ -144,11 +149,12 @@ export async function shipOnce(opts: {
   const unlink = opts.unlink ?? unlinkSync
   const skip = opts.skipUnlinked
   const files = readdirSync(opts.dir)
-    .filter((f) => SEALED_SEGMENT_RE.test(f) && !skip?.has(f) && !opts.skipNewer?.has(f))
+    .filter((f) => SEALED_SEGMENT_RE.test(f) && !skip?.has(f) && !opts.skipNewer.has(f))
     .sort()
     .slice(0, opts.maxSegments ?? MAX_SEGMENTS_PER_PASS)
   let rows = 0
   let malformed = 0
+  let leftNewer = 0
   for (const f of files) {
     const path = join(opts.dir, f)
 
@@ -172,13 +178,15 @@ export async function shipOnce(opts: {
 
     const values: Record<string, string | number | string[]>[] = []
     let newerVersion = false
+    // Counted per segment: a segment left for a newer worker reports none.
+    let segMalformed = 0
     for (const line of content.split('\n')) {
       if (line.length === 0) continue
       let parsed: unknown
       try {
         parsed = JSON.parse(line)
       } catch {
-        malformed++
+        segMalformed++
         continue
       }
       // A version above the newest this build knows comes from a newer
@@ -191,17 +199,19 @@ export async function shipOnce(opts: {
       }
       const r = SpoolRecordSchema.safeParse(parsed)
       if (!r.success) {
-        malformed++
+        segMalformed++
         continue
       }
       values.push(toClickhouseRow(r.data))
     }
 
     if (newerVersion) {
-      opts.skipNewer?.add(f)
+      opts.skipNewer.add(f)
+      leftNewer++
       log(`left ${f} in the spool: it holds a record version newer than this worker ships`)
       continue
     }
+    malformed += segMalformed
 
     if (values.length > 0) {
       try {
@@ -223,7 +233,7 @@ export async function shipOnce(opts: {
     }
     rows += values.length
   }
-  return { segments: files.length, rows, malformed }
+  return { segments: files.length - leftNewer, rows, malformed }
 }
 
 /** Ships continuously. The returned promise of `stop()` resolves after the pass in flight. Never rejects. */

@@ -14,7 +14,13 @@ import { type ClickRecordV1, type ClickRecordV2, ZERO_UUID, segmentName } from '
 import { createChClient } from '@clickmonk/db'
 import { TEST_CH, resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { MAX_SEGMENT_BYTES, shipOnce, startShipper, toClickhouseRow } from './shipper.js'
+import {
+  MAX_SEGMENTS_PER_PASS,
+  MAX_SEGMENT_BYTES,
+  shipOnce,
+  startShipper,
+  toClickhouseRow,
+} from './shipper.js'
 
 // The dead-client tests below deliberately connect to a closed port; this
 // silences the client's own connection-error logging for those, not ours.
@@ -137,7 +143,7 @@ describe('shipOnce', () => {
     const dir = tmp()
     segment(dir, [JSON.stringify(rec()), JSON.stringify(rec())])
     segment(dir, [JSON.stringify(rec())])
-    const r = await shipOnce({ dir, ch })
+    const r = await shipOnce({ dir, ch, skipNewer: new Set() })
     expect(r).toEqual({ segments: 2, rows: 3, malformed: 0 })
     expect(await clicks()).toBe(3)
     expect(readdirSync(dir)).toEqual([])
@@ -146,7 +152,7 @@ describe('shipOnce', () => {
   it('never touches the segment the redirect is still writing', async () => {
     const dir = tmp()
     writeFileSync(join(dir, 'open-1-0.part'), `${JSON.stringify(rec())}\n`)
-    await shipOnce({ dir, ch })
+    await shipOnce({ dir, ch, skipNewer: new Set() })
     expect(readdirSync(dir)).toEqual(['open-1-0.part'])
     expect(await clicks()).toBe(0)
   })
@@ -154,7 +160,7 @@ describe('shipOnce', () => {
   it('skips and counts malformed lines, and still ships the rest', async () => {
     const dir = tmp()
     segment(dir, [JSON.stringify(rec()), '{"torn":', JSON.stringify({ ...rec(), outcome: 'nope' })])
-    const r = await shipOnce({ dir, ch })
+    const r = await shipOnce({ dir, ch, skipNewer: new Set() })
     expect(r).toMatchObject({ rows: 1, malformed: 2 })
     expect(await clicks()).toBe(1)
   })
@@ -167,7 +173,7 @@ describe('shipOnce', () => {
     // No trailing newline: what renaming a crashed writer's .part produces
     // when the crash lands mid-line.
     writeFileSync(join(dir, name), `${whole}\n${torn}`)
-    const r = await shipOnce({ dir, ch })
+    const r = await shipOnce({ dir, ch, skipNewer: new Set() })
     expect(r).toEqual({ segments: 1, rows: 1, malformed: 1 })
     expect(await clicks()).toBe(1)
     expect(readdirSync(dir)).toEqual([])
@@ -178,7 +184,7 @@ describe('shipOnce', () => {
     const name = segment(dir, [JSON.stringify(rec()), JSON.stringify(rec())])
     // Same lines under another sealed name: what a crash between insert and delete produces.
     copyFileSync(join(dir, name), join(dir, name.replace('-1-', '-2-')))
-    await shipOnce({ dir, ch })
+    await shipOnce({ dir, ch, skipNewer: new Set() })
     expect(await clicks()).toBe(2)
   })
 
@@ -187,7 +193,7 @@ describe('shipOnce', () => {
     const a = segment(dir, [JSON.stringify(rec())])
     const b = segment(dir, [JSON.stringify(rec())])
     const dead = deadCh()
-    await expect(shipOnce({ dir, ch: dead })).rejects.toThrow()
+    await expect(shipOnce({ dir, ch: dead, skipNewer: new Set() })).rejects.toThrow()
     // Neither shipped, neither set aside: a connection failure is not this
     // segment's problem, unlike a rejection the server actually answered.
     expect(readdirSync(dir).sort()).toEqual([a, b].sort())
@@ -207,14 +213,14 @@ describe('shipOnce', () => {
       password: 'wrong-password',
       logLevel: ClickHouseLogLevel.OFF,
     })
-    await expect(shipOnce({ dir, ch: badAuth })).rejects.toThrow()
+    await expect(shipOnce({ dir, ch: badAuth, skipNewer: new Set() })).rejects.toThrow()
     expect(readdirSync(dir).sort()).toEqual([a, b].sort())
     await badAuth.close()
   })
 
   it('sets aside a segment ClickHouse rejects as malformed data, and still ships the good one behind it', async () => {
     const dir = tmp()
-    // ClickRecordSchema already enforces the same shape ClickHouse's own
+    // SpoolRecordSchema already enforces the same shape ClickHouse's own
     // column types accept (UUID, DateTime64, UInt16, UInt8), and ClickHouse's
     // JSON parser is lenient beyond that (a malformed-looking UUID like
     // "zzzz...z" is silently coerced, not rejected — checked by hand against
@@ -243,7 +249,7 @@ describe('shipOnce', () => {
     writeFileSync(join(dir, badName), `${JSON.stringify(rec())}\n`)
     writeFileSync(join(dir, goodName), `${JSON.stringify(rec())}\n`)
 
-    const r = await shipOnce({ dir, ch: badCh, maxSegments: 2 })
+    const r = await shipOnce({ dir, ch: badCh, skipNewer: new Set(), maxSegments: 2 })
     expect(r.rows).toBe(1)
     expect(readdirSync(dir)).toEqual([`${badName}.bad`])
     expect(await clicks()).toBe(1)
@@ -258,7 +264,7 @@ describe('shipOnce', () => {
     const goodName = segmentName(2, 1, seq++)
     mkdirSync(join(dir, probeName))
     writeFileSync(join(dir, goodName), `${JSON.stringify(rec())}\n`)
-    const r = await shipOnce({ dir, ch })
+    const r = await shipOnce({ dir, ch, skipNewer: new Set() })
     expect(r.rows).toBe(1)
     expect(await clicks()).toBe(1)
     // The good segment shipped and was deleted; only the set-aside probe remains.
@@ -282,13 +288,27 @@ describe('shipOnce', () => {
       unlinkSync(path)
     }
 
-    const r1 = await shipOnce({ dir, ch, skipUnlinked, log: () => {}, unlink: flakyUnlink })
+    const r1 = await shipOnce({
+      dir,
+      ch,
+      skipNewer: new Set(),
+      skipUnlinked,
+      log: () => {},
+      unlink: flakyUnlink,
+    })
     expect(r1.rows).toBe(1)
     expect(skipUnlinked.has(name)).toBe(true)
     expect(readdirSync(dir)).toEqual([name])
 
     const before = await rawRowCount()
-    const r2 = await shipOnce({ dir, ch, skipUnlinked, log: () => {}, unlink: flakyUnlink })
+    const r2 = await shipOnce({
+      dir,
+      ch,
+      skipNewer: new Set(),
+      skipUnlinked,
+      log: () => {},
+      unlink: flakyUnlink,
+    })
     expect(r2.segments).toBe(0)
     expect(r2.rows).toBe(0)
     expect(await rawRowCount()).toBe(before)
@@ -301,7 +321,7 @@ describe('shipOnce', () => {
     // before any attempt is made to read it.
     writeFileSync(join(dir, name), '')
     truncateSync(join(dir, name), MAX_SEGMENT_BYTES + 1)
-    const r = await shipOnce({ dir, ch, maxSegments: 1 })
+    const r = await shipOnce({ dir, ch, skipNewer: new Set(), maxSegments: 1 })
     expect(r).toMatchObject({ rows: 0, malformed: 0 })
     expect(readdirSync(dir)).toEqual([`${name}.bad`])
     expect(await clicks()).toBe(0)
@@ -313,7 +333,11 @@ describe('shipOnce', () => {
     segment(dir, [
       JSON.stringify(rec({ trafficClass: 'bot', signals: ['ua_bot'], action: 'flag' })),
     ])
-    expect(await shipOnce({ dir, ch })).toEqual({ segments: 2, rows: 2, malformed: 0 })
+    expect(await shipOnce({ dir, ch, skipNewer: new Set() })).toEqual({
+      segments: 2,
+      rows: 2,
+      malformed: 0,
+    })
     const rs = await ch.query({
       query: 'SELECT traffic_class, signals, action FROM clicks ORDER BY traffic_class',
       format: 'JSONEachRow',
@@ -326,16 +350,40 @@ describe('shipOnce', () => {
 
   it('leaves a segment from a newer redirect in the spool, untouched, and ships the rest', async () => {
     const dir = tmp()
-    const newer = segment(dir, [JSON.stringify(rec()), JSON.stringify({ ...rec(), v: 3 })])
+    // A malformed line ahead of the newer record is not reported: the
+    // segment is not this worker's to judge.
+    const newer = segment(dir, [
+      JSON.stringify(rec()),
+      '{"torn":',
+      JSON.stringify({ ...rec(), v: 3 }),
+    ])
     segment(dir, [JSON.stringify(rec())])
     const skipNewer = new Set<string>()
     const r = await shipOnce({ dir, ch, skipNewer })
-    expect(r).toMatchObject({ rows: 1, malformed: 0 })
+    // The segment left in place is not counted as work done.
+    expect(r).toEqual({ segments: 1, rows: 1, malformed: 0 })
     // Not deleted, not renamed to .bad: an upgraded worker ships it as it is.
     expect(readdirSync(dir)).toEqual([newer])
     expect(await clicks()).toBe(1)
-    // Not read again by this worker.
-    expect(await shipOnce({ dir, ch, skipNewer })).toMatchObject({ segments: 0 })
+    // Not read again by this worker: a second pass does not reach it.
+    const logged: string[] = []
+    expect(await shipOnce({ dir, ch, skipNewer, log: (m) => logged.push(m) })).toMatchObject({
+      segments: 0,
+    })
+    expect(logged).toEqual([])
+  })
+
+  it('reports no work for a pass that found only newer segments, so the shipper waits its interval', async () => {
+    const dir = tmp()
+    for (let i = 0; i < MAX_SEGMENTS_PER_PASS; i++) {
+      writeFileSync(join(dir, segmentName(1 + i, 1, 0)), `${JSON.stringify({ ...rec(), v: 3 })}\n`)
+    }
+    expect(await shipOnce({ dir, ch, skipNewer: new Set() })).toEqual({
+      segments: 0,
+      rows: 0,
+      malformed: 0,
+    })
+    expect(readdirSync(dir)).toHaveLength(MAX_SEGMENTS_PER_PASS)
   })
 
   it('counts a line with a version that is not a newer integer as malformed', async () => {
@@ -345,7 +393,11 @@ describe('shipOnce', () => {
       JSON.stringify({ ...rec(), v: 2.5 }),
       JSON.stringify(rec()),
     ])
-    expect(await shipOnce({ dir, ch })).toEqual({ segments: 1, rows: 1, malformed: 2 })
+    expect(await shipOnce({ dir, ch, skipNewer: new Set() })).toEqual({
+      segments: 1,
+      rows: 1,
+      malformed: 2,
+    })
     expect(readdirSync(dir)).toEqual([])
   })
 
@@ -353,14 +405,14 @@ describe('shipOnce', () => {
     const dir = tmp()
     writeFileSync(join(dir, segmentName(2, 1, 0)), `${JSON.stringify(rec())}\n`)
     writeFileSync(join(dir, segmentName(1, 1, 0)), `${JSON.stringify(rec())}\n`)
-    await shipOnce({ dir, ch, maxSegments: 1 })
+    await shipOnce({ dir, ch, skipNewer: new Set(), maxSegments: 1 })
     expect(readdirSync(dir)).toEqual([segmentName(2, 1, 0)])
   })
 
   it('ships at most maxSegments per pass', async () => {
     const dir = tmp()
     for (let i = 0; i < 5; i++) segment(dir, [JSON.stringify(rec())])
-    const r = await shipOnce({ dir, ch, maxSegments: 2 })
+    const r = await shipOnce({ dir, ch, skipNewer: new Set(), maxSegments: 2 })
     expect(r.segments).toBe(2)
     expect(readdirSync(dir)).toHaveLength(3)
   })
@@ -375,6 +427,20 @@ describe('startShipper', () => {
     while ((await clicks()) < 1 && Date.now() < end) await new Promise((r) => setTimeout(r, 25))
     await s.stop()
     expect(await clicks()).toBe(1)
+  })
+
+  it('ships a segment behind a full pass of newer segments', async () => {
+    const dir = tmp()
+    for (let i = 0; i < MAX_SEGMENTS_PER_PASS; i++) {
+      writeFileSync(join(dir, segmentName(1 + i, 1, 0)), `${JSON.stringify({ ...rec(), v: 3 })}\n`)
+    }
+    writeFileSync(join(dir, segmentName(1000, 1, 0)), `${JSON.stringify(rec())}\n`)
+    const s = startShipper({ dir, ch, intervalMs: 20, log: () => {} })
+    const end = Date.now() + 3000
+    while ((await clicks()) < 1 && Date.now() < end) await new Promise((r) => setTimeout(r, 25))
+    await s.stop()
+    expect(await clicks()).toBe(1)
+    expect(readdirSync(dir)).toHaveLength(MAX_SEGMENTS_PER_PASS)
   })
 
   it('survives ClickHouse being unreachable, without rejecting', async () => {

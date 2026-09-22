@@ -67,8 +67,11 @@ const Token = z.string().regex(/^[a-z0-9_]{1,24}$/)
  * Version 2 adds the traffic class, every signal that fired, the action
  * applied, the OS and browser families and the ASN. Signals, OS and browser
  * are open strings rather than closed lists, so a new family or signal
- * needs no new version; the class and action lists are fixed. A version the
- * worker does not know is left in the spool for a worker that does.
+ * needs no new version. The class, action, outcome and step lists are
+ * fixed: adding a value to any of them requires a new record version, since
+ * an older worker would read the new value as a malformed line and drop it.
+ * A version the worker does not know is left in the spool for a worker that
+ * does.
  */
 export const ClickRecordV2Schema = z
   .object({
