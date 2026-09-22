@@ -214,6 +214,27 @@ describe('clickmonk settings', () => {
     expect(await settings()).toEqual(before)
   })
 
+  it('shows the defaults, and says why, when core refuses the stored row', async () => {
+    // The database check allows a token in the safe URL's host; core does not.
+    await pg.query(
+      `UPDATE settings SET traffic_actions = '{"bot":"block","abuser":"flag","anonymous":"flag","datacenter":"flag"}',
+                           safe_url = 'https://{click_id}.example.com/'`,
+    )
+    lines.length = 0
+    expect(await run('settings', 'show')).toBe(0)
+    expect(lines[0]).toMatch(
+      /^note: the stored settings are invalid \(safeUrl: .+\); the defaults apply$/,
+    )
+    expect(lines.slice(1)).toEqual([
+      'bot: flag',
+      'abuser: flag',
+      'anonymous: flag',
+      'datacenter: flag',
+      'safe url: (none)',
+      'abuser threshold: 60 clicks a minute from one address',
+    ])
+  })
+
   it('shows the defaults, and says so, when the settings row is missing', async () => {
     await pg.query('DELETE FROM settings')
     lines.length = 0

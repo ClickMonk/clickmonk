@@ -176,20 +176,35 @@ const toSettings = (r: SettingsRow): TrafficSettings => ({
   abuserThreshold: r.abuser_threshold,
 })
 
-/** A missing row (deleted by hand) means the defaults, as the redirect reads it. */
+/**
+ * Shows what the redirect serves: a row that is missing (deleted by hand) or
+ * that core's schema refuses means the defaults there, so it does here too.
+ */
 async function settingsShow(d: CliDeps): Promise<void> {
   const r = await d.pg.query<SettingsRow>(
     'SELECT traffic_actions, safe_url, abuser_threshold FROM settings',
   )
   const row = r.rows[0]
-  if (!row) d.out('note: no settings are stored; the defaults apply')
-  printSettings(row ? toSettings(row) : DEFAULT_TRAFFIC_SETTINGS, d)
+  if (!row) {
+    d.out('note: no settings are stored; the defaults apply')
+    printSettings(DEFAULT_TRAFFIC_SETTINGS, d)
+    return
+  }
+  const parsed = TrafficSettingsSchema.safeParse(toSettings(row))
+  if (parsed.success) {
+    printSettings(parsed.data, d)
+    return
+  }
+  const why = parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')
+  d.out(`note: the stored settings are invalid (${why}); the defaults apply`)
+  printSettings(DEFAULT_TRAFFIC_SETTINGS, d)
 }
 
 /**
  * Changes only what is given; the result is validated whole before anything
- * is written. An upsert, so a row deleted by hand is written back, starting
- * from the defaults.
+ * is written. A row deleted by hand is first written back as the defaults,
+ * in the same transaction, so that concurrent writers still serialise on its
+ * lock.
  */
 async function settingsSet(args: string[], d: CliDeps): Promise<void> {
   const { values } = parseArgs({
@@ -207,11 +222,13 @@ async function settingsSet(args: string[], d: CliDeps): Promise<void> {
   const client = await d.pg.connect()
   try {
     await client.query('BEGIN')
+    await client.query('INSERT INTO settings DEFAULT VALUES ON CONFLICT DO NOTHING')
     const r = await client.query<SettingsRow>(
       'SELECT traffic_actions, safe_url, abuser_threshold FROM settings FOR UPDATE',
     )
     const row = r.rows[0]
-    const current = row ? toSettings(row) : DEFAULT_TRAFFIC_SETTINGS
+    if (!row) throw new Error('the settings row is missing after writing it')
+    const current = toSettings(row)
     const next = TrafficSettingsSchema.parse({
       actions: { ...current.actions, ...parseActions(values.action) },
       safeUrl: values['no-safe-url'] ? null : (values['safe-url'] ?? current.safeUrl),
@@ -221,11 +238,8 @@ async function settingsSet(args: string[], d: CliDeps): Promise<void> {
           : Number(values['abuser-threshold']),
     })
     await client.query(
-      `INSERT INTO settings (id, traffic_actions, safe_url, abuser_threshold, updated_at)
-       VALUES (true, $1, $2, $3, now())
-       ON CONFLICT (id) DO UPDATE SET traffic_actions = EXCLUDED.traffic_actions,
-         safe_url = EXCLUDED.safe_url, abuser_threshold = EXCLUDED.abuser_threshold,
-         updated_at = EXCLUDED.updated_at`,
+      `UPDATE settings SET traffic_actions = $1, safe_url = $2, abuser_threshold = $3,
+                           updated_at = now()`,
       [JSON.stringify(next.actions), next.safeUrl, next.abuserThreshold],
     )
     await client.query('COMMIT')

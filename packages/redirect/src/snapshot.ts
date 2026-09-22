@@ -103,18 +103,24 @@ export function settingsFromRow(row: SettingsRow | undefined): {
   problem: string | null
 } {
   if (!row) return { settings: DEFAULT_TRAFFIC_SETTINGS, problem: 'the settings row is missing' }
-  const r = TrafficSettingsSchema.safeParse({
-    actions: row.traffic_actions,
-    safeUrl: row.safe_url,
-    abuserThreshold: row.abuser_threshold,
-  })
+  return validSettings(
+    { actions: row.traffic_actions, safeUrl: row.safe_url, abuserThreshold: row.abuser_threshold },
+    'the settings row',
+  )
+}
+
+function validSettings(
+  value: unknown,
+  what: string,
+): { settings: TrafficSettings; problem: string | null } {
+  const r = TrafficSettingsSchema.safeParse(value)
   return r.success
     ? { settings: r.data, problem: null }
-    : {
-        settings: DEFAULT_TRAFFIC_SETTINGS,
-        problem: `the settings row is invalid (${issues(r.error)})`,
-      }
+    : { settings: DEFAULT_TRAFFIC_SETTINGS, problem: `${what} is invalid (${issues(r.error)})` }
 }
+
+const refusedOverrides = (n: number): string =>
+  `traffic action overrides of ${n} link(s) are invalid and ignored`
 
 /** A link's overrides through core's schema. Refused, the link keeps none and `problem` says why. */
 export function linkActionsFromRow(raw: unknown): {
@@ -174,12 +180,11 @@ export async function loadFromPostgres(
 
       await client.query('COMMIT')
 
-      // One line per load however many links are affected, naming the first.
+      // One line per load however many links are affected.
       let refused = 0
-      let firstRefused = ''
       const actionsOf = (r: LinkRow): LinkTrafficActions => {
         const a = linkActionsFromRow(r.traffic_actions)
-        if (a.problem && refused++ === 0) firstRefused = `${r.id} (${a.problem})`
+        if (a.problem) refused++
         return a.actions
       }
 
@@ -213,11 +218,7 @@ export async function loadFromPostgres(
         'postgres',
         settings,
       )
-      if (refused > 0) {
-        log(
-          `traffic action overrides of ${refused} link(s) are invalid and ignored; the first is ${firstRefused}`,
-        )
-      }
+      if (refused > 0) log(refusedOverrides(refused))
       return snapshot
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {})
@@ -241,30 +242,39 @@ export function serializeSnapshot(s: Snapshot): string {
  * Reads version 2, and version 1 as written before traffic settings existed:
  * the defaults and no link overrides, which is what Postgres held then too.
  * A redirect upgraded while Postgres is down still serves its last snapshot.
+ * A version 2 file's settings and overrides pass core's schemas as they do
+ * from Postgres; refused, the defaults and no overrides apply, with a log.
  */
-export function deserializeSnapshot(text: string): Snapshot {
+export function deserializeSnapshot(text: string, log: Log = () => {}): Snapshot {
   const raw = JSON.parse(text) as {
     v: number
     loadedAt: string
-    settings?: TrafficSettings
+    settings?: unknown
     domains: Domain[]
     links: (Omit<Link, 'expiresAt' | 'trafficActions'> & {
       expiresAt: string | null
-      trafficActions?: LinkTrafficActions
+      trafficActions?: unknown
     })[]
   }
   if (raw.v !== 1 && raw.v !== 2) throw new Error(`unknown snapshot version ${raw.v}`)
-  return new Snapshot(
-    raw.domains,
-    raw.links.map((l) => ({
+  let settings = DEFAULT_TRAFFIC_SETTINGS
+  if (raw.v === 2) {
+    const r = validSettings(raw.settings, 'the snapshot file settings')
+    if (r.problem) log(`traffic settings: ${r.problem}; using the defaults`)
+    settings = r.settings
+  }
+  let refused = 0
+  const links = raw.links.map((l) => {
+    const a = linkActionsFromRow(l.trafficActions ?? {})
+    if (a.problem) refused++
+    return {
       ...l,
       expiresAt: l.expiresAt === null ? null : new Date(l.expiresAt),
-      trafficActions: l.trafficActions ?? {},
-    })),
-    new Date(raw.loadedAt),
-    'file',
-    raw.v === 2 && raw.settings ? raw.settings : DEFAULT_TRAFFIC_SETTINGS,
-  )
+      trafficActions: a.actions,
+    }
+  })
+  if (refused > 0) log(refusedOverrides(refused))
+  return new Snapshot(raw.domains, links, new Date(raw.loadedAt), 'file', settings)
 }
 
 /**
@@ -290,9 +300,9 @@ export function writeSnapshotFile(path: string, s: Snapshot, write: WriteFn = wr
   }
 }
 
-export function readSnapshotFile(path: string): Snapshot | null {
+export function readSnapshotFile(path: string, log: Log = () => {}): Snapshot | null {
   try {
-    return deserializeSnapshot(readFileSync(path, 'utf8'))
+    return deserializeSnapshot(readFileSync(path, 'utf8'), log)
   } catch {
     return null
   }
@@ -337,7 +347,7 @@ export class SnapshotStore {
 
   async start(): Promise<void> {
     if (!(await this.reload())) {
-      this.snapshot = readSnapshotFile(this.o.filePath)
+      this.snapshot = readSnapshotFile(this.o.filePath, this.o.log)
       this.o.log(
         this.snapshot
           ? 'serving the last snapshot file; Postgres unreachable'

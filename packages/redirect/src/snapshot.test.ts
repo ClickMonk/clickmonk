@@ -162,12 +162,7 @@ describe('loadFromPostgres', () => {
       ])
       const s = await loadFromPostgres(pool, undefined, (m) => logs.push(m))
       expect(s.link(domainId, 'spring')?.trafficActions).toEqual({})
-      expect(logs).toHaveLength(1)
-      expect(logs[0]).toMatch(
-        new RegExp(
-          `^traffic action overrides of 1 link\\(s\\) are invalid and ignored; the first is ${linkId} \\(.+\\)$`,
-        ),
-      )
+      expect(logs).toEqual(['traffic action overrides of 1 link(s) are invalid and ignored'])
     } finally {
       await pool.query("UPDATE links SET traffic_actions = '{}'")
       await pool.query(
@@ -219,6 +214,46 @@ describe('snapshot file', () => {
     }
     const s = new Snapshot([], [], new Date(), 'postgres', settings)
     expect(deserializeSnapshot(serializeSnapshot(s)).settings).toEqual(settings)
+  })
+
+  it("refuses a version 2 file's settings and overrides that core refuses, and says so", () => {
+    const link = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      domainId: '00000000-0000-4000-8000-0000000000d1',
+      slug: 'spring',
+      enabled: true,
+      targets: [
+        { id: '00000000-0000-4000-8000-0000000000f1', url: 'https://example.com/', weight: 100 },
+      ],
+      backupUrl: null,
+      deviceUrls: {},
+      returningUrl: null,
+      countries: { mode: 'all' },
+      clickCap: null,
+      expiresAt: null,
+      passthrough: true,
+      trafficActions: { human: 'block' },
+    }
+    const v2 = JSON.stringify({
+      v: 2,
+      loadedAt: new Date().toISOString(),
+      settings: {
+        actions: { bot: 'safe', abuser: 'flag', anonymous: 'flag', datacenter: 'flag' },
+        safeUrl: null,
+        abuserThreshold: 60,
+      },
+      domains: [],
+      links: [link],
+    })
+    const logs: string[] = []
+    const s = deserializeSnapshot(v2, (m) => logs.push(m))
+    expect(s.settings).toEqual(DEFAULT_TRAFFIC_SETTINGS)
+    expect(s.link(link.domainId, 'spring')?.trafficActions).toEqual({})
+    expect(logs).toHaveLength(2)
+    expect(logs[0]).toMatch(
+      /^traffic settings: the snapshot file settings is invalid \(actions\.bot: .+\); using the defaults$/,
+    )
+    expect(logs[1]).toBe('traffic action overrides of 1 link(s) are invalid and ignored')
   })
 
   it('reads a version 1 file as the defaults and no link overrides', () => {
@@ -395,6 +430,23 @@ describe('SnapshotStore', () => {
     }
   })
 
+  it('reloads when the settings change', async () => {
+    await seed()
+    const store = make(join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json'))
+    await store.start()
+    expect(store.current()?.settings.abuserThreshold).toBe(60)
+    // As for links below: past the listener's catch-up reload, so only the
+    // notification can pick this change up.
+    await until(() => (store as unknown as { listener: unknown }).listener !== null)
+    await new Promise((r) => setTimeout(r, 200))
+    await pool.query('UPDATE settings SET abuser_threshold = 30')
+    try {
+      await until(() => store.current()?.settings.abuserThreshold === 30)
+    } finally {
+      await pool.query('UPDATE settings SET abuser_threshold = DEFAULT')
+    }
+  })
+
   it('reloads when a link changes', async () => {
     const { domainId } = await seed()
     const store = make(join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json'))
@@ -564,6 +616,43 @@ describe('SnapshotStore', () => {
     expect(store.current()?.link(domainId, 'spring')).not.toBeNull()
     await store.stop()
     await deadPool.end()
+  })
+
+  it('reports settings in the file that core refuses when it boots from the file', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json')
+    writeFileSync(
+      path,
+      JSON.stringify({
+        v: 2,
+        loadedAt: new Date().toISOString(),
+        settings: { actions: {}, safeUrl: null, abuserThreshold: 60 },
+        domains: [],
+        links: [],
+      }),
+    )
+    const { createPgPool } = await import('@clickmonk/db')
+    const dead = 'postgres://clickmonk:clickmonk@127.0.0.1:1/none'
+    const deadPool = createPgPool(dead, { connectTimeoutMs: 200 })
+    const logs: string[] = []
+    const store = new SnapshotStore({
+      pgUrl: dead,
+      pool: deadPool,
+      filePath: path,
+      retryMs: 50,
+      log: (m) => logs.push(m),
+    })
+    stores.push(store)
+    try {
+      await store.start()
+      expect(store.current()?.source).toBe('file')
+      expect(store.current()?.settings).toEqual(DEFAULT_TRAFFIC_SETTINGS)
+      expect(
+        logs.some((m) => m.startsWith('traffic settings: the snapshot file settings is invalid')),
+      ).toBe(true)
+    } finally {
+      await store.stop()
+      await deadPool.end()
+    }
   })
 
   it('picks Postgres up within retryMs once it becomes reachable, without a notification', async () => {
