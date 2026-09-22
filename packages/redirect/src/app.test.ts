@@ -1,5 +1,11 @@
 import http from 'node:http'
-import { type ClickRecord, ClickRecordSchema, type Domain, type Link } from '@clickmonk/core'
+import {
+  type ClickRecord,
+  ClickRecordSchema,
+  type Domain,
+  type Link,
+  isDestinationUrl,
+} from '@clickmonk/core'
 import { type Pool, createPgPool } from '@clickmonk/db'
 import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -350,6 +356,40 @@ describe('redirect', () => {
     })
     expect(badHost.statusCode).toBe(400)
     expect(badHost.headers['cache-control']).toBe('no-store, no-cache, must-revalidate, max-age=0')
+  })
+
+  it('sends every destination the validator accepts as its Location, and records the status it sent', async () => {
+    // Accepted and rejected candidates together: the invariant is that no
+    // accepted one fails on the way out, whatever the validator's rules are.
+    const candidates = [
+      'https://example.com/plain',
+      'https://xn--bcher-kva.example/',
+      'https://example.com/%E6%97%A5%E6%9C%AC?q=%C3%BC',
+      "https://example.com/a|b~c!d'e(f)*g",
+      'https://example.com/a\nb',
+      'https://example.com/a\tb',
+      'https://example.com/日本',
+      'https://example.com/café',
+      'https://bücher.example/',
+    ]
+    const accepted = candidates.filter(isDestinationUrl)
+    expect(accepted.length).toBeGreaterThanOrEqual(4)
+    for (const url of accepted) {
+      const l = link({
+        targets: [{ id: '00000000-0000-4000-8000-0000000000f1', url, weight: 100 }],
+        returningUrl: null,
+        passthrough: false,
+      })
+      const { app, records } = harness([l])
+      const res = await app.inject({
+        method: 'GET',
+        url: '/spring',
+        headers: { host: 'go.example.test' },
+      })
+      expect(res.statusCode, url).toBe(302)
+      expect(res.headers.location, url).toBe(url)
+      expect(records.map((r) => r.status)).toEqual([res.statusCode])
+    }
   })
 
   it('truncates the user-agent and referrer it records', async () => {

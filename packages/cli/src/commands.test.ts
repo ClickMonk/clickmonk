@@ -42,6 +42,17 @@ describe('clickmonk cli', () => {
     )
   })
 
+  it('rejects a token in a domain URL, which would be sent unrendered, and writes nothing', async () => {
+    const url = 'https://example.com/?c={click_id}'
+    expect(await run('domain', 'add', 'root.example.test', '--root-url', url)).toBe(2)
+    expect(await run('domain', 'add', 'nf.example.test', '--not-found-url', url)).toBe(2)
+    const r = await pg.query('SELECT 1 FROM domains WHERE host IN ($1, $2)', [
+      'root.example.test',
+      'nf.example.test',
+    ])
+    expect(r.rowCount).toBe(0)
+  })
+
   it('adds a link with weighted targets, a cap, an expiry and no passthrough', async () => {
     const expires = new Date(Date.now() + 86_400_000).toISOString()
     const code = await run(

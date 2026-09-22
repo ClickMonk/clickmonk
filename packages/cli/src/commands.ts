@@ -1,5 +1,5 @@
 import { parseArgs } from 'node:util'
-import { isDestinationUrl, normaliseHost, parseLinkInput } from '@clickmonk/core'
+import { isDomainUrl, normaliseHost, parseLinkInput } from '@clickmonk/core'
 import { type ClickHouseClient, type Pool, migrateToLatest } from '@clickmonk/db'
 import type { ZodError } from 'zod'
 
@@ -33,7 +33,9 @@ async function domainAdd(args: string[], d: CliDeps): Promise<void> {
   const host = normaliseHost(positionals[0] ?? '')
   if (!host) throw new Rejected(`not a valid host name: ${positionals[0] ?? '(none)'}`)
   for (const u of [values['root-url'], values['not-found-url']]) {
-    if (u !== undefined && !isDestinationUrl(u)) throw new Rejected(`not an http(s) URL: ${u}`)
+    // Sent as written, so no token: `{click_id}` would reach the visitor literally.
+    if (u !== undefined && !isDomainUrl(u))
+      throw new Rejected(`not an http(s) URL in printable ASCII without tokens: ${u}`)
   }
   const r = await d.pg.query<{ id: string }>(
     `INSERT INTO domains (host, verified, root_url, not_found_url) VALUES ($1, true, $2, $3)

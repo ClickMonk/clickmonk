@@ -49,9 +49,17 @@ const MAX_CLICK_CAP = 1_000_000_000
  * absolute http(s) URL. A token in the host part therefore fails: `{param:x}`
  * renders as `x`, and a host like `x` is allowed by URL, so hosts are also
  * checked to contain no token at all.
+ *
+ * The destination is sent as a Location header exactly as written (tokens
+ * render percent-encoded), so it must be printable ASCII with no space. The
+ * URL parser would forgive more: it silently drops a tab or newline and
+ * accepts any Unicode character, none of which a header can carry intact. An
+ * internationalised host is written in its punycode form (`xn--...`), and a
+ * non-ASCII path or query percent-encoded.
  */
 export function isDestinationUrl(s: string): boolean {
   if (s.length === 0 || s.length > MAX_URL_LENGTH) return false
+  if (!/^[\x21-\x7e]+$/.test(s)) return false
   const sample = s.replace(/\{[^{}]{1,80}\}/g, 'x')
   let u: URL
   try {
@@ -62,6 +70,15 @@ export function isDestinationUrl(s: string): boolean {
   if (u.protocol !== 'https:' && u.protocol !== 'http:') return false
   const hostPart = /^https?:\/\/([^/?#]*)/i.exec(s)?.[1] ?? ''
   return !hostPart.includes('{')
+}
+
+/**
+ * A domain's root or not-found URL. The same rules as a destination, but it
+ * is sent without rendering, so it may not contain a token: a brace would
+ * reach the visitor literally. Write `%7B` and `%7D` for a literal brace.
+ */
+export function isDomainUrl(s: string): boolean {
+  return isDestinationUrl(s) && !/[{}]/.test(s)
 }
 
 const HOST_LABEL = /^(?!-)[a-z0-9-]{1,63}(?<!-)$/
@@ -77,7 +94,8 @@ export function normaliseHost(host: string): string | null {
 }
 
 const Destination = z.string().refine(isDestinationUrl, {
-  message: 'must be an absolute http(s) URL of at most 2048 characters, with no token in the host',
+  message:
+    'must be an absolute http(s) URL of at most 2048 printable ASCII characters, with no token in the host',
 })
 const Country = z.string().regex(/^[A-Z]{2}$/, 'ISO 3166-1 alpha-2, upper case')
 

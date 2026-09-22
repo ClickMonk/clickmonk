@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { LinkInputSchema, isDestinationUrl, normaliseHost, parseLinkInput } from './link.js'
+import {
+  LinkInputSchema,
+  isDestinationUrl,
+  isDomainUrl,
+  normaliseHost,
+  parseLinkInput,
+} from './link.js'
 
 const base = { slug: 'spring-sale', targets: [{ url: 'https://example.com/offer' }] }
 
@@ -77,6 +83,8 @@ describe('isDestinationUrl', () => {
     'https://example.com/a?sub={click_id}',
     'http://example.com/{param:sub1}',
     'https://example.com/?c={country}&d={device}&l={link}',
+    'https://xn--bcher-kva.example/',
+    'https://example.com/%E6%97%A5%E6%9C%AC?q=%C3%BC',
   ])('accepts %s', (u) => expect(isDestinationUrl(u)).toBe(true))
 
   it.each([
@@ -87,6 +95,31 @@ describe('isDestinationUrl', () => {
     `https://example.com/${'a'.repeat(2048)}`,
     'not a url',
   ])('rejects %s', (u) => expect(isDestinationUrl(u)).toBe(false))
+
+  // Each of these parses as a URL, but none can be sent as a Location header
+  // as written: the parser drops a tab or newline, and a header carries no
+  // character above U+007E intact.
+  it.each([
+    ['a newline', 'https://example.com/a\nb'],
+    ['a carriage return', 'https://example.com/a\rb'],
+    ['a tab', 'https://example.com/a\tb'],
+    ['a space', 'https://example.com/a b'],
+    ['a CJK path', 'https://example.com/日本'],
+    ['a latin-1 path', 'https://example.com/café'],
+    ['an internationalised host', 'https://bücher.example/'],
+  ])('rejects a destination with %s', (_what, u) => {
+    expect(() => new URL(u)).not.toThrow()
+    expect(isDestinationUrl(u)).toBe(false)
+  })
+})
+
+describe('isDomainUrl', () => {
+  it('accepts a plain URL and rejects a token, which would be sent unrendered', () => {
+    expect(isDomainUrl('https://example.com/home?x=%7B1%7D')).toBe(true)
+    expect(isDomainUrl('https://example.com/?c={click_id}')).toBe(false)
+    expect(isDomainUrl('https://example.com/?c={nope')).toBe(false)
+    expect(isDomainUrl('https://example.com/日本')).toBe(false)
+  })
 })
 
 describe('normaliseHost', () => {
