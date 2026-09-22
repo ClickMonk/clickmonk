@@ -1,11 +1,13 @@
 # Distinct project name so a local stack (project "clickmonk") cannot stop or
-# replace the containers tests are talking to.
+# replace the containers tests are talking to. Ports are bound to loopback:
+# the credentials below are public, so the databases must not be reachable
+# from the network.
 name: clickmonk-test
 
 services:
   clickhouse:
     image: clickhouse/clickhouse-server:24.8-alpine
-    ports: ["8123:8123"]
+    ports: ["127.0.0.1:8123:8123"]
     environment:
       CLICKHOUSE_DB: clickmonk_test
       CLICKHOUSE_USER: clickmonk
@@ -24,7 +26,7 @@ services:
       start_period: 10s
   postgres:
     image: postgres:17-alpine
-    ports: ["5433:5432"]
+    ports: ["127.0.0.1:5433:5432"]
     environment:
       POSTGRES_DB: clickmonk_test
       POSTGRES_USER: clickmonk
