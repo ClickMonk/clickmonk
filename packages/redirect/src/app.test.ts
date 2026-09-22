@@ -691,6 +691,49 @@ describe('traffic classification', () => {
     ])
   })
 
+  it('sends a class set to safe to the safe URL without touching the cap', async () => {
+    const capped = link({
+      id: '00000000-0000-4000-8000-0000000000b6',
+      slug: 'safe-capped',
+      clickCap: 5,
+    })
+    await persist(capped)
+    const { app, records } = harness([capped], {
+      ipdata: IPDATA,
+      settings: settings({ datacenter: 'safe' }, 'https://example.com/safe'),
+    })
+    const res = await app.inject({
+      method: 'GET',
+      url: '/safe-capped',
+      headers: from('198.51.100.7'),
+    })
+    expect(res.statusCode).toBe(302)
+    expect(res.headers.location).toBe('https://example.com/safe')
+    expect(records[0]).toMatchObject({
+      outcome: 'safe',
+      step: 'classify',
+      trafficClass: 'datacenter',
+      action: 'safe',
+      capUnchecked: false,
+    })
+    const counters = await pool.query('SELECT 1 FROM link_counters WHERE link_id = $1', [capped.id])
+    expect(counters.rowCount).toBe(0)
+    // Not even read: against a cap store that cannot answer, the click is
+    // still not marked as unchecked.
+    const dead = createPgPool('postgres://clickmonk:clickmonk@127.0.0.1:1/none', {
+      connectTimeoutMs: 150,
+      queryTimeoutMs: 150,
+    })
+    const unread = harness([capped], {
+      ipdata: IPDATA,
+      settings: settings({ datacenter: 'safe' }, 'https://example.com/safe'),
+      capPool: dead,
+    })
+    await unread.app.inject({ method: 'GET', url: '/safe-capped', headers: from('198.51.100.7') })
+    expect(unread.records[0]).toMatchObject({ outcome: 'safe', capUnchecked: false })
+    await dead.end()
+  })
+
   it('sends a flagged click on and marks it seen, but never consumes the cap', async () => {
     const capped = link({
       id: '00000000-0000-4000-8000-0000000000b2',
