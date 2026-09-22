@@ -117,7 +117,7 @@ export interface TableUpdate {
 }
 
 /** A Node fs error (EACCES, EIO, EISDIR, EMFILE, …) carries a string `code`; a parse or schema failure (SyntaxError, ZodError, the size-bound Error) does not. */
-function isIoError(err: unknown): boolean {
+export function isIoError(err: unknown): boolean {
   return (
     typeof err === 'object' && err !== null && typeof (err as { code?: unknown }).code === 'string'
   )
