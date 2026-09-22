@@ -1,16 +1,27 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gzipSync } from 'node:zlib'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { LOCK_FILE, takeLock } from './lock.js'
 import { SOURCES, SOURCE_IDS, type SourceDef } from './sources.js'
-import { IpDataStore, readManifest } from './store.js'
+import { IpDataStore, type Manifest, readManifest } from './store.js'
 import {
+  DOWNLOAD_TIMEOUT_MS,
   type FetchResult,
   type Fetcher,
   LOCK_STALE_MS,
+  MAX_REDIRECTS,
   fetchBounded,
   runUpdate,
   startUpdater,
@@ -34,13 +45,23 @@ const edition = (now: Date, back: 0 | 1) => SOURCES.country.candidates(now)[back
 
 /** Serves each source's fixture; `missing` URLs answer 404, `failing` ones throw. */
 function fakeFetch(
-  opts: { missing?: (url: string) => boolean; failing?: (url: string) => boolean } = {},
+  opts: {
+    missing?: (url: string) => boolean
+    failing?: (url: string) => boolean
+    /** A body to serve instead of the fixture. */
+    body?: (url: string) => Uint8Array | undefined
+    /** Runs as each request is made. */
+    onFetch?: (url: string, o: Parameters<Fetcher>[1]) => void
+  } = {},
 ) {
   const calls: string[] = []
-  const fetch: Fetcher = async (url) => {
+  const fetch: Fetcher = async (url, o) => {
     calls.push(url)
+    opts.onFetch?.(url, o)
     if (opts.failing?.(url)) throw new Error('connection refused')
     if (opts.missing?.(url)) return { status: 'not_found' }
+    const own = opts.body?.(url)
+    if (own) return { status: 'ok', body: own }
     const id = url.includes('country')
       ? 'country'
       : url.includes('asn-lite')
@@ -53,7 +74,15 @@ function fakeFetch(
   return { fetch, calls }
 }
 
-const tmp = () => mkdtempSync(join(tmpdir(), 'clickmonk-update-'))
+const dirs: string[] = []
+const tmp = () => {
+  const dir = mkdtempSync(join(tmpdir(), 'clickmonk-update-'))
+  dirs.push(dir)
+  return dir
+}
+afterAll(() => {
+  for (const d of dirs) rmSync(d, { recursive: true, force: true })
+})
 
 describe('runUpdate', () => {
   it('installs every source into a fresh directory, and the store reads it', async () => {
@@ -102,10 +131,11 @@ describe('runUpdate', () => {
 
   it('keeps the table in use when a download fails or is refused', async () => {
     const dir = tmp()
-    await runUpdate({ dir, fetch: fakeFetch().fetch, sources: small() })
+    const now = new Date()
+    await runUpdate({ dir, now: () => now, fetch: fakeFetch().fetch, sources: small() })
     const before = readManifest(dir)
     const { fetch } = fakeFetch({ failing: (u) => u.includes('onionoo') })
-    const r = await runUpdate({ dir, fetch, sources: small(), force: true })
+    const r = await runUpdate({ dir, now: () => now, fetch, sources: small(), force: true })
     expect(r).toContainEqual({ id: 'tor', outcome: 'failed', error: 'connection refused' })
     expect(readManifest(dir)?.sources.tor).toEqual(before?.sources.tor)
   })
@@ -161,9 +191,10 @@ describe('runUpdate', () => {
 
   it('treats every source as due when the manifest is invalid, and the commit heals it', async () => {
     const dir = tmp()
-    await runUpdate({ dir, fetch: fakeFetch().fetch, sources: small() })
+    const now = new Date()
+    await runUpdate({ dir, now: () => now, fetch: fakeFetch().fetch, sources: small() })
     writeFileSync(join(dir, 'manifest.json'), '{ not json')
-    const r = await runUpdate({ dir, fetch: fakeFetch().fetch, sources: small() })
+    const r = await runUpdate({ dir, now: () => now, fetch: fakeFetch().fetch, sources: small() })
     expect(r !== 'busy' && r.map((s) => s.outcome)).toEqual([
       'updated',
       'updated',
@@ -180,9 +211,10 @@ describe('runUpdate', () => {
 
   it('makes no request for a source fetched within its refresh interval, unless forced', async () => {
     const dir = tmp()
-    await runUpdate({ dir, fetch: fakeFetch().fetch, sources: small() })
+    const now = new Date()
+    await runUpdate({ dir, now: () => now, fetch: fakeFetch().fetch, sources: small() })
     const quiet = fakeFetch()
-    const r = await runUpdate({ dir, fetch: quiet.fetch, sources: small() })
+    const r = await runUpdate({ dir, now: () => now, fetch: quiet.fetch, sources: small() })
     expect(quiet.calls).toEqual([])
     expect(r !== 'busy' && r.map((s) => s.outcome)).toEqual([
       'not_due',
@@ -191,25 +223,33 @@ describe('runUpdate', () => {
       'not_due',
     ])
     const forced = fakeFetch()
-    await runUpdate({ dir, fetch: forced.fetch, sources: small(), force: true })
+    await runUpdate({ dir, now: () => now, fetch: forced.fetch, sources: small(), force: true })
     expect(forced.calls.some((u) => u.includes('onionoo'))).toBe(true)
   })
 
   it('does not download a DB-IP edition it already has', async () => {
     const dir = tmp()
-    await runUpdate({ dir, fetch: fakeFetch().fetch, sources: small() })
+    const now = new Date()
+    await runUpdate({ dir, now: () => now, fetch: fakeFetch().fetch, sources: small() })
     const again = fakeFetch()
-    const r = await runUpdate({ dir, fetch: again.fetch, sources: small(), force: true })
+    const r = await runUpdate({
+      dir,
+      now: () => now,
+      fetch: again.fetch,
+      sources: small(),
+      force: true,
+    })
     expect(again.calls.filter((u) => u.includes('db-ip'))).toEqual([])
     expect(r).toContainEqual(expect.objectContaining({ id: 'country', outcome: 'unchanged' }))
   })
 
   it('remembers content found unchanged, and does not fetch it again within the interval', async () => {
     const dir = tmp()
-    await runUpdate({ dir, fetch: fakeFetch().fetch, sources: small() })
+    const now = new Date()
+    await runUpdate({ dir, now: () => now, fetch: fakeFetch().fetch, sources: small() })
     const checked = new Map()
     // Past Tor's refresh interval, the content is fetched and found unchanged...
-    const later = Date.now() + SOURCES.tor.refreshMs + 60_000
+    const later = now.getTime() + SOURCES.tor.refreshMs + 60_000
     const first = fakeFetch()
     await runUpdate({
       dir,
@@ -234,11 +274,120 @@ describe('runUpdate', () => {
 
   it('reports unchanged content without writing a new manifest', async () => {
     const dir = tmp()
-    await runUpdate({ dir, fetch: fakeFetch().fetch, sources: small() })
+    const now = new Date()
+    await runUpdate({ dir, now: () => now, fetch: fakeFetch().fetch, sources: small() })
     const before = readManifest(dir)
-    const r = await runUpdate({ dir, fetch: fakeFetch().fetch, sources: small(), force: true })
+    const r = await runUpdate({
+      dir,
+      now: () => now,
+      fetch: fakeFetch().fetch,
+      sources: small(),
+      force: true,
+    })
     expect(r).toContainEqual(expect.objectContaining({ id: 'tor', outcome: 'unchanged' }))
     expect(readManifest(dir)).toEqual(before)
+  })
+
+  it('writes the manifest once, after every download, into a fresh directory', async () => {
+    const dir = tmp()
+    let seen: Manifest | null | 'unread' = 'unread'
+    const { fetch } = fakeFetch({
+      onFetch: (u) => {
+        if (u.includes('onionoo')) seen = readManifest(dir)
+      },
+    })
+    await runUpdate({ dir, fetch, sources: small() })
+    expect(seen).toBeNull()
+    expect(Object.keys(readManifest(dir)?.sources ?? {})).toHaveLength(4)
+  })
+
+  it('writes the manifest once, after every download, over an existing one', async () => {
+    const dir = tmp()
+    const now = new Date()
+    await runUpdate({ dir, now: () => now, fetch: fakeFetch().fetch, sources: small() })
+    const before = readManifest(dir)
+    let seen: Manifest | null | 'unread' = 'unread'
+    const { fetch } = fakeFetch({
+      // A new datacenter list, fetched before Tor.
+      body: (u) =>
+        u.includes('bad-asn')
+          ? new TextEncoder().encode('ASN,Entity\n64501,Example Hosting\n64502,Example Cloud\n')
+          : undefined,
+      onFetch: (u) => {
+        if (u.includes('onionoo')) seen = readManifest(dir)
+      },
+    })
+    const r = await runUpdate({ dir, now: () => now, fetch, sources: small(), force: true })
+    expect(r).toContainEqual(expect.objectContaining({ id: 'datacenter', outcome: 'updated' }))
+    expect(seen).toEqual(before)
+    expect(readManifest(dir)?.sources.datacenter).not.toEqual(before?.sources.datacenter)
+  })
+
+  it("falls back to last month's edition when this month's is published but refused", async () => {
+    const dir = tmp()
+    const now = new Date()
+    const { fetch } = fakeFetch({
+      body: (u) =>
+        u.includes(`country-lite-${edition(now, 0)}`) ? gzipSync('not,a csv\n') : undefined,
+    })
+    const r = await runUpdate({ dir, now: () => now, fetch, sources: small() })
+    expect(r).toContainEqual({
+      id: 'country',
+      outcome: 'updated',
+      version: edition(now, 1),
+      refused: expect.stringMatching(new RegExp(`^${edition(now, 0)} refused: `)),
+    })
+  })
+
+  it('fails a source when every published edition is refused', async () => {
+    const dir = tmp()
+    const now = new Date()
+    const { fetch } = fakeFetch({
+      body: (u) => (u.includes('country-lite') ? gzipSync('not,a csv\n') : undefined),
+    })
+    const r = await runUpdate({ dir, now: () => now, fetch, sources: small() })
+    expect(r).toContainEqual({
+      id: 'country',
+      outcome: 'failed',
+      error: expect.stringMatching(
+        new RegExp(`${edition(now, 0)} refused: .*; ${edition(now, 1)} refused: `),
+      ),
+    })
+    expect(readManifest(dir)?.sources.country).toBeUndefined()
+  })
+
+  it('caps a plain download at its text bound, and waits two minutes by default', async () => {
+    const dir = tmp()
+    const seen = new Map<string, Parameters<Fetcher>[1]>()
+    const { fetch } = fakeFetch({ onFetch: (u, o) => seen.set(u, o) })
+    await runUpdate({ dir, fetch, sources: small() })
+    const opts = [...seen.entries()]
+    const tor = opts.find(([u]) => u.includes('onionoo'))?.[1]
+    const country = opts.find(([u]) => u.includes('country-lite'))?.[1]
+    // Tor is plain and may download far more than it may parse.
+    expect(SOURCES.tor.maxDownloadBytes).toBeGreaterThan(SOURCES.tor.maxTextBytes)
+    expect(tor?.maxBytes).toBe(SOURCES.tor.maxTextBytes)
+    expect(country?.maxBytes).toBe(SOURCES.country.maxDownloadBytes)
+    expect(DOWNLOAD_TIMEOUT_MS).toBe(120_000)
+    expect(opts.every(([, o]) => o.timeoutMs === 120_000)).toBe(true)
+  })
+
+  it("reports a network error's cause", async () => {
+    const dir = tmp()
+    // A port that was just free: nothing listens on it.
+    const probe = http.createServer()
+    await new Promise<void>((r) => probe.listen(0, '127.0.0.1', r))
+    const port = (probe.address() as AddressInfo).port
+    await new Promise((r) => probe.close(r))
+    const tor = {
+      ...SOURCES.tor,
+      minimum: { k32: 1, k128: 0 },
+      candidates: () => [{ url: `http://127.0.0.1:${port}/details`, version: null }],
+    }
+    const r = await runUpdate({ dir, sources: [tor], timeoutMs: 5000 })
+    expect(r).toEqual([
+      { id: 'tor', outcome: 'failed', error: expect.stringMatching(/ECONNREFUSED/) },
+    ])
   })
 
   it('stands aside while another update holds the lock, and takes over a stale one', async () => {
@@ -254,6 +403,34 @@ describe('runUpdate', () => {
       Array.isArray(await runUpdate({ dir, fetch: fakeFetch().fetch, sources: small() })),
     ).toBe(true)
     expect(readdirSync(dir)).not.toContain('update.lock')
+  })
+})
+
+describe('takeLock', () => {
+  const stale = () => JSON.stringify({ pid: 1, at: Date.now() - LOCK_STALE_MS - 1 })
+
+  it('takes over a stale lock, and leaves nothing else behind', () => {
+    const dir = tmp()
+    writeFileSync(join(dir, LOCK_FILE), stale())
+    const now = Date.now()
+    expect(takeLock(dir, now)).toBe(true)
+    expect(JSON.parse(readFileSync(join(dir, LOCK_FILE), 'utf8'))).toEqual({
+      pid: process.pid,
+      at: now,
+    })
+    expect(readdirSync(dir)).toEqual([LOCK_FILE])
+  })
+
+  it('backs off, and puts the lock back, when another process took the stale lock over first', () => {
+    const dir = tmp()
+    writeFileSync(join(dir, LOCK_FILE), stale())
+    const theirs = JSON.stringify({ pid: 2, at: Date.now() })
+    // Between this call reading the stale lock and renaming it, another
+    // process replaced it with its own: the file renamed is that live lock.
+    const took = takeLock(dir, Date.now(), (renamed) => writeFileSync(renamed, theirs))
+    expect(took).toBe(false)
+    expect(readFileSync(join(dir, LOCK_FILE), 'utf8')).toBe(theirs)
+    expect(readdirSync(dir)).toEqual([LOCK_FILE])
   })
 })
 
@@ -304,6 +481,50 @@ describe('startUpdater', () => {
     expect(existsSync(join(dir, 'update.lock'))).toBe(false)
   })
 
+  it('keeps going when its log throws', async () => {
+    const dir = tmp()
+    const lines: string[] = []
+    let passed: () => void = () => {}
+    const firstPass = new Promise<void>((r) => {
+      passed = r
+    })
+    const log = (m: string) => {
+      lines.push(m)
+      if (lines.length === 4) passed()
+      throw new Error('log is broken')
+    }
+    const u = startUpdater({ dir, fetch: fakeFetch().fetch, sources: small(), log })
+    await firstPass
+    await expect(u.stop()).resolves.toBeUndefined()
+    expect(lines).toHaveLength(4)
+  })
+
+  it('logs a refused edition, and the one it used instead', async () => {
+    const dir = tmp()
+    const now = new Date()
+    const lines: string[] = []
+    let passed: () => void = () => {}
+    const firstPass = new Promise<void>((r) => {
+      passed = r
+    })
+    const log = (m: string) => {
+      lines.push(m)
+      if (m.startsWith('IP data tor ')) passed()
+    }
+    const { fetch } = fakeFetch({
+      body: (u) =>
+        u.includes(`country-lite-${edition(now, 0)}`) ? gzipSync('not,a csv\n') : undefined,
+    })
+    const u = startUpdater({ dir, fetch, sources: small(), log })
+    await firstPass
+    await u.stop()
+    expect(lines).toContainEqual(
+      expect.stringMatching(
+        new RegExp(`^IP data country: ${edition(now, 0)} refused: .*; using ${edition(now, 1)}$`),
+      ),
+    )
+  })
+
   it('aborts a download in flight when stopped, and releases the lock', async () => {
     const dir = tmp()
     let started: () => void = () => {}
@@ -333,6 +554,7 @@ describe('startUpdater', () => {
 describe('fetchBounded', () => {
   let server: http.Server
   let base = ''
+  let port = 0
   beforeAll(async () => {
     server = http.createServer((req, res) => {
       if (req.url === '/ok') return res.end('hello')
@@ -346,10 +568,21 @@ describe('fetchBounded', () => {
         res.end('x'.repeat(60))
         return
       }
+      const hop = req.url?.match(/^\/hops\/(\d+)$/)
+      if (hop) {
+        const n = Number(hop[1])
+        // Relative, as a server may send it.
+        return res.writeHead(302, { location: n > 1 ? `/hops/${n - 1}` : '/ok' }).end()
+      }
+      if (req.url === '/to-https') {
+        return res.writeHead(301, { location: `https://127.0.0.1:${port}/ok` }).end()
+      }
+      if (req.url === '/no-location') return res.writeHead(302).end()
       // /slow: never answers.
     })
     await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
-    base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+    port = (server.address() as AddressInfo).port
+    base = `http://127.0.0.1:${port}`
   })
   afterAll(async () => {
     server.closeAllConnections()
@@ -373,9 +606,38 @@ describe('fetchBounded', () => {
     await expect(get('/streamed-big')).rejects.toThrow(/larger than 50/)
   })
 
+  it('follows a redirect to the same scheme, up to its bound', async () => {
+    const r = await get(`/hops/${MAX_REDIRECTS}`)
+    expect(r.status === 'ok' && Buffer.from(r.body).toString()).toBe('hello')
+    expect(MAX_REDIRECTS).toBe(3)
+  })
+
+  it('refuses one redirect too many', async () => {
+    await expect(get(`/hops/${MAX_REDIRECTS + 1}`)).rejects.toThrow(/more than 3 redirects/)
+  })
+
+  // The rule is that a redirect keeps the original URL's scheme, which is
+  // what forbids https to http. The fixture server is plain http, so the
+  // test shows the rule refusing a change of scheme in the other direction.
+  it('refuses a redirect to another scheme', async () => {
+    await expect(get('/to-https')).rejects.toThrow(
+      /redirect to https: refused, only http: is followed/,
+    )
+  })
+
+  it('refuses a redirect without a location', async () => {
+    await expect(get('/no-location')).rejects.toThrow(/HTTP 302 without a location/)
+  })
+
   // Its subject is the time bound itself, so it lets that timer fire.
   it('gives up on a server that does not answer', async () => {
-    await expect(get('/slow', 200)).rejects.toThrow()
+    await expect(get('/slow', 200)).rejects.toMatchObject({ name: 'TimeoutError' })
+  })
+
+  it('still gives up at its time bound when it has a signal', async () => {
+    const c = new AbortController()
+    const r = fetchBounded(`${base}/slow`, { maxBytes: 50, timeoutMs: 200, signal: c.signal })
+    await expect(r).rejects.toMatchObject({ name: 'TimeoutError' })
   })
 
   it('gives up when its signal aborts', async () => {
@@ -383,6 +645,6 @@ describe('fetchBounded', () => {
     // A time bound far past the test's own timeout: only the signal can end it.
     const r = fetchBounded(`${base}/slow`, { maxBytes: 50, timeoutMs: 600_000, signal: c.signal })
     c.abort()
-    await expect(r).rejects.toThrow()
+    await expect(r).rejects.toMatchObject({ name: 'AbortError' })
   })
 })

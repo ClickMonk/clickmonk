@@ -1,6 +1,5 @@
-import { closeSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
+import { releaseLock, takeLock } from './lock.js'
 import {
   SOURCES,
   SOURCE_IDS,
@@ -10,6 +9,7 @@ import {
   contentVersion,
 } from './sources.js'
 import { type TableUpdate, commitTables, isIoError, readManifest } from './store.js'
+import type { RangeTable } from './table.js'
 
 export type FetchResult = { status: 'ok'; body: Uint8Array } | { status: 'not_found' }
 export type Fetcher = (
@@ -17,16 +17,43 @@ export type Fetcher = (
   opts: { maxBytes: number; timeoutMs: number; signal?: AbortSignal },
 ) => Promise<FetchResult>
 
+export { LOCK_STALE_MS } from './lock.js'
+
+/** How long one download may take, redirects included. */
+export const DOWNLOAD_TIMEOUT_MS = 120_000
+/** Redirects one download may follow. */
+export const MAX_REDIRECTS = 3
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
+
 /**
  * One download, bounded in size and in time, and abandoned when `signal`
  * aborts. A 404 is an answer, not an error: a DB-IP edition may not be out yet.
+ * It follows at most `MAX_REDIRECTS` redirects, each only to a URL with the
+ * original's scheme, so an https download is never carried to plain http.
  */
 export const fetchBounded: Fetcher = async (url, { maxBytes, timeoutMs, signal }) => {
   const timeout = AbortSignal.timeout(timeoutMs)
-  const res = await fetch(url, {
-    signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
-    headers: { 'user-agent': 'ClickMonk IP data updater' },
-  })
+  const bound = signal ? AbortSignal.any([timeout, signal]) : timeout
+  const scheme = new URL(url).protocol
+  let at = url
+  let res: Response
+  for (let hops = 0; ; hops++) {
+    res = await fetch(at, {
+      signal: bound,
+      redirect: 'manual',
+      headers: { 'user-agent': 'ClickMonk IP data updater' },
+    })
+    if (!REDIRECT_STATUSES.has(res.status)) break
+    await res.body?.cancel()
+    const location = res.headers.get('location')
+    if (location === null) throw new Error(`${at}: HTTP ${res.status} without a location`)
+    const next = new URL(location, at)
+    if (next.protocol !== scheme) {
+      throw new Error(`${at}: redirect to ${next.protocol} refused, only ${scheme} is followed`)
+    }
+    if (hops === MAX_REDIRECTS) throw new Error(`${url}: more than ${MAX_REDIRECTS} redirects`)
+    at = next.href
+  }
   if (res.status === 404) {
     await res.body?.cancel()
     return { status: 'not_found' }
@@ -61,6 +88,8 @@ export interface SourceResult {
   outcome: UpdateOutcome
   version?: string
   error?: string
+  /** Why a newer edition that was published was refused in favour of `version`. */
+  refused?: string
 }
 
 export interface UpdateOptions {
@@ -82,32 +111,15 @@ export interface UpdateOptions {
   signal?: AbortSignal
 }
 
-const LOCK_FILE = 'update.lock'
-/** A lock older than this was left by a process that died; no update runs this long. */
-export const LOCK_STALE_MS = 30 * 60_000
-
-/** True when this process now holds the lock. */
-function takeLock(dir: string, now: number): boolean {
-  const path = join(dir, LOCK_FILE)
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const fd = openSync(path, 'wx')
-      writeFileSync(fd, JSON.stringify({ pid: process.pid, at: now }))
-      closeSync(fd)
-      return true
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
-      let at = 0
-      try {
-        at = Number((JSON.parse(readFileSync(path, 'utf8')) as { at?: unknown }).at) || 0
-      } catch {
-        // Unreadable: treat as stale.
-      }
-      if (now - at < LOCK_STALE_MS) return false
-      rmSync(path, { force: true })
-    }
-  }
-  return false
+/**
+ * An error's message with its cause's: `fetch` reports every network
+ * failure as "fetch failed" and keeps ECONNREFUSED or ENOTFOUND in `cause`.
+ */
+function describe(err: unknown): string {
+  if (!(err instanceof Error)) return String(err)
+  const cause = err.cause as { message?: unknown; code?: unknown } | undefined
+  const detail = cause?.message || cause?.code
+  return typeof detail === 'string' && detail !== '' ? `${err.message} (${detail})` : err.message
 }
 
 async function updateOne(
@@ -116,9 +128,17 @@ async function updateOne(
   o: Required<Pick<UpdateOptions, 'fetch' | 'timeoutMs'>> & Pick<UpdateOptions, 'signal'>,
   now: Date,
 ): Promise<{ result: SourceResult; update?: TableUpdate }> {
+  // A newer edition that is published but refused (it fails to parse or
+  // falls short of the minimum) gives way to the one before it, as a
+  // missing one does. A failed download does not: that is not the edition.
+  const refused: string[] = []
+  const withRefused = (r: SourceResult): SourceResult =>
+    refused.length > 0 ? { ...r, refused: refused.join('; ') } : r
   for (const candidate of def.candidates(now)) {
     if (candidate.version !== null && candidate.version === current?.version) {
-      return { result: { id: def.id, outcome: 'unchanged', version: current.version } }
+      return {
+        result: withRefused({ id: def.id, outcome: 'unchanged', version: current.version }),
+      }
     }
     const res = await o.fetch(candidate.url, {
       maxBytes: def.gzip ? def.maxDownloadBytes : Math.min(def.maxDownloadBytes, def.maxTextBytes),
@@ -128,26 +148,37 @@ async function updateOne(
     if (res.status === 'not_found') continue
     const version = candidate.version ?? contentVersion(res.body)
     if (version === current?.version) {
-      return { result: { id: def.id, outcome: 'unchanged', version } }
+      return { result: withRefused({ id: def.id, outcome: 'unchanged', version }) }
     }
-    // A plain download is its text, so it is held to maxTextBytes as well
-    // (checked here too, since a fetcher need not honour maxBytes); a
-    // compressed one is refused as soon as it unpacks past maxTextBytes.
-    if (!def.gzip && res.body.byteLength > def.maxTextBytes) {
-      throw new Error(`${def.id}: larger than ${def.maxTextBytes} bytes`)
-    }
-    const raw = def.gzip ? gunzipSync(res.body, { maxOutputLength: def.maxTextBytes }) : res.body
-    const table = def.parse(
-      Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength).toString('utf8'),
-      def.limits,
-    )
-    checkMinimum(def.id, table, def.minimum)
-    return {
-      result: { id: def.id, outcome: 'updated', version },
-      update: { table, version, fetchedAt: now },
+    try {
+      const table = validate(def, res.body)
+      return {
+        result: withRefused({ id: def.id, outcome: 'updated', version }),
+        update: { table, version, fetchedAt: now },
+      }
+    } catch (err) {
+      refused.push(`${candidate.version ?? 'download'} refused: ${describe(err)}`)
     }
   }
+  if (refused.length > 0) throw new Error(refused.join('; '))
   throw new Error('no edition published at any of the expected addresses')
+}
+
+/** Unpacks, parses and checks one download; throws if it may not replace the table in use. */
+function validate(def: SourceDef, body: Uint8Array): RangeTable {
+  // A plain download is its text, so it is held to maxTextBytes as well
+  // (checked here too, since a fetcher need not honour maxBytes); a
+  // compressed one is refused as soon as it unpacks past maxTextBytes.
+  if (!def.gzip && body.byteLength > def.maxTextBytes) {
+    throw new Error(`${def.id}: larger than ${def.maxTextBytes} bytes`)
+  }
+  const raw = def.gzip ? gunzipSync(body, { maxOutputLength: def.maxTextBytes }) : body
+  const table = def.parse(
+    Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength).toString('utf8'),
+    def.limits,
+  )
+  checkMinimum(def.id, table, def.minimum)
+  return table
 }
 
 /**
@@ -160,7 +191,7 @@ export async function runUpdate(opts: UpdateOptions): Promise<SourceResult[] | '
   const now = (opts.now ?? (() => new Date()))()
   const o = {
     fetch: opts.fetch ?? fetchBounded,
-    timeoutMs: opts.timeoutMs ?? 120_000,
+    timeoutMs: opts.timeoutMs ?? DOWNLOAD_TIMEOUT_MS,
     ...(opts.signal ? { signal: opts.signal } : {}),
   }
   if (!takeLock(opts.dir, now.getTime())) return 'busy'
@@ -198,14 +229,14 @@ export async function runUpdate(opts: UpdateOptions): Promise<SourceResult[] | '
         results.push({
           id: def.id,
           outcome: 'failed',
-          error: err instanceof Error ? err.message : String(err),
+          error: describe(err),
         })
       }
     }
     if (Object.keys(updates).length > 0) commitTables(opts.dir, updates)
     return results
   } finally {
-    rmSync(join(opts.dir, LOCK_FILE), { force: true })
+    releaseLock(opts.dir)
   }
 }
 
@@ -218,7 +249,14 @@ export function startUpdater(opts: {
   log?: (msg: string, err?: unknown) => void
 }): { stop(): Promise<void> } {
   const interval = opts.intervalMs ?? 3_600_000
-  const log = opts.log ?? (() => {})
+  // The loop must never reject, so a logger that throws is ignored.
+  const log = (msg: string, err?: unknown) => {
+    try {
+      opts.log?.(msg, err)
+    } catch {
+      // A broken logger must not stop the updates.
+    }
+  }
   const checked = new Map<SourceId, number>()
   // Aborts a download in flight on stop(), so the lock is released at once.
   const abort = new AbortController()
@@ -238,6 +276,7 @@ export function startUpdater(opts: {
         if (r === 'busy') log('IP data update skipped: another update holds the lock')
         else {
           for (const s of r) {
+            if (s.refused) log(`IP data ${s.id}: ${s.refused}; using ${s.version ?? 'none'}`)
             if (s.outcome === 'updated') log(`IP data ${s.id} updated to ${s.version}`)
             if (s.outcome === 'failed')
               log(`IP data ${s.id} update failed; keeping the table in use: ${s.error}`)
