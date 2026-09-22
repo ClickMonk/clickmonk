@@ -54,6 +54,11 @@ function orderCount(log: string): number {
   return log.split(NEW_ORDER).length - 1
 }
 
+/** The same count, read from the authority now. */
+function ordersSoFar(): number {
+  return orderCount(acmeLog())
+}
+
 let setUp = false
 let failures = 0
 
@@ -154,19 +159,30 @@ describe('publishing the token', () => {
 
   it('leaves the domain that published nothing with neither', () => {
     expect(curl([`http://${PENDING}/d`]).status).toBe(404)
+    // The authority has issued for the verified host by now, so the gate is
+    // open for this install: whatever it refuses below, it refuses per domain.
+    // Without this the count either side of the request could be zero and
+    // everything after it would hold on an install that never reached the
+    // authority at all.
+    const before = ordersSoFar()
+    expect(
+      before,
+      'the authority issued nothing at all, so the next lines prove nothing',
+    ).toBeGreaterThan(0)
+
     const r = curl(['-k', '--max-time', '30', `https://${PENDING}/d`])
-    // The sharp one, and again before the handshake's result. The authority has
-    // issued for the verified host by now, so the gate is open for this
-    // install — and still exactly one certificate was ever asked for, and this
-    // name was never one of them. That is what makes the gate per-domain
-    // rather than a switch the first verified domain throws for every host
-    // pointed at the server.
-    const log = acmeLog()
-    expect(log, 'the authority issued nothing at all, so the next lines prove nothing').toContain(
-      NEW_ORDER,
-    )
-    expect(orderCount(log), 'the authority was asked for a certificate it should not have').toBe(1)
-    expect(log, 'the authority was asked about a name that published no token').not.toContain(
+
+    // The sharp one, and before the handshake's own result. A count read either
+    // side of the request rather than an absolute one: any order opened while
+    // this install is asked for an unverified name is a breach whether or not
+    // the authority ever names it, and Caddy retrying the *verified* host's
+    // order is not — an absolute count could not tell those apart.
+    expect(
+      ordersSoFar() - before,
+      'the authority was asked for a certificate while an unverified name was requested',
+    ).toBe(0)
+    // Kept as well: it catches a breach whose order opens outside that window.
+    expect(acmeLog(), 'the authority was asked about a name that published no token').not.toContain(
       PENDING,
     )
     expect(r.status).toBe(0)
