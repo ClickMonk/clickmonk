@@ -1,6 +1,7 @@
 import { existsSync, mkdtempSync, readFileSync, writeFileSync, writeSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { Pool } from '@clickmonk/db'
 import { TEST_PG_URL, resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import {
@@ -244,6 +245,69 @@ describe('SnapshotStore', () => {
     // never up to hear it.
     ;(store as unknown as { o: { pgUrl: string } }).o.pgUrl = TEST_PG_URL
     await until(() => (store.current()?.link(domainId, 'late') ?? null) !== null)
+  })
+
+  it('keeps the newer snapshot when an older reload finishes after it', async () => {
+    const { domainId } = await seed()
+    // The first connection the store takes is held after its first query,
+    // the count. Its REPEATABLE READ transaction has already fixed what it
+    // will read, so however late it finishes, it returns the configuration
+    // from before the change below. Every query still runs on real Postgres;
+    // the wrapper only adds the wait.
+    let release = () => {}
+    const gate = new Promise<void>((r) => {
+      release = r
+    })
+    let parked = () => {}
+    const isParked = new Promise<void>((r) => {
+      parked = r
+    })
+    let first = true
+    const slowFirst = {
+      connect: async () => {
+        const client = await pool.connect()
+        if (!first) return client
+        first = false
+        const query = client.query.bind(client) as (...a: unknown[]) => Promise<unknown>
+        return {
+          query: async (...args: unknown[]) => {
+            const result = await query(...args)
+            if (String(args[0]).startsWith('SELECT count')) {
+              parked()
+              await gate
+            }
+            return result
+          },
+          release: () => client.release(),
+        }
+      },
+    } as unknown as Pool
+    const store = new SnapshotStore({
+      pgUrl: TEST_PG_URL,
+      pool: slowFirst,
+      filePath: join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json'),
+      log: () => {},
+    })
+    // Driven directly rather than through start(), so no timer or
+    // notification starts a third reload in between.
+    const reload = () => (store as unknown as { reload(): Promise<boolean> }).reload()
+
+    const older = reload()
+    await isParked
+    const l = await pool.query<{ id: string }>(
+      "INSERT INTO links (domain_id, slug) VALUES ($1, 'newer') RETURNING id",
+      [domainId],
+    )
+    await pool.query(
+      "INSERT INTO link_targets (link_id, url, weight, position) VALUES ($1, 'https://example.com/n', 100, 0)",
+      [l.rows[0]?.id],
+    )
+    expect(await reload()).toBe(true)
+    expect(store.current()?.link(domainId, 'newer') ?? null).not.toBeNull()
+
+    release()
+    expect(await older).toBe(true)
+    expect(store.current()?.link(domainId, 'newer') ?? null).not.toBeNull()
   })
 
   it('keeps the previous snapshot when a reload fails', async () => {
