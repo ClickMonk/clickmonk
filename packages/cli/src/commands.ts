@@ -145,7 +145,7 @@ async function ipdataUpdate(d: CliDeps): Promise<boolean> {
   }
   for (const s of r) {
     d.out(
-      `${s.id}: ${s.outcome}${s.version ? ` ${s.version}` : ''}${s.error ? ` (${s.error})` : ''}`,
+      `${s.id}: ${s.outcome}${s.version ? ` ${s.version}` : ''}${s.error ? ` (${s.error})` : ''}${s.refused ? `; ${s.refused}` : ''}`,
     )
   }
   return r.every((s) => s.outcome !== 'failed')

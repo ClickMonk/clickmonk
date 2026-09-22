@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gzipSync } from 'node:zlib'
@@ -181,6 +181,7 @@ describe('clickmonk ipdata', () => {
     lines.length = 0
     expect(await run('ipdata', 'status')).toBe(0)
     expect(lines).toContain('country: dbip-country-lite, not downloaded yet')
+    expect(lines.some((l) => l.includes('https://'))).toBe(false)
   })
 
   it('downloads every source, then reports each with its attribution', async () => {
@@ -196,6 +197,11 @@ describe('clickmonk ipdata', () => {
     expect(
       lines.filter((l) => l.startsWith('IP Geolocation by DB-IP (https://db-ip.com)')),
     ).toHaveLength(1)
+    // Run again at once: the update is forced, so no source is skipped as not due.
+    lines.length = 0
+    expect(await ip(dir, fetchAll(), 'ipdata', 'update')).toBe(0)
+    expect(lines).toHaveLength(4)
+    expect(lines.filter((l) => /not_due/.test(l))).toEqual([])
   })
 
   it('exits 4 when a source fails, and still installs the others', async () => {
@@ -204,5 +210,29 @@ describe('clickmonk ipdata', () => {
     expect(await ip(dir, fetchAll(true), 'ipdata', 'update')).toBe(4)
     expect(lines).toContain('tor: failed (connection refused)')
     expect(lines.filter((l) => /: updated /.test(l))).toHaveLength(3)
+  })
+
+  it('exits 4 while another update holds the lock', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clickmonk-cli-ipdata-'))
+    writeFileSync(join(dir, 'update.lock'), JSON.stringify({ at: Date.now() }))
+    lines.length = 0
+    expect(await ip(dir, fetchAll(), 'ipdata', 'update')).toBe(4)
+    expect(lines).toEqual(['another IP data update is running; try again when it finishes'])
+  })
+
+  it('says why a newer edition was refused when it keeps the one before', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clickmonk-cli-ipdata-'))
+    const all = fetchAll()
+    // The first country download is this month's edition; it does not parse.
+    let countryFetches = 0
+    const fetch: Fetcher = async (url, o) => {
+      if (url.includes('country') && countryFetches++ === 0) {
+        return { status: 'ok', body: gzipSync('not,a,range\n') }
+      }
+      return all(url, o)
+    }
+    lines.length = 0
+    expect(await ip(dir, fetch, 'ipdata', 'update')).toBe(0)
+    expect(lines.join('\n')).toMatch(/^country: updated \S+; \S+ refused: .+$/m)
   })
 })
