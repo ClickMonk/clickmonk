@@ -481,6 +481,20 @@ describe('classify, in order', () => {
     ).toBe('blocked')
   })
 
+  it('classifies before it sends a returning visitor to the returning URL', () => {
+    const returning = link({ returningUrl: 'https://example.com/again' })
+    const seen = { seenLink: true }
+    expect(evaluate(input({ ...blockBot, link: returning }, seen)).outcome).toBe('blocked')
+    const safeBot = {
+      traffic: traffic('bot', ['ua_bot']),
+      settings: settings({ bot: 'safe' }, 'https://example.com/safe'),
+    }
+    expect(evaluate(input({ ...safeBot, link: returning }, seen))).toMatchObject({
+      outcome: 'safe',
+      location: 'https://example.com/safe',
+    })
+  })
+
   it('carries the action through the steps after it', () => {
     const flagged = { traffic: traffic('bot', ['ua_bot']) }
     expect(evaluate(input({ ...flagged, link: link({ expiresAt: past }) }))).toMatchObject({

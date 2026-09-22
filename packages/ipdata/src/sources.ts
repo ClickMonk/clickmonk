@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { type Words, parseIp } from './ip.js'
+import { type Words, addressOnly, parseIp } from './ip.js'
 import {
   type Range32,
   type Range128,
@@ -233,22 +233,6 @@ export function parseBadAsnList(text: string, limits: TableLimits): RangeTable {
   return keySet('datacenter', asns, new Map(), limits)
 }
 
-/**
- * `203.0.113.5:443` or `[2001:db8::5]:443` to the address alone. An
- * unbracketed address with anything other than exactly one colon is
- * returned unchanged: an unbracketed IPv6 address, mapped or not, carries
- * several colons of its own and is never followed by a port here.
- */
-function stripPort(s: string): string {
-  if (s.startsWith('[')) {
-    const close = s.indexOf(']')
-    if (close < 0) throw new SourceError(`not an address: ${s.slice(0, 60)}`)
-    return s.slice(1, close)
-  }
-  const first = s.indexOf(':')
-  return first >= 0 && first === s.lastIndexOf(':') ? s.slice(0, first) : s
-}
-
 function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null
 }
@@ -290,7 +274,7 @@ export function parseOnionoo(text: string, limits: TableLimits): RangeTable {
     if (!isObject(relay)) throw new SourceError('a relay is not an object')
     const exitAddrs = stringArray(relay.exit_addresses, 'exit_addresses')
     const orAddrs = stringArray(relay.or_addresses, 'or_addresses')
-    const addresses = [...exitAddrs, ...orAddrs.map(stripPort)]
+    const addresses = [...exitAddrs, ...orAddrs.map(addressOnly)]
     for (const a of addresses) {
       const ip = parseIp(a)
       if (!ip) throw new SourceError(`not an address: ${a.slice(0, 60)}`)

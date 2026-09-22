@@ -17,10 +17,10 @@ import {
   uuidv7,
 } from '@clickmonk/core'
 import type { Pool } from '@clickmonk/db'
-import type { IpLookup } from '@clickmonk/ipdata'
+import { type IpLookup, addressOnly } from '@clickmonk/ipdata'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { checkCap, tryConsumeCap } from './cap.js'
-import { RateCounter } from './rate.js'
+import type { RateCounter } from './rate.js'
 import type { Snapshot } from './snapshot.js'
 import type { SpoolWriter } from './spool.js'
 import { readVisitor, visitorCookies } from './visitor.js'
@@ -32,8 +32,8 @@ export interface RedirectDeps {
   secret: string
   /** The loaded IP data, or null while there is none. Omitted: none. */
   ipdata?: () => IpLookup | null
-  /** Requests per address, for the abuser class. Omitted: a counter of the app's own. */
-  rate?: RateCounter
+  /** Requests per address, for the abuser class; the one `/health` reports. */
+  rate: RateCounter
   now?: () => Date
   random?: () => number
   /** `false` silences Fastify's logger (tests); omitted, it logs. */
@@ -46,23 +46,6 @@ const BODIES: Record<number, string> = {
   403: 'This link is not available here.\n',
   404: 'Not found.\n',
   410: 'This link has expired.\n',
-}
-
-/**
- * The client address alone. A proxy can name the client as
- * `[2001:db8::1]:443` or `192.0.2.1:8080`; the brackets and the port are
- * dropped so the lookup, the rate count and the record all see the address.
- * An unbracketed string with more than one colon is an IPv6 address and is
- * returned unchanged, as is anything else: the lookup refuses what is not an
- * address.
- */
-function clientAddress(raw: string): string {
-  if (raw.startsWith('[')) {
-    const close = raw.indexOf(']')
-    return close < 0 ? raw : raw.slice(1, close)
-  }
-  const colon = raw.indexOf(':')
-  return colon >= 0 && colon === raw.lastIndexOf(':') ? raw.slice(0, colon) : raw
 }
 
 /**
@@ -83,7 +66,6 @@ export function buildRedirectApp(
 ): FastifyInstance {
   const now = deps.now ?? (() => new Date())
   const random = deps.random ?? Math.random
-  const rate = deps.rate ?? new RateCounter()
   const app = Fastify({
     trustProxy: opts.trustProxy,
     logger: deps.log !== false,
@@ -124,7 +106,9 @@ export function buildRedirectApp(
     // once too rather than trusted to stay untouched across an await.
     const userAgent = (req.headers['user-agent'] ?? '').slice(0, MAX_UA_LENGTH)
     const referrer = String(req.headers.referer ?? '').slice(0, MAX_REFERRER_LENGTH)
-    const ip = clientAddress(req.ip ?? '').slice(0, 45)
+    // A proxy can name the client as `[2001:db8::1]:443` or `192.0.2.1:8080`:
+    // the lookup, the rate count and the record all take the address alone.
+    const ip = addressOnly(req.ip ?? '').slice(0, 45)
     const visitor = readVisitor(req.headers.cookie, deps.secret)
     const clickId = uuidv7()
     const at = now()
@@ -135,7 +119,7 @@ export function buildRedirectApp(
       userAgent,
       head: req.method === 'HEAD',
       // A monotonic clock: a wall clock stepped back would restart every count.
-      clicksThisMinute: rate.hit(ip, performance.now()),
+      clicksThisMinute: deps.rate.hit(ip, performance.now()),
       abuserThreshold: snapshot.settings.abuserThreshold,
       ip: ipFacts,
     })

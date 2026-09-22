@@ -119,7 +119,7 @@ function harness(
       random: () => 0.5,
       log: false,
       ipdata: () => (typeof opts.ipdata === 'function' ? opts.ipdata() : opts.ipdata) ?? null,
-      ...(opts.rate ? { rate: opts.rate } : {}),
+      rate: opts.rate ?? new RateCounter(),
       ...(opts.now ? { now: opts.now } : {}),
     },
     { trustProxy: '127.0.0.1' },
@@ -511,6 +511,7 @@ describe('redirect', () => {
         spool: { append: () => false },
         capPool: pool,
         secret: SECRET,
+        rate: new RateCounter(),
         log: false,
       },
       { trustProxy: false },
@@ -640,6 +641,31 @@ describe('traffic classification', () => {
     })
     const counters = await pool.query('SELECT 1 FROM link_counters WHERE link_id = $1', [capped.id])
     expect(counters.rowCount).toBe(0)
+  })
+
+  it('blocks a class set to block even for a visitor who has clicked the link before', async () => {
+    const { app } = harness([link()], { ipdata: IPDATA })
+    const first = await app.inject({ method: 'GET', url: '/spring', headers: from('192.0.2.7') })
+    const cookie = [first.headers['set-cookie'] ?? []]
+      .flat()
+      .map((c) => c.split(';')[0])
+      .join('; ')
+    expect(cookie).toContain('cm_seen=')
+    const blocking = harness([link()], {
+      ipdata: IPDATA,
+      settings: settings({ datacenter: 'block' }),
+    })
+    const res = await blocking.app.inject({
+      method: 'GET',
+      url: '/spring',
+      headers: from('198.51.100.7', { cookie }),
+    })
+    expect(res.statusCode).toBe(403)
+    expect(blocking.records[0]).toMatchObject({ outcome: 'blocked', returning: true })
+    // A blocked click marks nothing seen.
+    expect([res.headers['set-cookie'] ?? []].flat().some((c) => c.startsWith('cm_seen='))).toBe(
+      false,
+    )
   })
 
   it('sends a class set to safe to the safe URL, and a link override wins', async () => {

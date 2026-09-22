@@ -84,3 +84,20 @@ export function parseIp(s: string): ParsedIp | null {
   if (w[0] === 0 && w[1] === 0 && w[2] === 0xffff) return { v: 4, n: w[3] }
   return { v: 6, w }
 }
+
+/**
+ * The address alone, from the forms a proxy or a relay list names one in:
+ * `[2001:db8::5]:443` and `[2001:db8::5]` lose their brackets and port,
+ * `203.0.113.5:443` its port. An unbracketed string with more than one colon
+ * is an IPv6 address (`::ffff:192.0.2.1` included) and is returned
+ * unchanged, as is a `[` never closed: `parseIp` refuses what is still not an
+ * address. Never throws.
+ */
+export function addressOnly(s: string): string {
+  if (s.startsWith('[')) {
+    const close = s.indexOf(']')
+    return close < 0 ? s : s.slice(1, close)
+  }
+  const colon = s.indexOf(':')
+  return colon >= 0 && colon === s.lastIndexOf(':') ? s.slice(0, colon) : s
+}

@@ -46,6 +46,8 @@ const ipdata = new IpDataStore({
   log: (msg, err) => console.error(`ipdata: ${msg}`, err ?? ''),
 })
 const ipdataStarted = ipdata.start()
+/** How long shutdown waits for a start still loading the IP data. */
+const IPDATA_STOP_WAIT_MS = 5_000
 const rate = new RateCounter()
 
 const app = buildRedirectApp(
@@ -81,8 +83,17 @@ async function shutdown(signal: string): Promise<void> {
     spool.close()
     await internal.close()
     await store.stop()
-    // A start still loading would set its poll timer after a stop.
-    await ipdataStarted
+    // A start still loading would set its poll timer after a stop, so wait
+    // for it, but not for long: a stalled disk read must not hang the drain.
+    // The poll timer is unref'd and cannot keep the process alive.
+    let waited: NodeJS.Timeout | undefined
+    await Promise.race([
+      ipdataStarted,
+      new Promise<void>((resolve) => {
+        waited = setTimeout(resolve, IPDATA_STOP_WAIT_MS)
+      }),
+    ])
+    clearTimeout(waited)
     ipdata.stop()
     await Promise.allSettled([configPool.end(), capPool.end()])
   } catch (err) {

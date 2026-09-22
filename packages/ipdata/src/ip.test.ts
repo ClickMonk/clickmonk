@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseIp } from './ip.js'
+import { addressOnly, parseIp } from './ip.js'
 
 describe('parseIp', () => {
   it.each([
@@ -43,5 +43,20 @@ describe('parseIp', () => {
     'example.com',
   ])('refuses %j', (s) => {
     expect(parseIp(s)).toBeNull()
+  })
+})
+
+describe('addressOnly', () => {
+  it.each([
+    ['[2001:db8::5]:443', '2001:db8::5'],
+    ['[2001:db8::5]', '2001:db8::5'],
+    ['203.0.113.5:443', '203.0.113.5'],
+    ['203.0.113.5', '203.0.113.5'],
+    ['2001:db8::5', '2001:db8::5'],
+    ['::ffff:192.0.2.1', '::ffff:192.0.2.1'],
+    // Unclosed: returned as it is, for parseIp to refuse.
+    ['[2001:db8::5', '[2001:db8::5'],
+  ])('%s -> %s', (s, want) => {
+    expect(addressOnly(s)).toBe(want)
   })
 })
