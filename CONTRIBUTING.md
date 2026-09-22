@@ -1,6 +1,6 @@
 # Contributing to ClickMonk
 
-Thanks for your interest. ClickMonk has no code yet, so the most useful contributions right now are use cases, problems you hit with the link tracking you run today, and feedback via [issues](../../issues).
+Thanks for your interest. ClickMonk is early: the redirect and the click pipeline run, but most of the product is not built yet (see the status section of the [README](README.md)). The most useful contributions right now are use cases, problems you hit with the link tracking you run today, and feedback via [issues](../../issues).
 
 **Found a security problem? Do not open an issue.** Use [private vulnerability reporting](../../security/advisories/new) (the "Report a vulnerability" button on the Security tab) or email `hello@clickmonk.co` with `security` in the subject. See [SECURITY.md](SECURITY.md) for what to include and what to expect. ClickMonk is self-hosted, so a public report is a set of instructions for attacking every install that has not upgraded yet.
 

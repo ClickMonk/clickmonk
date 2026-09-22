@@ -41,8 +41,23 @@ run it on their own infrastructure; their click data stays theirs.
 
 ## Current status
 
-**Pre-code.** The repository holds the license, the community files and CI. There is no
-product, no install and no API yet. Do not write documentation that implies otherwise.
+**Early, unreleased, not for production.** What exists: the redirect (in-memory snapshot,
+spool before response, click caps), the worker (spool to ClickHouse, migrations on
+boot), the CLI (`migrate`, `domain add`, `link add`), a Compose stack, and the restart
+durability suite.
+
+What does not exist yet, and must not be implied by any documentation:
+
+- **TLS.** The redirect serves plain HTTP on 8080. Visitor cookies are `Secure`, so
+  browsers drop them over HTTP and returning-visitor routing does not work until TLS.
+- **Admin API and UI.** Links and domains are added with the CLI. `domain add` marks a
+  domain verified without a DNS check.
+- **Reporting.** Clicks reach ClickHouse; there are no reports or exports.
+- **IP lookup and traffic classification.** The country is always empty, so an
+  allow-list link sends everyone to its backup URL.
+- **Password links, backup and restore.**
+- Segments ClickHouse rejects are set aside as `.bad` files, and nothing reports them.
+- One redirect process per spool directory.
 
 ## Stack and layout
 
@@ -88,6 +103,10 @@ pnpm test
 each other by name, which resolves to the *built* `dist/`, and `dist/` is not committed.
 A test in `packages/redirect` exercising a change in `packages/core` runs against the
 last build until you rebuild; it stays green and the green means nothing.
+
+The image is compiled with `pnpm build:image` instead, which uses each package's
+`tsconfig.build.json` to leave out the tests and `packages/db/src/testing.ts`. A new
+test-only file that is not named `*.test.ts` must be excluded there too, or it ships.
 
 **While iterating, run the focused test files for what you touched.** Before opening a
 pull request, run the full gate in CI's order, so local red means CI red:
@@ -165,9 +184,9 @@ That rule is easy to satisfy badly, so:
 
 Anything that runs on an operator's host rather than in a container — an installer,
 backup or restore — targets **bash 3.2**, the version macOS still ships: no associative
-arrays, no `mapfile`. `shellcheck` is pinned in the repo and CI runs the pinned copy,
-never a runner's preinstalled binary, so a lint that fails in CI can be reproduced
-locally.
+arrays, no `mapfile`. There is no such script yet. The first one to land also pins
+`shellcheck` in the repo and has CI run the pinned copy, never a runner's preinstalled
+binary, so a lint that fails in CI can be reproduced locally.
 
 ## Conventions
 
