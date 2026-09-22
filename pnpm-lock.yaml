@@ -65,6 +65,21 @@ importers:
         specifier: ^8.23.1
         version: 8.23.1
 
+  packages/worker:
+    dependencies:
+      '@clickhouse/client':
+        specifier: ^1.23.1
+        version: 1.23.1
+      '@clickmonk/core':
+        specifier: workspace:*
+        version: link:../core
+      '@clickmonk/db':
+        specifier: workspace:*
+        version: link:../db
+      zod:
+        specifier: ^3.25.0
+        version: 3.25.76
+
 packages:
 
   '@biomejs/biome@1.9.4':
