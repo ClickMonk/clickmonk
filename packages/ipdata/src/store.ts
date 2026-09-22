@@ -116,6 +116,13 @@ export interface TableUpdate {
   fetchedAt: Date
 }
 
+/** A Node fs error (EACCES, EIO, EISDIR, EMFILE, …) carries a string `code`; a parse or schema failure (SyntaxError, ZodError, the size-bound Error) does not. */
+function isIoError(err: unknown): boolean {
+  return (
+    typeof err === 'object' && err !== null && typeof (err as { code?: unknown }).code === 'string'
+  )
+}
+
 /**
  * Writes each new table under a name taken from its content, then the
  * manifest naming them, then removes every table file that neither this
@@ -123,18 +130,34 @@ export interface TableUpdate {
  * files lets a reader that read it a moment ago still open them. The caller
  * holds the update lock: two writers would each remove the other's files.
  *
- * `readManifest` returns null only when there is no manifest file yet; any
- * other failure (unreadable, a directory, invalid, oversized) is rethrown
- * here rather than treated as "none" — guessing wrong would drop every
- * other source's entry from the sources object below, and the cleanup pass
- * would then delete their table files. Nothing is written, and nothing is
- * deleted, on the basis of a manifest this call could not actually read.
+ * `readManifest` returns null only when there is no manifest file yet.
+ * Any other failure splits in two: an I/O error (a directory in the
+ * manifest's place, a permission or read error — it has a `code`) is
+ * rethrown, aborting before anything is written, since guessing wrong here
+ * would drop every other source and the cleanup pass would then delete
+ * their files. A manifest that is merely unreadable *as one* — bad JSON, a
+ * schema this build does not know (for instance `v` from a version this
+ * build predates), or over its size bound — is instead treated as absent:
+ * the alternative is that one bad manifest stops every future update
+ * forever. This turn's cleanup pass is skipped in that case, because
+ * without the old manifest there is no way to tell which files besides the
+ * ones just written it is still safe to remove; the next commit, once
+ * there is a real previous manifest to compare against, removes whatever
+ * this turn left behind.
  */
 export function commitTables(
   dir: string,
   updates: Partial<Record<SourceId, TableUpdate>>,
 ): Manifest {
-  const previous = readManifest(dir)
+  let previous: Manifest | null
+  let cleanUp = true
+  try {
+    previous = readManifest(dir)
+  } catch (err) {
+    if (isIoError(err)) throw err
+    previous = null
+    cleanUp = false
+  }
   const sources: Manifest['sources'] = { ...previous?.sources }
   for (const id of SOURCE_IDS) {
     const u = updates[id]
@@ -156,12 +179,14 @@ export function commitTables(
   const next: Manifest = { v: 1, sources }
   writeFileAtomic(join(dir, MANIFEST_FILE), JSON.stringify(next))
 
-  const keep = new Set(
-    [next, previous].flatMap((m) => Object.values(m?.sources ?? {}).map((s) => s.file)),
-  )
-  for (const f of readdirSync(dir)) {
-    if ((TABLE_FILE_RE.test(f) && !keep.has(f)) || f.endsWith('.tmp'))
-      rmSync(join(dir, f), { force: true })
+  if (cleanUp) {
+    const keep = new Set(
+      [next, previous].flatMap((m) => Object.values(m?.sources ?? {}).map((s) => s.file)),
+    )
+    for (const f of readdirSync(dir)) {
+      if ((TABLE_FILE_RE.test(f) && !keep.has(f)) || f.endsWith('.tmp'))
+        rmSync(join(dir, f), { force: true })
+    }
   }
   return next
 }

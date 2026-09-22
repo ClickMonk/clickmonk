@@ -23,6 +23,7 @@ import {
   MANIFEST_FILE,
   MAX_MANIFEST_BYTES,
   commitTables,
+  maxTableBytes,
   readManifest,
 } from './store.js'
 import type { RangeTable } from './table.js'
@@ -183,6 +184,21 @@ describe('IpDataStore', () => {
     expect(String(errors[0])).toMatch(/over the bound of \d+ bytes/)
   })
 
+  it('refuses a table file exactly one byte over its bound', async () => {
+    const dir = tmp()
+    const m = commitTables(dir, all())
+    // Not sparse — small enough to write for real — and exactly one byte
+    // past the bound: pins the exact comparison, where the 3 GiB fixture
+    // above only pins that the check runs before a read.
+    const max = maxTableBytes(SOURCES.tor.limits)
+    truncateSync(join(dir, m.sources.tor?.file as string), max + 1)
+    const errors: unknown[] = []
+    const s = new IpDataStore({ dir, log: (_msg, err) => errors.push(err) })
+    await s.refresh()
+    expect(s.current()?.lookup('198.51.100.9')).toMatchObject({ country: 'FR', tor: null })
+    expect(String(errors[0])).toMatch(/over the bound of \d+ bytes/)
+  })
+
   it('refuses a manifest naming a file outside its directory, and keeps everything loaded', async () => {
     const dir = tmp()
     commitTables(dir, all())
@@ -222,6 +238,21 @@ describe('IpDataStore', () => {
     expect(await s.refresh()).toBe(false)
     expect(s.current()?.lookup('192.0.2.7').country).toBe('DE')
     // The size check's own message, not JSON.parse's: the file was never read.
+    expect(String(errors[0])).toMatch(/over the bound of 65536 bytes/)
+  })
+
+  it('refuses a manifest exactly one byte over its bound', async () => {
+    const dir = tmp()
+    commitTables(dir, all())
+    const errors: unknown[] = []
+    const s = new IpDataStore({ dir, log: (_msg, err) => errors.push(err) })
+    await s.refresh()
+    // Not sparse in any way that matters — exactly one byte past the
+    // bound: pins the exact comparison, where the 3 GiB fixture above only
+    // pins that the check runs before a read.
+    truncateSync(join(dir, MANIFEST_FILE), MAX_MANIFEST_BYTES + 1)
+    expect(await s.refresh()).toBe(false)
+    expect(s.current()?.lookup('192.0.2.7').country).toBe('DE')
     expect(String(errors[0])).toMatch(/over the bound of 65536 bytes/)
   })
 
@@ -322,16 +353,46 @@ describe('commitTables', () => {
     expect(readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([])
   })
 
-  it('aborts rather than lose every other source when the previous manifest cannot be read', () => {
+  it('aborts rather than lose every other source when the previous manifest cannot be read (an I/O error)', () => {
     const dir = tmp()
     commitTables(dir, all())
     const filesBefore = readdirSync(dir).sort()
-    // A manifest that exists but cannot be read as one: not "no manifest
-    // yet" (that is only ENOENT), so a guess of "none" here would drop
-    // every other source from the new manifest and delete their files.
+    // A manifest that exists but cannot be read as one, for an I/O reason
+    // (here: it is a directory, so reading it throws EISDIR — a `code`).
+    // Not "no manifest yet" (that is only ENOENT), so a guess of "none"
+    // here would drop every other source from the new manifest and delete
+    // their files.
     rmSync(join(dir, MANIFEST_FILE))
     mkdirSync(join(dir, MANIFEST_FILE))
     expect(() => commitTables(dir, { country: at(country('AT')) })).toThrow()
     expect(readdirSync(dir).sort()).toEqual(filesBefore)
+  })
+
+  it('heals from a manifest that cannot be parsed as JSON, without losing other sources', () => {
+    const dir = tmp()
+    const before = commitTables(dir, all())
+    // Not an I/O error (no `code`): treated as absent rather than blocking
+    // every future update forever, but this turn skips cleanup, so the
+    // other sources' files survive even though the new manifest does not
+    // name them.
+    writeFileSync(join(dir, MANIFEST_FILE), 'not json')
+    const next = commitTables(dir, { country: at(country('AT')) })
+    expect(Object.keys(next.sources)).toEqual(['country'])
+    expect(existsSync(join(dir, before.sources.asn?.file as string))).toBe(true)
+    expect(existsSync(join(dir, before.sources.datacenter?.file as string))).toBe(true)
+    expect(existsSync(join(dir, before.sources.tor?.file as string))).toBe(true)
+  })
+
+  it('heals from a manifest of a schema version this build does not know, without losing other sources', () => {
+    const dir = tmp()
+    const before = commitTables(dir, all())
+    // Valid JSON, but `v: 2` fails the schema (ZodError, no `code`) — the
+    // shape a downgrade to an older build would leave behind.
+    writeFileSync(join(dir, MANIFEST_FILE), JSON.stringify({ v: 2, sources: before.sources }))
+    const next = commitTables(dir, { country: at(country('AT')) })
+    expect(Object.keys(next.sources)).toEqual(['country'])
+    expect(existsSync(join(dir, before.sources.asn?.file as string))).toBe(true)
+    expect(existsSync(join(dir, before.sources.datacenter?.file as string))).toBe(true)
+    expect(existsSync(join(dir, before.sources.tor?.file as string))).toBe(true)
   })
 })
