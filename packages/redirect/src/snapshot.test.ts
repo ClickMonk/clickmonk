@@ -626,6 +626,27 @@ describe('SnapshotStore', () => {
     expect(await reloaded).toBe(true)
   })
 
+  it('stops within the bound when a reload never finishes', async () => {
+    // A pool whose connect() never settles: the reload can never finish, as
+    // one blocked behind a long lock holder cannot.
+    const never = { connect: () => new Promise(() => {}) } as unknown as Pool
+    const store = new SnapshotStore({
+      pgUrl: TEST_PG_URL,
+      pool: never,
+      filePath: join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json'),
+      log: () => {},
+    })
+    stores.push(store)
+    ;(store as unknown as { stopWaitMs: number }).stopWaitMs = 100
+    void (store as unknown as { reload(): Promise<boolean> }).reload()
+    await new Promise((r) => setTimeout(r, 20))
+    const started = Date.now()
+    await store.stop()
+    const took = Date.now() - started
+    expect(took).toBeGreaterThanOrEqual(50)
+    expect(took).toBeLessThan(2000)
+  })
+
   it('starts no reload once stopped', async () => {
     let connects = 0
     const counting = {

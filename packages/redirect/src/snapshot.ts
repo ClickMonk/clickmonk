@@ -308,6 +308,13 @@ export function readSnapshotFile(path: string, log: Log = () => {}): Snapshot | 
   }
 }
 
+/**
+ * How long stop() waits for a reload already in flight. A reload blocked on
+ * a lock (a long DDL holder, say) must not hold the drain open: past this,
+ * stopping continues and ending the pool drops the abandoned reload.
+ */
+export const RELOAD_STOP_WAIT_MS = 5_000
+
 export interface SnapshotStoreOptions {
   pgUrl: string
   pool: Pool
@@ -331,6 +338,8 @@ export class SnapshotStore {
   private reloadGen = 0
   // Reloads that have started and not finished; stop() waits for them.
   private inflight = new Set<Promise<boolean>>()
+  // The one seam a test uses to shorten the bound below.
+  private stopWaitMs = RELOAD_STOP_WAIT_MS
   private readonly o: Required<SnapshotStoreOptions>
 
   constructor(opts: SnapshotStoreOptions) {
@@ -391,10 +400,19 @@ export class SnapshotStore {
         // already gone
       }
     }
-    // Once stop() resolves, no reload is running or will start: the caller
-    // may end the pool, or change the tables, without a reload still holding
-    // locks on them.
-    await Promise.all(this.inflight)
+    // Once stop() resolves, no reload will start, and one in flight has
+    // either finished — so the caller may end the pool, or change the
+    // tables, without a reload still holding locks on them — or run past the
+    // bound, in which case stopping continues without it.
+    let waited: NodeJS.Timeout | undefined
+    await Promise.race([
+      Promise.all(this.inflight),
+      new Promise<void>((resolve) => {
+        waited = setTimeout(resolve, this.stopWaitMs)
+        waited.unref()
+      }),
+    ])
+    clearTimeout(waited)
   }
 
   /** True on success. Never rejects. False, without loading, once stopped. */

@@ -14,7 +14,11 @@ const config = loadConfig(process.env)
 // Two pools: one for snapshot loads, one for the cap counter on the request
 // path. tryConsumeCap and checkCap bound each call at 150 ms; the pool's own timeouts
 // only stop a connection or query it abandoned from lingering.
-const configPool = createPgPool(config.postgresUrl, { max: 2 })
+// The query timeout is generous: a snapshot load of a large install is a
+// long read, and a reload that fails keeps the previous snapshot. It is
+// there so a reload stuck on a lock gives its connection back rather than
+// holding one of two forever.
+const configPool = createPgPool(config.postgresUrl, { max: 2, queryTimeoutMs: 30_000 })
 const capPool = createPgPool(config.postgresUrl, {
   max: 10,
   queryTimeoutMs: 1000,
