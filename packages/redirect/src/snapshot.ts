@@ -329,6 +329,8 @@ export class SnapshotStore {
   // can all fire independently, and Postgres gives no ordering guarantee on
   // when each of their queries returns).
   private reloadGen = 0
+  // Reloads that have started and not finished; stop() waits for them.
+  private inflight = new Set<Promise<boolean>>()
   private readonly o: Required<SnapshotStoreOptions>
 
   constructor(opts: SnapshotStoreOptions) {
@@ -389,10 +391,26 @@ export class SnapshotStore {
         // already gone
       }
     }
+    // Once stop() resolves, no reload is running or will start: the caller
+    // may end the pool, or change the tables, without a reload still holding
+    // locks on them.
+    await Promise.all(this.inflight)
   }
 
-  /** True on success. Never rejects. */
+  /** True on success. Never rejects. False, without loading, once stopped. */
   private async reload(): Promise<boolean> {
+    // A notification or timer can still fire while stop() is in progress.
+    if (this.stopped) return false
+    const run = this.load()
+    this.inflight.add(run)
+    try {
+      return await run
+    } finally {
+      this.inflight.delete(run)
+    }
+  }
+
+  private async load(): Promise<boolean> {
     const gen = ++this.reloadGen
     try {
       const next = await loadFromPostgres(this.o.pool, undefined, this.o.log)

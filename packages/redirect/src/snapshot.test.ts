@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { DEFAULT_TRAFFIC_SETTINGS, type TrafficSettings } from '@clickmonk/core'
 import type { Pool } from '@clickmonk/db'
 import { TEST_PG_URL, resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import {
   Snapshot,
   SnapshotStore,
@@ -393,9 +393,13 @@ describe('writeSnapshotFile', () => {
 })
 
 describe('SnapshotStore', () => {
+  // Every store is stopped when its own test ends. A store left running
+  // reloads on the next test's writes, and its reload holds locks on links
+  // while it waits for domains: the next test's TRUNCATE takes them in the
+  // opposite order, and Postgres aborts one of the two as a deadlock.
   const stores: SnapshotStore[] = []
-  afterAll(async () => {
-    for (const s of stores) await s.stop()
+  afterEach(async () => {
+    await Promise.all(stores.splice(0).map((s) => s.stop()))
   })
   const make = (filePath: string, pgUrl = TEST_PG_URL, p = pool) => {
     const s = new SnapshotStore({
@@ -545,6 +549,7 @@ describe('SnapshotStore', () => {
       filePath: join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json'),
       log: () => {},
     })
+    stores.push(store)
     // Driven directly rather than through start(), so no timer or
     // notification starts a third reload in between.
     const reload = () => (store as unknown as { reload(): Promise<boolean> }).reload()
@@ -565,6 +570,81 @@ describe('SnapshotStore', () => {
     release()
     expect(await older).toBe(true)
     expect(store.current()?.link(domainId, 'newer') ?? null).not.toBeNull()
+  })
+
+  it('waits for a reload in flight before stop() resolves', async () => {
+    await seed()
+    // The store's reload is held after its first query, inside its
+    // transaction, as a slow Postgres would hold it.
+    let release = () => {}
+    const gate = new Promise<void>((r) => {
+      release = r
+    })
+    let parked = () => {}
+    const isParked = new Promise<void>((r) => {
+      parked = r
+    })
+    const held = {
+      connect: async () => {
+        const client = await pool.connect()
+        const query = client.query.bind(client) as (...a: unknown[]) => Promise<unknown>
+        return {
+          query: async (...args: unknown[]) => {
+            const result = await query(...args)
+            if (String(args[0]).startsWith('SELECT count')) {
+              parked()
+              await gate
+            }
+            return result
+          },
+          release: () => client.release(),
+        }
+      },
+    } as unknown as Pool
+    const store = new SnapshotStore({
+      pgUrl: TEST_PG_URL,
+      pool: held,
+      filePath: join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json'),
+      log: () => {},
+    })
+    stores.push(store)
+    const reloaded = (store as unknown as { reload(): Promise<boolean> }).reload()
+    await isParked
+    let stopped = false
+    const stopping = store.stop().then(() => {
+      stopped = true
+    })
+    try {
+      await new Promise((r) => setTimeout(r, 100))
+      expect(stopped).toBe(false)
+    } finally {
+      // Released even on a failed expectation: the parked reload is holding a
+      // pool connection, and every later test would wait for it.
+      release()
+    }
+    await stopping
+    expect(await reloaded).toBe(true)
+  })
+
+  it('starts no reload once stopped', async () => {
+    let connects = 0
+    const counting = {
+      connect: async () => {
+        connects++
+        return pool.connect()
+      },
+    } as unknown as Pool
+    const store = new SnapshotStore({
+      pgUrl: TEST_PG_URL,
+      pool: counting,
+      filePath: join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json'),
+      log: () => {},
+    })
+    stores.push(store)
+    await store.stop()
+    // A notification or timer that fires during or after stop() lands here.
+    expect(await (store as unknown as { reload(): Promise<boolean> }).reload()).toBe(false)
+    expect(connects).toBe(0)
   })
 
   it('keeps the previous snapshot when a reload fails', async () => {
