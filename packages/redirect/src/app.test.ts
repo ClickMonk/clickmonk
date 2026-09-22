@@ -8,7 +8,7 @@ import {
 } from '@clickmonk/core'
 import { type Pool, createPgPool } from '@clickmonk/db'
 import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { buildRedirectApp } from './app.js'
 import { Snapshot } from './snapshot.js'
 
@@ -52,6 +52,17 @@ const link = (over: Partial<Link> = {}): Link => ({
   ...over,
 })
 
+// Every record any test captures, checked after each test against the schema
+// the worker parses spool lines with: a record the redirect writes but the
+// worker would skip is a click lost.
+const captured: ClickRecord[] = []
+afterEach(() => {
+  for (const r of captured.splice(0)) {
+    const parsed = ClickRecordSchema.safeParse(r)
+    expect(parsed.success, JSON.stringify(parsed.error?.issues)).toBe(true)
+  }
+})
+
 function harness(
   links: Link[],
   opts: { snapshot?: Snapshot | null; capPool?: ReturnType<typeof createPgPool> } = {},
@@ -67,6 +78,7 @@ function harness(
       spool: {
         append: (r) => {
           records.push(r)
+          captured.push(r)
           return true
         },
       },
@@ -327,6 +339,8 @@ describe('redirect', () => {
     expect(records).toHaveLength(1)
     expect(records[0]?.outcome).toBe('target')
     expect(records[0]?.capUnchecked).toBe(true)
+    // Read before the await: after the disconnect the socket has no address.
+    expect(records[0]?.ip).toBe('127.0.0.1')
   })
 
   it('answers 503 and records nothing while there is no configuration', async () => {
@@ -356,6 +370,25 @@ describe('redirect', () => {
     })
     expect(badHost.statusCode).toBe(400)
     expect(badHost.headers['cache-control']).toBe('no-store, no-cache, must-revalidate, max-age=0')
+  })
+
+  it('serves and records a path of exactly the bound, and answers 414 one past it', async () => {
+    const { app, records } = harness([link()])
+    const at = await app.inject({
+      method: 'GET',
+      url: `/${'a'.repeat(2047)}`,
+      headers: { host: 'go.example.test' },
+    })
+    // No slug is that long, so it is not found, but it is served and recorded.
+    expect(at.statusCode).toBe(404)
+    expect(records[0]?.path).toHaveLength(2048)
+    const over = await app.inject({
+      method: 'GET',
+      url: `/${'a'.repeat(2048)}`,
+      headers: { host: 'go.example.test' },
+    })
+    expect(over.statusCode).toBe(414)
+    expect(records).toHaveLength(1)
   })
 
   it('sends every destination the validator accepts as its Location, and records the status it sent', async () => {

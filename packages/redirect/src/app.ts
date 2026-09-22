@@ -1,6 +1,8 @@
 import {
   type ClickRecord,
   type Decision,
+  MAX_PATH_LENGTH,
+  MAX_REFERRER_LENGTH,
   MAX_UA_LENGTH,
   ZERO_UUID,
   classifyDevice,
@@ -27,8 +29,6 @@ export interface RedirectDeps {
   log?: false
 }
 
-const MAX_PATH = 2048
-const MAX_REFERRER = 2048
 const NO_STORE = 'no-store, no-cache, must-revalidate, max-age=0'
 
 const BODIES: Record<number, string> = {
@@ -67,7 +67,7 @@ export function buildRedirectApp(
     const rawUrl = req.raw.url ?? '/'
     const q = rawUrl.indexOf('?')
     const path = q === -1 ? rawUrl : rawUrl.slice(0, q)
-    if (path.length > MAX_PATH)
+    if (path.length > MAX_PATH_LENGTH)
       return reply.code(414).header('cache-control', NO_STORE).send('URI too long.\n')
     const host = normaliseHost(req.hostname)
     if (!host) return reply.code(400).header('cache-control', NO_STORE).send('Bad host.\n')
@@ -82,7 +82,7 @@ export function buildRedirectApp(
     // the socket's remoteAddress) undefined, and req.headers is safest read
     // once too rather than trusted to stay untouched across an await.
     const userAgent = (req.headers['user-agent'] ?? '').slice(0, MAX_UA_LENGTH)
-    const referrer = String(req.headers.referer ?? '').slice(0, MAX_REFERRER)
+    const referrer = String(req.headers.referer ?? '').slice(0, MAX_REFERRER_LENGTH)
     const ip = (req.ip ?? '').slice(0, 45)
     const visitor = readVisitor(req.headers.cookie, deps.secret)
     const clickId = uuidv7()

@@ -3,6 +3,11 @@ import type { Outcome, Step } from './evaluate.js'
 
 export const ZERO_UUID = '00000000-0000-0000-0000-000000000000'
 
+/** The longest request path the redirect serves and records; longer is a 414. */
+export const MAX_PATH_LENGTH = 2048
+/** The referrer is recorded up to this many characters. */
+export const MAX_REFERRER_LENGTH = 2048
+
 /**
  * One line of the spool. Version 1. The redirect writes it, the worker parses
  * it with this same schema before inserting, so a malformed or foreign line
@@ -14,7 +19,7 @@ export const ClickRecordSchema = z
     clickId: z.string().uuid(),
     time: z.string().datetime({ offset: false }),
     host: z.string().max(253),
-    path: z.string().max(2048),
+    path: z.string().max(MAX_PATH_LENGTH),
     domainId: z.string().uuid(),
     linkId: z.string().uuid(),
     outcome: z.enum([
@@ -40,7 +45,7 @@ export const ClickRecordSchema = z
       .regex(/^[A-Z]{2}$/)
       .nullable(),
     userAgent: z.string().max(512),
-    referrer: z.string().max(2048),
+    referrer: z.string().max(MAX_REFERRER_LENGTH),
     ip: z.string().max(45),
     capUnchecked: z.boolean(),
   })
@@ -50,7 +55,7 @@ export type ClickRecord = z.infer<typeof ClickRecordSchema>
 
 /**
  * The spool's file contract, shared by the redirect (writer) and the worker
- * (reader). The writer appends to `open-<pid>-<seq>.part` and renames a full
+ * (reader). The writer appends to `open-<pid>-<run id>-<seq>.part` and renames a full
  * or old segment to `segmentName(...)`; the reader takes only names matching
  * SEALED_SEGMENT_RE, so it never reads a segment still being written. The
  * zero-padded timestamp makes a plain string sort oldest-first.
