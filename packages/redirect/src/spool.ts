@@ -1,5 +1,7 @@
+import { randomUUID } from 'node:crypto'
 import {
   closeSync,
+  existsSync,
   fsyncSync,
   mkdirSync,
   openSync,
@@ -42,6 +44,12 @@ export class SpoolWriter {
   private segBytes = 0
   private segOpenedAt = 0
   private seq = 0
+  /**
+   * Unique to this writer. In a container the redirect restarts with the
+   * same PID every time, so PID and sequence alone would name the new
+   * writer's open segment after one its predecessor left behind.
+   */
+  private readonly runId = randomUUID().slice(0, 8)
   private dirty = false
   private sealedBytes = 0
   private dropped = 0
@@ -158,7 +166,7 @@ export class SpoolWriter {
   }
 
   private openSegment(): void {
-    this.openPath = join(this.dir, `open-${process.pid}-${this.seq++}.part`)
+    this.openPath = join(this.dir, `open-${process.pid}-${this.runId}-${this.seq++}.part`)
     this.fd = openSync(this.openPath, 'a')
     this.segBytes = 0
     this.segOpenedAt = Date.now()
@@ -204,8 +212,17 @@ export class SpoolWriter {
     }
   }
 
+  /**
+   * `renameSync` replaces an existing file, so a name already taken is
+   * skipped rather than overwritten: a previous writer with this PID may
+   * have sealed a segment under the same name in the same millisecond.
+   * Checking first is safe because one process owns the directory.
+   */
   private renameToSealed(path: string): void {
-    renameSync(path, join(this.dir, segmentName(Date.now(), process.pid, this.seq++)))
+    let target: string
+    do target = join(this.dir, segmentName(Date.now(), process.pid, this.seq++))
+    while (existsSync(target))
+    renameSync(path, target)
   }
 
   private measureSealed(): number {

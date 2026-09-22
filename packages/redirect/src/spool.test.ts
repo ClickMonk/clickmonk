@@ -1,7 +1,7 @@
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { type ClickRecord, ZERO_UUID } from '@clickmonk/core'
+import { type ClickRecord, ZERO_UUID, segmentName } from '@clickmonk/core'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SpoolWriter } from './spool.js'
 
@@ -107,6 +107,61 @@ describe('SpoolWriter', () => {
     writer(dir)
     expect(existsSync(join(dir, 'open-999-0.part'))).toBe(false)
     expect(lines(dir)).toHaveLength(1)
+  })
+
+  it('never opens a segment path a previous writer in the same process used', () => {
+    const dir = tmp()
+    const openPart = () => readdirSync(dir).filter((f) => f.endsWith('.part'))
+    const used: string[] = []
+    // Two writers abandoned without close, as a killed process leaves them.
+    // The second recovers the first's segment at start, so a name built from
+    // PID and sequence alone would bring the third back to the second's path.
+    // Each writer starts a second after the last, as restarts do, so no
+    // sealed name collides and only the open segment's name is under test.
+    const now = vi.spyOn(Date, 'now')
+    let current: string[]
+    try {
+      for (let i = 0; i < 2; i++) {
+        now.mockReturnValue(1_700_000_000_000 + i * 1000)
+        const w = new SpoolWriter({ dir, fsyncIntervalMs: 60_000, maxSegmentAgeMs: 60_000 })
+        w.start()
+        w.append(rec(i))
+        used.push(...openPart())
+      }
+      now.mockReturnValue(1_700_000_002_000)
+      writer(dir).append(rec(2))
+      current = openPart()
+    } finally {
+      now.mockRestore()
+    }
+    expect(current).toHaveLength(1)
+    expect(used).not.toContain(current[0])
+    // Recovery sealed both abandoned segments, one record each.
+    expect(lines(dir).map((l) => JSON.parse(l).clickId)).toEqual(
+      expect.arrayContaining([rec(0).clickId, rec(1).clickId]),
+    )
+    expect(lines(dir)).toHaveLength(2)
+  })
+
+  it('never overwrites a sealed segment that already has the name it would take', () => {
+    const dir = tmp()
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000)
+    try {
+      // What a previous writer with this PID sealed in the same millisecond.
+      writeFileSync(
+        join(dir, segmentName(1_700_000_000_000, process.pid, 0)),
+        `${JSON.stringify(rec(1))}\n`,
+      )
+      writeFileSync(join(dir, 'open-999-0.part'), `${JSON.stringify(rec(2))}\n`)
+      writer(dir)
+    } finally {
+      now.mockRestore()
+    }
+    expect(
+      lines(dir)
+        .map((l) => JSON.parse(l).clickId)
+        .sort(),
+    ).toEqual([rec(1).clickId, rec(2).clickId])
   })
 
   it('drops instead of writing past the total bound, and counts it', () => {
