@@ -59,6 +59,11 @@ What does not work yet:
 - **Rejected clicks are not reported.** A batch of clicks ClickHouse refuses is set aside
   as a `.bad` file in the spool, and nothing tells you it is there.
 - **More than one redirect process per spool directory.**
+- **Real addresses for IPv6 visitors on the published port.** Docker relays IPv6
+  connections to the redirect's port through its own proxy, so they arrive from the
+  bridge gateway's address with no `X-Forwarded-For`. Until a TLS front end that passes
+  on the client's address exists, all IPv6 visitors are rated and located as one
+  address.
 
 If link tracking is a problem you have today, [open an issue](../../issues) describing
 it. That is the most useful contribution at this stage.
