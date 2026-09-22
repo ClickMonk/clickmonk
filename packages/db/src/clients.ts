@@ -1,15 +1,17 @@
-import { type ClickHouseClient, createClient } from '@clickhouse/client'
+import { type ClickHouseClient, type ClickHouseLogLevel, createClient } from '@clickhouse/client'
 import pg from 'pg'
 
 export type Pool = pg.Pool
 export type PoolClient = pg.PoolClient
-export type { ClickHouseClient }
+export type { ClickHouseClient, ClickHouseLogLevel }
 
 export interface ChConfig {
   url: string
   username: string
   password: string
   database: string
+  /** Passed straight through to the client's own logger, e.g. ClickHouseLogLevel.OFF to silence it. */
+  logLevel?: ClickHouseLogLevel
 }
 
 export interface PgPoolOptions {
@@ -47,5 +49,6 @@ export function createChClient(cfg: ChConfig): ClickHouseClient {
     username: cfg.username,
     password: cfg.password,
     database: cfg.database,
+    ...(cfg.logLevel !== undefined ? { log: { level: cfg.logLevel } } : {}),
   })
 }

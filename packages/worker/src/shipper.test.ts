@@ -1,11 +1,25 @@
-import { copyFileSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  truncateSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { ClickHouseLogLevel } from '@clickhouse/client'
 import { type ClickRecord, ZERO_UUID, segmentName } from '@clickmonk/core'
 import { createChClient } from '@clickmonk/db'
 import { TEST_CH, resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { shipOnce, startShipper, toClickhouseRow } from './shipper.js'
+import { MAX_SEGMENT_BYTES, shipOnce, startShipper, toClickhouseRow } from './shipper.js'
+
+// The dead-client tests below deliberately connect to a closed port; this
+// silences the client's own connection-error logging for those, not ours.
+const deadCh = () =>
+  createChClient({ ...TEST_CH, url: 'http://127.0.0.1:1', logLevel: ClickHouseLogLevel.OFF })
 
 const pg = testPg()
 const ch = testCh()
@@ -58,6 +72,14 @@ async function clicks(): Promise<number> {
     query: 'SELECT uniqExact(click_id) AS n FROM clicks',
     format: 'JSONEachRow',
   })
+  const [r] = await rs.json<{ n: string }>()
+  return Number(r?.n)
+}
+// Raw row count, not deduplicated by click_id: proves whether a second
+// insert actually happened, which uniqExact alone cannot (a re-shipped
+// segment is deduplicated away, not prevented).
+async function rawRowCount(): Promise<number> {
+  const rs = await ch.query({ query: 'SELECT count() AS n FROM clicks', format: 'JSONEachRow' })
   const [r] = await rs.json<{ n: string }>()
   return Number(r?.n)
 }
@@ -129,13 +151,77 @@ describe('shipOnce', () => {
     expect(await clicks()).toBe(2)
   })
 
-  it('keeps a segment on disk when ClickHouse refuses it', async () => {
+  it('keeps every segment on disk, untouched, when ClickHouse is unreachable', async () => {
     const dir = tmp()
-    segment(dir, [JSON.stringify(rec())])
-    const dead = createChClient({ ...TEST_CH, url: 'http://127.0.0.1:1' })
+    const a = segment(dir, [JSON.stringify(rec())])
+    const b = segment(dir, [JSON.stringify(rec())])
+    const dead = deadCh()
     await expect(shipOnce({ dir, ch: dead })).rejects.toThrow()
-    expect(readdirSync(dir)).toHaveLength(1)
+    // Neither shipped, neither set aside: a connection failure is not this
+    // segment's problem, unlike a rejection the server actually answered.
+    expect(readdirSync(dir).sort()).toEqual([a, b].sort())
     await dead.close()
+  })
+
+  it('sets aside a segment that is not a regular file, and still ships the good one behind it', async () => {
+    const dir = tmp()
+    // Named to sort before the good segment, so it is picked up first —
+    // reproduces a directory landing where a sealed segment name is expected.
+    const probeName = segmentName(1, 1, seq++)
+    const goodName = segmentName(2, 1, seq++)
+    mkdirSync(join(dir, probeName))
+    writeFileSync(join(dir, goodName), `${JSON.stringify(rec())}\n`)
+    const r = await shipOnce({ dir, ch })
+    expect(r.rows).toBe(1)
+    expect(await clicks()).toBe(1)
+    // The good segment shipped and was deleted; only the set-aside probe remains.
+    expect(readdirSync(dir)).toEqual([`${probeName}.bad`])
+  })
+
+  it('remembers a segment whose rows shipped but could not be deleted, and never re-inserts it', async () => {
+    const dir = tmp()
+    const name = segment(dir, [JSON.stringify(rec())])
+    const path = join(dir, name)
+    // ext4's immutable attribute: unlink fails even for root, a real
+    // permission failure rather than a mock.
+    execFileSync('chattr', ['+i', path])
+    const skipUnlinked = new Set<string>()
+    try {
+      const r1 = await shipOnce({ dir, ch, skipUnlinked, log: () => {} })
+      expect(r1.rows).toBe(1)
+      expect(skipUnlinked.has(name)).toBe(true)
+      expect(readdirSync(dir)).toEqual([name])
+
+      const before = await rawRowCount()
+      const r2 = await shipOnce({ dir, ch, skipUnlinked, log: () => {} })
+      expect(r2.segments).toBe(0)
+      expect(r2.rows).toBe(0)
+      expect(await rawRowCount()).toBe(before)
+    } finally {
+      execFileSync('chattr', ['-i', path])
+    }
+  })
+
+  it('sets aside a segment larger than the size cap without reading it', async () => {
+    const dir = tmp()
+    const name = segmentName(Date.now(), 1, seq++)
+    // A sparse file: only its reported size matters, the cap must trip
+    // before any attempt is made to read it.
+    writeFileSync(join(dir, name), '')
+    truncateSync(join(dir, name), MAX_SEGMENT_BYTES + 1)
+    const r = await shipOnce({ dir, ch, maxSegments: 1 })
+    expect(r).toMatchObject({ rows: 0, malformed: 0 })
+    expect(readdirSync(dir)).toEqual([`${name}.bad`])
+    expect(await clicks()).toBe(0)
+  })
+
+  it('sets aside a segment holding a record with an unrecognized version, instead of dropping just that line', async () => {
+    const dir = tmp()
+    const name = segment(dir, [JSON.stringify(rec()), JSON.stringify({ ...rec(), v: 2 })])
+    const r = await shipOnce({ dir, ch })
+    expect(r).toMatchObject({ rows: 0, malformed: 0 })
+    expect(readdirSync(dir)).toEqual([`${name}.bad`])
+    expect(await clicks()).toBe(0)
   })
 
   it('ships the oldest segment first', async () => {
@@ -169,7 +255,7 @@ describe('startShipper', () => {
   it('survives ClickHouse being unreachable, without rejecting', async () => {
     const dir = tmp()
     segment(dir, [JSON.stringify(rec())])
-    const dead = createChClient({ ...TEST_CH, url: 'http://127.0.0.1:1' })
+    const dead = deadCh()
     const s = startShipper({ dir, ch: dead, intervalMs: 20, maxBackoffMs: 50, log: () => {} })
     await new Promise((r) => setTimeout(r, 200))
     await s.stop()
