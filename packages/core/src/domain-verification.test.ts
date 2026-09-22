@@ -61,5 +61,14 @@ describe('reading the TXT records at that name', () => {
     const huge = ['y'.repeat(MAX_TXT_VALUE_LENGTH + 1)]
     expect(txtRecordsCarryToken([huge, [want]], token)).toBe(true)
     expect(txtRecordsCarryToken([huge], token)).toBe(false)
+
+    // A record whose raw chunk length exceeds the bound, but whose trimmed,
+    // joined value would equal `want` anyway: padded with enough leading
+    // whitespace that the total is over the bound before any chunk is
+    // joined or trimmed. If the bound were measured after joining and
+    // trimming instead of before, this record would pass. Only measuring it
+    // first — on the raw chunks — refuses it.
+    const padded = [' '.repeat(MAX_TXT_VALUE_LENGTH + 1 - want.length), want]
+    expect(txtRecordsCarryToken([padded], token)).toBe(false)
   })
 })

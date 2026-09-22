@@ -231,8 +231,10 @@ describe('postgres schema 005', () => {
     }
   })
 
-  it('keeps one check per domain and drops it with the domain', async () => {
-    const d = await insertDomain('checks.example.test')
+  it('allows at most one check per domain', async () => {
+    // A fresh domain_id, so this rejection is the primary key's, not a
+    // status or detail CHECK reachable only after the first row exists.
+    const d = await insertDomain('checks-pk.example.test')
     await pool.query(
       "INSERT INTO domain_dns_checks (domain_id, status, detail) VALUES ($1, 'verified', 'ok')",
       [d],
@@ -242,20 +244,36 @@ describe('postgres schema 005', () => {
         "INSERT INTO domain_dns_checks (domain_id, status, detail) VALUES ($1, 'error', 'x')",
         [d],
       ),
-    ).rejects.toThrow()
+    ).rejects.toThrow(/duplicate key value violates unique constraint "domain_dns_checks_pkey"/)
+  })
+
+  it('refuses a status outside the enum', async () => {
+    const d = await insertDomain('checks-status.example.test')
     await expect(
       pool.query(
         "INSERT INTO domain_dns_checks (domain_id, status, detail) VALUES ($1, 'nonsense', 'x')",
         [d],
       ),
-    ).rejects.toThrow()
+    ).rejects.toThrow(/violates check constraint "domain_dns_checks_status_check"/)
+  })
+
+  it('refuses a detail longer than 500 characters', async () => {
+    const d = await insertDomain('checks-detail.example.test')
     await expect(
       pool.query('INSERT INTO domain_dns_checks (domain_id, status, detail) VALUES ($1, $2, $3)', [
         d,
         'verified',
         'x'.repeat(501),
       ]),
-    ).rejects.toThrow()
+    ).rejects.toThrow(/violates check constraint "domain_dns_checks_detail_check"/)
+  })
+
+  it('drops the check with its domain', async () => {
+    const d = await insertDomain('checks-cascade.example.test')
+    await pool.query(
+      "INSERT INTO domain_dns_checks (domain_id, status, detail) VALUES ($1, 'verified', 'ok')",
+      [d],
+    )
     await pool.query('DELETE FROM domains WHERE id = $1', [d])
     const left = await pool.query('SELECT 1 FROM domain_dns_checks WHERE domain_id = $1', [d])
     expect(left.rowCount).toBe(0)
