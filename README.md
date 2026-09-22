@@ -13,8 +13,8 @@ on your own infrastructure, and your click data stays yours.
 **Early, and not ready for production.** There is no release yet. What runs today:
 
 - **The redirect**, which answers links on your domains from an in-memory copy of the
-  configuration: weighted rotation across destinations, per-device destinations, click
-  caps, expiry, backup URLs and query passthrough. It writes every click to a spool on
+  configuration: weighted rotation across destinations, click caps, expiry, backup URLs
+  and query passthrough. It writes every click to a spool on
   local disk before it answers, and keeps redirecting while Postgres or ClickHouse is
   down.
 - **The worker**, which ships spooled clicks into ClickHouse and runs the database
@@ -31,6 +31,10 @@ What does not work yet:
   different destination does not work until TLS does.
 - **An admin API or UI.** Domains and links are added with the CLI, and `domain add`
   marks a domain verified without checking its DNS.
+- **Most link settings.** `clickmonk link add` sets targets, a backup URL, a click cap,
+  an expiry and passthrough only. The redirect supports per-device destinations, a
+  returning-visitor destination, country rules, a link name and disabling a link, but
+  the CLI cannot set any of them yet, so they need SQL written by hand.
 - **Reports.** Clicks are stored in ClickHouse, but there are no reports or exports.
 - **IP lookup and traffic classification.** A click's country is always empty, so a link
   limited to a list of countries sends every visitor to its backup URL.

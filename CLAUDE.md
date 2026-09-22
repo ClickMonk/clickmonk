@@ -52,6 +52,10 @@ What does not exist yet, and must not be implied by any documentation:
   browsers drop them over HTTP and returning-visitor routing does not work until TLS.
 - **Admin API and UI.** Links and domains are added with the CLI. `domain add` marks a
   domain verified without a DNS check.
+- **Most link settings in the CLI.** `link add` takes `--target`, `--backup`, `--cap`,
+  `--expires` and `--no-passthrough` only. The evaluator supports device URLs, a
+  returning URL, country rules, a name and the disabled state; the CLI cannot set them
+  yet, so they need hand-written SQL.
 - **Reporting.** Clicks reach ClickHouse; there are no reports or exports.
 - **IP lookup and traffic classification.** The country is always empty, so an
   allow-list link sends everyone to its backup URL.
