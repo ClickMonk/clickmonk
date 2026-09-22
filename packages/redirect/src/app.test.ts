@@ -1,5 +1,6 @@
+import http from 'node:http'
 import { type ClickRecord, ClickRecordSchema, type Domain, type Link } from '@clickmonk/core'
-import { createPgPool } from '@clickmonk/db'
+import { type Pool, createPgPool } from '@clickmonk/db'
 import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { buildRedirectApp } from './app.js'
@@ -13,6 +14,13 @@ const domain: Domain = {
   id: '00000000-0000-4000-8000-00000000000d',
   host: 'go.example.test',
   verified: true,
+  rootUrl: null,
+  notFoundUrl: null,
+}
+const unverifiedDomain: Domain = {
+  id: '00000000-0000-4000-8000-00000000000e',
+  host: 'pending.example.test',
+  verified: false,
   rootUrl: null,
   notFoundUrl: null,
 }
@@ -76,7 +84,7 @@ afterAll(async () => {
 })
 
 describe('redirect', () => {
-  it('redirects with 302 and no-store, and records the click before answering', async () => {
+  it('redirects with 302 and no-store, and records the click it answers', async () => {
     const { app, records } = harness([link()])
     const res = await app.inject({
       method: 'GET',
@@ -122,6 +130,18 @@ describe('redirect', () => {
       url: '/spring',
       headers: { host: 'nope.example.test' },
     })
+    expect(res.headers['set-cookie']).toBeUndefined()
+  })
+
+  it('sets no cookies for a domain that exists but is not verified', async () => {
+    const snap = new Snapshot([unverifiedDomain], [], new Date(), 'postgres')
+    const { app } = harness([], { snapshot: snap })
+    const res = await app.inject({
+      method: 'GET',
+      url: '/spring',
+      headers: { host: 'pending.example.test' },
+    })
+    expect(res.statusCode).toBe(404)
     expect(res.headers['set-cookie']).toBeUndefined()
   })
 
@@ -198,11 +218,10 @@ describe('redirect', () => {
   })
 
   it('stops at the cap and sends the rest to the backup', async () => {
-    const d = await pool.query<{ id: string }>(
-      "INSERT INTO domains (id, host, verified) VALUES ($1, 'go.example.test', true) ON CONFLICT DO NOTHING RETURNING id",
+    await pool.query(
+      "INSERT INTO domains (id, host, verified) VALUES ($1, 'go.example.test', true) ON CONFLICT DO NOTHING",
       [domain.id],
     )
-    void d
     const capped = link({ clickCap: 2, returningUrl: null })
     await pool.query(
       "INSERT INTO links (id, domain_id, slug, click_cap) VALUES ($1, $2, 'spring', 2)",
@@ -222,6 +241,33 @@ describe('redirect', () => {
     expect(records.map((r) => r.outcome)).toEqual(['target', 'target', 'capped', 'capped'])
   })
 
+  it('never touches the cap counter for a click the evaluator already refused', async () => {
+    await pool.query(
+      "INSERT INTO domains (id, host, verified) VALUES ($1, 'go.example.test', true) ON CONFLICT DO NOTHING",
+      [domain.id],
+    )
+    const stale = link({
+      id: '00000000-0000-4000-8000-0000000000a2',
+      slug: 'stale',
+      clickCap: 5,
+      expiresAt: new Date(Date.now() - 1000),
+    })
+    await pool.query(
+      "INSERT INTO links (id, domain_id, slug, click_cap) VALUES ($1, $2, 'stale', 5) ON CONFLICT DO NOTHING",
+      [stale.id, domain.id],
+    )
+    const { app, records } = harness([stale])
+    const res = await app.inject({
+      method: 'GET',
+      url: '/stale',
+      headers: { host: 'go.example.test' },
+    })
+    expect(res.headers.location).toBe('https://example.com/backup')
+    expect(records[0]?.outcome).toBe('expired')
+    const counters = await pool.query('SELECT 1 FROM link_counters WHERE link_id = $1', [stale.id])
+    expect(counters.rowCount).toBe(0)
+  })
+
   it('fails open, and says so, when the cap cannot be checked', async () => {
     const dead = createPgPool('postgres://clickmonk:clickmonk@127.0.0.1:1/none', {
       connectTimeoutMs: 150,
@@ -238,6 +284,45 @@ describe('redirect', () => {
     await dead.end()
   })
 
+  it('still records the click when the client disconnects while the cap check is pending', async () => {
+    // A cap query slower than tryConsumeCap's own 150 ms bound: the redirect
+    // waits out that bound and treats the cap as unchecked, but the record
+    // must not depend on the request's socket still being open when it does.
+    const slowPool = {
+      query: () =>
+        new Promise((resolve) => {
+          setTimeout(() => resolve({ rowCount: 1, rows: [{ clicks: 1 }] }), 300)
+        }),
+    } as unknown as Pool
+    const { app, records } = harness([link({ clickCap: 5 })], { capPool: slowPool })
+    await app.listen({ port: 0, host: '127.0.0.1' })
+    try {
+      const address = app.server.address()
+      if (address === null || typeof address === 'string') throw new Error('no server address')
+      await new Promise<void>((resolve) => {
+        const client = http.request(
+          {
+            host: '127.0.0.1',
+            port: address.port,
+            path: '/spring',
+            headers: { host: 'go.example.test' },
+          },
+          () => {},
+        )
+        // The abort itself surfaces as a client-side socket error; not under test.
+        client.on('error', () => {})
+        client.end()
+        setTimeout(() => client.destroy(), 50)
+        setTimeout(resolve, 400)
+      })
+    } finally {
+      await app.close()
+    }
+    expect(records).toHaveLength(1)
+    expect(records[0]?.outcome).toBe('target')
+    expect(records[0]?.capUnchecked).toBe(true)
+  })
+
   it('answers 503 and records nothing while there is no configuration', async () => {
     const { app, records } = harness([], { snapshot: null })
     const res = await app.inject({
@@ -249,21 +334,22 @@ describe('redirect', () => {
     expect(records).toHaveLength(0)
   })
 
-  it('answers 414 for an over-long path, and 400 for an over-long host', async () => {
+  it('answers 414 for an over-long path, and 400 for an over-long host, both no-store', async () => {
     const { app } = harness([link()])
-    expect(
-      (
-        await app.inject({
-          method: 'GET',
-          url: `/${'a'.repeat(2100)}`,
-          headers: { host: 'go.example.test' },
-        })
-      ).statusCode,
-    ).toBe(414)
-    expect(
-      (await app.inject({ method: 'GET', url: '/x', headers: { host: `${'a'.repeat(254)}.test` } }))
-        .statusCode,
-    ).toBe(400)
+    const long = await app.inject({
+      method: 'GET',
+      url: `/${'a'.repeat(2100)}`,
+      headers: { host: 'go.example.test' },
+    })
+    expect(long.statusCode).toBe(414)
+    expect(long.headers['cache-control']).toBe('no-store, no-cache, must-revalidate, max-age=0')
+    const badHost = await app.inject({
+      method: 'GET',
+      url: '/x',
+      headers: { host: `${'a'.repeat(254)}.test` },
+    })
+    expect(badHost.statusCode).toBe(400)
+    expect(badHost.headers['cache-control']).toBe('no-store, no-cache, must-revalidate, max-age=0')
   })
 
   it('truncates the user-agent and referrer it records', async () => {

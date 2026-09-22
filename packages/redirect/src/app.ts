@@ -5,6 +5,7 @@ import {
   ZERO_UUID,
   classifyDevice,
   evaluate,
+  normaliseHost,
   slugFromPath,
   uuidv7,
 } from '@clickmonk/core'
@@ -27,7 +28,6 @@ export interface RedirectDeps {
 }
 
 const MAX_PATH = 2048
-const MAX_HOST = 253
 const MAX_REFERRER = 2048
 const NO_STORE = 'no-store, no-cache, must-revalidate, max-age=0'
 
@@ -69,14 +69,21 @@ export function buildRedirectApp(
     const path = q === -1 ? rawUrl : rawUrl.slice(0, q)
     if (path.length > MAX_PATH)
       return reply.code(414).header('cache-control', NO_STORE).send('URI too long.\n')
-    const host = req.hostname.toLowerCase().replace(/\.$/, '')
-    if (host.length === 0 || host.length > MAX_HOST) return reply.code(400).send('Bad host.\n')
+    const host = normaliseHost(req.hostname)
+    if (!host) return reply.code(400).header('cache-control', NO_STORE).send('Bad host.\n')
     const query = new URLSearchParams(q === -1 ? '' : rawUrl.slice(q + 1))
 
     const domain = snapshot.domain(host)
     const slug = slugFromPath(path)
     const link = domain && slug ? snapshot.link(domain.id, slug) : null
+    // Everything the click record needs from the request or its socket, read
+    // now rather than after the cap-check await below: a client that
+    // disconnects while that await is pending leaves `req.ip` (a getter over
+    // the socket's remoteAddress) undefined, and req.headers is safest read
+    // once too rather than trusted to stay untouched across an await.
     const userAgent = (req.headers['user-agent'] ?? '').slice(0, MAX_UA_LENGTH)
+    const referrer = String(req.headers.referer ?? '').slice(0, MAX_REFERRER)
+    const ip = (req.ip ?? '').slice(0, 45)
     const visitor = readVisitor(req.headers.cookie, deps.secret)
     const clickId = uuidv7()
     const at = now()
@@ -117,8 +124,8 @@ export function buildRedirectApp(
       device: facts.device,
       country: facts.country,
       userAgent,
-      referrer: String(req.headers.referer ?? '').slice(0, MAX_REFERRER),
-      ip: req.ip.slice(0, 45),
+      referrer,
+      ip,
       capUnchecked,
     }
     // Accepted here: the line is written before the response. A refused
