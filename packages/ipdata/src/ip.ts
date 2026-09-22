@@ -1,0 +1,86 @@
+/** An IPv6 address as four 32-bit words, most significant first. */
+export type Words = readonly [number, number, number, number]
+
+export type ParsedIp = { v: 4; n: number } | { v: 6; w: Words }
+
+/** The longest textual IP address: an IPv6 address with an embedded IPv4 one. */
+export const MAX_IP_LENGTH = 45
+
+const V4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
+const HEX_GROUP = /^[0-9A-Fa-f]{1,4}$/
+
+/** Dotted-quad to an unsigned 32-bit number. Leading zeros are refused: some parsers read them as octal. */
+function parseV4(s: string): number | null {
+  const m = V4.exec(s)
+  if (!m) return null
+  let n = 0
+  for (let i = 1; i <= 4; i++) {
+    const part = m[i] as string
+    if (part.length > 1 && part.startsWith('0')) return null
+    const octet = Number(part)
+    if (octet > 255) return null
+    n = n * 256 + octet
+  }
+  return n
+}
+
+function parseGroups(part: string, allowV4Tail: boolean): number[] | null {
+  if (part === '') return []
+  const out: number[] = []
+  const groups = part.split(':')
+  for (let i = 0; i < groups.length; i++) {
+    const g = groups[i] as string
+    if (allowV4Tail && i === groups.length - 1 && g.includes('.')) {
+      const v4 = parseV4(g)
+      if (v4 === null) return null
+      out.push(v4 >>> 16, v4 & 0xffff)
+      continue
+    }
+    if (!HEX_GROUP.test(g)) return null
+    out.push(Number.parseInt(g, 16))
+  }
+  return out
+}
+
+function parseV6(s: string): Words | null {
+  const halves = s.split('::')
+  if (halves.length > 2) return null
+  let groups: number[]
+  if (halves.length === 2) {
+    const head = parseGroups(halves[0] as string, false)
+    const tail = parseGroups(halves[1] as string, true)
+    if (!head || !tail) return null
+    const fill = 8 - head.length - tail.length
+    if (fill < 1) return null
+    groups = [...head, ...new Array<number>(fill).fill(0), ...tail]
+  } else {
+    const all = parseGroups(s, true)
+    if (!all || all.length !== 8) return null
+    groups = all
+  }
+  const g = (i: number) => groups[i] as number
+  return [
+    ((g(0) << 16) | g(1)) >>> 0,
+    ((g(2) << 16) | g(3)) >>> 0,
+    ((g(4) << 16) | g(5)) >>> 0,
+    ((g(6) << 16) | g(7)) >>> 0,
+  ]
+}
+
+/**
+ * Parses a textual IPv4 or IPv6 address, or returns null. An IPv4-mapped
+ * IPv6 address (`::ffff:192.0.2.1`) is returned as the IPv4 address it
+ * carries, so it finds the same entry. Zone IDs (`2001:db8::1%eth0`) are
+ * refused: no public client address carries one.
+ */
+export function parseIp(s: string): ParsedIp | null {
+  if (s.length === 0 || s.length > MAX_IP_LENGTH) return null
+  if (!s.includes(':')) {
+    const n = parseV4(s)
+    return n === null ? null : { v: 4, n }
+  }
+  const w = parseV6(s)
+  if (!w) return null
+  if (w[0] === 0 && w[1] === 0 && w[2] === 0xffff) return { v: 4, n: w[3] }
+  return { v: 6, w }
+}

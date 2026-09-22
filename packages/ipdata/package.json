@@ -1,0 +1,12 @@
+{
+  "name": "@clickmonk/ipdata",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "engines": { "node": ">=22 <23" },
+  "scripts": { "build": "tsc -b", "build:image": "tsc -b tsconfig.build.json" },
+  "dependencies": { "@clickmonk/core": "workspace:*" }
+}

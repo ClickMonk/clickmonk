@@ -23,6 +23,7 @@ RUN corepack enable \
 COPY pnpm-workspace.yaml package.json pnpm-lock.yaml ./
 COPY packages/core/package.json packages/core/
 COPY packages/db/package.json packages/db/
+COPY packages/ipdata/package.json packages/ipdata/
 COPY packages/redirect/package.json packages/redirect/
 COPY packages/worker/package.json packages/worker/
 COPY packages/cli/package.json packages/cli/
@@ -30,6 +31,7 @@ RUN pnpm install --frozen-lockfile --prod
 COPY packages/db/migrations packages/db/migrations
 COPY --from=build /app/packages/core/dist packages/core/dist
 COPY --from=build /app/packages/db/dist packages/db/dist
+COPY --from=build /app/packages/ipdata/dist packages/ipdata/dist
 COPY --from=build /app/packages/redirect/dist packages/redirect/dist
 COPY --from=build /app/packages/worker/dist packages/worker/dist
 COPY --from=build /app/packages/cli/dist packages/cli/dist
