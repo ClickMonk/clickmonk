@@ -1,10 +1,10 @@
-import { execFileSync } from 'node:child_process'
 import {
   copyFileSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   truncateSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -163,6 +163,62 @@ describe('shipOnce', () => {
     await dead.close()
   })
 
+  it('keeps every segment on disk, untouched, when ClickHouse answers with a server-state error', async () => {
+    const dir = tmp()
+    const a = segment(dir, [JSON.stringify(rec())])
+    const b = segment(dir, [JSON.stringify(rec())])
+    // A real ClickHouseError, but not a data rejection: wrong credentials
+    // against the real (reachable) test ClickHouse. Answered, not refused —
+    // the opposite failure shape from the test above, and must be handled
+    // the same way: stop the pass, touch nothing.
+    const badAuth = createChClient({
+      ...TEST_CH,
+      password: 'wrong-password',
+      logLevel: ClickHouseLogLevel.OFF,
+    })
+    await expect(shipOnce({ dir, ch: badAuth })).rejects.toThrow()
+    expect(readdirSync(dir).sort()).toEqual([a, b].sort())
+    await badAuth.close()
+  })
+
+  it('sets aside a segment ClickHouse rejects as malformed data, and still ships the good one behind it', async () => {
+    const dir = tmp()
+    // ClickRecordSchema already enforces the same shape ClickHouse's own
+    // column types accept (UUID, DateTime64, UInt16, UInt8), and ClickHouse's
+    // JSON parser is lenient beyond that (a malformed-looking UUID like
+    // "zzzz...z" is silently coerced, not rejected — checked by hand against
+    // the test ClickHouse). So no record that reaches here through the spool
+    // can actually diverge from what ClickHouse accepts: there is no valid
+    // spool line to write for this test. Instead, the outbound insert for
+    // the first segment processed is tampered with directly — the spool
+    // file stays fully valid, only the bytes that would leave this process
+    // are corrupted — so the request ClickHouse actually refuses is a real
+    // one, from the real test ClickHouse, not a fabricated error object.
+    const badCh = createChClient({ ...TEST_CH, logLevel: ClickHouseLogLevel.OFF })
+    let corrupted = false
+    const realInsert = badCh.insert.bind(badCh)
+    badCh.insert = ((params: Parameters<typeof realInsert>[0]) => {
+      if (corrupted) return realInsert(params)
+      corrupted = true
+      const values = (params.values as Record<string, unknown>[]).map((v) => ({
+        ...v,
+        click_id: 'not-a-uuid',
+      }))
+      return realInsert({ ...params, values })
+    }) as typeof realInsert
+
+    const badName = segmentName(1, 1, seq++)
+    const goodName = segmentName(2, 1, seq++)
+    writeFileSync(join(dir, badName), `${JSON.stringify(rec())}\n`)
+    writeFileSync(join(dir, goodName), `${JSON.stringify(rec())}\n`)
+
+    const r = await shipOnce({ dir, ch: badCh, maxSegments: 2 })
+    expect(r.rows).toBe(1)
+    expect(readdirSync(dir)).toEqual([`${badName}.bad`])
+    expect(await clicks()).toBe(1)
+    await badCh.close()
+  })
+
   it('sets aside a segment that is not a regular file, and still ships the good one behind it', async () => {
     const dir = tmp()
     // Named to sort before the good segment, so it is picked up first —
@@ -181,25 +237,30 @@ describe('shipOnce', () => {
   it('remembers a segment whose rows shipped but could not be deleted, and never re-inserts it', async () => {
     const dir = tmp()
     const name = segment(dir, [JSON.stringify(rec())])
-    const path = join(dir, name)
-    // ext4's immutable attribute: unlink fails even for root, a real
-    // permission failure rather than a mock.
-    execFileSync('chattr', ['+i', path])
     const skipUnlinked = new Set<string>()
-    try {
-      const r1 = await shipOnce({ dir, ch, skipUnlinked, log: () => {} })
-      expect(r1.rows).toBe(1)
-      expect(skipUnlinked.has(name)).toBe(true)
-      expect(readdirSync(dir)).toEqual([name])
-
-      const before = await rawRowCount()
-      const r2 = await shipOnce({ dir, ch, skipUnlinked, log: () => {} })
-      expect(r2.segments).toBe(0)
-      expect(r2.rows).toBe(0)
-      expect(await rawRowCount()).toBe(before)
-    } finally {
-      execFileSync('chattr', ['-i', path])
+    let unlinkCalls = 0
+    // A filesystem seam, not a database mock: the row still goes to real
+    // ClickHouse. Throws once (a real EPERM's shape), then would behave like
+    // the real fs.unlinkSync — though nothing here calls it a second time,
+    // since a remembered segment is never revisited.
+    const flakyUnlink = (path: string) => {
+      unlinkCalls++
+      if (unlinkCalls === 1) {
+        throw Object.assign(new Error('EPERM: operation not permitted, unlink'), { code: 'EPERM' })
+      }
+      unlinkSync(path)
     }
+
+    const r1 = await shipOnce({ dir, ch, skipUnlinked, log: () => {}, unlink: flakyUnlink })
+    expect(r1.rows).toBe(1)
+    expect(skipUnlinked.has(name)).toBe(true)
+    expect(readdirSync(dir)).toEqual([name])
+
+    const before = await rawRowCount()
+    const r2 = await shipOnce({ dir, ch, skipUnlinked, log: () => {}, unlink: flakyUnlink })
+    expect(r2.segments).toBe(0)
+    expect(r2.rows).toBe(0)
+    expect(await rawRowCount()).toBe(before)
   })
 
   it('sets aside a segment larger than the size cap without reading it', async () => {
