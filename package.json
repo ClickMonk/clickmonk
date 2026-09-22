@@ -6,6 +6,7 @@
   "packageManager": "pnpm@9.15.9",
   "scripts": {
     "build": "pnpm -r build",
+    "build:image": "pnpm -r build:image",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "biome check .",

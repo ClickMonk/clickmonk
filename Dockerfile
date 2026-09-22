@@ -3,7 +3,9 @@ WORKDIR /app
 RUN corepack enable
 COPY pnpm-workspace.yaml package.json pnpm-lock.yaml tsconfig.base.json tsconfig.json ./
 COPY packages ./packages
-RUN pnpm install --frozen-lockfile && pnpm build
+# build:image compiles each package without its tests or the database test
+# helpers, which exist only to run the test suite.
+RUN pnpm install --frozen-lockfile && pnpm build:image
 
 # The runtime installs production dependencies from the lockfile into a clean
 # directory and takes only compiled output from the build stage, so no
