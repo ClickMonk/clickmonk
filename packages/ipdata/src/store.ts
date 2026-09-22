@@ -95,6 +95,21 @@ export function writeFileAtomic(path: string, bytes: Uint8Array | string): void 
   }
 }
 
+/**
+ * Makes a directory's own entries durable. A file's own fsync (in
+ * `writeFileAtomic`) only guarantees its content; the rename that gives it
+ * its final name is a change to the directory, which needs its own fsync or
+ * a crash can lose the rename even though the file's bytes survive.
+ */
+function fsyncDir(dir: string): void {
+  const fd = openSync(dir, 'r')
+  try {
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+}
+
 export interface TableUpdate {
   table: RangeTable
   version: string
@@ -107,17 +122,19 @@ export interface TableUpdate {
  * manifest nor the one it replaced names. Keeping the replaced manifest's
  * files lets a reader that read it a moment ago still open them. The caller
  * holds the update lock: two writers would each remove the other's files.
+ *
+ * `readManifest` returns null only when there is no manifest file yet; any
+ * other failure (unreadable, a directory, invalid, oversized) is rethrown
+ * here rather than treated as "none" — guessing wrong would drop every
+ * other source's entry from the sources object below, and the cleanup pass
+ * would then delete their table files. Nothing is written, and nothing is
+ * deleted, on the basis of a manifest this call could not actually read.
  */
 export function commitTables(
   dir: string,
   updates: Partial<Record<SourceId, TableUpdate>>,
 ): Manifest {
-  let previous: Manifest | null
-  try {
-    previous = readManifest(dir)
-  } catch {
-    previous = null
-  }
+  const previous = readManifest(dir)
   const sources: Manifest['sources'] = { ...previous?.sources }
   for (const id of SOURCE_IDS) {
     const u = updates[id]
@@ -132,6 +149,10 @@ export function commitTables(
       entries: u.table.size,
     }
   }
+  // The renames above are durable before the manifest that names them is
+  // written, so a crash between the two never leaves the manifest pointing
+  // at a file the directory does not yet durably have.
+  fsyncDir(dir)
   const next: Manifest = { v: 1, sources }
   writeFileAtomic(join(dir, MANIFEST_FILE), JSON.stringify(next))
 
@@ -223,9 +244,12 @@ export class IpDataStore {
     })
   }
 
+  /** A second call while already started is a no-op: it neither reloads nor starts a second timer. Call `stop()` first to restart. */
   async start(): Promise<void> {
+    if (this.timer) return
     await this.refresh()
-    if (!this.data) this.o.log('no IP data yet: countries are unknown and the IP checks do not run')
+    if (!this.data)
+      this.safeLog('no IP data yet: countries are unknown and the IP checks do not run')
     this.timer = setInterval(() => void this.refresh(), this.o.pollMs)
     this.timer.unref()
   }
@@ -233,6 +257,19 @@ export class IpDataStore {
   stop(): void {
     if (this.timer) clearInterval(this.timer)
     this.timer = null
+  }
+
+  /**
+   * `refresh()` promises never to reject, including when the caller's own
+   * `log` throws — the interval below calls it fire-and-forget, so a
+   * rejection there would be an unhandled rejection, not a caught error.
+   */
+  private safeLog(msg: string, err?: unknown): void {
+    try {
+      this.o.log(msg, err)
+    } catch {
+      // A broken logger must not take the store down.
+    }
   }
 
   /**
@@ -257,7 +294,7 @@ export class IpDataStore {
     try {
       manifest = readManifest(this.o.dir)
     } catch (err) {
-      this.o.log('could not read the IP data manifest; keeping what is loaded', err)
+      this.safeLog('could not read the IP data manifest; keeping what is loaded', err)
       return false
     }
     if (!manifest) return false
@@ -267,6 +304,9 @@ export class IpDataStore {
     let changed = 0
     for (const id of SOURCE_IDS) {
       const entry = manifest.sources[id]
+      // No entry means this source is not in the manifest — removed, or not
+      // yet written — not "failed to load"; the table already loaded for it,
+      // if any, is carried over above and left exactly as it was.
       if (!entry || entry.file === this.loaded[id]?.file) continue
       try {
         const path = join(this.o.dir, entry.file)
@@ -277,7 +317,7 @@ export class IpDataStore {
         loaded[id] = entry
         changed++
       } catch (err) {
-        this.o.log(`could not load IP data ${id}; keeping the table in use`, err)
+        this.safeLog(`could not load IP data ${id}; keeping the table in use`, err)
       }
     }
     if (changed === 0) return false

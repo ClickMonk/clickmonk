@@ -1,14 +1,16 @@
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
+  rmSync,
   truncateSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   SOURCES,
   parseBadAsnList,
@@ -51,7 +53,16 @@ const all = () => ({
   datacenter: at(datacenter()),
   tor: at(tor()),
 })
-const tmp = () => mkdtempSync(join(tmpdir(), 'clickmonk-ipdata-'))
+const tmpDirs: string[] = []
+const tmp = () => {
+  const dir = mkdtempSync(join(tmpdir(), 'clickmonk-ipdata-'))
+  tmpDirs.push(dir)
+  return dir
+}
+afterEach(() => {
+  for (const dir of tmpDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+})
+
 const store = (dir: string, log: (m: string) => void = () => {}) => new IpDataStore({ dir, log })
 
 describe('IpDataStore', () => {
@@ -159,8 +170,11 @@ describe('IpDataStore', () => {
   it('refuses a table file over its bound without reading it', async () => {
     const dir = tmp()
     const m = commitTables(dir, all())
-    // Sparse: past the bound on paper, with no disk used.
-    truncateSync(join(dir, m.sources.tor?.file as string), 64 * 1024 * 1024)
+    // Sparse: 3 GiB on paper, with no disk used. Big enough that a
+    // read-first implementation (readFile, then compare the bytes it got)
+    // would itself throw on the read (ERR_FS_FILE_TOO_LARGE), not with this
+    // message: only a check that stats before reading produces it.
+    truncateSync(join(dir, m.sources.tor?.file as string), 3 * 1024 * 1024 * 1024)
     const errors: unknown[] = []
     const s = new IpDataStore({ dir, log: (_msg, err) => errors.push(err) })
     await s.refresh()
@@ -199,11 +213,35 @@ describe('IpDataStore', () => {
     const errors: unknown[] = []
     const s = new IpDataStore({ dir, log: (_msg, err) => errors.push(err) })
     await s.refresh()
-    // Sparse: past the bound on paper, with no disk used.
-    truncateSync(join(dir, MANIFEST_FILE), MAX_MANIFEST_BYTES + 1)
+    // Sparse: 3 GiB on paper, with no disk used — big enough that a
+    // read-first implementation (readFileSync, then compare .length) would
+    // itself throw on the read (ERR_FS_FILE_TOO_LARGE / ERR_STRING_TOO_LONG)
+    // rather than with this message: only a check that stats before reading
+    // produces it.
+    truncateSync(join(dir, MANIFEST_FILE), 3 * 1024 * 1024 * 1024)
     expect(await s.refresh()).toBe(false)
     expect(s.current()?.lookup('192.0.2.7').country).toBe('DE')
     // The size check's own message, not JSON.parse's: the file was never read.
+    expect(String(errors[0])).toMatch(/over the bound of 65536 bytes/)
+  })
+
+  it('refuses a manifest by its byte size, not its character count', async () => {
+    const dir = tmp()
+    commitTables(dir, all())
+    const errors: unknown[] = []
+    const s = new IpDataStore({ dir, log: (_msg, err) => errors.push(err) })
+    await s.refresh()
+    // Each of these is one UTF-16 code unit (so `.length` stays well under
+    // the bound) but three bytes in UTF-8 (so the file on disk is not): a
+    // check against `.length` instead of the byte size on disk would miss
+    // this file entirely and let it through to JSON.parse.
+    const pad = '龍'.repeat(30_000)
+    const content = JSON.stringify({ v: 1, sources: {}, pad })
+    expect(content.length).toBeLessThan(MAX_MANIFEST_BYTES)
+    expect(Buffer.byteLength(content, 'utf8')).toBeGreaterThan(MAX_MANIFEST_BYTES)
+    writeFileSync(join(dir, MANIFEST_FILE), content)
+    expect(await s.refresh()).toBe(false)
+    expect(s.current()?.lookup('192.0.2.7').country).toBe('DE')
     expect(String(errors[0])).toMatch(/over the bound of 65536 bytes/)
   })
 
@@ -224,6 +262,34 @@ describe('IpDataStore', () => {
     writeFileSync(file, good)
     expect(await s.refresh()).toBe(true)
     expect(s.current()?.lookup('198.51.100.9').tor).toBe(true)
+  })
+
+  it('never rejects, even when the injected log itself throws', async () => {
+    const dir = tmp()
+    // Invalid, so load() takes the catch branch and calls the (throwing) log.
+    writeFileSync(join(dir, MANIFEST_FILE), 'not json')
+    const s = new IpDataStore({
+      dir,
+      log: () => {
+        throw new Error('logger is broken')
+      },
+    })
+    await expect(s.refresh()).resolves.toBe(false)
+  })
+
+  it('does not start a second timer, or reload, on a second start() while already started', async () => {
+    const dir = tmp()
+    commitTables(dir, all())
+    const s = store(dir)
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval')
+    try {
+      await s.start()
+      await s.start()
+      expect(setIntervalSpy).toHaveBeenCalledTimes(1)
+    } finally {
+      s.stop()
+      setIntervalSpy.mockRestore()
+    }
   })
 })
 
@@ -254,5 +320,18 @@ describe('commitTables', () => {
     writeFileSync(join(dir, 'manifest.json.tmp'), 'left by a crash')
     commitTables(dir, all())
     expect(readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([])
+  })
+
+  it('aborts rather than lose every other source when the previous manifest cannot be read', () => {
+    const dir = tmp()
+    commitTables(dir, all())
+    const filesBefore = readdirSync(dir).sort()
+    // A manifest that exists but cannot be read as one: not "no manifest
+    // yet" (that is only ENOENT), so a guess of "none" here would drop
+    // every other source from the new manifest and delete their files.
+    rmSync(join(dir, MANIFEST_FILE))
+    mkdirSync(join(dir, MANIFEST_FILE))
+    expect(() => commitTables(dir, { country: at(country('AT')) })).toThrow()
+    expect(readdirSync(dir).sort()).toEqual(filesBefore)
   })
 })

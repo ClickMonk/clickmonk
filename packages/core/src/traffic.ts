@@ -73,14 +73,14 @@ export interface IpFacts {
   geoSource: string
 }
 
-/** No IP data at all. */
-export const NO_IP_FACTS: IpFacts = {
+/** No IP data at all. Shared and returned by every lookup that finds nothing loaded; frozen so no caller can mutate the one instance for every other. */
+export const NO_IP_FACTS: IpFacts = Object.freeze({
   country: null,
   asn: null,
   tor: null,
   datacenter: null,
   geoSource: '',
-}
+})
 
 export interface TrafficFacts {
   /** Already cut to the bounded length the redirect records. */

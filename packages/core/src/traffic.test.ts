@@ -29,6 +29,16 @@ const facts = (over: Partial<TrafficFacts> = {}, ip: Partial<IpFacts> = {}): Tra
   ip: { ...CHECKED, ...ip },
 })
 
+describe('NO_IP_FACTS', () => {
+  it('is frozen: the one shared instance cannot be mutated by a caller', () => {
+    expect(Object.isFrozen(NO_IP_FACTS)).toBe(true)
+    expect(() => {
+      ;(NO_IP_FACTS as { country: string | null }).country = 'DE'
+    }).toThrow(TypeError)
+    expect(NO_IP_FACTS.country).toBeNull()
+  })
+})
+
 describe('classifyTraffic', () => {
   it('is human when every check ran and none fired', () => {
     expect(classifyTraffic(facts())).toEqual({ class: 'human', ruleClass: 'human', signals: [] })
