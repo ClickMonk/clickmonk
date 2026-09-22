@@ -16,8 +16,8 @@ describe('RateCounter', () => {
   it('counts IPv6 per /64', () => {
     const r = new RateCounter()
     expect(r.hit('2001:db8:0:1::1', T)).toBe(1)
-    // Same /64: shares bits 0-63, differs in bits 64-95, not just the tail.
-    expect(r.hit('2001:db8:0:1:ffff:ffff::1', T)).toBe(2)
+    // Same /64: shares bits 0-63 and differs in every bit of 64-127.
+    expect(r.hit('2001:db8:0:1:ffff:ffff:ffff:fffe', T)).toBe(2)
     // A different /64.
     expect(r.hit('2001:db8:0:2::1', T)).toBe(1)
   })
