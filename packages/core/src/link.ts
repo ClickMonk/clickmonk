@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { type LinkTrafficActions, LinkTrafficActionsSchema } from './traffic.js'
 
 export type Device = 'ios' | 'android' | 'desktop'
 export const DEVICES: readonly Device[] = ['ios', 'android', 'desktop']
@@ -27,6 +28,8 @@ export interface Link {
   clickCap: number | null
   expiresAt: Date | null
   passthrough: boolean
+  /** Overrides of the install-wide traffic actions, per class. */
+  trafficActions: LinkTrafficActions
 }
 
 export interface Domain {
@@ -127,6 +130,7 @@ export const LinkInputSchema = z
     clickCap: z.number().int().min(1).max(MAX_CLICK_CAP).nullable().default(null),
     expiresAt: z.coerce.date().nullable().default(null),
     passthrough: z.boolean().default(true),
+    trafficActions: LinkTrafficActionsSchema.default({}),
   })
   .strict()
   .transform((l, ctx) => {

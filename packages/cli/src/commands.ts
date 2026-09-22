@@ -1,5 +1,14 @@
 import { parseArgs } from 'node:util'
-import { isDomainUrl, normaliseHost, parseLinkInput } from '@clickmonk/core'
+import {
+  DEFAULT_TRAFFIC_SETTINGS,
+  NON_HUMAN_CLASSES,
+  type TrafficActions,
+  type TrafficSettings,
+  TrafficSettingsSchema,
+  isDomainUrl,
+  normaliseHost,
+  parseLinkInput,
+} from '@clickmonk/core'
 import { type ClickHouseClient, type Pool, migrateToLatest } from '@clickmonk/db'
 import {
   type Fetcher,
@@ -25,10 +34,28 @@ const USAGE = `usage:
   clickmonk domain add <host> [--root-url <url>] [--not-found-url <url>]
   clickmonk link add <host> <slug> --target [<weight>=]<url> ... [--backup <url>]
                      [--cap <n>] [--expires <iso-8601>] [--no-passthrough]
+                     [--action <class>=<action> ...]
+  clickmonk settings show
+  clickmonk settings set [--action <class>=<action> ...] [--safe-url <url> | --no-safe-url]
+                         [--abuser-threshold <n>]
   clickmonk ipdata update
   clickmonk ipdata status`
 
 class Rejected extends Error {}
+
+/**
+ * `bot=block` pairs into an object. Unknown classes and actions are left in
+ * for the core schema to reject, so the message names the field.
+ */
+function parseActions(pairs: string[] | undefined): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const p of pairs ?? []) {
+    const m = /^([a-z]+)=([a-z]+)$/.exec(p)
+    if (!m) throw new Rejected(`--action takes <class>=<action>, such as bot=block: ${p}`)
+    out[m[1] as string] = m[2] as string
+  }
+  return out
+}
 
 /** `70=https://x/` -> weight 70; `https://x/?a=1` -> no weight. A URL starts with its scheme, so a leading `<digits>=` is unambiguous. */
 function splitTarget(s: string): { url: string; weight?: number } {
@@ -70,12 +97,14 @@ async function linkAdd(args: string[], d: CliDeps): Promise<void> {
       cap: { type: 'string' },
       expires: { type: 'string' },
       'no-passthrough': { type: 'boolean' },
+      action: { type: 'string', multiple: true },
     },
   })
   const host = normaliseHost(positionals[0] ?? '')
   if (!host) throw new Rejected(`not a valid host name: ${positionals[0] ?? '(none)'}`)
 
   const input = parseLinkInput({
+    trafficActions: parseActions(values.action),
     slug: positionals[1] ?? '',
     targets: (values.target ?? []).map(splitTarget),
     backupUrl: values.backup ?? null,
@@ -93,8 +122,8 @@ async function linkAdd(args: string[], d: CliDeps): Promise<void> {
       throw new Rejected(`unknown domain: ${host} (add it with "clickmonk domain add")`)
     const l = await client.query<{ id: string }>(
       `INSERT INTO links (domain_id, slug, name, enabled, backup_url, device_urls, returning_url,
-                          countries, click_cap, expires_at, passthrough)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                          countries, click_cap, expires_at, passthrough, traffic_actions)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        ON CONFLICT (domain_id, slug) DO NOTHING RETURNING id`,
       [
         domainId,
@@ -108,6 +137,7 @@ async function linkAdd(args: string[], d: CliDeps): Promise<void> {
         input.clickCap,
         input.expiresAt,
         input.passthrough,
+        JSON.stringify(input.trafficActions),
       ],
     )
     const linkId = l.rows[0]?.id
@@ -120,6 +150,86 @@ async function linkAdd(args: string[], d: CliDeps): Promise<void> {
     }
     await client.query('COMMIT')
     d.out(`link ${host}/${input.slug} ${linkId}`)
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw err
+  } finally {
+    client.release()
+  }
+}
+
+function printSettings(s: TrafficSettings, d: CliDeps): void {
+  for (const c of NON_HUMAN_CLASSES) d.out(`${c}: ${s.actions[c]}`)
+  d.out(`safe url: ${s.safeUrl ?? '(none)'}`)
+  d.out(`abuser threshold: ${s.abuserThreshold} clicks a minute from one address`)
+}
+
+interface SettingsRow {
+  traffic_actions: TrafficActions
+  safe_url: string | null
+  abuser_threshold: number
+}
+
+const toSettings = (r: SettingsRow): TrafficSettings => ({
+  actions: r.traffic_actions,
+  safeUrl: r.safe_url,
+  abuserThreshold: r.abuser_threshold,
+})
+
+/** A missing row (deleted by hand) means the defaults, as the redirect reads it. */
+async function settingsShow(d: CliDeps): Promise<void> {
+  const r = await d.pg.query<SettingsRow>(
+    'SELECT traffic_actions, safe_url, abuser_threshold FROM settings',
+  )
+  const row = r.rows[0]
+  if (!row) d.out('note: no settings are stored; the defaults apply')
+  printSettings(row ? toSettings(row) : DEFAULT_TRAFFIC_SETTINGS, d)
+}
+
+/**
+ * Changes only what is given; the result is validated whole before anything
+ * is written. An upsert, so a row deleted by hand is written back, starting
+ * from the defaults.
+ */
+async function settingsSet(args: string[], d: CliDeps): Promise<void> {
+  const { values } = parseArgs({
+    args,
+    options: {
+      action: { type: 'string', multiple: true },
+      'safe-url': { type: 'string' },
+      'no-safe-url': { type: 'boolean' },
+      'abuser-threshold': { type: 'string' },
+    },
+  })
+  if (values['safe-url'] !== undefined && values['no-safe-url']) {
+    throw new Rejected('--safe-url and --no-safe-url together')
+  }
+  const client = await d.pg.connect()
+  try {
+    await client.query('BEGIN')
+    const r = await client.query<SettingsRow>(
+      'SELECT traffic_actions, safe_url, abuser_threshold FROM settings FOR UPDATE',
+    )
+    const row = r.rows[0]
+    const current = row ? toSettings(row) : DEFAULT_TRAFFIC_SETTINGS
+    const next = TrafficSettingsSchema.parse({
+      actions: { ...current.actions, ...parseActions(values.action) },
+      safeUrl: values['no-safe-url'] ? null : (values['safe-url'] ?? current.safeUrl),
+      abuserThreshold:
+        values['abuser-threshold'] === undefined
+          ? current.abuserThreshold
+          : Number(values['abuser-threshold']),
+    })
+    await client.query(
+      `INSERT INTO settings (id, traffic_actions, safe_url, abuser_threshold, updated_at)
+       VALUES (true, $1, $2, $3, now())
+       ON CONFLICT (id) DO UPDATE SET traffic_actions = EXCLUDED.traffic_actions,
+         safe_url = EXCLUDED.safe_url, abuser_threshold = EXCLUDED.abuser_threshold,
+         updated_at = EXCLUDED.updated_at`,
+      [JSON.stringify(next.actions), next.safeUrl, next.abuserThreshold],
+    )
+    await client.query('COMMIT')
+    printSettings(next, d)
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {})
     throw err
@@ -185,6 +295,14 @@ export async function runCli(argv: string[], d: CliDeps): Promise<number> {
     }
     if (cmd === 'link' && sub === 'add') {
       await linkAdd(rest, d)
+      return 0
+    }
+    if (cmd === 'settings' && sub === 'show' && rest.length === 0) {
+      await settingsShow(d)
+      return 0
+    }
+    if (cmd === 'settings' && sub === 'set') {
+      await settingsSet(rest, d)
       return 0
     }
     if (cmd === 'ipdata' && sub === 'update' && rest.length === 0) {

@@ -152,6 +152,123 @@ describe('clickmonk cli', () => {
   })
 })
 
+describe('clickmonk settings', () => {
+  const settings = async () =>
+    (await pg.query('SELECT traffic_actions, safe_url, abuser_threshold FROM settings')).rows[0]
+
+  it('shows the defaults', async () => {
+    lines.length = 0
+    expect(await run('settings', 'show')).toBe(0)
+    expect(lines).toEqual([
+      'bot: flag',
+      'abuser: flag',
+      'anonymous: flag',
+      'datacenter: flag',
+      'safe url: (none)',
+      'abuser threshold: 60 clicks a minute from one address',
+    ])
+  })
+
+  it('changes only what it is given', async () => {
+    expect(
+      await run(
+        'settings',
+        'set',
+        '--action',
+        'bot=block',
+        '--action',
+        'datacenter=safe',
+        '--safe-url',
+        'https://example.com/safe?c={click_id}',
+        '--abuser-threshold',
+        '30',
+      ),
+    ).toBe(0)
+    expect(await settings()).toEqual({
+      traffic_actions: { bot: 'block', abuser: 'flag', anonymous: 'flag', datacenter: 'safe' },
+      safe_url: 'https://example.com/safe?c={click_id}',
+      abuser_threshold: 30,
+    })
+    expect(await run('settings', 'set', '--action', 'bot=flag')).toBe(0)
+    expect(await settings()).toMatchObject({
+      traffic_actions: { bot: 'flag', datacenter: 'safe' },
+      abuser_threshold: 30,
+    })
+  })
+
+  it('refuses to leave the safe action without a safe URL, and writes nothing', async () => {
+    const before = await settings()
+    expect(await run('settings', 'set', '--no-safe-url')).toBe(2)
+    expect(await settings()).toEqual(before)
+  })
+
+  it.each([
+    ['a malformed pair', ['--action', 'bot']],
+    ['an unknown class', ['--action', 'human=block']],
+    ['an unknown action', ['--action', 'bot=drop']],
+    ['a threshold out of range', ['--abuser-threshold', '0']],
+    ['both safe URL flags', ['--safe-url', 'https://example.com/', '--no-safe-url']],
+  ])('refuses %s', async (_label, args) => {
+    const before = await settings()
+    expect(await run('settings', 'set', ...args)).toBe(2)
+    expect(await settings()).toEqual(before)
+  })
+
+  it('shows the defaults, and says so, when the settings row is missing', async () => {
+    await pg.query('DELETE FROM settings')
+    lines.length = 0
+    expect(await run('settings', 'show')).toBe(0)
+    expect(lines).toEqual([
+      'note: no settings are stored; the defaults apply',
+      'bot: flag',
+      'abuser: flag',
+      'anonymous: flag',
+      'datacenter: flag',
+      'safe url: (none)',
+      'abuser threshold: 60 clicks a minute from one address',
+    ])
+  })
+
+  it('writes the row back when it is missing, starting from the defaults', async () => {
+    await pg.query('DELETE FROM settings')
+    expect(await run('settings', 'set', '--action', 'bot=block')).toBe(0)
+    expect(await settings()).toEqual({
+      traffic_actions: { bot: 'block', abuser: 'flag', anonymous: 'flag', datacenter: 'flag' },
+      safe_url: null,
+      abuser_threshold: 60,
+    })
+  })
+
+  it('stores a link override', async () => {
+    expect(
+      await run(
+        'link',
+        'add',
+        'go.example.test',
+        'guarded',
+        '--target',
+        'https://example.com/',
+        '--action',
+        'datacenter=block',
+      ),
+    ).toBe(0)
+    const r = await pg.query("SELECT traffic_actions FROM links WHERE slug = 'guarded'")
+    expect(r.rows[0]?.traffic_actions).toEqual({ datacenter: 'block' })
+    expect(
+      await run(
+        'link',
+        'add',
+        'go.example.test',
+        'bad-override',
+        '--target',
+        'https://example.com/',
+        '--action',
+        'human=block',
+      ),
+    ).toBe(2)
+  })
+})
+
 describe('clickmonk ipdata', () => {
   // Made-up data on the documentation ranges and ASNs, with minimums cut to fit.
   const bodies: Record<string, Uint8Array> = {

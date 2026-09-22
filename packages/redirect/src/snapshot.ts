@@ -7,7 +7,17 @@ import {
   rmSync,
   writeSync,
 } from 'node:fs'
-import type { CountryRule, Device, Domain, Link } from '@clickmonk/core'
+import {
+  type CountryRule,
+  DEFAULT_TRAFFIC_SETTINGS,
+  type Device,
+  type Domain,
+  type Link,
+  type LinkTrafficActions,
+  LinkTrafficActionsSchema,
+  type TrafficSettings,
+  TrafficSettingsSchema,
+} from '@clickmonk/core'
 import type { Pool } from '@clickmonk/db'
 import pg from 'pg'
 import { type WriteFn, writeAll } from './write-all.js'
@@ -31,6 +41,8 @@ export class Snapshot {
     links: Link[],
     readonly loadedAt: Date,
     readonly source: 'postgres' | 'file',
+    /** The install-wide traffic settings; the defaults until Postgres has any. */
+    readonly settings: TrafficSettings = DEFAULT_TRAFFIC_SETTINGS,
   ) {
     this.byHost = new Map(domains.map((d) => [d.host, d]))
     this.bySlug = new Map(links.map((l) => [`${l.domainId}/${l.slug}`, l]))
@@ -66,17 +78,66 @@ interface LinkRow {
   click_cap: string | null
   expires_at: Date | null
   passthrough: boolean
+  traffic_actions: unknown
   targets: { id: string; url: string; weight: number }[] | null
+}
+
+export interface SettingsRow {
+  traffic_actions: unknown
+  safe_url: string | null
+  abuser_threshold: number
+}
+
+type Log = (msg: string, err?: unknown) => void
+
+const issues = (e: { issues: { path: (string | number)[]; message: string }[] }): string =>
+  e.issues.map((i) => `${i.path.join('.') || 'value'}: ${i.message}`).join('; ')
+
+/**
+ * The settings row, read through core's schema rather than trusted: the
+ * database checks are looser than core in places (a token in the safe URL's
+ * host, say). Missing or refused, the defaults apply and `problem` says why.
+ */
+export function settingsFromRow(row: SettingsRow | undefined): {
+  settings: TrafficSettings
+  problem: string | null
+} {
+  if (!row) return { settings: DEFAULT_TRAFFIC_SETTINGS, problem: 'the settings row is missing' }
+  const r = TrafficSettingsSchema.safeParse({
+    actions: row.traffic_actions,
+    safeUrl: row.safe_url,
+    abuserThreshold: row.abuser_threshold,
+  })
+  return r.success
+    ? { settings: r.data, problem: null }
+    : {
+        settings: DEFAULT_TRAFFIC_SETTINGS,
+        problem: `the settings row is invalid (${issues(r.error)})`,
+      }
+}
+
+/** A link's overrides through core's schema. Refused, the link keeps none and `problem` says why. */
+export function linkActionsFromRow(raw: unknown): {
+  actions: LinkTrafficActions
+  problem: string | null
+} {
+  const r = LinkTrafficActionsSchema.safeParse(raw)
+  return r.success ? { actions: r.data, problem: null } : { actions: {}, problem: issues(r.error) }
 }
 
 /**
  * One REPEATABLE READ READ ONLY transaction on one connection, so the count,
- * the domains and the links are all a consistent view of the same instant.
+ * the settings, the domains and the links are all a consistent view of the
+ * same instant.
  * Three queries on separate pool connections could each see a different
  * commit in between (a target inserted after the count, say), producing a
  * snapshot that never existed in Postgres.
  */
-export async function loadFromPostgres(pool: Pool, maxLinks = 2_000_000): Promise<Snapshot> {
+export async function loadFromPostgres(
+  pool: Pool,
+  maxLinks = 2_000_000,
+  log: Log = () => {},
+): Promise<Snapshot> {
   const client = await pool.connect()
   try {
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
@@ -84,6 +145,13 @@ export async function loadFromPostgres(pool: Pool, maxLinks = 2_000_000): Promis
       const count = await client.query<{ n: string }>('SELECT count(*) AS n FROM links')
       const n = Number(count.rows[0]?.n ?? 0)
       if (n > maxLinks) throw new SnapshotTooLargeError(n, maxLinks)
+
+      // One row by construction, but it can be deleted by hand.
+      const settingsRow = await client.query<SettingsRow>(
+        'SELECT traffic_actions, safe_url, abuser_threshold FROM settings',
+      )
+      const { settings, problem } = settingsFromRow(settingsRow.rows[0])
+      if (problem) log(`traffic settings: ${problem}; using the defaults`)
 
       const domains = await client.query<{
         id: string
@@ -97,7 +165,7 @@ export async function loadFromPostgres(pool: Pool, maxLinks = 2_000_000): Promis
       // dropped: the evaluator cannot choose a destination for it.
       const links = await client.query<LinkRow>(`
         SELECT l.id, l.domain_id, l.slug, l.enabled, l.backup_url, l.device_urls, l.returning_url,
-               l.countries, l.click_cap, l.expires_at, l.passthrough,
+               l.countries, l.click_cap, l.expires_at, l.passthrough, l.traffic_actions,
                json_agg(json_build_object('id', t.id, 'url', t.url, 'weight', t.weight)
                         ORDER BY t.position) FILTER (WHERE t.id IS NOT NULL) AS targets
           FROM links l
@@ -106,7 +174,16 @@ export async function loadFromPostgres(pool: Pool, maxLinks = 2_000_000): Promis
 
       await client.query('COMMIT')
 
-      return new Snapshot(
+      // One line per load however many links are affected, naming the first.
+      let refused = 0
+      let firstRefused = ''
+      const actionsOf = (r: LinkRow): LinkTrafficActions => {
+        const a = linkActionsFromRow(r.traffic_actions)
+        if (a.problem && refused++ === 0) firstRefused = `${r.id} (${a.problem})`
+        return a.actions
+      }
+
+      const snapshot = new Snapshot(
         domains.rows.map((d) => ({
           id: d.id,
           host: d.host,
@@ -130,10 +207,18 @@ export async function loadFromPostgres(pool: Pool, maxLinks = 2_000_000): Promis
             clickCap: r.click_cap === null ? null : Number(r.click_cap),
             expiresAt: r.expires_at,
             passthrough: r.passthrough,
+            trafficActions: actionsOf(r),
           })),
         new Date(),
         'postgres',
+        settings,
       )
+      if (refused > 0) {
+        log(
+          `traffic action overrides of ${refused} link(s) are invalid and ignored; the first is ${firstRefused}`,
+        )
+      }
+      return snapshot
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {})
       throw err
@@ -144,25 +229,41 @@ export async function loadFromPostgres(pool: Pool, maxLinks = 2_000_000): Promis
 }
 
 export function serializeSnapshot(s: Snapshot): string {
-  return JSON.stringify({ v: 1, loadedAt: s.loadedAt.toISOString(), ...s.entries() })
+  return JSON.stringify({
+    v: 2,
+    loadedAt: s.loadedAt.toISOString(),
+    settings: s.settings,
+    ...s.entries(),
+  })
 }
 
+/**
+ * Reads version 2, and version 1 as written before traffic settings existed:
+ * the defaults and no link overrides, which is what Postgres held then too.
+ * A redirect upgraded while Postgres is down still serves its last snapshot.
+ */
 export function deserializeSnapshot(text: string): Snapshot {
   const raw = JSON.parse(text) as {
     v: number
     loadedAt: string
+    settings?: TrafficSettings
     domains: Domain[]
-    links: (Omit<Link, 'expiresAt'> & { expiresAt: string | null })[]
+    links: (Omit<Link, 'expiresAt' | 'trafficActions'> & {
+      expiresAt: string | null
+      trafficActions?: LinkTrafficActions
+    })[]
   }
-  if (raw.v !== 1) throw new Error(`unknown snapshot version ${raw.v}`)
+  if (raw.v !== 1 && raw.v !== 2) throw new Error(`unknown snapshot version ${raw.v}`)
   return new Snapshot(
     raw.domains,
     raw.links.map((l) => ({
       ...l,
       expiresAt: l.expiresAt === null ? null : new Date(l.expiresAt),
+      trafficActions: l.trafficActions ?? {},
     })),
     new Date(raw.loadedAt),
     'file',
+    raw.v === 2 && raw.settings ? raw.settings : DEFAULT_TRAFFIC_SETTINGS,
   )
 }
 
@@ -284,7 +385,7 @@ export class SnapshotStore {
   private async reload(): Promise<boolean> {
     const gen = ++this.reloadGen
     try {
-      const next = await loadFromPostgres(this.o.pool)
+      const next = await loadFromPostgres(this.o.pool, undefined, this.o.log)
       // A newer reload already started while this one was in flight: its
       // result, whenever it lands, is the current one. Applying this older
       // result now would overwrite it with stale data.

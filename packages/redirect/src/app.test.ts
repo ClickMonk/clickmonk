@@ -49,6 +49,7 @@ const link = (over: Partial<Link> = {}): Link => ({
   clickCap: null,
   expiresAt: null,
   passthrough: true,
+  trafficActions: {},
   ...over,
 })
 

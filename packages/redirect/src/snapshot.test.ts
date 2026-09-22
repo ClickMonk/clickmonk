@@ -1,6 +1,7 @@
 import { existsSync, mkdtempSync, readFileSync, writeFileSync, writeSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DEFAULT_TRAFFIC_SETTINGS, type TrafficSettings } from '@clickmonk/core'
 import type { Pool } from '@clickmonk/db'
 import { TEST_PG_URL, resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
@@ -9,9 +10,11 @@ import {
   SnapshotStore,
   SnapshotTooLargeError,
   deserializeSnapshot,
+  linkActionsFromRow,
   loadFromPostgres,
   readSnapshotFile,
   serializeSnapshot,
+  settingsFromRow,
   writeSnapshotFile,
 } from './snapshot.js'
 
@@ -90,6 +93,96 @@ describe('loadFromPostgres', () => {
     ])
   })
 
+  it("loads the install's traffic settings and each link's overrides", async () => {
+    const { domainId } = await seed()
+    await pool.query(
+      `UPDATE settings SET traffic_actions = '{"bot":"block","abuser":"flag","anonymous":"safe","datacenter":"nothing"}',
+                           safe_url = 'https://example.com/safe', abuser_threshold = 30`,
+    )
+    await pool.query(`UPDATE links SET traffic_actions = '{"bot":"nothing"}' WHERE slug = 'spring'`)
+    try {
+      const s = await loadFromPostgres(pool)
+      expect(s.settings).toEqual({
+        actions: { bot: 'block', abuser: 'flag', anonymous: 'safe', datacenter: 'nothing' },
+        safeUrl: 'https://example.com/safe',
+        abuserThreshold: 30,
+      })
+      expect(s.link(domainId, 'spring')?.trafficActions).toEqual({ bot: 'nothing' })
+    } finally {
+      await pool.query(
+        'UPDATE settings SET traffic_actions = DEFAULT, safe_url = NULL, abuser_threshold = DEFAULT',
+      )
+    }
+  })
+
+  it('uses the default settings when the settings row is missing, and says so', async () => {
+    await seed()
+    await pool.query('TRUNCATE settings')
+    const logs: string[] = []
+    try {
+      const s = await loadFromPostgres(pool, undefined, (m) => logs.push(m))
+      expect(s.settings).toEqual(DEFAULT_TRAFFIC_SETTINGS)
+      expect(logs).toEqual(['traffic settings: the settings row is missing; using the defaults'])
+    } finally {
+      await pool.query('INSERT INTO settings DEFAULT VALUES ON CONFLICT DO NOTHING')
+    }
+  })
+
+  it('uses the default settings when the row passes the database checks but not the schema', async () => {
+    await seed()
+    // The database check allows any printable http(s) URL; core also refuses a token in the host.
+    await pool.query(
+      `UPDATE settings SET traffic_actions = '{"bot":"safe","abuser":"flag","anonymous":"flag","datacenter":"flag"}',
+                           safe_url = 'https://{click_id}.example.com/'`,
+    )
+    const logs: string[] = []
+    try {
+      const s = await loadFromPostgres(pool, undefined, (m) => logs.push(m))
+      expect(s.settings).toEqual(DEFAULT_TRAFFIC_SETTINGS)
+      expect(logs).toHaveLength(1)
+      expect(logs[0]).toMatch(
+        /^traffic settings: the settings row is invalid \(safeUrl: .+\); using the defaults$/,
+      )
+    } finally {
+      await pool.query(
+        'UPDATE settings SET traffic_actions = DEFAULT, safe_url = NULL, abuser_threshold = DEFAULT',
+      )
+    }
+  })
+
+  it('ignores an invalid link override, keeps the link, and says so once', async () => {
+    const { domainId, linkId } = await seed()
+    // The database check refuses every override core refuses, so it is lifted
+    // for this test alone to stand in for a row written before it existed.
+    await pool.query('ALTER TABLE links DROP CONSTRAINT links_traffic_actions_check')
+    const logs: string[] = []
+    try {
+      await pool.query(`UPDATE links SET traffic_actions = '{"human":"block"}' WHERE id = $1`, [
+        linkId,
+      ])
+      const s = await loadFromPostgres(pool, undefined, (m) => logs.push(m))
+      expect(s.link(domainId, 'spring')?.trafficActions).toEqual({})
+      expect(logs).toHaveLength(1)
+      expect(logs[0]).toMatch(
+        new RegExp(
+          `^traffic action overrides of 1 link\\(s\\) are invalid and ignored; the first is ${linkId} \\(.+\\)$`,
+        ),
+      )
+    } finally {
+      await pool.query("UPDATE links SET traffic_actions = '{}'")
+      await pool.query(
+        'ALTER TABLE links ADD CONSTRAINT links_traffic_actions_check CHECK (valid_traffic_actions(traffic_actions, false))',
+      )
+    }
+  })
+
+  it('logs nothing when the settings and overrides are valid', async () => {
+    await seed()
+    const logs: string[] = []
+    await loadFromPostgres(pool, undefined, (m) => logs.push(m))
+    expect(logs).toEqual([])
+  })
+
   it('omits a link with no targets rather than serving it', async () => {
     const { domainId } = await seed()
     await pool.query("INSERT INTO links (domain_id, slug) VALUES ($1, 'empty')", [domainId])
@@ -118,6 +211,57 @@ describe('snapshot file', () => {
     expect(back.source).toBe('file')
   })
 
+  it('round-trips the traffic settings', () => {
+    const settings: TrafficSettings = {
+      actions: { bot: 'block', abuser: 'flag', anonymous: 'safe', datacenter: 'nothing' },
+      safeUrl: 'https://example.com/safe',
+      abuserThreshold: 30,
+    }
+    const s = new Snapshot([], [], new Date(), 'postgres', settings)
+    expect(deserializeSnapshot(serializeSnapshot(s)).settings).toEqual(settings)
+  })
+
+  it('reads a version 1 file as the defaults and no link overrides', () => {
+    const v1 = JSON.stringify({
+      v: 1,
+      loadedAt: new Date().toISOString(),
+      domains: [
+        {
+          id: '00000000-0000-4000-8000-0000000000d1',
+          host: 'go.example.test',
+          verified: true,
+          rootUrl: null,
+          notFoundUrl: null,
+        },
+      ],
+      links: [
+        {
+          id: '00000000-0000-4000-8000-0000000000a1',
+          domainId: '00000000-0000-4000-8000-0000000000d1',
+          slug: 'spring',
+          enabled: true,
+          targets: [
+            {
+              id: '00000000-0000-4000-8000-0000000000f1',
+              url: 'https://example.com/',
+              weight: 100,
+            },
+          ],
+          backupUrl: null,
+          deviceUrls: {},
+          returningUrl: null,
+          countries: { mode: 'all' },
+          clickCap: null,
+          expiresAt: null,
+          passthrough: true,
+        },
+      ],
+    })
+    const s = deserializeSnapshot(v1)
+    expect(s.settings).toEqual(DEFAULT_TRAFFIC_SETTINGS)
+    expect(s.link('00000000-0000-4000-8000-0000000000d1', 'spring')?.trafficActions).toEqual({})
+  })
+
   it('writes atomically and reads back; a corrupt file reads as null', async () => {
     await seed()
     const dir = mkdtempSync(join(tmpdir(), 'clickmonk-snap-'))
@@ -127,6 +271,47 @@ describe('snapshot file', () => {
     writeFileSync(path, '{not json')
     expect(readSnapshotFile(path)).toBeNull()
     expect(readSnapshotFile(join(dir, 'missing.json'))).toBeNull()
+  })
+})
+
+describe('row parsers', () => {
+  it('reads a valid settings row as it is', () => {
+    expect(
+      settingsFromRow({
+        traffic_actions: { bot: 'block', abuser: 'flag', anonymous: 'flag', datacenter: 'nothing' },
+        safe_url: null,
+        abuser_threshold: 30,
+      }),
+    ).toEqual({
+      settings: {
+        actions: { bot: 'block', abuser: 'flag', anonymous: 'flag', datacenter: 'nothing' },
+        safeUrl: null,
+        abuserThreshold: 30,
+      },
+      problem: null,
+    })
+  })
+
+  it('refuses a settings row core refuses, and says why', () => {
+    const r = settingsFromRow({
+      traffic_actions: { bot: 'flag', abuser: 'flag', anonymous: 'flag', datacenter: 'flag' },
+      safe_url: null,
+      abuser_threshold: 0,
+    })
+    expect(r.settings).toEqual(DEFAULT_TRAFFIC_SETTINGS)
+    expect(r.problem).toMatch(/^the settings row is invalid \(abuserThreshold: .+\)$/)
+  })
+
+  it('keeps a valid link override and ignores an invalid one, saying why', () => {
+    expect(linkActionsFromRow({ bot: 'block' })).toEqual({
+      actions: { bot: 'block' },
+      problem: null,
+    })
+    for (const bad of [{ human: 'block' }, { bot: 'drop' }, [], 'block', null]) {
+      const r = linkActionsFromRow(bad)
+      expect(r.actions).toEqual({})
+      expect(r.problem).not.toBeNull()
+    }
   })
 })
 
@@ -189,6 +374,26 @@ describe('SnapshotStore', () => {
     stores.push(s)
     return s
   }
+
+  it('passes its log to the loader, so an invalid settings row is reported', async () => {
+    await seed()
+    await pool.query('TRUNCATE settings')
+    const logs: string[] = []
+    const store = new SnapshotStore({
+      pgUrl: TEST_PG_URL,
+      pool,
+      filePath: join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json'),
+      log: (m) => logs.push(m),
+    })
+    stores.push(store)
+    try {
+      await store.start()
+      expect(logs).toContain('traffic settings: the settings row is missing; using the defaults')
+    } finally {
+      await store.stop()
+      await pool.query('INSERT INTO settings DEFAULT VALUES ON CONFLICT DO NOTHING')
+    }
+  })
 
   it('reloads when a link changes', async () => {
     const { domainId } = await seed()
