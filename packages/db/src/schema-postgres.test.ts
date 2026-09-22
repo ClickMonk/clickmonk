@@ -108,7 +108,7 @@ const TOUCH_COLUMN: Record<ConfigTable, string> = {
 // under test never touches). link_counters has no config_changed trigger of
 // its own but must be listed here because it references links.
 const TRUNCATE_STATEMENT: Record<ConfigTable, string> = {
-  domains: 'TRUNCATE domains, links, link_targets, link_counters',
+  domains: 'TRUNCATE domains, domain_dns_checks, links, link_targets, link_counters',
   links: 'TRUNCATE links, link_targets, link_counters',
   link_targets: 'TRUNCATE link_targets',
   settings: 'TRUNCATE settings',
@@ -205,4 +205,59 @@ describe('config_changed notifications', () => {
       }
     },
   )
+})
+
+describe('postgres schema 005', () => {
+  it('gives every domain a token of the right shape without being told one', async () => {
+    const r = await pool.query<{ verification_token: string }>(
+      "INSERT INTO domains (host) VALUES ('token.example.test') RETURNING verification_token",
+    )
+    expect(r.rows[0]?.verification_token).toMatch(/^[0-9a-f]{32}$/)
+  })
+
+  it('refuses a token an outsider could guess', async () => {
+    // The host is a fixed lower-case name rather than one derived from the
+    // token: derived, the upper-case case would break the host CHECK first
+    // and the row would be refused for the wrong reason. The constraint is
+    // named in the assertion for the same reason.
+    const bad = ['', 'not-hex', 'A'.repeat(32), '0'.repeat(31)]
+    for (const [i, token] of bad.entries()) {
+      await expect(
+        pool.query('INSERT INTO domains (host, verification_token) VALUES ($1, $2)', [
+          `bad-${i}.example.test`,
+          token,
+        ]),
+      ).rejects.toThrow(/domains_verification_token_valid/)
+    }
+  })
+
+  it('keeps one check per domain and drops it with the domain', async () => {
+    const d = await insertDomain('checks.example.test')
+    await pool.query(
+      "INSERT INTO domain_dns_checks (domain_id, status, detail) VALUES ($1, 'verified', 'ok')",
+      [d],
+    )
+    await expect(
+      pool.query(
+        "INSERT INTO domain_dns_checks (domain_id, status, detail) VALUES ($1, 'error', 'x')",
+        [d],
+      ),
+    ).rejects.toThrow()
+    await expect(
+      pool.query(
+        "INSERT INTO domain_dns_checks (domain_id, status, detail) VALUES ($1, 'nonsense', 'x')",
+        [d],
+      ),
+    ).rejects.toThrow()
+    await expect(
+      pool.query('INSERT INTO domain_dns_checks (domain_id, status, detail) VALUES ($1, $2, $3)', [
+        d,
+        'verified',
+        'x'.repeat(501),
+      ]),
+    ).rejects.toThrow()
+    await pool.query('DELETE FROM domains WHERE id = $1', [d])
+    const left = await pool.query('SELECT 1 FROM domain_dns_checks WHERE domain_id = $1', [d])
+    expect(left.rowCount).toBe(0)
+  })
 })
