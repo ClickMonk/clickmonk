@@ -101,6 +101,55 @@ describe('RangeTable.build', () => {
     const bad = [{ start: 1, end: 2, value: packCountry('de') }]
     expect(() => RangeTable.build('country', bad, [], LIMITS)).toThrow(/not a country code/)
   })
+
+  it('refuses a 32-bit start or end that is not an integer in 0..2^32-1', () => {
+    const cases: Range32[] = [
+      { start: 1.5, end: 2, value: packCountry('DE') },
+      { start: -1, end: 2, value: packCountry('DE') },
+      { start: 0, end: 0x100000000, value: packCountry('DE') },
+    ]
+    for (const bad of cases) {
+      expect(() => RangeTable.build('country', [bad], [], LIMITS)).toThrow(TableError)
+    }
+  })
+})
+
+describe('RangeTable.build range boundaries', () => {
+  it('accepts adjacent 32-bit ranges and answers correctly on each side of the join', () => {
+    const adjacent: Range32[] = [
+      { start: v4('203.0.113.0'), end: v4('203.0.113.9'), value: packCountry('DE') },
+      { start: v4('203.0.113.10'), end: v4('203.0.113.19'), value: packCountry('FR') },
+    ]
+    const t = RangeTable.build('country', adjacent, [], LIMITS)
+    expect(t.get32(v4('203.0.113.9'))).toBe(packCountry('DE'))
+    expect(t.get32(v4('203.0.113.10'))).toBe(packCountry('FR'))
+  })
+
+  it('refuses 32-bit ranges that share an endpoint', () => {
+    const shared: Range32[] = [
+      { start: v4('203.0.113.0'), end: v4('203.0.113.9'), value: packCountry('DE') },
+      { start: v4('203.0.113.9'), end: v4('203.0.113.19'), value: packCountry('FR') },
+    ]
+    expect(() => RangeTable.build('country', shared, [], LIMITS)).toThrow(/overlaps/)
+  })
+
+  it('accepts adjacent 128-bit ranges and answers correctly on each side of the join', () => {
+    const adjacent: Range128[] = [
+      { start: v6('2001:db8:9::'), end: v6('2001:db8:9::9'), value: packCountry('DE') },
+      { start: v6('2001:db8:9::a'), end: v6('2001:db8:9::13'), value: packCountry('FR') },
+    ]
+    const t = RangeTable.build('country', [], adjacent, LIMITS)
+    expect(t.get128(v6('2001:db8:9::9'))).toBe(packCountry('DE'))
+    expect(t.get128(v6('2001:db8:9::a'))).toBe(packCountry('FR'))
+  })
+
+  it('refuses 128-bit ranges that share an endpoint', () => {
+    const shared: Range128[] = [
+      { start: v6('2001:db8:9::'), end: v6('2001:db8:9::9'), value: packCountry('DE') },
+      { start: v6('2001:db8:9::9'), end: v6('2001:db8:9::13'), value: packCountry('FR') },
+    ]
+    expect(() => RangeTable.build('country', [], shared, LIMITS)).toThrow(/overlaps/)
+  })
 })
 
 describe('RangeTable.decode', () => {
@@ -151,5 +200,17 @@ describe('RangeTable.decode', () => {
     const bytes = table().encode().slice()
     new Uint32Array(bytes.buffer)[2] = 0x04030201
     expect(() => RangeTable.decode('country', bytes, LIMITS)).toThrow(/byte order/)
+  })
+
+  it('refuses a file with an unknown format version', () => {
+    const bytes = table().encode().slice()
+    new Uint32Array(bytes.buffer)[1] = 99
+    expect(() => RangeTable.decode('country', bytes, LIMITS)).toThrow(/format/)
+  })
+
+  it('refuses a file whose reserved header words are not zero', () => {
+    const bytes = table().encode().slice()
+    new Uint32Array(bytes.buffer)[6] = 1
+    expect(() => RangeTable.decode('country', bytes, LIMITS)).toThrow(/reserved/)
   })
 })

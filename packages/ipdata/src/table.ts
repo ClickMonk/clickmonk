@@ -86,6 +86,15 @@ function cmpWords(a: Words, b: Words): number {
   return 0
 }
 
+const U32_MAX = 0xffffffff
+
+/** Refuses a 32-bit range endpoint that is not an integer in 0..2^32-1, rather than letting Uint32Array wrap it silently. */
+function assertU32(kind: TableKind, label: string, n: number): void {
+  if (!Number.isInteger(n) || n < 0 || n > U32_MAX) {
+    throw new TableError(`${kind}: ${label} ${n} is not an integer in 0..${U32_MAX}`)
+  }
+}
+
 /**
  * An immutable, sorted table of non-overlapping ranges. A lookup is a binary
  * search: at most about 20 comparisons for a million entries, with no
@@ -108,6 +117,10 @@ export class RangeTable {
       throw new TableError(
         `${kind}: ${r32.length} + ${r128.length} entries, over the bound of ${limits.max32} + ${limits.max128}`,
       )
+    }
+    for (const r of r32) {
+      assertU32(kind, 'start', r.start)
+      assertU32(kind, 'end', r.end)
     }
     const a = [...r32].sort((x, y) => x.start - y.start)
     const b = [...r128].sort((x, y) => cmpWords(x.start, y.start))
@@ -132,7 +145,13 @@ export class RangeTable {
     return t
   }
 
-  /** Reads a table written by `encode`, checking everything `build` checks. Throws TableError. */
+  /**
+   * Reads a table written by `encode`, checking everything `build` checks.
+   * Throws TableError. When `bytes` is already 4-byte aligned, the returned
+   * table's typed arrays alias it directly instead of copying it: the caller
+   * must not reuse or mutate that buffer afterward. An unaligned buffer is
+   * copied internally, so it carries no such restriction.
+   */
   static decode(kind: TableKind, bytes: Uint8Array, limits: TableLimits): RangeTable {
     if (bytes.byteLength < HEADER_BYTES) throw new TableError(`${kind}: file too short`)
     // Typed arrays need 4-byte alignment; a Buffer may start anywhere in its pool.
@@ -144,6 +163,8 @@ export class RangeTable {
       throw new TableError(`${kind}: written on a host of the other byte order`)
     if (h[3] !== TABLE_KINDS[kind])
       throw new TableError(`${kind}: the file holds another kind of table`)
+    if (h[6] !== 0 || h[7] !== 0)
+      throw new TableError(`${kind}: reserved header words must be zero`)
     const n32 = h[4] as number
     const n128 = h[5] as number
     if (n32 > limits.max32 || n128 > limits.max128) {
