@@ -208,11 +208,16 @@ describe('config_changed notifications', () => {
 })
 
 describe('postgres schema 005', () => {
-  it('gives every domain a token of the right shape without being told one', async () => {
-    const r = await pool.query<{ verification_token: string }>(
-      "INSERT INTO domains (host) VALUES ('token.example.test') RETURNING verification_token",
+  it('gives every domain a token of the right shape without being told one, and a different one each time', async () => {
+    const a = await pool.query<{ verification_token: string }>(
+      "INSERT INTO domains (host) VALUES ('token-a.example.test') RETURNING verification_token",
     )
-    expect(r.rows[0]?.verification_token).toMatch(/^[0-9a-f]{32}$/)
+    const b = await pool.query<{ verification_token: string }>(
+      "INSERT INTO domains (host) VALUES ('token-b.example.test') RETURNING verification_token",
+    )
+    expect(a.rows[0]?.verification_token).toMatch(/^[0-9a-f]{32}$/)
+    expect(b.rows[0]?.verification_token).toMatch(/^[0-9a-f]{32}$/)
+    expect(a.rows[0]?.verification_token).not.toBe(b.rows[0]?.verification_token)
   })
 
   it('refuses a token an outsider could guess', async () => {
@@ -257,11 +262,16 @@ describe('postgres schema 005', () => {
     ).rejects.toThrow(/violates check constraint "domain_dns_checks_status_check"/)
   })
 
-  it('refuses a detail longer than 500 characters', async () => {
-    const d = await insertDomain('checks-detail.example.test')
+  it('accepts a detail of exactly 500 characters, and refuses one longer', async () => {
+    const ok = await insertDomain('checks-detail-ok.example.test')
+    await pool.query(
+      'INSERT INTO domain_dns_checks (domain_id, status, detail) VALUES ($1, $2, $3)',
+      [ok, 'verified', 'x'.repeat(500)],
+    )
+    const tooLong = await insertDomain('checks-detail-long.example.test')
     await expect(
       pool.query('INSERT INTO domain_dns_checks (domain_id, status, detail) VALUES ($1, $2, $3)', [
-        d,
+        tooLong,
         'verified',
         'x'.repeat(501),
       ]),

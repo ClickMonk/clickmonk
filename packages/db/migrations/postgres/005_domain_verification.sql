@@ -10,10 +10,10 @@
 -- The column is added without a default, filled, and only then given one:
 -- adding it with a volatile default rewrites the table instead.
 ALTER TABLE domains ADD COLUMN verification_token text;
-UPDATE domains SET verification_token = md5(gen_random_uuid()::text) WHERE verification_token IS NULL;
+UPDATE domains SET verification_token = replace(gen_random_uuid()::text, '-', '') WHERE verification_token IS NULL;
 ALTER TABLE domains
   ALTER COLUMN verification_token SET NOT NULL,
-  ALTER COLUMN verification_token SET DEFAULT md5(gen_random_uuid()::text),
+  ALTER COLUMN verification_token SET DEFAULT replace(gen_random_uuid()::text, '-', ''),
   -- The write gate for anything that bypasses the application, such as
   -- hand-written SQL. A token that is not 32 random hex characters is one an
   -- outsider might guess, and a guessable token is the whole of what stands

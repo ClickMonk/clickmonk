@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  MAX_TXT_CHUNKS_PER_RECORD,
   MAX_TXT_RECORDS,
   MAX_TXT_VALUE_LENGTH,
   isVerificationToken,
@@ -47,6 +48,10 @@ describe('reading the TXT records at that name', () => {
     expect(txtRecordsCarryToken([], token)).toBe(false)
   })
 
+  it('compares case-sensitively: the record must match exactly, not just fold to it', () => {
+    expect(txtRecordsCarryToken([[want.toUpperCase()]], token)).toBe(false)
+  })
+
   it('refuses a token that is not one, whatever DNS says', () => {
     expect(txtRecordsCarryToken([['clickmonk-verify=nope']], 'nope')).toBe(false)
   })
@@ -70,5 +75,15 @@ describe('reading the TXT records at that name', () => {
     // first — on the raw chunks — refuses it.
     const padded = [' '.repeat(MAX_TXT_VALUE_LENGTH + 1 - want.length), want]
     expect(txtRecordsCarryToken([padded], token)).toBe(false)
+  })
+
+  it('refuses a record with more chunks than the bound, even when the bytes stay small', () => {
+    // The byte total only grows on a non-empty chunk, so padding with empty
+    // ones keeps it under the value bound while still growing the chunk
+    // count past its own bound. If chunk count went unchecked, joining these
+    // (empty strings contribute nothing) would still land on `want`.
+    const manyEmptyThenWant = [...Array.from({ length: MAX_TXT_CHUNKS_PER_RECORD }, () => ''), want]
+    expect(manyEmptyThenWant.length).toBe(MAX_TXT_CHUNKS_PER_RECORD + 1)
+    expect(txtRecordsCarryToken([manyEmptyThenWant], token)).toBe(false)
   })
 })
