@@ -11,6 +11,9 @@ importers:
       '@biomejs/biome':
         specifier: ^1.9.4
         version: 1.9.4
+      '@clickmonk/db':
+        specifier: workspace:*
+        version: link:packages/db
       '@types/node':
         specifier: ^22.10.0
         version: 22.20.4

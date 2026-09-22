@@ -100,6 +100,23 @@ pnpm lint && pnpm typecheck && pnpm build && pnpm test
 databases in `beforeAll`; two runs at once delete each other's fixtures. A mass failure
 across files you did not touch is a second test run until proven otherwise.
 
+### The durability suite
+
+```sh
+pnpm build
+pnpm vitest run --config vitest.durability.config.ts   # builds an image; a few minutes
+```
+
+It builds the image, starts the whole stack from `docker-compose.ci.yml`, and restarts
+ClickHouse, the worker and the redirect under continuous traffic, then requires every
+`302` the client received to be a click in ClickHouse. It is excluded from `pnpm test`
+and runs as its own CI job.
+
+The CI stack binds **8080 and 8123**; the test databases bind **8123 and 5433**. Stop the
+test databases before running it, or you get "port is already allocated", which reads
+like a broken test. Bring them back before the next `pnpm test`. The suite runs
+`down -v` on its own project only (`clickmonk-ci`).
+
 ## License and its consequences
 
 Fair-code, under the Sustainable Use License (`LICENSE.md`). Two rules follow:

@@ -1,0 +1,88 @@
+name: clickmonk
+
+# The image is built from this checkout; nothing is pulled from a registry.
+# `clickmonk:local` is a local tag, deliberately not a registry-looking name,
+# so nobody mistakes it for a published image.
+x-app: &app
+  image: clickmonk:local
+  build: .
+  # PID 1 must forward SIGTERM, or `docker compose stop` kills the redirect
+  # without the drain that seals its spool segment.
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 30s
+
+services:
+  redirect:
+    <<: *app
+    command: ["node", "packages/redirect/dist/index.js"]
+    # Started after Postgres, but not gated on its health: the redirect must
+    # be able to start and serve its last snapshot while Postgres is down.
+    depends_on: [postgres]
+    environment:
+      CLICKMONK_POSTGRES_URL: postgres://clickmonk:${POSTGRES_PASSWORD:?set it in .env}@postgres:5432/clickmonk
+      CLICKMONK_SECRET: ${CLICKMONK_SECRET:?set it in .env}
+    ports: ["8080:8080"]
+    volumes:
+      - spool:/var/lib/clickmonk/spool
+      - state:/var/lib/clickmonk/state
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9091/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+
+  worker:
+    <<: *app
+    command: ["node", "packages/worker/dist/index.js"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+    environment:
+      CLICKMONK_POSTGRES_URL: postgres://clickmonk:${POSTGRES_PASSWORD}@postgres:5432/clickmonk
+      CLICKMONK_CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKMONK_CLICKHOUSE_USER: clickmonk
+      CLICKMONK_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set it in .env}
+      CLICKMONK_CLICKHOUSE_DB: clickmonk
+    volumes:
+      - spool:/var/lib/clickmonk/spool
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: clickmonk
+      POSTGRES_USER: clickmonk
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clickmonk -d clickmonk -h \"$$(hostname)\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: clickmonk
+      CLICKHOUSE_USER: clickmonk
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes: ["clickhouse-data:/var/lib/clickhouse"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- \"http://$$(hostname):8123/ping\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  spool:
+  state:
+  postgres-data:
+  clickhouse-data:

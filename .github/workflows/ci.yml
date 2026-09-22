@@ -77,3 +77,16 @@ jobs:
       - run: pnpm build
       - run: docker compose -f docker-compose.test.yml up -d --wait
       - run: pnpm test
+
+  durability:
+    runs-on: ubuntu-latest
+    # Sized against the suite: image build plus about a minute of load.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm vitest run --config vitest.durability.config.ts

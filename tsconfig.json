@@ -5,6 +5,7 @@
     { "path": "packages/core" },
     { "path": "packages/db" },
     { "path": "packages/redirect" },
-    { "path": "packages/worker" }
+    { "path": "packages/worker" },
+    { "path": "test" }
   ]
 }
