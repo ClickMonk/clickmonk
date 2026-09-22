@@ -1,9 +1,10 @@
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, writeSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { TEST_PG_URL, resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import {
+  Snapshot,
   SnapshotStore,
   SnapshotTooLargeError,
   deserializeSnapshot,
@@ -125,6 +126,48 @@ describe('snapshot file', () => {
     writeFileSync(path, '{not json')
     expect(readSnapshotFile(path)).toBeNull()
     expect(readSnapshotFile(join(dir, 'missing.json'))).toBeNull()
+  })
+})
+
+describe('writeSnapshotFile', () => {
+  const snap = (host: string) =>
+    new Snapshot(
+      [
+        {
+          id: '00000000-0000-4000-8000-0000000000d1',
+          host,
+          verified: true,
+          rootUrl: null,
+          notFoundUrl: null,
+        },
+      ],
+      [],
+      new Date(),
+      'postgres',
+    )
+
+  it('finishes a short write, so the file is always whole', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json')
+    // At most seven bytes per call, as a nearly full disk might allow.
+    writeSnapshotFile(path, snap('go.example.test'), (fd, buf, off, len) =>
+      writeSync(fd, buf, off, Math.min(len, 7)),
+    )
+    expect(readSnapshotFile(path)?.domain('go.example.test')?.host).toBe('go.example.test')
+  })
+
+  it('keeps the previous file, and leaves no temporary one, when a write fails part way', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'clickmonk-snap-')), 's.json')
+    writeSnapshotFile(path, snap('old.example.test'))
+    const before = readFileSync(path, 'utf8')
+    let calls = 0
+    expect(() =>
+      writeSnapshotFile(path, snap('new.example.test'), (fd, buf, off, len) => {
+        if (++calls > 1) throw new Error('simulated write failure')
+        return writeSync(fd, buf, off, Math.min(len, 7))
+      }),
+    ).toThrow('simulated write failure')
+    expect(readFileSync(path, 'utf8')).toBe(before)
+    expect(existsSync(`${path}.tmp`)).toBe(false)
   })
 })
 

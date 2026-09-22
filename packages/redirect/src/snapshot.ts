@@ -1,7 +1,16 @@
-import { closeSync, fsyncSync, openSync, readFileSync, renameSync, writeSync } from 'node:fs'
+import {
+  closeSync,
+  fsyncSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeSync,
+} from 'node:fs'
 import type { CountryRule, Device, Domain, Link } from '@clickmonk/core'
 import type { Pool } from '@clickmonk/db'
 import pg from 'pg'
+import { type WriteFn, writeAll } from './write-all.js'
 
 export class SnapshotTooLargeError extends Error {
   constructor(count: number, max: number) {
@@ -157,17 +166,27 @@ export function deserializeSnapshot(text: string): Snapshot {
   )
 }
 
-/** Write, fsync, rename: a reader sees the old file or the new one, never half of either. */
-export function writeSnapshotFile(path: string, s: Snapshot): void {
+/**
+ * Write the whole file under a temporary name, fsync, rename: a reader sees
+ * the old file or the new one, never half of either. A write that stops
+ * short throws before the rename, so the previous file stays in place.
+ * `write` is a seam for tests.
+ */
+export function writeSnapshotFile(path: string, s: Snapshot, write: WriteFn = writeSync): void {
   const tmp = `${path}.tmp`
   const fd = openSync(tmp, 'w')
   try {
-    writeSync(fd, serializeSnapshot(s))
-    fsyncSync(fd)
-  } finally {
-    closeSync(fd)
+    try {
+      writeAll(fd, Buffer.from(serializeSnapshot(s)), write)
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+    renameSync(tmp, path)
+  } catch (err) {
+    rmSync(tmp, { force: true })
+    throw err
   }
-  renameSync(tmp, path)
 }
 
 export function readSnapshotFile(path: string): Snapshot | null {
