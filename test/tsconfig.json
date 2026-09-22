@@ -1,6 +1,6 @@
 {
   "extends": "../tsconfig.base.json",
   "compilerOptions": { "noEmit": true },
-  "include": ["*.ts"],
+  "include": ["*.ts", "stack/*.ts"],
   "references": [{ "path": "../packages/db" }]
 }

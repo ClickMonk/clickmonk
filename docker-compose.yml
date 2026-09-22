@@ -22,8 +22,7 @@ services:
     environment:
       CLICKMONK_POSTGRES_URL: postgres://clickmonk:${POSTGRES_PASSWORD:?set it in .env}@postgres:5432/clickmonk
       CLICKMONK_SECRET: ${CLICKMONK_SECRET:?set it in .env}
-      CLICKMONK_TRUSTED_PROXIES: ${CLICKMONK_TRUSTED_PROXIES:-127.0.0.1}
-    ports: ["8080:8080"]
+      CLICKMONK_TRUSTED_PROXIES: ${CLICKMONK_TRUSTED_PROXIES:-uniquelocal,loopback}
     volumes:
       - spool:/var/lib/clickmonk/spool
       - state:/var/lib/clickmonk/state
@@ -34,6 +33,32 @@ services:
       interval: 5s
       timeout: 5s
       retries: 24
+      start_period: 10s
+
+  caddy:
+    image: caddy:2.11-alpine
+    restart: unless-stopped
+    depends_on: [redirect]
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/tls.d:/etc/caddy/tls.d:ro
+      - ./caddy/proxy.d:/etc/caddy/proxy.d:ro
+      # Certificates and the ACME account live here. Back this volume up.
+      - caddy-data:/data
+      - caddy-config:/config
+    # Not "is the process alive": a Caddyfile error under `restart:
+    # unless-stopped` is a crash-loop that `up --wait` would otherwise report
+    # as healthy, and a Caddy that starts and proxies nothing would pass any
+    # probe that only asked for a response. Asking the reverse-proxy module
+    # for its upstreams answers only once the site block is provisioned, names
+    # the upstream, and does not fail while a certificate is still being
+    # obtained — which is allowed to lag without failing an install.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:2019/reverse_proxy/upstreams | grep -q 'redirect:8080'"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
       start_period: 10s
 
   worker:
@@ -49,6 +74,8 @@ services:
       CLICKMONK_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set it in .env}
       CLICKMONK_CLICKHOUSE_DB: clickmonk
       CLICKMONK_IPDATA_UPDATE: ${CLICKMONK_IPDATA_UPDATE:-on}
+      CLICKMONK_DNS_CHECK: ${CLICKMONK_DNS_CHECK:-on}
+      CLICKMONK_DNS_SERVERS: ${CLICKMONK_DNS_SERVERS:-}
     volumes:
       - spool:/var/lib/clickmonk/spool
       - ipdata:/var/lib/clickmonk/ipdata
@@ -87,8 +114,21 @@ services:
       start_period: 10s
 
 volumes:
+  caddy-data:
+  caddy-config:
   spool:
   state:
   ipdata:
   postgres-data:
   clickhouse-data:
+
+networks:
+  default:
+    # Without this, Docker relays IPv6 connections to a published port through
+    # its own userland proxy and they arrive from the bridge gateway, so every
+    # IPv6 visitor shares one address. Change the range only if it collides
+    # with a network this host already has.
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: ${CLICKMONK_IPV6_SUBNET:-fd00:c11c:0::/64}

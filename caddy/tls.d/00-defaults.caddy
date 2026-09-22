@@ -1,0 +1,28 @@
+# Directives dropped in here land inside this site's `tls` block. Empty by
+# default, which is right for a server that gets its certificates from Let's
+# Encrypt.
+#
+# WHAT THIS IS FOR: changing where certificates come from.
+#
+# A different certificate authority, or a local one during a trial:
+#
+#     ca https://acme.example.com/directory
+#
+# An address to be warned at when a certificate is about to expire:
+#
+#     email you@example.com
+#
+# A certificate you already hold, which is the answer for a domain behind
+# Cloudflare's proxy. With the proxy on, the challenge Let's Encrypt sends is
+# answered by Cloudflare rather than by this server, so issuance here fails.
+# The two setups that work are a DNS-only (grey cloud) record, or the proxy on
+# with Cloudflare set to Full (strict) and an Origin certificate mounted into
+# this container:
+#
+#     tls /etc/caddy/certs/origin.pem /etc/caddy/certs/origin.key
+#
+# Flexible mode is not one of them: it sends traffic to this server in clear.
+#
+# This file is not decoration. With an empty directory Caddy logs
+# "No files matching import glob pattern" on every start, which reads as a
+# misconfiguration to whoever is tailing the logs for the first time.

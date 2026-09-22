@@ -1,0 +1,34 @@
+# Caddy terminates TLS for every link domain and forwards to the redirect.
+#
+# A certificate is obtained on the first HTTPS request for a host name, and
+# only after the redirect has said yes to the `ask` check below: yes means a
+# domain an admin added and verified. Any other host name pointed at this
+# server gets no certificate, so nobody outside can make this install ask a
+# certificate authority for one.
+{
+	on_demand_tls {
+		# The internal port, reachable on the stack's own network and
+		# published nowhere.
+		ask http://redirect:9091/ask
+	}
+}
+
+# Every host name. The redirect answers for the ones it knows and serves a
+# 404 page for the rest. Plain HTTP is proxied rather than redirected: a
+# domain that has not been verified has no certificate, and a local trial has
+# no domain at all.
+:443 {
+	tls {
+		on_demand
+		import /etc/caddy/tls.d/*.caddy
+	}
+	reverse_proxy redirect:8080 {
+		import /etc/caddy/proxy.d/*.caddy
+	}
+}
+
+:80 {
+	reverse_proxy redirect:8080 {
+		import /etc/caddy/proxy.d/*.caddy
+	}
+}
