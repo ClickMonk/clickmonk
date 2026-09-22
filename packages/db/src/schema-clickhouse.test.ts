@@ -39,9 +39,15 @@ const row = (clickId: string) => ({
   referrer: '',
   ip: '192.0.2.1',
   cap_unchecked: 0,
+  traffic_class: 'bot',
+  signals: ['ua_bot', 'rate'],
+  action: 'flag',
+  os: 'windows',
+  browser: 'chrome',
+  asn: 64500,
 })
 
-describe('clickhouse schema 002', () => {
+describe('clickhouse clicks table', () => {
   it('has the columns the shipper writes, including the city-ready location', async () => {
     const rs = await ch.query({ query: 'DESCRIBE TABLE clicks', format: 'JSONEachRow' })
     const cols = (await rs.json<{ name: string }>()).map((c) => c.name)
@@ -67,5 +73,35 @@ describe('clickhouse schema 002', () => {
     } finally {
       await ch.command({ query: 'SYSTEM START MERGES clicks' })
     }
+  })
+
+  it('gives a click written without classification empty values, not human', async () => {
+    const id = '01920000-0000-7000-8000-00000000abce'
+    const { traffic_class, signals, action, os, browser, asn, ...older } = row(id)
+    await ch.insert({ table: 'clicks', values: [older], format: 'JSONEachRow' })
+    const rs = await ch.query({
+      query:
+        'SELECT traffic_class, signals, action, os, browser, asn FROM clicks WHERE click_id = {id:UUID}',
+      query_params: { id },
+      format: 'JSONEachRow',
+    })
+    expect(await rs.json()).toEqual([
+      { traffic_class: '', signals: [], action: '', os: '', browser: '', asn: 0 },
+    ])
+  })
+
+  it('stores the largest ASN there is', async () => {
+    const id = '01920000-0000-7000-8000-00000000abcf'
+    await ch.insert({
+      table: 'clicks',
+      values: [{ ...row(id), asn: 4294967295 }],
+      format: 'JSONEachRow',
+    })
+    const rs = await ch.query({
+      query: 'SELECT asn FROM clicks WHERE click_id = {id:UUID}',
+      query_params: { id },
+      format: 'JSONEachRow',
+    })
+    expect(await rs.json()).toEqual([{ asn: 4294967295 }])
   })
 })
