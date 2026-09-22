@@ -120,10 +120,36 @@ describe('checkDomain', () => {
     expect(r.status).toBe('verified')
     expect(r.detail.length).toBeLessThanOrEqual(MAX_DETAIL)
   })
+
+  it('cuts an error detail too, when the overflow comes from the resolver’s own message', async () => {
+    // The address list is bounded by MAX_ADDRESSES before it ever reaches
+    // MAX_DETAIL, so the previous test never actually needs cut() to act.
+    // A resolver's own error message has no such bound: it is text this
+    // install did not choose, from a library or an OS resolver, and nothing
+    // here caps its length before it is written into the detail.
+    const resolver: DomainResolver = {
+      async resolveTxt() {
+        throw new Error('x'.repeat(600))
+      },
+      async resolve4() {
+        throw new Error('unused')
+      },
+      async resolve6() {
+        throw new Error('unused')
+      },
+      cancel() {},
+    }
+    const r = await checkDomain(resolver, 'go.example.test', TOKEN)
+    expect(r.status).toBe('error')
+    expect(r.detail.length).toBeLessThanOrEqual(MAX_DETAIL)
+  })
 })
 
-async function addDomain(host: string, verified = false): Promise<{ id: string; token: string }> {
-  const token = newVerificationToken()
+async function addDomain(
+  host: string,
+  verified = false,
+  token: string = newVerificationToken(),
+): Promise<{ id: string; token: string }> {
   const r = await pool.query<{ id: string }>(
     'INSERT INTO domains (host, verified, verification_token) VALUES ($1, $2, $3) RETURNING id',
     [host, verified, token],
@@ -161,14 +187,29 @@ describe('runDomainChecks', () => {
   })
 
   it('refuses a domain publishing another domain’s token', async () => {
-    const mine = await addDomain('go.example.test')
-    const theirs = await addDomain('other.example.test')
+    // go.example.test really does own TOKEN, so it verifies normally. The
+    // attack is other.example.test publishing that same TOKEN at ITS OWN
+    // name: one well-formed record, a real address behind it, wrong only in
+    // whose token it is. Both domains resolving correctly except for that
+    // is what makes this pin the token comparison itself: a check that
+    // compared every row against a fixed known token instead of its own
+    // would verify both instead of just the true owner.
+    const owner = await addDomain('go.example.test', false, TOKEN)
+    const impostor = await addDomain('other.example.test')
     const run = await runDomainChecks({
       pg: pool,
-      resolver: fakeResolver({ txt: { [NAME]: [[verificationRecordValue(theirs.token)]] } }),
+      resolver: fakeResolver({
+        txt: {
+          [NAME]: [[verificationRecordValue(TOKEN)]],
+          '_clickmonk.other.example.test': [[verificationRecordValue(TOKEN)]],
+        },
+        a: { 'other.example.test': ['192.0.2.20'] },
+      }),
     })
-    expect(run).toMatchObject({ verified: 0, failed: 2 })
-    expect(await verifiedOf(mine.id)).toBe(false)
+    expect(run).toEqual({ checked: 2, verified: 1, failed: 1 })
+    expect(await verifiedOf(owner.id)).toBe(true)
+    expect(await verifiedOf(impostor.id)).toBe(false)
+    expect((await checkOf(impostor.id))?.status).toBe('missing_token')
   })
 
   it('never un-verifies a domain whose record has gone, and records why', async () => {
