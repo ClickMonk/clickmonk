@@ -3,6 +3,7 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  ftruncateSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -12,6 +13,7 @@ import {
 } from 'node:fs'
 import { join } from 'node:path'
 import { type ClickRecord, SEALED_SEGMENT_RE, segmentName } from '@clickmonk/core'
+import { type WriteFn, writeAll } from './write-all.js'
 
 export interface SpoolOptions {
   dir: string
@@ -24,6 +26,10 @@ export interface SpoolOptions {
   /** Stop writing (and count drops) above this many bytes on disk. Default 5 GB. */
   maxTotalBytes?: number
   onError?: (err: unknown) => void
+  /** Filesystem seam for tests: defaults to `fs.writeSync`. */
+  write?: WriteFn
+  /** Filesystem seam for tests: defaults to `fs.ftruncateSync`. */
+  truncate?: (fd: number, length: number) => void
 }
 
 /**
@@ -38,6 +44,8 @@ export class SpoolWriter {
   private readonly fsyncIntervalMs: number
   private readonly maxTotalBytes: number
   private readonly onError: (err: unknown) => void
+  private readonly write: WriteFn
+  private readonly truncate: (fd: number, length: number) => void
 
   private fd: number | null = null
   private openPath = ''
@@ -73,6 +81,8 @@ export class SpoolWriter {
     this.fsyncIntervalMs = opts.fsyncIntervalMs ?? 200
     this.maxTotalBytes = opts.maxTotalBytes ?? 5 * 1024 * 1024 * 1024
     this.onError = opts.onError ?? (() => {})
+    this.write = opts.write ?? writeSync
+    this.truncate = opts.truncate ?? ftruncateSync
   }
 
   start(): void {
@@ -95,14 +105,23 @@ export class SpoolWriter {
       return false
     }
     try {
-      const line = `${JSON.stringify(record)}\n`
-      const n = Buffer.byteLength(line)
+      const line = Buffer.from(`${JSON.stringify(record)}\n`)
+      const n = line.length
       if (this.sealedBytes + this.segBytes + n > this.maxTotalBytes) {
         this.dropped++
         return false
       }
       if (this.fd === null) this.openSegment()
-      writeSync(this.fd as number, line)
+      const fd = this.fd as number
+      const progress = { written: 0 }
+      try {
+        writeAll(fd, line, this.write, progress)
+      } catch (err) {
+        this.dropped++
+        this.onError(err)
+        this.discardPartial(fd, progress.written)
+        return false
+      }
       this.segBytes += n
       this.dirty = true
       // The record is accepted from here on: it is on disk. A failure
@@ -120,6 +139,27 @@ export class SpoolWriter {
       this.dropped++
       this.onError(err)
       return false
+    }
+  }
+
+  /**
+   * A record that was only partly written is cut off again, so the next
+   * record starts on a fresh line instead of being appended to the fragment
+   * (which would make both unreadable). If the cut fails too, the segment is
+   * sealed with the fragment as its final line, which the worker skips, and
+   * the next record goes to a new segment.
+   */
+  private discardPartial(fd: number, written: number): void {
+    try {
+      this.truncate(fd, this.segBytes)
+    } catch (err) {
+      this.onError(err)
+      this.segBytes += written
+      try {
+        this.seal()
+      } catch (sealErr) {
+        this.onError(sealErr)
+      }
     }
   }
 

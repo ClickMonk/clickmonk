@@ -1,9 +1,18 @@
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+  writeSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { type ClickRecord, ZERO_UUID, segmentName } from '@clickmonk/core'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SpoolWriter } from './spool.js'
+import type { WriteFn } from './write-all.js'
 
 // A real `node:fs` module namespace can't be spied on directly under ESM
 // ("Module namespace is not configurable"), so `renameSync` is routed
@@ -285,5 +294,104 @@ describe('SpoolWriter', () => {
     expect(sealed(dir)).toHaveLength(2)
     expect(lines(dir)).toHaveLength(2)
     expect(readdirSync(dir).some((f) => f.endsWith('.part'))).toBe(false)
+  })
+
+  describe('a short or failed write', () => {
+    // What the seam does to the next write call; `real` passes it through.
+    type Mode = 'real' | 'half-then-real' | 'half-then-throw' | 'throw' | 'none'
+    function seam() {
+      const state = { mode: 'real' as Mode, calls: 0 }
+      const write: WriteFn = (fd, buf, off, len) => {
+        state.calls++
+        // A guard for the test itself: a writer that loops on a write that
+        // makes no progress would otherwise spin here forever.
+        if (state.calls > 100) throw new Error('the writer kept retrying a write with no progress')
+        switch (state.mode) {
+          case 'real':
+            return writeSync(fd, buf, off, len)
+          case 'none':
+            return 0
+          case 'throw':
+            throw new Error('simulated write failure')
+          case 'half-then-real':
+          case 'half-then-throw':
+            state.mode = state.mode === 'half-then-real' ? 'real' : 'throw'
+            return writeSync(fd, buf, off, Math.floor(len / 2))
+        }
+      }
+      return { state, write }
+    }
+    const openText = (dir: string) => {
+      const part = readdirSync(dir).filter((f) => f.endsWith('.part'))
+      expect(part).toHaveLength(1)
+      return readFileSync(join(dir, part[0] as string), 'utf8')
+    }
+    // A fixed time, so the line a test expects is byte for byte the one written.
+    const fixed = (n: number): ClickRecord => ({ ...rec(n), time: '2026-01-01T00:00:00.000Z' })
+    const line = (n: number) => `${JSON.stringify(fixed(n))}\n`
+
+    it('finishes a short write and accepts the record whole', () => {
+      const dir = tmp()
+      const { state, write } = seam()
+      const w = writer(dir, { write })
+      expect(w.append(fixed(1))).toBe(true)
+      state.mode = 'half-then-real'
+      expect(w.append(fixed(2))).toBe(true)
+      expect(openText(dir)).toBe(line(1) + line(2))
+      expect(w.stats().dropped).toBe(0)
+    })
+
+    it('refuses a record it could only partly write, and cuts the fragment off', () => {
+      const dir = tmp()
+      const onError = vi.fn()
+      const { state, write } = seam()
+      const w = writer(dir, { write, onError })
+      expect(w.append(fixed(1))).toBe(true)
+      state.mode = 'half-then-throw'
+      expect(w.append(fixed(2))).toBe(false)
+      expect(w.stats().dropped).toBe(1)
+      expect(onError).toHaveBeenCalledTimes(1)
+      expect(openText(dir)).toBe(line(1))
+      state.mode = 'real'
+      expect(w.append(fixed(3))).toBe(true)
+      expect(openText(dir)).toBe(line(1) + line(3))
+    })
+
+    it('refuses a write that makes no progress rather than retrying it forever', () => {
+      const dir = tmp()
+      const { state, write } = seam()
+      const w = writer(dir, { write })
+      state.mode = 'none'
+      expect(w.append(fixed(1))).toBe(false)
+      expect(state.calls).toBe(1)
+      expect(w.stats().dropped).toBe(1)
+    })
+
+    it('seals the segment behind a fragment it cannot cut off, and writes on in a new one', () => {
+      const dir = tmp()
+      const onError = vi.fn()
+      const { state, write } = seam()
+      const w = writer(dir, {
+        write,
+        onError,
+        truncate: () => {
+          throw new Error('simulated truncate failure')
+        },
+      })
+      expect(w.append(fixed(1))).toBe(true)
+      state.mode = 'half-then-throw'
+      expect(w.append(fixed(2))).toBe(false)
+      expect(w.stats().dropped).toBe(1)
+      // The fragment is the sealed segment's final line, where the worker
+      // expects a torn line and skips it.
+      expect(sealed(dir)).toHaveLength(1)
+      const first = readFileSync(join(dir, sealed(dir)[0] as string), 'utf8')
+      expect(first.startsWith(line(1))).toBe(true)
+      expect(first.length).toBeGreaterThan(line(1).length)
+      expect(first.endsWith('\n')).toBe(false)
+      state.mode = 'real'
+      expect(w.append(fixed(3))).toBe(true)
+      expect(openText(dir)).toBe(line(3))
+    })
   })
 })
