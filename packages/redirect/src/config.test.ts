@@ -37,7 +37,7 @@ describe('loadConfig', () => {
     ['an IPv6 range', '2001:db8::/32', ['2001:db8::/32']],
     ['an address', '192.0.2.10', ['192.0.2.10']],
     ['a named range', 'loopback', ['loopback']],
-    ['a list', 'loopback, 172.17.0.1', ['loopback', '172.17.0.1']],
+    ['a list', 'loopback, 203.0.113.10', ['loopback', '203.0.113.10']],
   ])('accepts %s as a trusted proxy', (_label, value, want) => {
     expect(loadConfig({ ...base, CLICKMONK_TRUSTED_PROXIES: value }).trustedProxies).toEqual(want)
   })
