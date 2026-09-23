@@ -590,30 +590,24 @@ describe('a link domain', () => {
   // admin service refuses any Host but its own — so a name that reached the
   // admin service would answer in the admin service's words, whatever its
   // status code happened to be.
+  // Both ports, because they are two separate routing decisions in the shipped
+  // file and a link domain has a certificate of its own: the port a visitor
+  // reaches this name on is theirs to choose.
   it('does not reach the admin API', () => {
-    const get = curl(['--max-time', '30', '-D', '-', `http://${LINK_HOST}/api/session`], [], {
-      body: true,
-    })
-    expect(get.status).toBe(404)
-    expect(get.body).toBe(REDIRECT_404)
-    expect(get.headers).not.toMatch(ADMIN_ONLY_HEADER)
-    const post = curl(
-      [
-        '--max-time',
-        '30',
-        '-D',
-        '-',
-        '-X',
-        'POST',
-        '-H',
-        'content-type: application/json',
-        '--data-binary',
-        JSON.stringify({ email: EMAIL, password: PASSWORD }),
-        `http://${LINK_HOST}/api/session`,
-      ],
-      [],
-      { body: true },
-    )
+    for (const r of [visit('/api/session'), visitTls('/api/session')]) {
+      expect(r.exit, r.stderr).toBe(0)
+      expect(r.status, r.body).toBe(404)
+      expect(r.body).toBe(REDIRECT_404)
+      expect(r.headers).not.toMatch(ADMIN_ONLY_HEADER)
+    }
+    const post = visitTls('/api/session', [
+      '-X',
+      'POST',
+      '-H',
+      'content-type: application/json',
+      '--data-binary',
+      JSON.stringify({ email: EMAIL, password: PASSWORD }),
+    ])
     // 415, because the only body the redirect reads is a password form and it
     // has no parser for JSON — which is itself the proof that this sign-in
     // reached the redirect. The admin API parses JSON, so a request that got
