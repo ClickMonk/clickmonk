@@ -3,9 +3,11 @@ import type { Pool } from '@clickmonk/db'
 import type { DomainResolver } from '@clickmonk/worker/domains'
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify'
 import { type Credential, authenticate, checkCsrf, hasBearer } from './auth.js'
+import { registerDomainRoutes } from './domains.js'
 import { HttpError, MAX_BODY_BYTES, securityHeaders } from './http.js'
 import { registerKeyRoutes } from './keys.js'
 import { registerSessionRoutes } from './session-routes.js'
+import { registerSettingsRoutes } from './settings-routes.js'
 
 /** Failed sign-ins from one address before it is refused, and the window. */
 export const LOGIN_ATTEMPT_LIMIT = 10
@@ -176,6 +178,8 @@ export function buildAdminApp(
 
   registerSessionRoutes(app, ctx)
   registerKeyRoutes(app, ctx)
+  registerDomainRoutes(app, ctx)
+  registerSettingsRoutes(app, ctx)
 
   return app
 }
