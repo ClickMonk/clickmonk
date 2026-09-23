@@ -129,13 +129,35 @@ describe('creating a link', () => {
     expect((await pg.query('SELECT 1 FROM links')).rowCount).toBe(0)
   })
 
-  it('refuses a field nobody knows, including one naming an owner', async () => {
-    expect((await create({ targets: [target], domainId: 'x' })).statusCode).toBe(400)
-    expect((await create({ targets: [target], accountId: 'x' })).statusCode).toBe(400)
-    expect((await create({ targets: [target], passwordHash: 'anything at all' })).statusCode).toBe(
-      400,
+  // `invalid_body`, not merely 400: the body schema is what must refuse these,
+  // and it has to be checked by name. A body that let an unknown field through
+  // reaches core's own strict schema and is refused there instead — a 400 with
+  // a different code, which a test that only read the status would accept,
+  // leaving the field this API never wants to see written into the link input.
+  it.each(['domainId', 'accountId', 'adminId', 'passwordHash'])(
+    'refuses a body carrying %s, a field nobody knows',
+    async (field) => {
+      const r = await create({ targets: [target], [field]: 'anything at all' })
+      expect(r.statusCode).toBe(400)
+      expect(r.json().error).toBe('invalid_body')
+      expect((await pg.query('SELECT 1 FROM links')).rowCount).toBe(0)
+    },
+  )
+
+  it('refuses a patch carrying a field nobody knows', async () => {
+    const created = (await create({ slug: 'spring', targets: [target] })).json()
+    const r = await app.inject({
+      method: 'PATCH',
+      url: `/api/links/${created.id}`,
+      headers: write(cookie),
+      payload: { name: 'Spring', passwordHash: 'anything at all' },
+    })
+    expect(r.statusCode).toBe(400)
+    expect(r.json().error).toBe('invalid_body')
+    const after = await pg.query<{ name: string | null; password_hash: string | null }>(
+      'SELECT name, password_hash FROM links',
     )
-    expect((await pg.query('SELECT 1 FROM links')).rowCount).toBe(0)
+    expect(after.rows).toEqual([{ name: null, password_hash: null }])
   })
 })
 
