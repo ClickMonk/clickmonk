@@ -38,6 +38,25 @@ const put = (payload: Record<string, unknown>) =>
 
 const ALL_FLAG = { bot: 'flag', abuser: 'flag', anonymous: 'flag', datacenter: 'flag' }
 
+// As on the domain routes: the host guard and the cross-site check are not
+// credentials, and the hook that resolves one refuses nothing. One row per
+// route, so removing one handler's call fails that row alone.
+describe('every route needs a credential', () => {
+  it.each([
+    ['GET', undefined],
+    ['PUT', { actions: ALL_FLAG, safeUrl: null, abuserThreshold: 60 }],
+  ])('refuses an anonymous %s /api/settings', async (method, payload) => {
+    const r = await app.inject({
+      method: method as 'GET',
+      url: '/api/settings',
+      headers: write(),
+      ...(payload ? { payload } : {}),
+    })
+    expect(r.statusCode).toBe(401)
+    expect(r.json().error).toBe('unauthenticated')
+  })
+})
+
 describe('reading the settings', () => {
   it('reports what the redirect serves', async () => {
     const r = await get()
@@ -60,6 +79,9 @@ describe('reading the settings', () => {
     // the host, so core does not. That gap is why what is read is validated.
     await pg.query("UPDATE settings SET safe_url = 'https://{param:h}/safe'")
     const r = await get()
+    // The field the fixture corrupted, not one the defaults happen to match
+    // anyway: `safeUrl` is what tells a stored row from the defaults here.
+    expect(r.json().safeUrl).toBe(DEFAULT_TRAFFIC_SETTINGS.safeUrl)
     expect(r.json().actions).toEqual(DEFAULT_TRAFFIC_SETTINGS.actions)
     expect(r.json().problem).toContain('invalid')
   })
@@ -119,6 +141,12 @@ describe('writing the settings', () => {
     ['a threshold of zero', { actions: ALL_FLAG, safeUrl: null, abuserThreshold: 0 }],
     ['a threshold past the bound', { actions: ALL_FLAG, safeUrl: null, abuserThreshold: 100_001 }],
     ['a partial write', { abuserThreshold: 90 }],
+    // There is one admin, so nothing in a body may name whose settings these
+    // are. A strict schema is what makes that checkable rather than ignored.
+    [
+      'a field it does not know',
+      { actions: ALL_FLAG, safeUrl: null, abuserThreshold: 60, accountId: 'a2f' },
+    ],
   ])('refuses %s', async (_label, payload) => {
     const before = await get()
     const r = await put(payload)

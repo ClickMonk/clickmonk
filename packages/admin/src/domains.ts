@@ -18,7 +18,6 @@
  */
 import {
   isDomainUrl,
-  newVerificationToken,
   normaliseHost,
   verificationRecordName,
   verificationRecordValue,
@@ -26,6 +25,7 @@ import {
 import {
   type DomainDnsStatus,
   checkDomain,
+  createDomain,
   createResolver,
   recordDomainCheck,
 } from '@clickmonk/worker/domains'
@@ -132,24 +132,25 @@ export function registerDomainRoutes(app: FastifyInstance, ctx: AdminContext): v
   })
 
   /**
-   * Adds a domain, unverified, with a token this install mints. The column
-   * has a default that mints one too, for SQL written by hand; this path
-   * mints it the way the CLI does, from `core`.
+   * Adds a domain through the one writer the CLI also uses, so the statement
+   * that decides a new domain's `verified` exists once. This route never
+   * passes `verified`, and the body it read cannot carry one.
+   *
+   * The host is normalised here as well as there, so a bad one is a 400 that
+   * names the field rather than the writer's last-resort refusal.
    */
   app.post('/api/domains', async (req, reply) => {
     requireCredential(req)
     const body = readBody(CreateBody, req.body)
     const host = normaliseHost(body.host)
-    if (!host) fail(400, 'invalid_host', 'not a valid host name')
-    const r = await ctx.pg.query<{ id: string }>(
-      `INSERT INTO domains (host, verified, root_url, not_found_url, verification_token)
-       VALUES ($1, false, $2, $3, $4)
-       ON CONFLICT (host) DO NOTHING RETURNING id`,
-      [host, body.rootUrl, body.notFoundUrl, newVerificationToken()],
-    )
-    const id = r.rows[0]?.id
-    if (!id) fail(409, 'host_taken', 'this install already has that domain')
-    return reply.code(201).send(asDomain(await domainById(ctx, id as string)))
+    if (!host) return fail(400, 'invalid_host', 'not a valid host name')
+    const created = await createDomain(ctx.pg, {
+      host,
+      rootUrl: body.rootUrl,
+      notFoundUrl: body.notFoundUrl,
+    })
+    if (!created) return fail(409, 'host_taken', 'this install already has that domain')
+    return reply.code(201).send(asDomain(await domainById(ctx, created.id)))
   })
 
   app.patch<{ Params: { id: string } }>('/api/domains/:id', async (req) => {
@@ -242,16 +243,21 @@ export function registerDomainRoutes(app: FastifyInstance, ctx: AdminContext): v
    * the token, and every domain no check has reached yet. Verification is
    * never revoked automatically, so a domain here may still be serving — that
    * is the point of showing it.
+   *
+   * Capped and counted exactly as the listing is: an operator shown a prefix
+   * of what is wrong, with no sign that it was a prefix, is worse off than
+   * one shown nothing.
    */
   app.get('/api/alerts', async (req) => {
     requireCredential(req)
     const r = await ctx.pg.query<DomainRow>(
       `${SELECT_DOMAINS}
         WHERE c.status IS NULL OR c.status <> 'verified'
-        ORDER BY d.host LIMIT ${MAX_DOMAINS_LISTED}`,
+        ORDER BY d.host LIMIT ${MAX_DOMAINS_LISTED + 1}`,
     )
     return {
-      domains: r.rows.map((d) => ({
+      truncated: r.rows.length > MAX_DOMAINS_LISTED,
+      domains: r.rows.slice(0, MAX_DOMAINS_LISTED).map((d) => ({
         id: d.id,
         host: d.host,
         verified: d.verified,

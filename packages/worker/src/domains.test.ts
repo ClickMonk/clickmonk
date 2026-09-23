@@ -7,6 +7,7 @@ import {
   MAX_ADDRESSES,
   MAX_DETAIL,
   checkDomain,
+  createDomain,
   isResolverAddress,
   recordDomainCheck,
   runDomainChecks,
@@ -230,6 +231,61 @@ const verifiedOf = (id: string) =>
   pool
     .query<{ verified: boolean }>('SELECT verified FROM domains WHERE id = $1', [id])
     .then((r) => r.rows[0]?.verified)
+
+// The single writer both the API and `domain add` go through. These call it
+// directly, with no schema and no argument parser in front of it, which is
+// the case its own checks exist for.
+describe('createDomain', () => {
+  afterEach(async () => {
+    await pool.query('TRUNCATE domains CASCADE')
+  })
+
+  it('writes an unverified domain with a token of its own', async () => {
+    const created = await createDomain(pool, { host: 'Go.Example.TEST.' })
+    expect(created?.host).toBe('go.example.test')
+    const row = await pool.query<{ host: string; verified: boolean; verification_token: string }>(
+      'SELECT host, verified, verification_token FROM domains',
+    )
+    expect(row.rows[0]?.host).toBe('go.example.test')
+    expect(row.rows[0]?.verified).toBe(false)
+    expect(row.rows[0]?.verification_token).toBe(created?.verificationToken)
+  })
+
+  // The flag that decides whether a host name serves and whether this install
+  // asks for a certificate in its name. A caller that says nothing about it
+  // gets `false`, so the only way to `true` is asking for it in so many words.
+  it('is verified only when the caller asks in so many words', async () => {
+    await createDomain(pool, { host: 'quiet.example.test' })
+    await createDomain(pool, { host: 'asked.example.test', verified: true })
+    const rows = await pool.query<{ host: string; verified: boolean }>(
+      'SELECT host, verified FROM domains ORDER BY host',
+    )
+    expect(rows.rows.map((r) => `${r.host}:${r.verified}`)).toEqual([
+      'asked.example.test:true',
+      'quiet.example.test:false',
+    ])
+  })
+
+  it('refuses a URL carrying a token, and a host name that is not one', async () => {
+    await expect(
+      createDomain(pool, { host: 'go.example.test', rootUrl: 'https://example.com/{click_id}' }),
+    ).rejects.toThrow(/no token/)
+    await expect(
+      createDomain(pool, {
+        host: 'go.example.test',
+        notFoundUrl: 'https://example.com/{click_id}',
+      }),
+    ).rejects.toThrow(/no token/)
+    await expect(createDomain(pool, { host: 'not a host' })).rejects.toThrow(/host name/)
+    expect((await pool.query('SELECT 1 FROM domains')).rowCount).toBe(0)
+  })
+
+  it('answers null for a host this install already has', async () => {
+    expect(await createDomain(pool, { host: 'go.example.test' })).not.toBeNull()
+    expect(await createDomain(pool, { host: 'go.example.test' })).toBeNull()
+    expect((await pool.query('SELECT 1 FROM domains')).rowCount).toBe(1)
+  })
+})
 
 describe('recordDomainCheck', () => {
   afterEach(async () => {

@@ -3,7 +3,7 @@ import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import type { DomainResolver } from '@clickmonk/worker/domains'
 import type { FastifyInstance } from 'fastify'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { MAX_DOMAINS_LISTED, MIN_CHECK_INTERVAL_MS } from './domains.js'
+import { CHECKS_IN_FLIGHT, MAX_DOMAINS_LISTED, MIN_CHECK_INTERVAL_MS } from './domains.js'
 import { ADMIN_HOST, clockFrom, read, signedIn, testApp, write } from './testing.js'
 
 const pg = testPg()
@@ -19,9 +19,19 @@ class FakeResolver implements DomainResolver {
   cancelled = 0
   /** How many times DNS was actually asked: what the interval bound must stop. */
   asked = 0
+  /**
+   * A lookup waits on this before answering, so a test can hold queries open
+   * and have a known number of checks in flight at once. Ordering only: no
+   * timer, and no wall clock.
+   */
+  held: Promise<void> | null = null
+  /** Called as each lookup starts, so a test can wait for the nth one. */
+  onAsked: (() => void) | null = null
 
   async resolveTxt(): Promise<string[][]> {
     this.asked++
+    this.onAsked?.()
+    if (this.held) await this.held
     if (this.txtError) throw this.txtError
     return this.txt
   }
@@ -39,6 +49,17 @@ class FakeResolver implements DomainResolver {
 }
 
 let resolver = new FakeResolver()
+
+/** A promise and the handle that settles it, for ordering without timers. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void
+  const promise = new Promise<void>((r) => {
+    resolve = () => {
+      r()
+    }
+  })
+  return { promise, resolve }
+}
 
 beforeAll(async () => {
   await resetDatabases(pg, ch)
@@ -64,6 +85,37 @@ afterAll(async () => {
 
 const add = (payload: Record<string, unknown> = { host: 'go.example.test' }) =>
   app.inject({ method: 'POST', url: '/api/domains', headers: write(cookie), payload })
+
+// The host guard and the cross-site check are not credentials: `curl` sets
+// any `Origin` it likes, and a bearer-shaped header skips that check
+// altogether. The hook resolves whatever credential a request carries and
+// refuses nothing, so the call in each handler is the whole of what stands
+// between a stranger and this API. One row per route, so removing one
+// handler's call fails that row alone.
+describe('every route needs a credential', () => {
+  it.each([
+    ['GET', '/api/domains', undefined],
+    ['POST', '/api/domains', { host: 'anon.example.test' }],
+    ['PATCH', '/api/domains/:id', { rootUrl: null }],
+    ['DELETE', '/api/domains/:id', undefined],
+    ['POST', '/api/domains/:id/check', undefined],
+    ['POST', '/api/domains/:id/unverify', undefined],
+    ['GET', '/api/alerts', undefined],
+  ])('refuses an anonymous %s %s', async (method, path, payload) => {
+    const created = (await add()).json()
+    const r = await app.inject({
+      // The row's method, which `inject` types as its own narrow union.
+      method: method as 'GET',
+      url: path.replace(':id', created.id),
+      // Everything a request can carry except a credential: the right host,
+      // and an `Origin` the cross-site check accepts.
+      headers: write(),
+      ...(payload ? { payload } : {}),
+    })
+    expect(r.statusCode).toBe(401)
+    expect(r.json().error).toBe('unauthenticated')
+  })
+})
 
 describe('adding a domain', () => {
   // The flag that gates serving and certificate issuance is not something the
@@ -209,6 +261,10 @@ describe('changing and removing one', () => {
       headers: write(cookie),
     })
     expect(r.statusCode).toBe(200)
+    // The domain itself first: a row that survives keeps whatever `verified`
+    // it had, so the host goes on serving and goes on renewing a certificate.
+    // Its links going is the cascade, not the point.
+    expect((await pg.query('SELECT 1 FROM domains')).rowCount).toBe(0)
     expect((await pg.query('SELECT 1 FROM links')).rowCount).toBe(0)
   })
 
@@ -330,6 +386,43 @@ describe('checking the DNS on demand', () => {
     }
   })
 
+  // The gate above pins that a refusal happens; this pins the number it
+  // happens at. Ordering only: the resolver holds every lookup open until the
+  // test lets go, so "in flight" is a fact rather than a race.
+  it('runs exactly as many checks at once as it says it does', async () => {
+    // The declared bound is two. It is asserted rather than merely used,
+    // because a bound nothing pins is one a later change can widen silently,
+    // and this one costs a DNS query per pass through the install's own
+    // resolvers.
+    expect(CHECKS_IN_FLIGHT).toBe(2)
+    const ids: string[] = []
+    for (let i = 0; i < CHECKS_IN_FLIGHT; i++) {
+      ids.push((await add({ host: `busy-${i}.example.test` })).json().id)
+    }
+    const spare = (await add({ host: 'one-too-many.example.test' })).json()
+
+    const release = deferred()
+    const allInFlight = deferred()
+    resolver.held = release.promise
+    resolver.onAsked = () => {
+      if (resolver.asked === CHECKS_IN_FLIGHT) allInFlight.resolve()
+    }
+    const check = (id: string) =>
+      app.inject({ method: 'POST', url: `/api/domains/${id}/check`, headers: write(cookie) })
+
+    const running = ids.map(check)
+    await allInFlight.promise
+
+    const refused = await check(spare.id)
+    expect(refused.statusCode).toBe(429)
+    expect(refused.json().error).toBe('too_many_checks')
+    // Refused before the resolver was reached, not after.
+    expect(resolver.asked).toBe(CHECKS_IN_FLIGHT)
+
+    release.resolve()
+    expect((await Promise.all(running)).map((r) => r.statusCode)).toEqual(ids.map(() => 200))
+  })
+
   it('never un-verifies a domain whose check fails', async () => {
     const created = (await add()).json()
     await pg.query('UPDATE domains SET verified = true')
@@ -391,11 +484,26 @@ describe('what the operator has to know', () => {
 
     const r = await app.inject({ method: 'GET', url: '/api/alerts', headers: read(cookie) })
     expect(r.statusCode).toBe(200)
+    expect(r.json().truncated).toBe(false)
     const hosts = (r.json().domains as { host: string; status: string }[]).map(
       (d) => `${d.host}:${d.status}`,
     )
     expect(hosts).toContain(`${never.host}:never_checked`)
     expect(hosts).toContain(`${failing.host}:missing_token`)
     expect(hosts.some((h) => h.startsWith(good.host))).toBe(false)
+  })
+
+  // An operator shown a prefix of what is wrong, with nothing saying it was a
+  // prefix, believes they have seen all of it.
+  it('says when the alert listing was cut', async () => {
+    await pg.query(
+      `INSERT INTO domains (host, verification_token)
+       SELECT 'bulk-' || n || '.example.test', lpad(to_hex(n), 32, '0')
+         FROM generate_series(1, $1) AS n`,
+      [MAX_DOMAINS_LISTED + 1],
+    )
+    const r = await app.inject({ method: 'GET', url: '/api/alerts', headers: read(cookie) })
+    expect(r.json().domains).toHaveLength(MAX_DOMAINS_LISTED)
+    expect(r.json().truncated).toBe(true)
   })
 })

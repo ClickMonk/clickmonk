@@ -6,7 +6,6 @@ import {
   type TrafficSettings,
   TrafficSettingsSchema,
   isDomainUrl,
-  newVerificationToken,
   normaliseHost,
   parseLinkInput,
   verificationRecordName,
@@ -24,6 +23,7 @@ import {
 import {
   type DomainResolver,
   checkDomain,
+  createDomain,
   createResolver,
   recordDomainCheck,
   runDomainChecks,
@@ -101,26 +101,30 @@ async function domainAdd(args: string[], d: CliDeps): Promise<void> {
   const host = normaliseHost(positionals[0] ?? '')
   if (!host) throw new Rejected(`not a valid host name: ${positionals[0] ?? '(none)'}`)
   for (const u of [values['root-url'], values['not-found-url']]) {
-    // Sent as written, so no token: `{click_id}` would reach the visitor literally.
+    // Sent as written, so no token: `{click_id}` would reach the visitor
+    // literally. Checked here so the refusal names the value the operator
+    // typed; the writer checks it again for callers that have no argument
+    // parser in front of them.
     if (u !== undefined && !isDomainUrl(u))
       throw new Rejected(`not an http(s) URL in printable ASCII without tokens: ${u}`)
   }
-  const token = newVerificationToken()
   const verified = values.verified === true
-  const r = await d.pg.query<{ id: string; verification_token: string }>(
-    `INSERT INTO domains (host, verified, root_url, not_found_url, verification_token)
-     VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (host) DO NOTHING RETURNING id, verification_token`,
-    [host, verified, values['root-url'] ?? null, values['not-found-url'] ?? null, token],
-  )
-  const row = r.rows[0]
-  if (!row) throw new Rejected(`domain already exists: ${host}`)
-  d.out(`domain ${host} ${row.id}`)
+  // The one writer, shared with the API, so `verified` is decided in one
+  // statement. This is the only caller that may pass it true, and it can
+  // because it is typed on the server by whoever installed this.
+  const created = await createDomain(d.pg, {
+    host,
+    rootUrl: values['root-url'] ?? null,
+    notFoundUrl: values['not-found-url'] ?? null,
+    verified,
+  })
+  if (!created) throw new Rejected(`domain already exists: ${host}`)
+  d.out(`domain ${host} ${created.id}`)
   if (verified) {
     d.out('marked verified without a DNS check, so it can be given a certificate at once')
     return
   }
-  printVerificationRecords(host, row.verification_token, d)
+  printVerificationRecords(host, created.verificationToken, d)
 }
 
 /**

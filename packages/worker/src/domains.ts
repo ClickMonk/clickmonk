@@ -1,6 +1,12 @@
 import { Resolver } from 'node:dns/promises'
 import { isIP } from 'node:net'
-import { txtRecordsCarryToken, verificationRecordName } from '@clickmonk/core'
+import {
+  isDomainUrl,
+  newVerificationToken,
+  normaliseHost,
+  txtRecordsCarryToken,
+  verificationRecordName,
+} from '@clickmonk/core'
 import type { Pool } from '@clickmonk/db'
 
 /**
@@ -153,6 +159,58 @@ export interface DomainRow {
   verified: boolean
   /** The status this domain's last check recorded, or `null` if it has never been checked. */
   previous_status: DomainDnsStatus | null
+}
+
+export interface CreatedDomain {
+  id: string
+  host: string
+  /** Published as a TXT record by the admin; not a secret, and printed freely. */
+  verificationToken: string
+}
+
+/**
+ * Adds a domain, and is the only place that writes one. Shared by the API and
+ * by `clickmonk domain add`, for the same reason `recordDomainCheck` is: the
+ * flag this writes decides whether a host name's links answer and whether
+ * this install asks a certificate authority for a certificate in its name,
+ * and a second copy of the statement is a second place for that flag to be
+ * got wrong.
+ *
+ * `verified` is false unless a caller asks for it, and the only caller that
+ * may ask is one already running on the server — `domain add --verified`,
+ * typed by whoever installed it. Nothing reachable over the network passes
+ * it: the API's own body schema is strict, so a `verified` field is a 400,
+ * and its route never forwards one.
+ *
+ * The host and the URLs are checked here rather than only in the schema in
+ * front of an HTTP request, because this function has callers with no schema
+ * in front of them. Both existing callers reject the same values first, so
+ * nothing either of them answers changes; what this stops is the next caller.
+ * Returns `null` when the host is already taken, which each caller reports in
+ * its own words.
+ */
+export async function createDomain(
+  pg: Pool,
+  o: { host: string; rootUrl?: string | null; notFoundUrl?: string | null; verified?: boolean },
+): Promise<CreatedDomain | null> {
+  const host = normaliseHost(o.host)
+  if (!host) throw new Error('a domain needs a valid host name')
+  for (const url of [o.rootUrl, o.notFoundUrl]) {
+    // Sent to the visitor as written, so no token: a brace would reach them
+    // literally.
+    if (url !== null && url !== undefined && !isDomainUrl(url)) {
+      throw new Error("a domain's URL must be an absolute http(s) URL with no token")
+    }
+  }
+  const r = await pg.query<{ id: string; verification_token: string }>(
+    `INSERT INTO domains (host, verified, root_url, not_found_url, verification_token)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (host) DO NOTHING RETURNING id, verification_token`,
+    [host, o.verified === true, o.rootUrl ?? null, o.notFoundUrl ?? null, newVerificationToken()],
+  )
+  const row = r.rows[0]
+  if (!row) return null
+  return { id: row.id, host, verificationToken: row.verification_token }
 }
 
 export interface DomainCheckRun {
