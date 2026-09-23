@@ -8,6 +8,7 @@ import {
 import { describe, expect, it } from 'vitest'
 import {
   MAX_PASSWORD_BODY_BYTES,
+  PASSWORD_CHECKS_IN_FLIGHT,
   PASSWORD_PROOF_MS,
   hasPasswordProof,
   passwordCookieName,
@@ -194,12 +195,14 @@ describe('the form body', () => {
   it('takes a password, bounded, and nothing else', () => {
     expect(passwordFromBody({ password: 'spring2026' })).toBe('spring2026')
     expect(passwordFromBody({ password: '' })).toBeNull()
-    // The bound itself, from both sides: a password of exactly the length the
-    // admin service accepts is still answerable here.
-    expect(passwordFromBody({ password: 'x'.repeat(MAX_PASSWORD_LENGTH) })).toBe(
-      'x'.repeat(MAX_PASSWORD_LENGTH),
-    )
-    expect(passwordFromBody({ password: 'x'.repeat(MAX_PASSWORD_LENGTH + 1) })).toBeNull()
+    // The bound itself, from both sides. The length is written out rather than
+    // taken from the constant on both sides of the assertion: two values built
+    // from the same constant agree with each other however it changes, so a
+    // bound quietly shrunk to ten would have passed.
+    const atBound = 'x'.repeat(200)
+    expect(MAX_PASSWORD_LENGTH).toBe(200)
+    expect(passwordFromBody({ password: atBound })).toBe(atBound)
+    expect(passwordFromBody({ password: `${atBound}x` })).toBeNull()
     expect(passwordFromBody({})).toBeNull()
     expect(passwordFromBody(null)).toBeNull()
     expect(passwordFromBody('password=x')).toBeNull()
@@ -207,6 +210,12 @@ describe('the form body', () => {
     // Nothing inherited counts: a body carrying only a prototype key has no
     // password of its own.
     expect(passwordFromBody(JSON.parse('{"__proto__":{"password":"x"}}'))).toBeNull()
+  })
+
+  it('bounds what one process will check at once', () => {
+    // Only observable otherwise by a burst timed against a scrypt pass, which
+    // is not a test this suite can hold still.
+    expect(PASSWORD_CHECKS_IN_FLIGHT).toBe(2)
   })
 
   it('bounds the body well inside what a password can need', () => {

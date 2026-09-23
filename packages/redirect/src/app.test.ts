@@ -32,6 +32,7 @@ import {
 } from '@clickmonk/ipdata'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { buildRedirectApp } from './app.js'
+import { PASSWORD_ATTEMPT_LIMIT } from './password.js'
 import { RateCounter } from './rate.js'
 import { Snapshot, UNREADABLE_PASSWORD_HASH } from './snapshot.js'
 
@@ -1310,7 +1311,9 @@ describe('a password-protected link', () => {
     expect(shown.body).toContain('name="password"')
     // Answering with the sentinel itself, which is the one string an attacker
     // could read off this repository, is a wrong answer like any other.
-    for (const attempt of [UNREADABLE_PASSWORD_HASH, PASSWORD, '']) {
+    // Each of these reaches the verifier: an empty one would be refused by the
+    // body parser first, which is a different path and has its own test.
+    for (const attempt of [UNREADABLE_PASSWORD_HASH, PASSWORD, 'unreadable-ish']) {
       const r = await post(app, `password=${attempt}`)
       expect(r.statusCode, attempt).toBe(200)
       expect(r.body, attempt).toContain('That password is not right.')
@@ -1468,13 +1471,32 @@ describe('a password-protected link', () => {
     // may cost an attempt: counting a right one would lock that visitor out
     // after five, with nothing they could do about it. No injected counter —
     // this is the bound the install runs with.
+    // One more than the limit: at exactly five, a success counted as an attempt
+    // still leaves the fifth allowed, so five of them cannot tell the two apart.
     const { app, records } = harness([locked])
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < PASSWORD_ATTEMPT_LIMIT + 1; i++) {
       const r = await post(app, `password=${PASSWORD}`)
       expect(r.statusCode, `answer ${i + 1}`).toBe(302)
       expect(String(r.headers['set-cookie']), `answer ${i + 1}`).toContain(`cm_pw_${locked.id}=`)
     }
-    expect(records.map((x) => x.status)).toEqual([302, 302, 302, 302, 302])
+    expect(records.map((x) => x.status)).toEqual([302, 302, 302, 302, 302, 302])
+  })
+
+  it('runs the bounds the install runs with, not a test\u2019s own', async () => {
+    // Every other rate test injects its own counter, so all three constants
+    // could be raised to anything and nothing would fail. This one takes the
+    // defaults: five wrong answers are allowed, the sixth is refused, and the
+    // window is read off the Retry-After rather than waited out.
+    const { app, records } = harness([locked])
+    const statuses: number[] = []
+    for (let i = 0; i < PASSWORD_ATTEMPT_LIMIT + 1; i++) {
+      statuses.push((await post(app, `password=wrong-${i}`)).statusCode)
+    }
+    expect(statuses).toEqual([200, 200, 200, 200, 200, 429])
+    const refused = await post(app, `password=${PASSWORD}`)
+    expect(refused.statusCode).toBe(429)
+    expect(refused.headers['retry-after']).toBe('60')
+    expect(records.map((x) => x.status)).toEqual([200, 200, 200, 200, 200, 429, 429])
   })
 
   it('says the server is busy in its own words, not the limiter\u2019s', async () => {
