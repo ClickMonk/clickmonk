@@ -20,18 +20,49 @@ import {
 const HOST = 'go.example.test'
 
 /**
- * The unique-local prefix this stack's own network is given, read from the
+ * The eight hextets of an IPv6 address. One address has many spellings —
+ * `fd00:c11c:7::9`, `fd00:c11c:0007:0:0:0:0:9` — so a subnet comparison has to
+ * be arithmetic; a string prefix would call an equivalent subnet a different
+ * one and report a red that says nothing about the stack.
+ */
+function hextets(address: string): number[] {
+  const [head = '', tail = ''] = address.split('::')
+  const left = head === '' ? [] : head.split(':')
+  const right = !address.includes('::') || tail === '' ? [] : tail.split(':')
+  const parts = [...left, ...Array(8 - left.length - right.length).fill('0'), ...right]
+  const out = parts.map((p) => Number.parseInt(p, 16))
+  if (out.length !== 8 || out.some((n) => !Number.isInteger(n) || n < 0 || n > 0xffff)) {
+    throw new Error(`not an IPv6 address: ${address}`)
+  }
+  return out
+}
+
+/**
+ * The unique-local subnet this stack's own network is given, read from the
  * file that gives it rather than written out a second time here. An IPv6
  * client container's address has to be inside it: that is what makes "the
  * address the redirect recorded is the client's" an assertion about this
  * stack, rather than about whatever address the machine happened to have.
  */
-const ULA_PREFIX = ((): string => {
+const ULA = ((): { subnet: string; network: number[]; bits: number } => {
   const yml = readFileSync(join(ROOT, 'test', 'stack', 'docker-compose.tls.yml'), 'utf8')
-  const m = /subnet: (fd[0-9a-f:]*?)::\/\d+/.exec(yml)
+  const m = /subnet: (fd[0-9a-f:]+)\/(\d+)/.exec(yml)
   if (!m) throw new Error('the test stack defines no unique-local IPv6 subnet')
-  return `${m[1] as string}:`
+  const address = m[1] as string
+  const bits = Number(m[2])
+  return { subnet: `${address}/${bits}`, network: hextets(address), bits }
 })()
+
+/** Whether an address is inside the subnet the stack's compose file defines. */
+function onStackNetwork(address: string): boolean {
+  const a = hextets(address)
+  const whole = Math.floor(ULA.bits / 16)
+  for (let i = 0; i < whole; i++) if (a[i] !== ULA.network[i]) return false
+  const rest = ULA.bits % 16
+  if (rest === 0) return true
+  const mask = 0xffff << (16 - rest)
+  return ((a[whole] ?? 0) & mask) === ((ULA.network[whole] ?? 0) & mask)
+}
 
 /** One column of the clicks this stack has shipped, a row per line. */
 function query(select: string): string[] {
@@ -64,7 +95,19 @@ function query(select: string): string[] {
  */
 function recordedAddresses(path?: string): string[] {
   const scope = path === undefined ? '' : ` AND path = '${path}'`
-  return query(`SELECT DISTINCT ip FROM clicks WHERE host = '${HOST}'${scope}`)
+  // Grouped and ordered: the clicks table is a ReplacingMergeTree, so a
+  // re-shipped segment leaves two rows per click until a merge ClickHouse
+  // times itself collapses them, and an unordered result makes an equality
+  // assertion fail on the order rows came back in.
+  return query(`SELECT ip FROM clicks WHERE host = '${HOST}'${scope} GROUP BY ip ORDER BY ip`)
+}
+
+/** How many clicks one link has, counted so that a re-shipped segment is not two. */
+function recordedClicks(path: string): number {
+  const [n] = query(
+    `SELECT count(DISTINCT click_id) FROM clicks WHERE host = '${HOST}' AND path = '${path}'`,
+  )
+  return Number(n ?? 0)
 }
 
 /**
@@ -78,11 +121,9 @@ const waitForAddress = (ip: string, path?: string) =>
     recordedAddresses(path).includes(ip),
   )
 
-/** Waits for a click on one link to arrive, whatever address it was recorded as. */
-const waitForClick = (path: string) =>
-  until(`the click on ${path} to reach ClickHouse`, 60_000, () => {
-    return recordedAddresses(path).length > 0
-  })
+/** Waits for `n` clicks on one link to arrive, whatever they were recorded as. */
+const waitForClicks = (path: string, n = 1) =>
+  until(`${n} click(s) on ${path} to reach ClickHouse`, 60_000, () => recordedClicks(path) >= n)
 
 /**
  * This host's own address, which is what an outside visitor would arrive
@@ -133,7 +174,7 @@ beforeAll(async () => {
   // how a domain proves itself.
   cli('domain', 'add', HOST, '--verified')
   // A link per case below, so that each test reads back the click it made.
-  for (const slug of ['d', 'v4', 'v6', 'claimed', 'again']) {
+  for (const slug of ['d', 'v4', 'v6', 'claimed', 'p4', 'p6', 'again']) {
     cli('link', 'add', HOST, slug, '--target', 'https://example.com/landing')
   }
   await until(
@@ -180,10 +221,9 @@ describe('the address the redirect records', () => {
     // On the subnet this stack's compose file defines, not merely "has a
     // colon in it": the bridge gateway's address has a colon too, and that is
     // the address this whole suite exists to tell apart from a visitor's.
-    expect(
-      r.ip.startsWith(ULA_PREFIX),
-      `${r.ip} is not on the stack's own ${ULA_PREFIX} network`,
-    ).toBe(true)
+    expect(onStackNetwork(r.ip), `${r.ip} is not on the stack's own ${ULA.subnet} network`).toBe(
+      true,
+    )
     await waitForAddress(r.ip, '/v6')
     expect(recordedAddresses('/v6')).toEqual([r.ip])
   })
@@ -196,7 +236,7 @@ describe('the address the redirect records', () => {
     // have, and then reads the address back: waiting for the client's own
     // address would be satisfied by an earlier test's click from the same
     // reused container address, and the claim would never be looked at.
-    await waitForClick('/claimed')
+    await waitForClicks('/claimed')
     expect(recordedAddresses('/claimed')).toEqual([r.ip])
     expect(recordedAddresses()).not.toContain(forged)
   })
@@ -207,10 +247,22 @@ describe('a visitor arriving on the published port', () => {
   // own proxy, and the address the container sees is then the bridge
   // gateway's. A visitor from outside never arrives that way, and neither
   // does this test.
-  const v4 = hostAddress('IPv4')
-  const v6 = hostAddress('IPv6')
+  //
+  // Caught rather than allowed to throw here: a throw in a describe body is a
+  // collection error that takes the whole file down, and a host with nothing
+  // but a Docker bridge address would then also silence the forged-header and
+  // cookie guards, which have nothing to do with this host's interfaces. The
+  // refusal is rethrown inside each of the two tests it belongs to instead:
+  // loud, and local to them.
+  const host = ((): { v4: string | null; v6: string | null; refused?: unknown } => {
+    try {
+      return { v4: hostAddress('IPv4'), v6: hostAddress('IPv6') }
+    } catch (refused) {
+      return { v4: null, v6: null, refused }
+    }
+  })()
 
-  const throughPort = (address: string): number => {
+  const throughPort = (address: string, path: string): number => {
     const r = spawnSync(
       'curl',
       [
@@ -224,7 +276,7 @@ describe('a visitor arriving on the published port', () => {
         '30',
         '--resolve',
         `${HOST}:443:${address}`,
-        `https://${HOST}/d`,
+        `https://${HOST}${path}`,
       ],
       { encoding: 'utf8', timeout: 60_000 },
     )
@@ -233,18 +285,24 @@ describe('a visitor arriving on the published port', () => {
   }
 
   it('keeps its IPv4 address', async () => {
-    if (!v4) throw new Error('this host has no non-loopback IPv4 address')
-    expect(throughPort(v4)).toBe(302)
-    await waitForAddress(v4)
+    if (host.refused) throw host.refused
+    if (!host.v4) throw new Error('this host has no non-loopback IPv4 address')
+    expect(throughPort(host.v4, '/p4')).toBe(302)
+    await waitForAddress(host.v4, '/p4')
+    expect(recordedAddresses('/p4')).toEqual([host.v4])
   })
 
   // Skipped where the host has no IPv6 address of its own — a hosted CI
   // runner usually has none — and run by hand before a release. A host whose
   // only IPv6 address is unique-local exercises the same path; a globally
-  // routable one is the case nothing here can arrange.
-  it.skipIf(!v6)('keeps its IPv6 address', async () => {
-    expect(throughPort(v6 as string)).toBe(302)
-    await waitForAddress(v6 as string)
+  // routable one is the case nothing here can arrange. A refused address is
+  // not "no address": that case runs and reports the refusal.
+  it.skipIf(!host.refused && !host.v6)('keeps its IPv6 address', async () => {
+    if (host.refused) throw host.refused
+    const v6 = host.v6 as string
+    expect(throughPort(v6, '/p6')).toBe(302)
+    await waitForAddress(v6, '/p6')
+    expect(recordedAddresses('/p6')).toEqual([v6])
   })
 })
 
@@ -279,14 +337,13 @@ describe('a returning visitor over HTTPS', () => {
     // the returning flag the redirect reads off the cookie the first one set.
     // Without this the test holds for a server that mints a new visitor on
     // every request.
-    await until('both clicks on /again to reach ClickHouse', 60_000, () => {
-      return (
-        query(`SELECT count() FROM clicks WHERE host = '${HOST}' AND path = '/again'`)[0] === '2'
-      )
-    })
+    await waitForClicks('/again', 2)
+    // In the order the visits happened, not sorted: sorting by the flag passes
+    // for a server that recorded the second visit first. One row per click,
+    // because a re-shipped segment holds each of them twice.
     expect(
       query(
-        `SELECT returning FROM clicks WHERE host = '${HOST}' AND path = '/again' ORDER BY returning`,
+        `SELECT any(returning) FROM clicks WHERE host = '${HOST}' AND path = '/again' GROUP BY click_id ORDER BY min(time)`,
       ),
     ).toEqual(['0', '1'])
   })
