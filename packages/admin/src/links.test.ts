@@ -572,6 +572,52 @@ describe('the client a handler holds', () => {
       await tight.end()
     }
   })
+
+  // Every way out of the write's transaction, not only the one that commits.
+  // A client released while its transaction is still open goes back into the
+  // pool that way, and the next request to borrow it runs inside a transaction
+  // it did not open and will not commit. One client, so "the next request" is
+  // certain to be the same connection; the state is read from the other pool,
+  // because asking the connection itself would be another statement in the
+  // transaction under test.
+  it.each([
+    {
+      what: 'refuses an unknown domain',
+      payload: { host: 'nowhere.example.test', targets: [target] },
+      status: 404,
+    },
+    {
+      what: 'refuses a slug that is taken',
+      payload: { host: 'go.example.test', slug: 'taken', targets: [target] },
+      status: 409,
+    },
+  ])(
+    'gives the client back with no transaction open when it $what',
+    async ({ payload, status }) => {
+      const tight = createPgPool(TEST_PG_URL, { max: 1, connectTimeoutMs: 1000 })
+      const tightApp = testApp(tight, clock)
+      try {
+        expect((await create({ slug: 'taken', targets: [target] })).statusCode).toBe(201)
+        const pid = (await tight.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]
+          ?.pid
+        const r = await tightApp.inject({
+          method: 'POST',
+          url: '/api/links',
+          headers: write(cookie),
+          payload,
+        })
+        expect(r.statusCode).toBe(status)
+        const state = await pg.query<{ state: string }>(
+          'SELECT state FROM pg_stat_activity WHERE pid = $1',
+          [pid],
+        )
+        expect(state.rows[0]?.state).toBe('idle')
+      } finally {
+        await tightApp.close()
+        await tight.end()
+      }
+    },
+  )
 })
 
 /**
