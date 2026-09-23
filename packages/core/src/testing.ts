@@ -57,6 +57,12 @@
  * - It says nothing about randomness. A package that mints a credential needs
  *   its own check for that; `Math.random` is legitimate in a package that picks
  *   a weighted target with it.
+ * - **Every package but this one runs the built copy of this file.** They import
+ *   it by package name, which resolves to `dist`, so weakening this source
+ *   without rebuilding leaves their gates green on the previous version. The
+ *   full gate builds before it tests, so that is a hazard while editing rather
+ *   than one that reaches a commit — but it is why the tests beside this file
+ *   exercise the parser directly instead of only through a package's own source.
  */
 import { readFileSync, readdirSync } from 'node:fs'
 import { dirname, join, relative, resolve } from 'node:path'

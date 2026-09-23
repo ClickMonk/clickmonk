@@ -19,6 +19,7 @@ import { describe, expect, it } from 'vitest'
 import {
   type HygieneConfig,
   decisionProblems,
+  findDisallowedComparisons,
   gatedFiles,
   missingComparers,
   readSource,
@@ -161,5 +162,24 @@ describe('the shared checker on a body that only looks careful', () => {
 
   it('says so when the call is not there at all', () => {
     expect(why('{ return a === b }')).toBe('timingSafeEqual is not called here')
+  })
+
+  it('finds the comparisons it is there to find', () => {
+    // A direct pin on the finder. Every other check here is satisfied by a
+    // finder that finds nothing: this package exempts no comparison, so its
+    // stale-exemption check is empty either way, and a stubbed finder left this
+    // file's gate green while the other two packages' caught it.
+    expect(findDisallowedComparisons('{ return given === want }').map((v) => v.expression)) //
+      .toEqual(['given === want'])
+    expect(findDisallowedComparisons('{ return given == want }').map((v) => v.expression)) //
+      .toEqual(['given == want'])
+    expect(findDisallowedComparisons('{ return a.equals(b) }').map((v) => v.expression)) //
+      .toEqual(['a.equals('])
+    expect(
+      findDisallowedComparisons('{ return hashToken(x) === row.digest }').map((v) => v.why),
+    ).toEqual(['an operand is a call or template result'])
+    // And leaves alone what it is not there to find.
+    expect(findDisallowedComparisons('{ if (a.length !== b.length) return null }')).toEqual([])
+    expect(findDisallowedComparisons("{ if (kind === 'totp') return 1 }")).toEqual([])
   })
 })
