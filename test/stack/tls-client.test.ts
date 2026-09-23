@@ -306,6 +306,25 @@ describe('a visitor arriving on the published port', () => {
   })
 })
 
+describe('what reaches the visitor through Caddy', () => {
+  // Both of these are set by the redirect and have to survive the hop: a
+  // proxy is free to add, drop or rewrite a header, and nothing else in this
+  // suite looks at one. A redirect that got cached anywhere sends the next
+  // visitor on without a click being recorded at all, and a visitor cookie
+  // that lost `Secure` is one a browser will send back over plain HTTP.
+  it('keeps the no-store headers and the cookie attributes', () => {
+    const r = curl(['-k', '-D', '-', `https://${HOST}/d`])
+    expect(r.status).toBe(302)
+    expect(r.headers).toMatch(/^cache-control: no-store, no-cache, must-revalidate, max-age=0$/im)
+    const cookies = r.headers.split('\n').filter((l) => /^set-cookie:/i.test(l))
+    // cm_vid and cm_seen, as the returning-visitor test below spells out.
+    expect(cookies.length, `no cookie survived the hop: ${r.headers}`).toBe(2)
+    for (const c of cookies) {
+      expect(c, c).toContain('; HttpOnly; Secure; SameSite=Lax')
+    }
+  })
+})
+
 describe('a returning visitor over HTTPS', () => {
   it('is given a cookie and recognised by it', async () => {
     // The visitor cookies are Secure, so this is the first release in which

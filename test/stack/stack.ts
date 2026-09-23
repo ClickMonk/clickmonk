@@ -93,6 +93,12 @@ export interface CurlResult {
   exit: number
   /** The address the client used, which is what the redirect should record. */
   ip: string
+  /**
+   * The response headers, when the call asked for them with `-D -`; empty
+   * otherwise. The body goes to /dev/null below, so `-D -` has stdout to
+   * itself and the write-out line is the last line of it.
+   */
+  headers: string
   stderr: string
 }
 
@@ -114,8 +120,10 @@ export function curl(args: string[], docker: string[] = []): CurlResult {
       '-sS',
       '-o',
       '/dev/null',
+      // On its own line, so a call that also asked for the headers with
+      // `-D -` does not have them run into the two values parsed below.
       '-w',
-      '%{http_code} %{local_ip}',
+      '\\n%{http_code} %{local_ip}',
       ...args,
     ],
     { encoding: 'utf8', stdio: 'pipe', timeout: CLIENT_TIMEOUT },
@@ -127,8 +135,19 @@ export function curl(args: string[], docker: string[] = []): CurlResult {
   if (r.error || r.status === 125) {
     throw new Error(`could not run the client: ${r.error?.message ?? ''} ${r.stderr ?? ''}`)
   }
-  const [code = '0', ip = ''] = (r.stdout ?? '').trim().split(' ')
-  return { status: Number(code), exit: r.status ?? -1, ip, stderr: r.stderr ?? '' }
+  const out = (r.stdout ?? '').replace(/\r\n/g, '\n')
+  const nl = out.lastIndexOf('\n')
+  const [code = '0', ip = ''] = out
+    .slice(nl + 1)
+    .trim()
+    .split(' ')
+  return {
+    status: Number(code),
+    exit: r.status ?? -1,
+    ip,
+    headers: nl === -1 ? '' : out.slice(0, nl),
+    stderr: r.stderr ?? '',
+  }
 }
 
 /**
