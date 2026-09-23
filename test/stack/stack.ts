@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** The repository root: every compose path below is relative to it. */
@@ -151,9 +151,31 @@ export function curl(args: string[], docker: string[] = []): CurlResult {
 }
 
 /**
+ * The one file in a tar stream: a 512-byte ustar header whose size field is
+ * octal, then that many bytes. Enough to unpack one known file, and not a tar
+ * reader.
+ */
+function oneFileFromTar(tar: Buffer): Buffer {
+  const field = tar
+    .toString('ascii', 124, 136)
+    .replace(/\0[\s\S]*$/, '')
+    .trim()
+  const size = Number.parseInt(field, 8)
+  if (!Number.isInteger(size) || size <= 0 || 512 + size > tar.length) {
+    throw new Error(`docker cp returned an archive this cannot read: size field ${field}`)
+  }
+  return tar.subarray(512, 512 + size)
+}
+
+/**
  * The local ACME server's own HTTPS certificate, which Caddy has to trust
- * before it can talk to it at all. Copied out of the image with
+ * before it can talk to it at all. Taken out of the image with
  * `docker create` + `docker cp`, because the image has no shell to cat it.
+ *
+ * `docker cp … -` writes a tar to stdout and node unpacks it, rather than
+ * letting `docker cp <path>` create the file: the Docker CLI preserves the
+ * archive's ownership when it runs as root, and a root-owned file here is one
+ * a later non-root run of these suites can neither read nor replace.
  */
 export function writeAcmeRoot(): void {
   mkdirSync(TMP, { recursive: true })
@@ -161,15 +183,24 @@ export function writeAcmeRoot(): void {
     encoding: 'utf8',
     timeout: CLIENT_TIMEOUT,
   }).trim()
+  let tar: Buffer
   try {
-    execFileSync(
-      'docker',
-      ['cp', `${id}:/test/certs/pebble.minica.pem`, join(TMP, 'acme-root.pem')],
-      { timeout: CLIENT_TIMEOUT },
-    )
+    tar = execFileSync('docker', ['cp', `${id}:/test/certs/pebble.minica.pem`, '-'], {
+      maxBuffer: 8 * 1024 * 1024,
+      timeout: CLIENT_TIMEOUT,
+    })
   } finally {
     execFileSync('docker', ['rm', id], { stdio: 'ignore', timeout: CLIENT_TIMEOUT })
   }
+  const pem = oneFileFromTar(tar).toString('utf8')
+  if (!pem.startsWith('-----BEGIN CERTIFICATE-----')) {
+    throw new Error(`the image holds no certificate at that path: ${pem.slice(0, 200)}`)
+  }
+  const path = join(TMP, 'acme-root.pem')
+  // A file an earlier run left owned by root, from when the Docker CLI wrote
+  // it: writing over it would fail, removing it needs only this directory.
+  rmSync(path, { force: true })
+  writeFileSync(path, pem, { mode: 0o644 })
 }
 
 /**
