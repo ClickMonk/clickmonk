@@ -124,14 +124,15 @@ describe('what the stack publishes', () => {
   // The admin surface must not be reachable from a link domain. Caddy routes
   // by host name, and every service that has to agree on which name that is
   // reads it from the same variable: the admin API refuses any other Host, the
-  // redirect approves a certificate for that name and no other, and Caddy
-  // sends that name to the admin service instead of to the redirect.
-  it('gives the same admin host name to caddy, the admin API and the redirect', () => {
+  // redirect approves a certificate for that name and no other, Caddy sends
+  // that name to the admin service instead of to the redirect, and the
+  // container the CLI runs in refuses to store a link domain of that name.
+  it('gives the same admin host name to caddy, the admin API, the redirect and the worker', () => {
     const named = config('docker-compose.yml', 'CLICKMONK_ADMIN_HOST=admin.example.test\n')
     // Anchored to the end of the line, not `toContain`: a service given
     // `${CLICKMONK_ADMIN_HOST:-}.internal` resolves to a name that starts with
     // this one, and a substring match reads that as agreement.
-    for (const service of ['caddy', 'admin', 'redirect']) {
+    for (const service of ['caddy', 'admin', 'redirect', 'worker']) {
       expect(serviceBlock(named, service), service).toMatch(
         /\n {6}CLICKMONK_ADMIN_HOST: admin\.example\.test\n/,
       )
@@ -139,7 +140,7 @@ describe('what the stack publishes', () => {
   })
 
   it('starts with no admin host at all, and says nothing about one', () => {
-    for (const service of ['caddy', 'admin', 'redirect']) {
+    for (const service of ['caddy', 'admin', 'redirect', 'worker']) {
       expect(serviceBlock(cfg, service), service).toMatch(/CLICKMONK_ADMIN_HOST: ""?\n/)
     }
   })

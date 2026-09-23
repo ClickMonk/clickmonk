@@ -61,6 +61,13 @@ export interface CliDeps {
   /** The clock a check is stamped with, so the worker and the CLI can be made to agree in a test. */
   now?: () => Date
   /**
+   * The host name the admin API answers on, or null when this install has not
+   * named one. `domain add` refuses it: the reverse proxy sends that name to
+   * the admin service, so a link domain of the same name would accept links
+   * that then never resolve.
+   */
+  adminHost?: string | null
+  /**
    * Reads a password from standard input. A password never comes from an
    * argument: `argv` is visible to every process on the host through `ps`, and
    * it lands in the shell's history. A test passes its own.
@@ -121,6 +128,16 @@ async function domainAdd(args: string[], d: CliDeps): Promise<void> {
   })
   const host = normaliseHost(positionals[0] ?? '')
   if (!host) throw new Rejected(`not a valid host name: ${positionals[0] ?? '(none)'}`)
+  // Refused rather than stored, because storing it would look like it worked.
+  // Requests for the admin host are sent to the admin API, so every link added
+  // under this name would answer as the API does and none of them would ever
+  // redirect — with a domain row, a verification record and a certificate all
+  // saying the domain was set up correctly.
+  if (d.adminHost !== null && d.adminHost !== undefined && host === d.adminHost) {
+    throw new Rejected(
+      `${host} is the host name the admin API answers on (CLICKMONK_ADMIN_HOST), so links on it would never resolve; use a different name for links`,
+    )
+  }
   for (const u of [values['root-url'], values['not-found-url']]) {
     // Sent as written, so no token: `{click_id}` would reach the visitor
     // literally. Checked here so the refusal names the value the operator

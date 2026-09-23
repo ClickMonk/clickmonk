@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { formatConfigError } from '@clickmonk/core'
+import { formatConfigError, normaliseHost } from '@clickmonk/core'
 import { type ClickHouseClient, createChClient, createPgPool } from '@clickmonk/db'
 import { DEFAULT_IPDATA_DIR } from '@clickmonk/ipdata'
 import { isResolverAddress } from '@clickmonk/worker/domains'
@@ -61,6 +61,13 @@ async function main(): Promise<number> {
         return Buffer.concat(chunks).toString('utf8')
       },
       ipdata: { dir: process.env.CLICKMONK_IPDATA_DIR || DEFAULT_IPDATA_DIR },
+      // Normalised rather than validated: the services parse this variable
+      // strictly and refuse to boot on a value that is not a bare lower-case
+      // host name, so the only job left here is to recognise the name a
+      // reverse proxy would match case-insensitively. A value too malformed to
+      // normalise leaves this null, and an install whose admin service will
+      // not boot has no admin host to collide with.
+      adminHost: normaliseHost(process.env.CLICKMONK_ADMIN_HOST ?? ''),
       dnsServers,
     })
   } finally {

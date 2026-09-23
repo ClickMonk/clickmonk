@@ -945,3 +945,39 @@ describe('the admin account and API keys from the CLI', () => {
     expect(lines.join('\n')).toContain('clickmonk apikey create <name>')
   })
 })
+
+describe('a link domain and the admin host', () => {
+  // Caddy sends the admin host name to the admin service, so a link domain of
+  // the same name accepts links that can never redirect: a domain row, a
+  // verification record and a certificate all saying the setup worked.
+  it('refuses a link domain with the same name as the admin host, and writes nothing', async () => {
+    const withAdminHost = (...argv: string[]) =>
+      runCli(argv, {
+        pg,
+        ch: () => ch,
+        out: (s) => lines.push(s),
+        ipdata: { dir: ipdataDir },
+        adminHost: 'admin.example.test',
+      })
+    lines.length = 0
+    // Written as the operator would type it: the name is normalised before the
+    // comparison, so a trailing dot and upper case do not slip past.
+    expect(await withAdminHost('domain', 'add', 'Admin.Example.TEST.')).toBe(2)
+    expect(lines.join('\n')).toContain('CLICKMONK_ADMIN_HOST')
+    expect(
+      (await pg.query('SELECT 1 FROM domains WHERE host = $1', ['admin.example.test'])).rowCount,
+    ).toBe(0)
+    // A different name on the same install is added as usual, so what was
+    // refused was the collision and not the command.
+    expect(await withAdminHost('domain', 'add', 'links.example.test')).toBe(0)
+    expect(
+      (await pg.query('SELECT 1 FROM domains WHERE host = $1', ['links.example.test'])).rowCount,
+    ).toBe(1)
+    // And with no admin host configured, that same name is an ordinary domain:
+    // nothing routes it away, so there is nothing to refuse.
+    expect(await run('domain', 'add', 'admin.example.test')).toBe(0)
+    expect(
+      (await pg.query('SELECT 1 FROM domains WHERE host = $1', ['admin.example.test'])).rowCount,
+    ).toBe(1)
+  })
+})
