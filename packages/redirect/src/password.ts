@@ -148,15 +148,30 @@ export function passwordPage(o: { wrong: boolean } = { wrong: false }): string {
 `
 }
 
-/** The page shown when an address has answered wrongly too many times. */
-export function tooManyAttemptsPage(): string {
+function plainPage(title: string, message: string): string {
   return `<!doctype html>
 <html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>Too many attempts</title>
-<p>Too many attempts. Wait a minute and try again.</p>
+<title>${title}</title>
+<p>${message}</p>
 </html>
 `
+}
+
+/** The page shown when an address has answered wrongly too many times. */
+export function tooManyAttemptsPage(): string {
+  return plainPage('Too many attempts', 'Too many attempts. Wait a minute and try again.')
+}
+
+/**
+ * The page shown when the process is already checking as many passwords as it
+ * will check at once. Its own words, not the attempt limiter's: this is the
+ * server's state and not the visitor's doing, it can happen on a first attempt,
+ * and telling someone they have tried too often beside a `Retry-After: 1` is
+ * both a lie and a contradiction of the header next to it.
+ */
+export function serverBusyPage(): string {
+  return plainPage('Busy', 'The server is busy. Try again in a moment.')
 }

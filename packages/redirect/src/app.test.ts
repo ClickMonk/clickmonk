@@ -1462,12 +1462,70 @@ describe('a password-protected link', () => {
     expect(records[1]?.signals).toEqual(['rate'])
   })
 
-  it('refuses a body larger than the bound', async () => {
+  it('lets a visitor answer correctly as often as they need to', async () => {
+    // On a plain-HTTP install the `Secure` proof cookie is never stored, so a
+    // correct password is answered again on every click. Only a wrong answer
+    // may cost an attempt: counting a right one would lock that visitor out
+    // after five, with nothing they could do about it. No injected counter —
+    // this is the bound the install runs with.
     const { app, records } = harness([locked])
-    const r = await post(app, `password=${'x'.repeat(2000)}`)
-    expect(r.statusCode).toBe(413)
-    // Refused before anything was checked: no proof, and no click.
+    for (let i = 0; i < 5; i++) {
+      const r = await post(app, `password=${PASSWORD}`)
+      expect(r.statusCode, `answer ${i + 1}`).toBe(302)
+      expect(String(r.headers['set-cookie']), `answer ${i + 1}`).toContain(`cm_pw_${locked.id}=`)
+    }
+    expect(records.map((x) => x.status)).toEqual([302, 302, 302, 302, 302])
+  })
+
+  it('says the server is busy in its own words, not the limiter\u2019s', async () => {
+    // A first attempt can land here, so it must not say the visitor has tried
+    // too often — beside a Retry-After of one second, that is both untrue and a
+    // contradiction of the header next to it.
+    const { app } = harness([locked], { passwordGate: new ConcurrencyGate(0) })
+    const r = await post(app, `password=${PASSWORD}`)
+    expect(r.statusCode).toBe(503)
+    expect(r.headers['retry-after']).toBe('1')
+    expect(r.body).toContain('The server is busy.')
+    expect(r.body).not.toContain('Too many attempts')
+    // And the limiter still says what it says, so the two are not one page.
+    const limited = harness([locked], { passwordAttempts: new AttemptCounter(0, 60_000) })
+    const refused = await post(limited.app, `password=${PASSWORD}`)
+    expect(refused.statusCode).toBe(429)
+    expect(refused.body).toContain('Too many attempts')
+    expect(refused.body).not.toContain('The server is busy.')
+  })
+
+  it('reads the form encoding and nothing else', async () => {
+    // Fastify ships a JSON parser; with it in place a JSON body was an answer.
+    const { app, records } = harness([locked])
+    const r = await app.inject({
+      method: 'POST',
+      url: '/spring',
+      headers: { ...from('192.0.2.7'), 'content-type': 'application/json' },
+      payload: JSON.stringify({ password: PASSWORD }),
+    })
+    expect(r.statusCode).toBe(415)
+    expect(r.headers['cache-control']).toBe('no-store, no-cache, must-revalidate, max-age=0')
     expect(r.headers['set-cookie']).toBeUndefined()
+    expect(r.body).not.toContain('FST_ERR')
+    expect(records).toHaveLength(0)
+  })
+
+  it('refuses a body larger than the bound, in its own words', async () => {
+    const { app, records } = harness([locked])
+    for (const size of [600, 2000]) {
+      const r = await post(app, `password=${'x'.repeat(size)}`)
+      expect(r.statusCode, String(size)).toBe(413)
+      // The band between the old bound and the new one answered with Fastify's
+      // internals and no cache-control, which is not how this service answers.
+      expect(r.headers['cache-control'], String(size)).toBe(
+        'no-store, no-cache, must-revalidate, max-age=0',
+      )
+      expect(r.body, String(size)).not.toContain('FST_ERR')
+      expect(r.body, String(size)).toContain('too large')
+      // Refused before anything was checked: no proof, and no click.
+      expect(r.headers['set-cookie'], String(size)).toBeUndefined()
+    }
     expect(records).toHaveLength(0)
   })
 })

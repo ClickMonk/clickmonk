@@ -39,6 +39,7 @@ import {
   passwordFromBody,
   passwordPage,
   passwordProofCookie,
+  serverBusyPage,
   tooManyAttemptsPage,
 } from './password.js'
 import type { RateCounter } from './rate.js'
@@ -117,9 +118,10 @@ export function buildRedirectApp(
   const passwordGate = deps.passwordGate ?? new ConcurrencyGate(PASSWORD_CHECKS_IN_FLIGHT)
   const monotonic = deps.monotonic ?? (() => performance.now())
 
-  // The password form is the one body this service reads. Parsed here rather
-  // than by a plugin, and only as a bounded query string: nothing else about
-  // a POST is interpreted.
+  // The password form is the one body this service reads, and now the only one
+  // it will parse: Fastify ships a JSON parser, so without this a JSON body was
+  // accepted as an answer and the sentence above was false.
+  app.removeAllContentTypeParsers()
   app.addContentTypeParser(
     'application/x-www-form-urlencoded',
     { parseAs: 'string', bodyLimit: MAX_PASSWORD_BODY_BYTES },
@@ -128,6 +130,23 @@ export function buildRedirectApp(
       done(null, { password: params.get('password') ?? '' })
     },
   )
+
+  /**
+   * Bounds this service enforces itself, answered in its own words. Fastify's
+   * own answers carry its internal error codes and no `Cache-Control`, and the
+   * bounds here are reachable by anyone: a body over the limit, or in a media
+   * type this service does not read.
+   */
+  app.setErrorHandler((err: { statusCode?: number }, req, reply) => {
+    const status = typeof err.statusCode === 'number' ? err.statusCode : 500
+    reply.header('cache-control', NO_STORE).type('text/plain; charset=utf-8')
+    if (status === 413) return reply.code(413).send('That body is too large.\n')
+    if (status === 415) return reply.code(415).send('That content type is not read here.\n')
+    // Nothing of the error itself reaches the caller; it is logged instead.
+    if (status < 500) return reply.code(status).send(BODIES[status] ?? 'Bad request.\n')
+    req.log.error(err)
+    return reply.code(500).send('Internal error.\n')
+  })
 
   /**
    * The decision both routes run, and the facts a click record takes from it.
@@ -490,7 +509,7 @@ export function buildRedirectApp(
         .header('cache-control', NO_STORE)
         .header('retry-after', '1')
         .type('text/html; charset=utf-8')
-        .send(tooManyAttemptsPage())
+        .send(serverBusyPage())
     }
     let ok = false
     try {

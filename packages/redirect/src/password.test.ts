@@ -14,6 +14,8 @@ import {
   passwordFromBody,
   passwordPage,
   passwordProofCookie,
+  serverBusyPage,
+  tooManyAttemptsPage,
 } from './password.js'
 import { UNREADABLE_PASSWORD_HASH } from './snapshot.js'
 
@@ -211,6 +213,22 @@ describe('the form body', () => {
     expect(MAX_PASSWORD_BODY_BYTES).toBeGreaterThan(
       `password=${'x'.repeat(MAX_PASSWORD_LENGTH)}`.length,
     )
+  })
+})
+
+describe('the pages beside it', () => {
+  it('say different things, so neither stands in for the other', () => {
+    // One is about this visitor's attempts, the other about the process being
+    // busy; a first attempt can meet the second, and being told it has tried
+    // too often would be false.
+    expect(tooManyAttemptsPage()).toContain('Too many attempts.')
+    expect(serverBusyPage()).toContain('The server is busy.')
+    expect(serverBusyPage()).not.toContain('Too many attempts')
+    expect(serverBusyPage()).not.toContain('Wait a minute')
+    for (const page of [tooManyAttemptsPage(), serverBusyPage()]) {
+      expect(page).toContain('noindex')
+      expect(page).not.toContain('name="password"')
+    }
   })
 })
 
