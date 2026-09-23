@@ -49,7 +49,9 @@
  *   anywhere in the package, so spelling a secret comparison the way an exempt
  *   one is spelled — in another file, in another function — passed the gate.
  *   A secret comparison added beside an exempt one still fails, and an entry
- *   that no longer matches anything fails too, so the list cannot rot.
+ *   that no longer matches anything fails too, so the list cannot rot. An
+ *   exemption applies only while its function name means one function in that
+ *   file: a second declaration of the name would otherwise borrow it.
  * - `digestsMatch`'s result is traced from `return` and assignment through
  *   continuation lines. A result routed through a data structure, or through a
  *   second function, is not followed.
@@ -88,7 +90,7 @@ const CREDENTIAL_PRIMITIVES = new Set([
  * gate covers less than it did and someone has to look, rather than passing
  * over an empty set. Add to it when a module joins; never trim it to pass.
  */
-const EXPECTED_GATED_FILES = ['auth.ts', 'keys.ts']
+const EXPECTED_GATED_FILES = ['auth.ts', 'http.ts', 'keys.ts']
 
 /**
  * Comparisons of things that are not secret, exempt by exact text in exactly
@@ -169,11 +171,18 @@ function coreImports(source: string): string[] {
 function localImports(file: string, source: string): string[] {
   const from = dirname(join(here, file))
   const out: string[] = []
-  for (const match of source.matchAll(/from\s*'(\.[^']*)'/g)) {
-    const before = source.slice(0, match.index)
-    const keyword = before.lastIndexOf('import')
-    if (keyword === -1) continue
-    const clause = before.slice(keyword + 'import'.length)
+  // Each statement is matched from its own start — an `import` or an `export`
+  // at the beginning of a line — rather than by scanning backwards for the
+  // nearest `import`. Backwards, a re-export (`export { x } from './x.js'`,
+  // which has no `import` of its own) took the classification of whatever
+  // statement happened to precede it, so the same line was followed or skipped
+  // depending on what was above it. The clause may not contain a quote, which
+  // is what stops a match running past its own module specifier into the next
+  // statement's.
+  for (const match of source.matchAll(
+    /^[ \t]*(?:import|export)\b([^'"]*?)\bfrom\s*'(\.[^']*)'/gm,
+  )) {
+    const clause = match[1] as string
     const specifiers = clause
       .replace(/[{}]/g, '')
       .split(',')
@@ -183,7 +192,7 @@ function localImports(file: string, source: string): string[] {
       /^\s*type\b/.test(clause) ||
       (specifiers.length > 0 && specifiers.every((s) => /^type\b/.test(s)))
     if (typeOnly) continue
-    const target = resolve(from, (match[1] as string).replace(/\.js$/, '.ts'))
+    const target = resolve(from, (match[2] as string).replace(/\.js$/, '.ts'))
     out.push(relative(here, target))
   }
   return out
@@ -470,12 +479,38 @@ describe('crypto hygiene in the admin service', () => {
     expect(gated).toEqual(expect.arrayContaining(EXPECTED_GATED_FILES))
   })
 
+  /**
+   * A re-export carries no `import` keyword of its own, so which statement it
+   * belongs to has to be decided by where that statement starts. Both
+   * positions are checked: a re-export is followed whatever sits above it, and
+   * only its own `type` keyword takes it out of the gate.
+   */
+  it('classifies a re-export by its own statement, not the one above it', () => {
+    const reExport = "export { compare } from './helper.js'\n"
+    expect(localImports('keys.ts', `import type { AdminContext } from './app.js'\n${reExport}`)) //
+      .toEqual(['helper.ts'])
+    expect(localImports('keys.ts', `import { requireSession } from './auth.js'\n${reExport}`)) //
+      .toEqual(['auth.ts', 'helper.ts'])
+    expect(localImports('keys.ts', "export type { Shape } from './helper.js'\n")).toEqual([])
+    // A module specifier that is not relative is not mistaken for the next
+    // statement's, whichever kind of statement follows it.
+    expect(localImports('keys.ts', `import { z } from 'zod'\n${reExport}`)).toEqual(['helper.ts'])
+  })
+
   it('compares a credential, in every gated file, only with digestsMatch', () => {
     for (const file of gated) {
       // An exemption applies in the one file and function it was granted for,
       // and nowhere else: the same text elsewhere is an unexempted comparison.
+      //
+      // And only while that name means one function. A second declaration of
+      // the same name — a nested helper shadowing it, say — would otherwise
+      // inherit the exemption, so an exemption over a duplicated name applies
+      // nowhere and the file fails until the names are distinct again.
+      const declared = functionBodies(read(file)).map((fn) => fn.name)
       const exempt = new Set(
-        ALLOWED_COMPARISONS.filter((a) => a.file === file).map((a) => `${a.fn}: ${a.expression}`),
+        ALLOWED_COMPARISONS.filter(
+          (a) => a.file === file && declared.filter((n) => n === a.fn).length === 1,
+        ).map((a) => `${a.fn}: ${a.expression}`),
       )
       const found = comparisonsIn(file)
       expect(

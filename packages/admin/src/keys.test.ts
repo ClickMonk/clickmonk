@@ -2,7 +2,7 @@ import { hashToken } from '@clickmonk/core'
 import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import type { FastifyInstance } from 'fastify'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { MAX_KEYS_LISTED, MAX_KEY_DAYS } from './keys.js'
+import { MAX_KEYS_LISTED, MAX_KEY_DAYS, MAX_KEY_NAME_LENGTH, createApiKey } from './keys.js'
 import { ADMIN_HOST, clockFrom, read, signedIn, testApp, write } from './testing.js'
 
 const pg = testPg()
@@ -73,6 +73,31 @@ describe('minting an API key', () => {
     expect((await create({ name: 'never', expiresDays: 0 })).statusCode).toBe(400)
   })
 
+  // Every timestamp the listing carries, by value rather than by name. They
+  // are what an operator reads the list for — above all `lastUsedAt`, which is
+  // how a key someone thought was unused is noticed still being used — so a
+  // listing that answers the right field names with the wrong instants is
+  // worse than one that answers nothing.
+  it('says when each key was made, when it expires, and when it was last used', async () => {
+    const made = (await create({ name: 'scripting', expiresDays: 7 })).json() as {
+      id: string
+      key: string
+    }
+    clock.advance(90 * 60 * 1000)
+    const used = await app.inject({
+      method: 'GET',
+      url: '/api/me',
+      headers: { host: ADMIN_HOST, authorization: `Bearer ${made.key}` },
+    })
+    expect(used.statusCode).toBe(200)
+    const list = await app.inject({ method: 'GET', url: '/api/keys', headers: read(cookie) })
+    expect(list.json().keys[0]).toMatchObject({
+      createdAt: '2026-09-23T10:00:00.000Z',
+      expiresAt: '2026-09-30T10:00:00.000Z',
+      lastUsedAt: '2026-09-23T11:30:00.000Z',
+    })
+  })
+
   it('refuses a name that is empty or too long, and an unknown field', async () => {
     expect((await create({ name: '' })).statusCode).toBe(400)
     expect((await create({ name: 'x'.repeat(101) })).statusCode).toBe(400)
@@ -121,36 +146,82 @@ describe('revoking one', () => {
     expect(list.json().keys[0].revokedAt).not.toBeNull()
   })
 
-  // The same rule the other credential routes carry, on the two that are
-  // added here: a stolen key must not be able to list the keys or mint a
-  // successor that outlives its own revocation.
+  // The same rule the other credential routes carry, on the three that are
+  // added here: a stolen key must not be able to list the keys, mint a
+  // successor that outlives its own revocation, or revoke the keys the
+  // operator would use to shut it out. `:id` is the key's own, so the row it
+  // would destroy exists and the refusal is the only reason it survives.
   it.each([
     ['GET', '/api/keys'],
     ['POST', '/api/keys'],
+    ['DELETE', '/api/keys/:id'],
   ])('cannot be reached by an API key: %s %s', async (method, url) => {
-    const minted = (await create({ name: 'scripting' })).json() as { key: string }
+    const minted = (await create({ name: 'scripting' })).json() as { id: string; key: string }
     const r = await app.inject({
       method: method as 'GET',
-      url,
+      url: url.replace(':id', minted.id),
       headers: { host: ADMIN_HOST, authorization: `Bearer ${minted.key}` },
-      payload: method === 'GET' ? undefined : { name: 'a successor' },
+      payload: method === 'POST' ? { name: 'a successor' } : undefined,
     })
     expect(r.statusCode).toBe(403)
     expect(r.json().error).toBe('session_required')
-    expect((await pg.query('SELECT 1 FROM api_keys')).rowCount).toBe(1)
+    const rows = await pg.query<{ revoked_at: Date | null }>('SELECT revoked_at FROM api_keys')
+    expect(rows.rowCount).toBe(1)
+    expect(rows.rows[0]?.revoked_at).toBeNull()
   })
 
   it('answers 404 for a key that is not there, or already revoked', async () => {
     const key = (await create()).json() as { id: string }
-    const del = () =>
-      app.inject({ method: 'DELETE', url: `/api/keys/${key.id}`, headers: write(cookie) })
-    expect((await del()).statusCode).toBe(200)
-    expect((await del()).statusCode).toBe(404)
-    const bad = await app.inject({
-      method: 'DELETE',
-      url: '/api/keys/not-an-id',
-      headers: write(cookie),
+    const del = (id: string) =>
+      app.inject({ method: 'DELETE', url: `/api/keys/${id}`, headers: write(cookie) })
+    // A well-formed id that is in no row, and an id no row could hold: the
+    // same 404, and neither says which. Both are asked while the real key is
+    // still live, so the 404 means the id decided it — asked after everything
+    // had been revoked, a route that ignored the id entirely would answer 404
+    // too, and the case would pin nothing.
+    expect((await del('0123456789abcdef')).statusCode).toBe(404)
+    expect((await del('not-an-id')).statusCode).toBe(404)
+    expect((await pg.query('SELECT 1 FROM api_keys WHERE revoked_at IS NULL')).rowCount).toBe(1)
+    expect((await del(key.id)).statusCode).toBe(200)
+    expect((await del(key.id)).statusCode).toBe(404)
+  })
+})
+
+// The CLI calls this without a route in front of it, so the bounds the schema
+// applies have to hold here too.
+describe('createApiKey, called directly', () => {
+  const day = 24 * 60 * 60 * 1000
+
+  it('bounds the life it will store', async () => {
+    const now = clock.now()
+    const at = (days: number) => new Date(now.getTime() + days * day)
+    await expect(
+      createApiKey(pg, { name: 'too long', expiresAt: at(MAX_KEY_DAYS + 1), now }),
+    ).rejects.toMatchObject({ status: 400, code: 'invalid_key' })
+    await expect(
+      createApiKey(pg, { name: 'already gone', expiresAt: at(-1), now }),
+    ).rejects.toMatchObject({ status: 400, code: 'invalid_key' })
+    expect((await pg.query('SELECT 1 FROM api_keys')).rowCount).toBe(0)
+    // And the bound is reachable: exactly the longest life is stored.
+    const ok = await createApiKey(pg, { name: 'the longest', expiresAt: at(MAX_KEY_DAYS), now })
+    expect(ok.expiresAt).toBe(at(MAX_KEY_DAYS).toISOString())
+  })
+
+  it('bounds the name it will store', async () => {
+    const now = clock.now()
+    await expect(createApiKey(pg, { name: '', expiresAt: null, now })).rejects.toMatchObject({
+      status: 400,
+      code: 'invalid_key',
     })
-    expect(bad.statusCode).toBe(404)
+    await expect(
+      createApiKey(pg, { name: 'x'.repeat(MAX_KEY_NAME_LENGTH + 1), expiresAt: null, now }),
+    ).rejects.toMatchObject({ status: 400, code: 'invalid_key' })
+    expect((await pg.query('SELECT 1 FROM api_keys')).rowCount).toBe(0)
+    const ok = await createApiKey(pg, {
+      name: 'x'.repeat(MAX_KEY_NAME_LENGTH),
+      expiresAt: null,
+      now,
+    })
+    expect(ok.name).toHaveLength(MAX_KEY_NAME_LENGTH)
   })
 })
