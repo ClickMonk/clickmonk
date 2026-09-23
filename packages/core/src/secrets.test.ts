@@ -86,6 +86,7 @@ describe('storing a password', () => {
   it('refuses a stored value it cannot parse, rather than throwing', async () => {
     const b64salt = Buffer.from('salt').toString('base64url')
     const b64hash = Buffer.from('hash').toString('base64url')
+    const b64zeroKey = Buffer.alloc(32).toString('base64url')
     for (const bad of [
       '',
       'not-a-hash',
@@ -94,15 +95,22 @@ describe('storing a password', () => {
       frame(`0$8$1$${b64salt}$${b64hash}`),
       frame(`16384$8$1$${b64salt}$`),
       frame(`16384$8$1$!!!$${b64hash}`),
-      // N must be a power of two: scrypt's own algorithm requires it, and a
-      // row that names one that is not must be refused by the parser, not by
-      // whatever the underlying scrypt call happens to validate.
-      frame(
-        `3$8$1$${Buffer.from('salt').toString('base64url')}$${Buffer.alloc(32).toString('base64url')}`,
-      ),
+      // N must be a power of two: scrypt's own algorithm requires it, so a
+      // stored row naming one that is not is invalid and must be refused.
+      frame(`3$8$1$${b64salt}$${b64zeroKey}`),
     ]) {
       expect(await verifyPassword('correct horse battery', bad), bad).toBe(false)
     }
+  })
+
+  it('never rejects, even for a stored value that is not a string at all', async () => {
+    // A NULL column read straight off a row is exactly this: it bypasses
+    // whatever this build's own types claim `stored` will be. The parse has
+    // to fail as gracefully as a malformed string does, not throw before it
+    // is ever reached.
+    await expect(verifyPassword('correct horse battery', null as unknown as string)).resolves.toBe(
+      false,
+    )
   })
 
   it('refuses a stored hash whose key is too short to trust a match', async () => {
@@ -129,9 +137,8 @@ describe('storing a password', () => {
     // whichever process verifies against it, so this is refused before the
     // scrypt call rather than left to it: the catch around that call means
     // this now resolves false either way, so this pins the *outcome*, not
-    // which of the two guards produced it — see the mutation notes for why
-    // that pairing cannot be told apart by a fixture. Nothing here times the
-    // call — a clock on a machine that is also building images is a flake.
+    // which of the two guards produced it. Nothing here times the call — a
+    // clock on a machine that is also building images is a flake.
     const salt = Buffer.from('salt').toString('base64url')
     const key = Buffer.alloc(32).toString('base64url')
     const hostile = frame(`${1024 * 1024}$8$1$${salt}$${key}`)

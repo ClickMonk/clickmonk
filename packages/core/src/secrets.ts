@@ -173,17 +173,16 @@ function parseStoredHash(stored: string): StoredHash | null {
  * True only for the password this hash was made from. A stored value this
  * cannot parse, or one asking for more memory than the bound allows, is false
  * — never an exception, because that would turn a bad row into a 500 on a
- * login or on the redirect path.
+ * login or on the redirect path. The parse sits inside the same catch as the
+ * scrypt call: a stored value that is not even a string — a NULL column read
+ * straight off a row, past whatever this build's own types claim — throws
+ * just as synchronously as a malformed one, and both need the same answer.
  */
 export async function verifyPassword(password: string, stored: string): Promise<boolean> {
   if (password.length === 0 || password.length > MAX_PASSWORD_LENGTH) return false
-  const parsed = parseStoredHash(stored)
-  if (!parsed) return false
-  // parseStoredHash already refuses every shape this build knows makes scrypt
-  // itself throw; this catches whatever it does not — a future scrypt with a
-  // narrower or different validation than today's — so the promise this
-  // function returns never rejects, whatever the stored row contains.
   try {
+    const parsed = parseStoredHash(stored)
+    if (!parsed) return false
     const key = await scrypt(password, parsed.salt, parsed.key.length, {
       N: parsed.n,
       r: parsed.r,
