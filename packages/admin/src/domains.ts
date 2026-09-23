@@ -23,6 +23,7 @@ import {
   verificationRecordValue,
 } from '@clickmonk/core'
 import {
+  AdminHostDomainError,
   type DomainDnsStatus,
   checkDomain,
   createDomain,
@@ -144,11 +145,30 @@ export function registerDomainRoutes(app: FastifyInstance, ctx: AdminContext): v
     const body = readBody(CreateBody, req.body)
     const host = normaliseHost(body.host)
     if (!host) return fail(400, 'invalid_host', 'not a valid host name')
-    const created = await createDomain(ctx.pg, {
-      host,
-      rootUrl: body.rootUrl,
-      notFoundUrl: body.notFoundUrl,
-    })
+    let created: Awaited<ReturnType<typeof createDomain>>
+    try {
+      created = await createDomain(ctx.pg, {
+        host,
+        // This service's own configured host, which is the name the reverse
+        // proxy sends here. The writer holds the rule; this passes what only
+        // this process knows.
+        adminHost: ctx.adminHost,
+        rootUrl: body.rootUrl,
+        notFoundUrl: body.notFoundUrl,
+      })
+    } catch (err) {
+      // A conflict with how this install is configured, not a malformed body:
+      // the name is a perfectly good host name and every link on it would be
+      // stored, verified and then answered by this API instead of redirected.
+      if (err instanceof AdminHostDomainError) {
+        return fail(
+          409,
+          'host_is_admin_host',
+          'that is the host name this API answers on, so links on it would never resolve',
+        )
+      }
+      throw err
+    }
     if (!created) return fail(409, 'host_taken', 'this install already has that domain')
     return reply.code(201).send(asDomain(await domainById(ctx, created.id)))
   })

@@ -169,6 +169,23 @@ export interface CreatedDomain {
 }
 
 /**
+ * Thrown when the host asked for is the one the admin API answers on.
+ *
+ * Its own class rather than a bare `Error` because, unlike the other two
+ * refusals here, this one is reachable from an operator's first attempt: a
+ * name that looks exactly right is the name they would try. Each caller catches
+ * it and words the refusal for its own surface, the way each already words the
+ * `null` that means the host is taken — a 500 or a stack trace for a typo would
+ * be the wrong answer on either of them.
+ */
+export class AdminHostDomainError extends Error {
+  constructor(readonly host: string) {
+    super(`${host} is the host name the admin API answers on`)
+    this.name = 'AdminHostDomainError'
+  }
+}
+
+/**
  * Adds a domain, and is the only place that writes one. Shared by the API and
  * by `clickmonk domain add`, for the same reason `recordDomainCheck` is: the
  * flag this writes decides whether a host name's links answer and whether
@@ -188,13 +205,34 @@ export interface CreatedDomain {
  * nothing either of them answers changes; what this stops is the next caller.
  * Returns `null` when the host is already taken, which each caller reports in
  * its own words.
+ *
+ * `adminHost` is required, and null is how a caller says this install has not
+ * named one. Optional, a caller who knows the name and forgets to pass it loses
+ * the rule silently — and what it decides is whether a domain's links resolve
+ * at all, which is the same reason `verified` has to be asked for in so many
+ * words rather than defaulted from somewhere.
  */
 export async function createDomain(
   pg: Pool,
-  o: { host: string; rootUrl?: string | null; notFoundUrl?: string | null; verified?: boolean },
+  o: {
+    host: string
+    /** The host name the admin API answers on, or null when none is configured. */
+    adminHost: string | null
+    rootUrl?: string | null
+    notFoundUrl?: string | null
+    verified?: boolean
+  },
 ): Promise<CreatedDomain | null> {
   const host = normaliseHost(o.host)
   if (!host) throw new Error('a domain needs a valid host name')
+  // One rule, here, because both callers would otherwise need their own copy
+  // of it. The reverse proxy sends the admin host name to the admin service, so
+  // a link domain of that name would take every one of its links with it: they
+  // would be stored, verified, given a certificate, and answer as the API does
+  // instead of redirecting. Normalised on both sides, since the proxy matches a
+  // host name without regard to case or a trailing dot.
+  const adminHost = o.adminHost === null ? null : normaliseHost(o.adminHost)
+  if (adminHost !== null && host === adminHost) throw new AdminHostDomainError(host)
   // An own property, not an inherited one. `o` is an object literal a caller
   // builds, and a plain `o.verified` walks the prototype chain: a property
   // planted on `Object.prototype` would then decide the flag that lets a host

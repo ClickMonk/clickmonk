@@ -15,7 +15,7 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   await pool.query('TRUNCATE domains CASCADE')
-  await createDomain(pool, { host })
+  await createDomain(pool, { host, adminHost: null })
 })
 
 afterAll(async () => {

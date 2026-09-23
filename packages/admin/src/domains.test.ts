@@ -293,6 +293,28 @@ describe('adding a domain', () => {
     expect(again.json().error).toBe('host_taken')
   })
 
+  // The same rule the CLI's `domain add` is refused by, held in the one writer
+  // both of them go through. Requests for this name reach this service, so a
+  // link domain of this name would be stored, verified, given a certificate and
+  // then answered by this API instead of redirecting.
+  it('refuses a domain with the name this API answers on, and writes nothing', async () => {
+    const r = await add({ host: ADMIN_HOST })
+    expect(r.statusCode).toBe(409)
+    expect(r.json().error).toBe('host_is_admin_host')
+    // Nothing the refusal says gives away a password, a token or the name of a
+    // constraint; and nothing was written.
+    expect((await pg.query('SELECT 1 FROM domains')).rowCount).toBe(0)
+    // As an operator would type it into a form, upper case and trailing dot:
+    // the name is normalised before the comparison on both sides.
+    const typed = await add({ host: 'Admin.Example.TEST.' })
+    expect(typed.statusCode).toBe(409)
+    expect(typed.json().error).toBe('host_is_admin_host')
+    expect((await pg.query('SELECT 1 FROM domains')).rowCount).toBe(0)
+    // Any other name on this same install is added as usual, so what was
+    // refused was the collision and not the route.
+    expect((await add({ host: 'links.example.test' })).statusCode).toBe(201)
+  })
+
   it('takes a root and a not-found URL, and refuses one carrying a token', async () => {
     const r = await add({
       host: 'go.example.test',

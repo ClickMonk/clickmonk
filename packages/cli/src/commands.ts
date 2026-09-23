@@ -31,6 +31,7 @@ import {
   runUpdate,
 } from '@clickmonk/ipdata'
 import {
+  AdminHostDomainError,
   type DomainResolver,
   checkDomain,
   createDomain,
@@ -129,16 +130,6 @@ async function domainAdd(args: string[], d: CliDeps): Promise<void> {
   })
   const host = normaliseHost(positionals[0] ?? '')
   if (!host) throw new Rejected(`not a valid host name: ${positionals[0] ?? '(none)'}`)
-  // Refused rather than stored, because storing it would look like it worked.
-  // Requests for the admin host are sent to the admin API, so every link added
-  // under this name would answer as the API does and none of them would ever
-  // redirect — with a domain row, a verification record and a certificate all
-  // saying the domain was set up correctly.
-  if (d.adminHost !== null && d.adminHost !== undefined && host === d.adminHost) {
-    throw new Rejected(
-      `${host} is the host name the admin API answers on (CLICKMONK_ADMIN_HOST), so links on it would never resolve; use a different name for links`,
-    )
-  }
   for (const u of [values['root-url'], values['not-found-url']]) {
     // Sent as written, so no token: `{click_id}` would reach the visitor
     // literally. Checked here so the refusal names the value the operator
@@ -149,14 +140,29 @@ async function domainAdd(args: string[], d: CliDeps): Promise<void> {
   }
   const verified = values.verified === true
   // The one writer, shared with the API, so `verified` is decided in one
-  // statement. This is the only caller that may pass it true, and it can
-  // because it is typed on the server by whoever installed this.
-  const created = await createDomain(d.pg, {
-    host,
-    rootUrl: values['root-url'] ?? null,
-    notFoundUrl: values['not-found-url'] ?? null,
-    verified,
-  })
+  // statement and so is the refusal of the admin host. This is the only caller
+  // that may pass `verified` true, and it can because it is typed on the server
+  // by whoever installed this.
+  let created: Awaited<ReturnType<typeof createDomain>>
+  try {
+    created = await createDomain(d.pg, {
+      host,
+      adminHost: d.adminHost ?? null,
+      rootUrl: values['root-url'] ?? null,
+      notFoundUrl: values['not-found-url'] ?? null,
+      verified,
+    })
+  } catch (err) {
+    // The writer's rule, worded for an operator at a shell: it names the
+    // variable they would have to change, which is something only this surface
+    // knows to say.
+    if (err instanceof AdminHostDomainError) {
+      throw new Rejected(
+        `${err.host} is the host name the admin API answers on (CLICKMONK_ADMIN_HOST), so links on it would never resolve; use a different name for links`,
+      )
+    }
+    throw err
+  }
   if (!created) throw new Rejected(`domain already exists: ${host}`)
   d.out(`domain ${host} ${created.id}`)
   if (verified) {
