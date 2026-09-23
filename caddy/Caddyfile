@@ -6,6 +6,15 @@
 # server gets no certificate, so nobody outside can make this install ask a
 # certificate authority for one.
 {
+	# HTTP/1.1 and HTTP/2 only. HTTP/3 runs over UDP, and docker-compose.yml
+	# publishes 443 as TCP alone, so advertising HTTP/3 would point clients
+	# at a port the host never forwards: they try it, get nothing, and fall
+	# back. To turn it on, publish `443:443/udp` for caddy as well and add
+	# h3 to the line below. The two only make sense together.
+	servers {
+		protocols h1 h2
+	}
+
 	on_demand_tls {
 		# The internal port, reachable on the stack's own network and
 		# published nowhere.

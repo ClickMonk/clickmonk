@@ -244,6 +244,24 @@ describe('the shipped Caddy configuration', () => {
     }
   })
 
+  // HTTP/3 is reached over UDP, and the stack publishes 443 as TCP alone, so
+  // an install that advertised HTTP/3 would be pointing clients at a port the
+  // host never forwards. The two settings only make sense together, which is
+  // what this asserts: h3 is served exactly when a UDP port is published.
+  // Read as one equality rather than as two separate checks, so it fails from
+  // either side — the protocols line quietly disappearing (Caddy's own
+  // default serves h3), and a UDP port published without h3 being put back.
+  it('serves HTTP/3 exactly when the stack publishes a UDP port', () => {
+    const udp = serviceBlock(config('docker-compose.yml'), 'caddy').includes('protocol: udp')
+    const line = /^[ \t]*protocols[ \t]+(.*)$/m.exec(caddyfile)?.[1]
+    // No line at all is Caddy's default, which is h1 h2 h3.
+    const protocols = (line ?? 'h1 h2 h3').trim().split(/\s+/)
+    expect(
+      protocols.includes('h3'),
+      `protocols ${protocols.join(' ')} with 443/udp ${udp ? '' : 'not '}published`,
+    ).toBe(udp)
+  })
+
   it('ships a file in each, so the glob is never empty', () => {
     for (const d of ['tls.d', 'proxy.d']) {
       const files = readdirSync(join(ROOT, 'caddy', d)).filter((f) => f.endsWith('.caddy'))
