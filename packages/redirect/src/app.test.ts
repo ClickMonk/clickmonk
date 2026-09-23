@@ -1474,7 +1474,8 @@ describe('a password-protected link', () => {
     // One more than the limit: at exactly five, a success counted as an attempt
     // still leaves the fifth allowed, so five of them cannot tell the two apart.
     const { app, records } = harness([locked])
-    for (let i = 0; i < PASSWORD_ATTEMPT_LIMIT + 1; i++) {
+    expect(PASSWORD_ATTEMPT_LIMIT).toBe(5)
+    for (let i = 0; i < 6; i++) {
       const r = await post(app, `password=${PASSWORD}`)
       expect(r.statusCode, `answer ${i + 1}`).toBe(302)
       expect(String(r.headers['set-cookie']), `answer ${i + 1}`).toContain(`cm_pw_${locked.id}=`)
@@ -1489,7 +1490,10 @@ describe('a password-protected link', () => {
     // window is read off the Retry-After rather than waited out.
     const { app, records } = harness([locked])
     const statuses: number[] = []
-    for (let i = 0; i < PASSWORD_ATTEMPT_LIMIT + 1; i++) {
+    // Six, written out. Derived from the constant, the loop would grow with a
+    // raised limit and take the suite with it instead of failing at once.
+    expect(PASSWORD_ATTEMPT_LIMIT).toBe(5)
+    for (let i = 0; i < 6; i++) {
       statuses.push((await post(app, `password=wrong-${i}`)).statusCode)
     }
     expect(statuses).toEqual([200, 200, 200, 200, 200, 429])
