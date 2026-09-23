@@ -30,15 +30,26 @@
  *   method this file has never heard of — is invisible to it.
  * - It does not prove the comparison it finds runs in constant time, only that
  *   the source calls the function this codebase uses for that.
- * - It follows relative imports. A comparison moved into another workspace
- *   package, or reached through a dynamic `import()`, is outside its reach —
- *   though a new package holding credential logic would need its own gate
- *   anyway, which is the same reason this one exists.
+ * - A comparison written without a comparison operator at all is invisible:
+ *   most sharply, a `switch` on a digest with the stored value as a `case`,
+ *   which compares exactly as early-exitingly as `===` and contains no `==`,
+ *   `!=` or `.equals(` for this file to find.
+ * - It follows relative imports **for their values**. A comparison moved into
+ *   another workspace package, or reached through a dynamic `import()`, is
+ *   outside its reach — though a new package holding credential logic would
+ *   need its own gate anyway, which is the same reason this one exists. A
+ *   type-only import is not followed either: it names nothing that exists at
+ *   runtime, so no comparison can run through it, and importing a type from a
+ *   module must not drag that module's whole import graph into the gate. A
+ *   module a gated file imports for a *value* is gated as it always was.
  * - `ALLOWED_COMPARISONS` below exempts specific expressions by their exact
- *   text. Each is a comparison of something that is not secret. The exemption
- *   is the expression, not the function around it, so a secret comparison added
- *   beside an exempt one still fails — and an entry that no longer matches
- *   anything fails too, so the list cannot rot.
+ *   text, **each keyed to the file and the declared function it was granted
+ *   for**. Each is a comparison of something that is not secret. Keying is what
+ *   makes the exemption narrow: without it the text alone was the exemption
+ *   anywhere in the package, so spelling a secret comparison the way an exempt
+ *   one is spelled — in another file, in another function — passed the gate.
+ *   A secret comparison added beside an exempt one still fails, and an entry
+ *   that no longer matches anything fails too, so the list cannot rot.
  * - `digestsMatch`'s result is traced from `return` and assignment through
  *   continuation lines. A result routed through a data structure, or through a
  *   second function, is not followed.
@@ -77,14 +88,25 @@ const CREDENTIAL_PRIMITIVES = new Set([
  * gate covers less than it did and someone has to look, rather than passing
  * over an empty set. Add to it when a module joins; never trim it to pass.
  */
-const EXPECTED_GATED_FILES = ['auth.ts']
+const EXPECTED_GATED_FILES = ['auth.ts', 'keys.ts']
 
 /**
- * Comparisons of things that are not secret, exempt by exact text. Every entry
- * must still match something, so a stale exemption is a failure.
+ * Comparisons of things that are not secret, exempt by exact text in exactly
+ * one file and one declared function. Every entry must still match something
+ * there, so a stale exemption is a failure. `(module)` is the name for an
+ * expression that sits outside any declared function.
  */
-const ALLOWED_COMPARISONS: { expression: string; because: string }[] = [
+interface Exemption {
+  file: string
+  fn: string
+  expression: string
+  because: string
+}
+
+const ALLOWED_COMPARISONS: Exemption[] = [
   {
+    file: 'auth.ts',
+    fn: 'checkCsrf',
     expression: 'o.origin !== expected',
     because:
       'the cross-site write guard compares a request header to the admin origin; ' +
@@ -134,11 +156,33 @@ function coreImports(source: string): string[] {
   return names
 }
 
-/** The package-relative files a file imports, as `sourceFiles()` names them. */
+/**
+ * The package-relative files a file imports **for a value**, as `sourceFiles()`
+ * names them.
+ *
+ * A type-only import — `import type { X } from './x.js'`, or a clause whose
+ * every specifier is `type`-prefixed — is left out. Nothing it names survives
+ * compilation, so no comparison can be reached through it, and following one
+ * would gate a module's entire import graph on the strength of a borrowed
+ * interface. A module imported for a value from the same file is still gated.
+ */
 function localImports(file: string, source: string): string[] {
   const from = dirname(join(here, file))
   const out: string[] = []
   for (const match of source.matchAll(/from\s*'(\.[^']*)'/g)) {
+    const before = source.slice(0, match.index)
+    const keyword = before.lastIndexOf('import')
+    if (keyword === -1) continue
+    const clause = before.slice(keyword + 'import'.length)
+    const specifiers = clause
+      .replace(/[{}]/g, '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+    const typeOnly =
+      /^\s*type\b/.test(clause) ||
+      (specifiers.length > 0 && specifiers.every((s) => /^type\b/.test(s)))
+    if (typeOnly) continue
     const target = resolve(from, (match[1] as string).replace(/\.js$/, '.ts'))
     out.push(relative(here, target))
   }
@@ -170,6 +214,8 @@ interface Comparison {
   /** The whole expression, whitespace collapsed: what an exemption names. */
   expression: string
   why: string
+  /** Where it sits in the file, so it can be attributed to a function. */
+  at: number
 }
 
 /** Where an operand stops, scanning outward from the operator. */
@@ -246,7 +292,7 @@ function lhsText(text: string, opStart: number): string {
 function findDisallowedComparisons(body: string): Comparison[] {
   const violations: Comparison[] = []
   for (const match of body.matchAll(/[\w$]+\.equals\(/g)) {
-    violations.push({ expression: match[0], why: 'compares with .equals(' })
+    violations.push({ expression: match[0], why: 'compares with .equals(', at: match.index })
   }
 
   const isWholeValue = (token: string): boolean =>
@@ -267,16 +313,17 @@ function findDisallowedComparisons(body: string): Comparison[] {
     const lhs = lhsText(body, match.index).replace(/\s+/g, ' ')
     const rhs = rhsText(body, match.index + op.length).replace(/\s+/g, ' ')
     const expression = `${lhs} ${op} ${rhs}`.trim()
+    const at = match.index
     if (lhs.endsWith(')') || lhs.endsWith('`') || rhs.endsWith(')') || rhs.endsWith('`')) {
-      violations.push({ expression, why: 'an operand is a call or template result' })
+      violations.push({ expression, why: 'an operand is a call or template result', at })
       continue
     }
     if (!isWholeValue(lhs) || !isWholeValue(rhs)) {
-      violations.push({ expression, why: 'an operand is an expression, not one whole value' })
+      violations.push({ expression, why: 'an operand is an expression, not one whole value', at })
       continue
     }
     if (!(isSafeOperand(lhs) || isSafeOperand(rhs))) {
-      violations.push({ expression, why: 'neither operand is a literal, a length or null' })
+      violations.push({ expression, why: 'neither operand is a literal, a length or null', at })
     }
   }
   return violations
@@ -285,6 +332,9 @@ function findDisallowedComparisons(body: string): Comparison[] {
 interface FunctionBody {
   name: string
   body: string
+  /** The extent of the body in the file, so an expression can be placed in it. */
+  start: number
+  end: number
 }
 
 /**
@@ -318,13 +368,50 @@ function functionBodies(source: string): FunctionBody[] {
       else if (source[j] === '}') {
         braceDepth--
         if (braceDepth === 0) {
-          out.push({ name: match[1] as string, body: source.slice(openBrace, j + 1) })
+          out.push({
+            name: match[1] as string,
+            body: source.slice(openBrace, j + 1),
+            start: openBrace,
+            end: j + 1,
+          })
           break
         }
       }
     }
   }
   return out
+}
+
+/** The name an expression is exempted under: its innermost declared function. */
+const MODULE_LEVEL = '(module)'
+
+/**
+ * The innermost declared function containing an offset, or `(module)`. Innermost
+ * by extent, so a helper declared inside another function is named rather than
+ * its parent — an exemption granted to the outer one must not cover it.
+ */
+function enclosingFunction(functions: FunctionBody[], at: number): string {
+  let name = MODULE_LEVEL
+  let narrowest = Number.POSITIVE_INFINITY
+  for (const fn of functions) {
+    const width = fn.end - fn.start
+    if (at >= fn.start && at < fn.end && width < narrowest) {
+      name = fn.name
+      narrowest = width
+    }
+  }
+  return name
+}
+
+/** Every disallowed comparison in a file, each named by the function it sits in. */
+function comparisonsIn(file: string): { fn: string; expression: string; why: string }[] {
+  const source = read(file)
+  const functions = functionBodies(source)
+  return findDisallowedComparisons(source).map((c) => ({
+    fn: enclosingFunction(functions, c.at),
+    expression: c.expression,
+    why: c.why,
+  }))
 }
 
 /**
@@ -384,34 +471,47 @@ describe('crypto hygiene in the admin service', () => {
   })
 
   it('compares a credential, in every gated file, only with digestsMatch', () => {
-    const exempt = new Set(ALLOWED_COMPARISONS.map((a) => a.expression))
     for (const file of gated) {
-      const found = findDisallowedComparisons(read(file))
+      // An exemption applies in the one file and function it was granted for,
+      // and nowhere else: the same text elsewhere is an unexempted comparison.
+      const exempt = new Set(
+        ALLOWED_COMPARISONS.filter((a) => a.file === file).map((a) => `${a.fn}: ${a.expression}`),
+      )
+      const found = comparisonsIn(file)
       expect(
-        found.filter((c) => !exempt.has(c.expression)),
+        found.filter((c) => !exempt.has(`${c.fn}: ${c.expression}`)),
         file,
       ).toEqual([])
     }
   })
 
   it('has no exemption that stopped matching anything', () => {
-    const found = gated.flatMap((file) =>
-      findDisallowedComparisons(read(file)).map((c) => c.expression),
-    )
-    for (const { expression, because } of ALLOWED_COMPARISONS) {
-      expect(found, `${expression} (${because})`).toContain(expression)
+    for (const { file, fn, expression, because } of ALLOWED_COMPARISONS) {
+      const found = gated.includes(file)
+        ? comparisonsIn(file).map((c) => `${c.fn}: ${c.expression}`)
+        : []
+      // A file that has left the gate fails here too: an exemption over
+      // unscanned source exempts nothing and hides that it stopped applying.
+      expect(found, `${file}#${fn} ${expression} (${because})`).toContain(`${fn}: ${expression}`)
     }
   })
 
-  it('lets the result of digestsMatch decide the answer wherever it is called', () => {
-    const subjects = gated.flatMap((file) =>
-      functionBodies(read(file))
+  it('lets the result of digestsMatch decide the answer, file by file', () => {
+    // Per file, not one count over the package: a single call anywhere used to
+    // satisfy this, so a throwaway helper elsewhere covered for the file whose
+    // comparison had been taken out.
+    const comparers = gated.filter((file) => coreImports(read(file)).includes('digestsMatch'))
+    // And a floor under that: the package compares a digest somewhere.
+    expect(comparers.length).toBeGreaterThan(0)
+    for (const file of gated) {
+      const subjects = functionBodies(read(file))
         .filter((fn) => fn.body.includes('digestsMatch('))
-        .map((fn) => ({ label: `${file}#${fn.name}`, body: fn.body })),
-    )
-    expect(subjects.length).toBeGreaterThan(0)
-    for (const { label, body } of subjects) {
-      expect(whyDigestsMatchDoesNotDecide(body), label).toBe('')
+        .map((fn) => ({ label: `${file}#${fn.name}`, body: fn.body }))
+      // A file that imports it must call it where the answer turns on it.
+      if (comparers.includes(file)) expect(subjects.length, file).toBeGreaterThan(0)
+      for (const { label, body } of subjects) {
+        expect(whyDigestsMatchDoesNotDecide(body), label).toBe('')
+      }
     }
   })
 })

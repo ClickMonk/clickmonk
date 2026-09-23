@@ -289,19 +289,30 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: AdminContext): 
     if (!account) fail(503, 'no_admin', 'this install has no admin account yet')
     const a = account as NonNullable<typeof account>
     const now = ctx.now()
+    // The failure count as an attempt right now would read it, and the lockout
+    // if one is standing. Nothing else surfaces either, so an admin whose count
+    // is creeping up has no way to see it before the lock lands — which is the
+    // whole complaint against a count that never decays.
+    //
+    // To a session only. Those two fields say whether the account is under
+    // attack and whether it is locked out right now, which is a running
+    // commentary on someone else's sign-ins; a key is a string in a script and
+    // has no business reading it. A key holder who wants it can sign in.
+    const attempts =
+      credential.kind === 'session'
+        ? {
+            failedLogins: activeFailures(a, now),
+            lockedUntil:
+              a.lockedUntil && a.lockedUntil.getTime() > now.getTime()
+                ? a.lockedUntil.toISOString()
+                : null,
+          }
+        : {}
     return {
       email: a.email,
       totpEnabled: a.totpSecret !== null,
       recoveryCodesLeft: await unusedRecoveryCodeCount(ctx.pg),
-      // The failure count as an attempt right now would read it, and the
-      // lockout if one is standing. Nothing else surfaces either, so an admin
-      // whose count is creeping up has no way to see it before the lock lands —
-      // which is the whole complaint against a count that never decays.
-      failedLogins: activeFailures(a, now),
-      lockedUntil:
-        a.lockedUntil && a.lockedUntil.getTime() > now.getTime()
-          ? a.lockedUntil.toISOString()
-          : null,
+      ...attempts,
       credential: credential.kind,
     }
   })

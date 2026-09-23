@@ -355,10 +355,32 @@ describe('an API key', () => {
     expect(me.json().credential).toBe('key')
   })
 
+  // What a key may read there stops short of the account's sign-in history.
+  // `failedLogins` and `lockedUntil` say whether someone is guessing the
+  // password right now and whether the account is locked — a running
+  // commentary on the admin's sign-ins, which a string in a script has no
+  // business reading. A session sees both, and that is where they are for.
+  it('is not told the failure count or the lockout', async () => {
+    const key = await keyFor(pg)
+    const byKey = await app.inject({
+      method: 'GET',
+      url: '/api/me',
+      headers: { host: ADMIN_HOST, authorization: `Bearer ${key}` },
+    })
+    expect(byKey.statusCode).toBe(200)
+    expect(byKey.json()).not.toHaveProperty('failedLogins')
+    expect(byKey.json()).not.toHaveProperty('lockedUntil')
+
+    const cookie = await signInAs(app)
+    const bySession = await app.inject({ method: 'GET', url: '/api/me', headers: read(cookie) })
+    expect(bySession.json().failedLogins).toBe(0)
+    expect(bySession.json().lockedUntil).toBeNull()
+  })
+
   // A stolen key must not be able to widen itself: not into a session, not
   // into another key, and not into a new password.
-  // `/api/keys` is not in this list: it is not a route yet, and it carries its
-  // own two rows of this same check where it is added.
+  // `/api/keys` is not in this list: it carries its own two rows of this same
+  // check beside the routes that answer it.
   it.each([
     ['GET', '/api/sessions'],
     ['POST', '/api/password'],

@@ -4,6 +4,7 @@ import type { DomainResolver } from '@clickmonk/worker/domains'
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify'
 import { type Credential, authenticate, checkCsrf, hasBearer } from './auth.js'
 import { HttpError, MAX_BODY_BYTES, securityHeaders } from './http.js'
+import { registerKeyRoutes } from './keys.js'
 import { registerSessionRoutes } from './session-routes.js'
 
 /** Failed sign-ins from one address before it is refused, and the window. */
@@ -174,6 +175,7 @@ export function buildAdminApp(
   app.get('/health', async () => ({ status: 'ok' }))
 
   registerSessionRoutes(app, ctx)
+  registerKeyRoutes(app, ctx)
 
   return app
 }
