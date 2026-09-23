@@ -59,7 +59,8 @@ What does not exist yet, and must not be implied by any documentation:
   after `link add`. `settings set` sets the install-wide traffic actions, the safe URL
   and the abuser threshold. The evaluator supports device URLs, a returning URL,
   country rules, a name and the disabled state; the CLI cannot set them yet, so they
-  need hand-written SQL.
+  need hand-written SQL. A returning URL also needs HTTPS to do anything: its cookie
+  is marked `Secure`, so a browser drops it over plain HTTP.
 - **Reporting.** Clicks reach ClickHouse; there are no reports or exports.
 - **Proxy/VPN detection beyond Tor exits, cloud providers' published ranges, and region
   or city.** No licensed VPN or proxy list has been found; datacenter traffic is
