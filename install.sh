@@ -136,6 +136,10 @@ ClickMonk is running. Add your first link domain:
 
   docker compose exec worker node packages/cli/dist/index.js domain add links.example.com
 
+The worker runs the database migrations when it starts, and nothing here
+waited for them. If that command fails with a Postgres error about a missing
+relation, wait a few seconds and run it again.
+
 That prints a TXT record to publish. Point the domain at this server with an A
 or AAAA record as well. Once the TXT record is found — within a few minutes,
 or at once with `domain verify` — the domain is verified, its links start
