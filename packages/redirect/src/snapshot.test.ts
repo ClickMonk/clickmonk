@@ -189,6 +189,17 @@ describe('loadFromPostgres', () => {
     await expect(loadFromPostgres(pool, 0)).rejects.toBeInstanceOf(SnapshotTooLargeError)
   })
 
+  // The one flag that decides both whether a domain's links answer and
+  // whether this install will ask a certificate authority for a certificate
+  // in its name. A load that carried it as true for every row would hand out
+  // both to a host name nobody proved control of, and every other assertion
+  // in this file seeds a verified domain, so none of them would notice.
+  it('carries an unverified domain through as unverified', async () => {
+    await pool.query("INSERT INTO domains (host, verified) VALUES ('new.example.test', false)")
+    const s = await loadFromPostgres(pool)
+    expect(s.domain('new.example.test')?.verified).toBe(false)
+  })
+
   it('looks slugs up case-sensitively and hosts exactly', async () => {
     const { domainId } = await seed()
     const s = await loadFromPostgres(pool)
