@@ -274,7 +274,7 @@ export async function loadFromPostgres(
 
 export function serializeSnapshot(s: Snapshot): string {
   return JSON.stringify({
-    v: 2,
+    v: 3,
     loadedAt: s.loadedAt.toISOString(),
     settings: s.settings,
     ...s.entries(),
@@ -282,11 +282,20 @@ export function serializeSnapshot(s: Snapshot): string {
 }
 
 /**
- * Reads version 2, and version 1 as written before traffic settings existed:
- * the defaults and no link overrides, which is what Postgres held then too.
- * A redirect upgraded while Postgres is down still serves its last snapshot.
- * A version 2 file's settings and overrides pass core's schemas as they do
- * from Postgres; refused, the defaults and no overrides apply, with a log.
+ * Reads version 3 and the two before it: version 2 as written before the file
+ * said it carried a link password hash, and version 1 as written before
+ * traffic settings existed — the defaults and no link overrides, which is what
+ * Postgres held then too. A redirect upgraded while Postgres is down still
+ * serves its last snapshot. A file's settings and overrides pass core's
+ * schemas as they do from Postgres; refused, the defaults and no overrides
+ * apply, with a log.
+ *
+ * Neither the settings nor the password hash is read on the version number.
+ * The settings are read from every file that has them, `v >= 2`, and the hash
+ * from whatever field a file holds, because the field arrived before the
+ * version said so: a build of this release writes `v: 2` files that carry a
+ * hash, and gating either read on `v === 3` would discard it and open every
+ * link those files protect.
  */
 export function deserializeSnapshot(text: string, log: Log = () => {}): Snapshot {
   const raw = JSON.parse(text) as {
@@ -300,9 +309,11 @@ export function deserializeSnapshot(text: string, log: Log = () => {}): Snapshot
       passwordHash?: unknown
     })[]
   }
-  if (raw.v !== 1 && raw.v !== 2) throw new Error(`unknown snapshot version ${raw.v}`)
+  if (raw.v !== 1 && raw.v !== 2 && raw.v !== 3) {
+    throw new Error(`unknown snapshot version ${raw.v}`)
+  }
   let settings = DEFAULT_TRAFFIC_SETTINGS
-  if (raw.v === 2) {
+  if (raw.v >= 2) {
     const r = validSettings(raw.settings, 'the snapshot file settings')
     if (r.problem) log(`traffic settings: ${r.problem}; using the defaults`)
     settings = r.settings

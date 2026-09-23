@@ -247,10 +247,10 @@ describe('snapshot file', () => {
   })
 
   const FILE_DOMAIN_ID = '00000000-0000-4000-8000-0000000000d1'
-  /** One link in a version 2 file, with whatever the case under test adds. */
-  const fileWithLink = (over: Record<string, unknown>) =>
+  /** One link in a file of the given version, with whatever the case under test adds. */
+  const fileWithLink = (over: Record<string, unknown>, v = 2) =>
     JSON.stringify({
-      v: 2,
+      v,
       loadedAt: new Date().toISOString(),
       settings: DEFAULT_TRAFFIC_SETTINGS,
       domains: [],
@@ -279,8 +279,70 @@ describe('snapshot file', () => {
         },
       ],
     })
-  const fileLink = (over: Record<string, unknown>, log?: (m: string) => void) =>
-    deserializeSnapshot(fileWithLink(over), log).link(FILE_DOMAIN_ID, 'spring')
+  const fileLink = (over: Record<string, unknown>, log?: (m: string) => void, v = 2) =>
+    deserializeSnapshot(fileWithLink(over, v), log).link(FILE_DOMAIN_ID, 'spring')
+
+  it('writes the current version, and round-trips a link password hash through it', async () => {
+    // A real hash, derived here: the gate verifies an answer against whatever
+    // comes back out of the file, so what goes in is the shape Postgres holds.
+    const hash = await hashPassword('spring2026', LINK_SCRYPT)
+    const locked = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      domainId: FILE_DOMAIN_ID,
+      slug: 'spring',
+      enabled: true,
+      targets: [
+        { id: '00000000-0000-4000-8000-0000000000f1', url: 'https://example.com/', weight: 100 },
+      ],
+      backupUrl: null,
+      deviceUrls: {},
+      returningUrl: null,
+      countries: { mode: 'all' } as const,
+      clickCap: null,
+      expiresAt: null,
+      passthrough: true,
+      passwordHash: hash,
+      trafficActions: {},
+    }
+    const written = serializeSnapshot(new Snapshot([], [locked], new Date(), 'postgres'))
+    expect(JSON.parse(written).v).toBe(3)
+    expect(deserializeSnapshot(written).link(FILE_DOMAIN_ID, 'spring')?.passwordHash).toBe(hash)
+  })
+
+  // Five files, not two. The field arrived before the version said so, so a
+  // build of this release writes `v: 2` files that carry a hash: a read gated
+  // on the version — `if (raw.v >= 3)` — would silently discard every one of
+  // them and open every link they protect. A missing field is `null`, never
+  // merely falsy, because the evaluator asks for a password whenever the hash
+  // is not null.
+  it.each([
+    ['a version 2 file with no field', 2, {}, null],
+    [
+      'a version 2 file carrying a hash',
+      2,
+      { passwordHash: 'no-verifier-accepts-this' },
+      'no-verifier-accepts-this',
+    ],
+    ['a version 2 file carrying the sentinel', 2, { passwordHash: 42 }, UNREADABLE_PASSWORD_HASH],
+    ['a version 3 file with no field', 3, {}, null],
+    [
+      'a version 3 file carrying a hash',
+      3,
+      { passwordHash: 'no-verifier-accepts-this' },
+      'no-verifier-accepts-this',
+    ],
+  ] as [string, number, Record<string, unknown>, string | null][])(
+    'reads %s',
+    (_label, v, over, expected) => {
+      expect(fileLink(over, undefined, v)?.passwordHash).toBe(expected)
+    },
+  )
+
+  it('refuses a file from a version it does not know', () => {
+    // A file a later release wrote is not read as though this one understood
+    // it: the store keeps whatever it already had instead.
+    expect(() => deserializeSnapshot(fileWithLink({}, 4))).toThrow(/unknown snapshot version 4/)
+  })
 
   // `undefined` is not `null`, and the evaluator asks for a password for every
   // link whose hash is not null. A file written before links had passwords has

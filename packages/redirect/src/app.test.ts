@@ -3,13 +3,17 @@ import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  AttemptCounter,
   type ClickRecord,
   ClickRecordSchema,
+  ConcurrencyGate,
   DEFAULT_TRAFFIC_SETTINGS,
   type Domain,
   type IpFacts,
+  LINK_SCRYPT,
   type Link,
   type TrafficSettings,
+  hashPassword,
   isDestinationUrl,
 } from '@clickmonk/core'
 import { type Pool, createPgPool } from '@clickmonk/db'
@@ -29,7 +33,7 @@ import {
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { buildRedirectApp } from './app.js'
 import { RateCounter } from './rate.js'
-import { Snapshot } from './snapshot.js'
+import { Snapshot, UNREADABLE_PASSWORD_HASH } from './snapshot.js'
 
 const SECRET = 'test-secret-that-is-long-enough-000000'
 const pool = testPg()
@@ -98,6 +102,9 @@ function harness(
     ipdata?: IpLookup | null | (() => IpLookup | null)
     rate?: RateCounter
     now?: () => Date
+    passwordAttempts?: AttemptCounter
+    passwordGate?: ConcurrencyGate
+    monotonic?: () => number
   } = {},
 ) {
   const records: ClickRecord[] = []
@@ -122,6 +129,9 @@ function harness(
       ipdata: () => (typeof opts.ipdata === 'function' ? opts.ipdata() : opts.ipdata) ?? null,
       rate: opts.rate ?? new RateCounter(),
       ...(opts.now ? { now: opts.now } : {}),
+      ...(opts.passwordAttempts ? { passwordAttempts: opts.passwordAttempts } : {}),
+      ...(opts.passwordGate ? { passwordGate: opts.passwordGate } : {}),
+      ...(opts.monotonic ? { monotonic: opts.monotonic } : {}),
     },
     { trustProxy: '127.0.0.1' },
   )
@@ -991,5 +1001,330 @@ describe('traffic classification', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+describe('a password-protected link', () => {
+  // Every request below arrives through a trusted proxy that names the visitor.
+  const from = (ip: string, over: Record<string, string> = {}) => ({
+    host: 'go.example.test',
+    'user-agent': BROWSER,
+    'x-forwarded-for': ip,
+    ...over,
+  })
+  const PASSWORD = 'spring2026'
+  let hash = ''
+  let locked: Link
+
+  beforeAll(async () => {
+    hash = await hashPassword(PASSWORD, LINK_SCRYPT)
+    locked = link({ passwordHash: hash })
+  })
+
+  const post = (
+    app: ReturnType<typeof harness>['app'],
+    body: string,
+    headers: Record<string, string> = {},
+    url = '/spring',
+  ) =>
+    app.inject({
+      method: 'POST',
+      url,
+      headers: {
+        ...from('192.0.2.7'),
+        'content-type': 'application/x-www-form-urlencoded',
+        ...headers,
+      },
+      payload: body,
+    })
+
+  /**
+   * The whole of a password record, field by field: a prompt, a wrong answer
+   * and a refusal are all clicks, and none of them may carry a destination.
+   * `toMatchObject` would pass over a destination that arrived beside the
+   * fields it was given.
+   */
+  const expectPasswordRecord = (r: ClickRecord | undefined, status: number, linkId: string) => {
+    expect(r?.v).toBe(3)
+    expect(r?.outcome).toBe('password')
+    expect(r?.step).toBe('password')
+    expect(r?.status).toBe(status)
+    expect(r?.destination).toBeNull()
+    expect(r?.targetId).toBeNull()
+    expect(r?.linkId).toBe(linkId)
+    expect(r?.domainId).toBe(domain.id)
+    expect(r?.path).toBe('/spring')
+    expect(r?.ip).toBe('192.0.2.7')
+  }
+
+  it('shows the page rather than the destination, and records the prompt', async () => {
+    const { app, records } = harness([locked])
+    const r = await app.inject({ method: 'GET', url: '/spring', headers: from('192.0.2.7') })
+    expect(r.statusCode).toBe(200)
+    expect(r.headers['content-type']).toBe('text/html; charset=utf-8')
+    expect(r.headers['cache-control']).toBe('no-store, no-cache, must-revalidate, max-age=0')
+    expect(r.body).toContain('name="password"')
+    // Nothing about the password, the hash or the destination reaches the visitor.
+    expect(r.body).not.toContain('scrypt')
+    expect(r.body).not.toContain(PASSWORD)
+    expect(r.body).not.toContain(hash)
+    expect(r.body).not.toContain('example.com/offer')
+    // A prompt is not a visit: the visitor is identified, nothing is marked
+    // seen, and no proof is handed out for a password nobody answered.
+    const cookies = [r.headers['set-cookie'] ?? []].flat()
+    expect(cookies.filter((c) => c.startsWith('cm_vid='))).toHaveLength(1)
+    expect(cookies.some((c) => c.startsWith('cm_seen='))).toBe(false)
+    expect(cookies.some((c) => c.startsWith('cm_pw_'))).toBe(false)
+    expect(records).toHaveLength(1)
+    expectPasswordRecord(records[0], 200, locked.id)
+  })
+
+  it('answers HEAD with the same decision and no page at all', async () => {
+    const { app, records } = harness([locked])
+    const r = await app.inject({ method: 'HEAD', url: '/spring', headers: from('192.0.2.7') })
+    expect(r.statusCode).toBe(200)
+    expect(r.headers['content-type']).toBe('text/html; charset=utf-8')
+    // The page is a body, and a HEAD response carries none.
+    expect(r.body).toBe('')
+    expect(records).toHaveLength(1)
+    expectPasswordRecord(records[0], 200, locked.id)
+  })
+
+  it('sends the visitor on, with a proof, when the password is right', async () => {
+    const { app, records } = harness([locked])
+    const r = await post(app, `password=${PASSWORD}`)
+    expect(r.statusCode).toBe(302)
+    expect(r.headers.location).toBe('/spring')
+    const cookies = [r.headers['set-cookie'] ?? []].flat()
+    // One cookie, the proof, named for this link and nothing else.
+    expect(cookies).toHaveLength(1)
+    const setCookie = cookies[0] as string
+    const [pair, ...attributes] = setCookie.split('; ')
+    expect((pair as string).startsWith(`cm_pw_${locked.id}=`)).toBe(true)
+    expect(attributes).toEqual(['Path=/', 'Max-Age=43200', 'HttpOnly', 'Secure', 'SameSite=Lax'])
+    expect(setCookie).not.toContain(PASSWORD)
+    expect(setCookie).not.toContain(hash)
+    expectPasswordRecord(records[0], 302, locked.id)
+
+    // The cookie the browser sends back gets the destination.
+    const cookie = setCookie.split(';')[0] as string
+    const followed = await app.inject({
+      method: 'GET',
+      url: '/spring',
+      headers: { ...from('192.0.2.7'), cookie },
+    })
+    expect(followed.statusCode).toBe(302)
+    expect(followed.headers.location).toContain('https://example.com/offer')
+    expect(records[1]?.outcome).toBe('target')
+    expect(records[1]?.step).toBe('destination')
+  })
+
+  it('will not open another link with a proof minted for this one', async () => {
+    // Two links, one password, so one stored hash: nothing but the cookie's
+    // name and its signed payload keeps the two apart.
+    const other = link({
+      id: '00000000-0000-4000-8000-0000000000a9',
+      slug: 'summer',
+      passwordHash: hash,
+    })
+    const { app } = harness([locked, other])
+    const setCookie = String((await post(app, `password=${PASSWORD}`)).headers['set-cookie'])
+    const cookie = setCookie.split(';')[0] as string
+    // Good for the link it was issued for.
+    expect(
+      (
+        await app.inject({
+          method: 'GET',
+          url: '/spring',
+          headers: { ...from('192.0.2.7'), cookie },
+        })
+      ).statusCode,
+    ).toBe(302)
+    // And for the other link, whose hash is the same, it is not a proof at all
+    // — under its own name either.
+    const asOther = cookie.replace(`cm_pw_${locked.id}`, `cm_pw_${other.id}`)
+    for (const c of [cookie, asOther]) {
+      const r = await app.inject({
+        method: 'GET',
+        url: '/summer',
+        headers: { ...from('192.0.2.7'), cookie: c },
+      })
+      expect(r.statusCode, c).toBe(200)
+      expect(r.body, c).toContain('name="password"')
+    }
+  })
+
+  it('shows the same page again for a wrong password, and says nothing more', async () => {
+    const { app, records } = harness([locked])
+    const r = await post(app, 'password=not-it')
+    expect(r.statusCode).toBe(200)
+    expect(r.headers['cache-control']).toBe('no-store, no-cache, must-revalidate, max-age=0')
+    expect(r.body).toContain('That password is not right.')
+    expect(r.body).not.toContain('not-it')
+    // Nothing is handed out on a wrong answer: no proof, and not even the
+    // visitor cookie a prompt sets, so a guess changes nothing at all.
+    expect(r.headers['set-cookie']).toBeUndefined()
+    expectPasswordRecord(records[0], 200, locked.id)
+  })
+
+  it('refuses an address that keeps guessing, and lets it try again in the next window', async () => {
+    const attempts = new AttemptCounter(2, 60_000)
+    // A monotonic clock the test moves, so "the next window" is something this
+    // test can actually reach rather than a phrase in its name.
+    let tick = 0
+    const { app, records } = harness([locked], {
+      passwordAttempts: attempts,
+      monotonic: () => tick,
+    })
+    expect((await post(app, 'password=wrong-1')).statusCode).toBe(200)
+    expect((await post(app, 'password=wrong-2')).statusCode).toBe(200)
+    const refused = await post(app, `password=${PASSWORD}`)
+    expect(refused.statusCode).toBe(429)
+    expect(Number(refused.headers['retry-after'])).toBeGreaterThan(0)
+    // The right password, refused: nothing was checked and nothing was issued.
+    expect(refused.headers['set-cookie']).toBeUndefined()
+    expect(refused.body).not.toContain('name="password"')
+
+    tick += 60_001
+    const allowed = await post(app, `password=${PASSWORD}`)
+    expect(allowed.statusCode).toBe(302)
+    expect(String(allowed.headers['set-cookie'])).toContain(`cm_pw_${locked.id}=`)
+    // Every one of the four is a click, recorded with the status it answered.
+    expect(records.map((r) => r.status)).toEqual([200, 200, 429, 302])
+    expectPasswordRecord(records[2], 429, locked.id)
+  })
+
+  it('counts guesses per link and address, not per link alone or per address alone', async () => {
+    const attempts = new AttemptCounter(1, 60_000)
+    const other = link({
+      id: '00000000-0000-4000-8000-0000000000a9',
+      slug: 'summer',
+      passwordHash: hash,
+    })
+    const { app } = harness([locked, other], { passwordAttempts: attempts })
+    expect((await post(app, 'password=wrong')).statusCode).toBe(200)
+    expect((await post(app, 'password=wrong')).statusCode).toBe(429)
+    // Another address still gets its own allowance.
+    const otherAddress = await post(app, `password=${PASSWORD}`, {
+      'x-forwarded-for': '198.51.100.7',
+    })
+    expect(otherAddress.statusCode).toBe(302)
+    // And so does another link from the same address that used up its own.
+    const otherLink = await post(app, `password=${PASSWORD}`, {}, '/summer')
+    expect(otherLink.statusCode).toBe(302)
+  })
+
+  it('answers "try again" rather than queueing when too many checks are in flight', async () => {
+    const gate = new ConcurrencyGate(0)
+    const { app, records } = harness([locked], { passwordGate: gate })
+    const r = await post(app, `password=${PASSWORD}`)
+    expect(r.statusCode).toBe(503)
+    expect(r.headers['retry-after']).toBe('1')
+    expect(r.headers['set-cookie']).toBeUndefined()
+    expectPasswordRecord(records[0], 503, locked.id)
+  })
+
+  it('treats a body with no password as a wrong answer', async () => {
+    const { app, records } = harness([locked])
+    const r = await post(app, 'nothing=here')
+    expect(r.statusCode).toBe(200)
+    expect(r.body).toContain('That password is not right.')
+    expectPasswordRecord(records[0], 200, locked.id)
+  })
+
+  it('counts a body with no password against the address that sent it', async () => {
+    // The cheapest way to ask this endpoint for work, so it is paid for at the
+    // same rate as a guess.
+    const { app } = harness([locked], { passwordAttempts: new AttemptCounter(1, 60_000) })
+    expect((await post(app, 'nothing=here')).statusCode).toBe(200)
+    expect((await post(app, `password=${PASSWORD}`)).statusCode).toBe(429)
+  })
+
+  it('answers 404 to a POST at a link with no password, and at an unknown slug', async () => {
+    const { app, records } = harness([link()])
+    expect((await post(app, `password=${PASSWORD}`)).statusCode).toBe(404)
+    const unknown = await app.inject({
+      method: 'POST',
+      url: '/nothing-here',
+      headers: { ...from('192.0.2.7'), 'content-type': 'application/x-www-form-urlencoded' },
+      payload: 'password=x',
+    })
+    expect(unknown.statusCode).toBe(404)
+    // A POST that is not a password answer is not recorded as a click.
+    expect(records).toHaveLength(0)
+  })
+
+  it('answers 404 to a POST on an unverified domain', async () => {
+    const snap = new Snapshot(
+      [unverifiedDomain],
+      [link({ domainId: unverifiedDomain.id, passwordHash: hash })],
+      new Date(),
+      'postgres',
+    )
+    const { app, records } = harness([], { snapshot: snap })
+    const r = await app.inject({
+      method: 'POST',
+      url: '/spring',
+      headers: {
+        ...from('192.0.2.7'),
+        host: unverifiedDomain.host,
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      payload: `password=${PASSWORD}`,
+    })
+    expect(r.statusCode).toBe(404)
+    expect(r.headers['set-cookie']).toBeUndefined()
+    expect(records).toHaveLength(0)
+  })
+
+  it('ignores a proof issued for the password it used to have', async () => {
+    const { app } = harness([locked])
+    const cookie = (String((await post(app, `password=${PASSWORD}`)).headers['set-cookie']).split(
+      ';',
+    )[0] ?? '') as string
+    // The cookie is a working proof before the password changes: without this,
+    // the test below would pass on an empty or malformed cookie too.
+    const before = await app.inject({
+      method: 'GET',
+      url: '/spring',
+      headers: { ...from('192.0.2.7'), cookie },
+    })
+    expect(before.statusCode).toBe(302)
+    const changed = harness([link({ passwordHash: await hashPassword('summer2026', LINK_SCRYPT) })])
+    const r = await changed.app.inject({
+      method: 'GET',
+      url: '/spring',
+      headers: { ...from('192.0.2.7'), cookie },
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.body).toContain('name="password"')
+  })
+
+  it('keeps a link locked when the file it came from had no readable hash', async () => {
+    // The sentinel from a damaged snapshot file. It is ten characters of
+    // ordinary text, and it fingerprints like any stored hash, so the only
+    // thing keeping the link shut is that no verifier parses it.
+    const { app, records } = harness([link({ passwordHash: UNREADABLE_PASSWORD_HASH })])
+    const shown = await app.inject({ method: 'GET', url: '/spring', headers: from('192.0.2.7') })
+    expect(shown.statusCode).toBe(200)
+    expect(shown.body).toContain('name="password"')
+    // Answering with the sentinel itself, which is the one string an attacker
+    // could read off this repository, is a wrong answer like any other.
+    for (const attempt of [UNREADABLE_PASSWORD_HASH, PASSWORD, '']) {
+      const r = await post(app, `password=${attempt}`)
+      expect(r.statusCode, attempt).toBe(200)
+      expect(r.body, attempt).toContain('That password is not right.')
+      expect(r.headers['set-cookie'], attempt).toBeUndefined()
+    }
+    expect(records.map((r) => r.status)).toEqual([200, 200, 200, 200])
+  })
+
+  it('refuses a body larger than the bound', async () => {
+    const { app, records } = harness([locked])
+    const r = await post(app, `password=${'x'.repeat(2000)}`)
+    expect(r.statusCode).toBe(413)
+    // Refused before anything was checked: no proof, and no click.
+    expect(r.headers['set-cookie']).toBeUndefined()
+    expect(records).toHaveLength(0)
   })
 })
