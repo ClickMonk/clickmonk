@@ -51,6 +51,9 @@ importers:
 
   packages/cli:
     dependencies:
+      '@clickmonk/admin':
+        specifier: workspace:*
+        version: link:../admin
       '@clickmonk/core':
         specifier: workspace:*
         version: link:../core

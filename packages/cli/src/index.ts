@@ -53,6 +53,13 @@ async function main(): Promise<number> {
       pg,
       ch,
       out: (s) => console.log(s),
+      // Read whole, never echoed. A password on the command line would be
+      // visible in `ps` and left in the shell's history.
+      stdin: async () => {
+        const chunks: Buffer[] = []
+        for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk))
+        return Buffer.concat(chunks).toString('utf8')
+      },
       ipdata: { dir: process.env.CLICKMONK_IPDATA_DIR || DEFAULT_IPDATA_DIR },
       dnsServers,
     })

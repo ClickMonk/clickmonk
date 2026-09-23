@@ -1,6 +1,15 @@
 import { parseArgs } from 'node:util'
+import { AccountExistsError, createAccount, setAccountPassword } from '@clickmonk/admin/account'
+import {
+  MAX_KEY_DAYS,
+  MAX_KEY_NAME_LENGTH,
+  createApiKey,
+  listApiKeys,
+  revokeApiKey,
+} from '@clickmonk/admin/keys'
 import {
   DEFAULT_TRAFFIC_SETTINGS,
+  MIN_ADMIN_PASSWORD_LENGTH,
   NON_HUMAN_CLASSES,
   type TrafficActions,
   type TrafficSettings,
@@ -51,6 +60,12 @@ export interface CliDeps {
   dnsServers?: string[]
   /** The clock a check is stamped with, so the worker and the CLI can be made to agree in a test. */
   now?: () => Date
+  /**
+   * Reads a password from standard input. A password never comes from an
+   * argument: `argv` is visible to every process on the host through `ps`, and
+   * it lands in the shell's history. A test passes its own.
+   */
+  stdin?: () => Promise<string>
 }
 
 const USAGE = `usage:
@@ -65,7 +80,12 @@ const USAGE = `usage:
   clickmonk settings set [--action <class>=<action> ...] [--safe-url <url> | --no-safe-url]
                          [--abuser-threshold <n>]
   clickmonk ipdata update
-  clickmonk ipdata status`
+  clickmonk ipdata status
+  clickmonk admin create <email>      # the password is read from standard input
+  clickmonk admin passwd              # the new password is read from standard input
+  clickmonk apikey create <name> [--expires-days <n>]
+  clickmonk apikey list
+  clickmonk apikey revoke <id>`
 
 class Rejected extends Error {}
 
@@ -321,6 +341,116 @@ async function linkAdd(args: string[], d: CliDeps): Promise<void> {
   }
 }
 
+/**
+ * The password on standard input, with one trailing newline removed so that
+ * `printf 'pw\n' | clickmonk admin create …` and `printf 'pw'` mean the same
+ * thing. Nothing here is printed or logged, ever — the refusal below says how
+ * long what it read was, and never what it was.
+ */
+async function readPassword(d: CliDeps): Promise<string> {
+  if (!d.stdin) throw new Rejected('no way to read the password: standard input is not available')
+  const raw = await d.stdin()
+  const password = raw.replace(/\r?\n$/, '')
+  if (password.length < MIN_ADMIN_PASSWORD_LENGTH) {
+    throw new Rejected(
+      `the password must be at least ${MIN_ADMIN_PASSWORD_LENGTH} characters (read ${password.length} from standard input)`,
+    )
+  }
+  return password
+}
+
+/**
+ * Creates the one admin account. The API cannot do this — there is nothing to
+ * authenticate as yet — so it is typed on the server by whoever installed it.
+ */
+async function adminCreate(args: string[], d: CliDeps): Promise<void> {
+  const { positionals } = parseArgs({ args, allowPositionals: true, options: {} })
+  const email = (positionals[0] ?? '').trim().toLowerCase()
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 320) {
+    throw new Rejected(`not an email address: ${positionals[0] ?? '(none)'}`)
+  }
+  const password = await readPassword(d)
+  try {
+    await createAccount(d.pg, { email, password })
+  } catch (err) {
+    if (err instanceof AccountExistsError) throw new Rejected(err.message)
+    throw err
+  }
+  d.out(`admin ${email} created`)
+  d.out('')
+  d.out('Set CLICKMONK_ADMIN_HOST in .env to the host name the admin API answers on,')
+  d.out('point that name at this server, and restart the stack. Until it is set, the')
+  d.out('admin service answers 503 and links keep serving as usual.')
+}
+
+/** Changes the password, and signs every browser out: a session minted under the old one is exactly what an attacker would still hold. */
+async function adminPasswd(d: CliDeps): Promise<void> {
+  const password = await readPassword(d)
+  // The one writer, which clears the failure count and any standing lockout in
+  // the same statement: this command is the way back in, and a lock over a
+  // password that no longer exists would keep the only account out for nothing.
+  await setAccountPassword(d.pg, password)
+  const r = await d.pg.query('DELETE FROM sessions')
+  d.out(`password changed; ${r.rowCount ?? 0} session(s) signed out`)
+}
+
+async function apikeyCreate(args: string[], d: CliDeps): Promise<void> {
+  const { values, positionals } = parseArgs({
+    args,
+    allowPositionals: true,
+    options: { 'expires-days': { type: 'string' } },
+  })
+  const name = positionals[0] ?? ''
+  if (name.length === 0 || name.length > MAX_KEY_NAME_LENGTH)
+    throw new Rejected(`a key needs a name of 1 to ${MAX_KEY_NAME_LENGTH} characters`)
+  let expiresAt: Date | null = null
+  const now = d.now?.() ?? new Date()
+  if (values['expires-days'] !== undefined) {
+    // `Number('')` is 0 and `Number(' 7 ')` is 7, so the floor below is what
+    // refuses an empty value rather than reading it as no expiry at all.
+    const days = Number(values['expires-days'])
+    if (!Number.isInteger(days) || days < 1 || days > MAX_KEY_DAYS) {
+      throw new Rejected(`--expires-days takes a whole number of days from 1 to ${MAX_KEY_DAYS}`)
+    }
+    expiresAt = new Date(now.getTime() + days * 24 * 60 * 60 * 1000)
+  }
+  const created = await createApiKey(d.pg, { name, expiresAt, now })
+  d.out(created.key)
+  d.out('')
+  d.out('That is the only time this key is shown. Store it somewhere safe; if it is lost,')
+  d.out(`revoke it with "clickmonk apikey revoke ${created.id}" and make another.`)
+}
+
+async function apikeyList(d: CliDeps): Promise<void> {
+  const { keys, truncated } = await listApiKeys(d.pg)
+  if (keys.length === 0) {
+    d.out('no API keys yet (make one with "clickmonk apikey create <name>")')
+    return
+  }
+  for (const k of keys) {
+    const state = k.revoked_at
+      ? `revoked ${k.revoked_at.toISOString()}`
+      : k.expires_at && k.expires_at.getTime() <= (d.now?.() ?? new Date()).getTime()
+        ? `expired ${k.expires_at.toISOString()}`
+        : 'active'
+    const used = k.last_used_at ? `last used ${k.last_used_at.toISOString()}` : 'never used'
+    d.out(`${k.id}  ${k.name}: ${state}; ${used}`)
+  }
+  // Said rather than left silent: a listing that stopped at the cap is a
+  // prefix, and an operator managing the wrong set would never find out.
+  if (truncated) d.out('(more keys than this list shows; revoke some)')
+}
+
+async function apikeyRevoke(args: string[], d: CliDeps): Promise<void> {
+  const { positionals } = parseArgs({ args, allowPositionals: true, options: {} })
+  const id = positionals[0] ?? ''
+  if (!/^[0-9a-f]{16}$/.test(id)) throw new Rejected(`not a key id: ${id || '(none)'}`)
+  if (!(await revokeApiKey(d.pg, id, d.now?.() ?? new Date()))) {
+    throw new Rejected(`no such key, or it was already revoked: ${id}`)
+  }
+  d.out(`key ${id} revoked`)
+}
+
 function printSettings(s: TrafficSettings, d: CliDeps): void {
   for (const c of NON_HUMAN_CLASSES) d.out(`${c}: ${s.actions[c]}`)
   d.out(`safe url: ${s.safeUrl ?? '(none)'}`)
@@ -505,6 +635,26 @@ export async function runCli(argv: string[], d: CliDeps): Promise<number> {
     }
     if (cmd === 'ipdata' && sub === 'status' && rest.length === 0) {
       ipdataStatus(d)
+      return 0
+    }
+    if (cmd === 'admin' && sub === 'create') {
+      await adminCreate(rest, d)
+      return 0
+    }
+    if (cmd === 'admin' && sub === 'passwd' && rest.length === 0) {
+      await adminPasswd(d)
+      return 0
+    }
+    if (cmd === 'apikey' && sub === 'create') {
+      await apikeyCreate(rest, d)
+      return 0
+    }
+    if (cmd === 'apikey' && sub === 'list' && rest.length === 0) {
+      await apikeyList(d)
+      return 0
+    }
+    if (cmd === 'apikey' && sub === 'revoke') {
+      await apikeyRevoke(rest, d)
       return 0
     }
     d.out(USAGE)

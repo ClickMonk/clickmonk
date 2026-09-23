@@ -2,10 +2,20 @@ import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gzipSync } from 'node:zlib'
+import { MAX_KEYS_LISTED, MAX_KEY_DAYS, MAX_KEY_NAME_LENGTH } from '@clickmonk/admin/keys'
+import {
+  ADMIN_SCRYPT,
+  LINK_SCRYPT,
+  SCRYPT_PREFIX,
+  hashPassword,
+  hashToken,
+  parseApiKey,
+  verifyPassword,
+} from '@clickmonk/core'
 import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { type Fetcher, SOURCES, SOURCE_IDS } from '@clickmonk/ipdata'
 import type { DomainResolver } from '@clickmonk/worker/domains'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { runCli } from './commands.js'
 
 const pg = testPg()
@@ -651,5 +661,287 @@ describe('clickmonk domain list and verify', () => {
     expect(out).toContain('nv.example.test: unverified')
     expect(out).toContain('_clickmonk.nv.example.test  TXT')
     expect(out).toContain('point nv.example.test at this server with an A or AAAA record')
+  })
+})
+
+describe('the admin account and API keys from the CLI', () => {
+  /** The moment the clock reads for every command below, so an expiry is exact. */
+  const NOW = new Date('2026-09-23T10:00:00.000Z')
+
+  /** The CLI with a password on standard input, which is the only way it takes one. */
+  const withPassword = (password: string, ...argv: string[]) =>
+    runCli(argv, {
+      pg,
+      ch: () => ch,
+      out: (s) => lines.push(s),
+      ipdata: { dir: ipdataDir },
+      stdin: async () => password,
+      now: () => NOW,
+    })
+
+  /** The same, at a later moment: what an operator sees once a key has run out. */
+  const later = (days: number, ...argv: string[]) =>
+    runCli(argv, {
+      pg,
+      ch: () => ch,
+      out: (s) => lines.push(s),
+      ipdata: { dir: ipdataDir },
+      now: () => new Date(NOW.getTime() + days * 86_400_000),
+    })
+
+  const account = () =>
+    pg.query<{ email: string; password_hash: string }>(
+      'SELECT email, password_hash FROM admin_account',
+    )
+
+  /**
+   * A stored hash for the account the key tests need, derived here rather than
+   * written out, and at the link cost because nothing below verifies against
+   * it: this is the cheapest thing that satisfies the column's own check.
+   */
+  let storedHash = ''
+  beforeAll(async () => {
+    storedHash = await hashPassword('nothing below verifies against this', LINK_SCRYPT)
+  })
+
+  /**
+   * An API key references the account row, so a key cannot exist without one.
+   * Written straight in: `admin create` has its own tests, and going through it
+   * here would cost every key test a scrypt pass at the admin's cost.
+   */
+  const anAccount = () =>
+    pg.query('INSERT INTO admin_account (email, password_hash) VALUES ($1, $2)', [
+      'admin@example.com',
+      storedHash,
+    ])
+
+  beforeEach(async () => {
+    lines.length = 0
+    await pg.query('TRUNCATE admin_account, admin_recovery_codes, sessions, api_keys')
+  })
+
+  it('creates the one admin account, and says what to set next', async () => {
+    expect(
+      await withPassword('a decent admin password', 'admin', 'create', 'Admin@Example.com'),
+    ).toBe(0)
+    const r = await account()
+    expect(r.rows[0]?.email).toBe('admin@example.com')
+    // The frame and the admin's cost, built from the constants rather than
+    // written out: no `scrypt$…` literal is committed anywhere in this tree.
+    expect(r.rows[0]?.password_hash.startsWith(`${SCRYPT_PREFIX}$${ADMIN_SCRYPT.N}$`)).toBe(true)
+    const out = lines.join('\n')
+    expect(out).toContain('admin admin@example.com created')
+    expect(out).toContain('CLICKMONK_ADMIN_HOST')
+    // The password is never printed, whatever else is.
+    expect(out).not.toContain('a decent admin password')
+  })
+
+  // Ordered so that each refusal is the only thing that could have produced
+  // it: the floor and the address are tried while there is no account, because
+  // once one exists a second `admin create` is refused whatever the password
+  // or the address was, and a test run in that order passes with the floor
+  // taken out.
+  it('refuses a short password, an address that is not one, and a second account', async () => {
+    expect(await withPassword('short', 'admin', 'create', 'admin@example.com')).toBe(2)
+    expect(lines.join('\n')).toContain('at least 12 characters')
+    // Neither the password nor its length is echoed back.
+    expect(lines.join('\n')).not.toContain('short')
+    expect((await account()).rowCount).toBe(0)
+
+    lines.length = 0
+    expect(await withPassword('a decent admin password', 'admin', 'create', 'not-an-address')).toBe(
+      2,
+    )
+    expect(lines.join('\n')).toContain('not an email address')
+    expect((await account()).rowCount).toBe(0)
+
+    expect(
+      await withPassword('a decent admin password', 'admin', 'create', 'admin@example.com'),
+    ).toBe(0)
+    const first = await account()
+    lines.length = 0
+    expect(
+      await withPassword('another decent password', 'admin', 'create', 'other@example.com'),
+    ).toBe(2)
+    expect(lines.join('\n')).toContain('already has an admin account')
+    // The refusal is not enough on its own: the account it would have replaced
+    // may be the only way into this install, so the row is read back whole.
+    expect((await account()).rows).toEqual(first.rows)
+  })
+
+  it('takes a password with a trailing newline, as a shell pipe sends one', async () => {
+    expect(
+      await withPassword('a decent admin password\n', 'admin', 'create', 'admin@example.com'),
+    ).toBe(0)
+    const r = await account()
+    expect(
+      await verifyPassword('a decent admin password', r.rows[0]?.password_hash as string),
+    ).toBe(true)
+    // And the newline is not part of it, so the two spellings are one password.
+    expect(
+      await verifyPassword('a decent admin password\n', r.rows[0]?.password_hash as string),
+    ).toBe(false)
+  })
+
+  it('changes the password and signs every browser out', async () => {
+    await withPassword('a decent admin password', 'admin', 'create', 'admin@example.com')
+    const before = (await account()).rows[0]?.password_hash as string
+    await pg.query(
+      "INSERT INTO sessions (token_hash, expires_at) VALUES ($1, now() + interval '1 day')",
+      ['a'.repeat(64)],
+    )
+    lines.length = 0
+    expect(await withPassword('a new decent password', 'admin', 'passwd')).toBe(0)
+    expect(lines.join('\n')).toContain('1 session(s) signed out')
+    expect((await pg.query('SELECT 1 FROM sessions')).rowCount).toBe(0)
+    const after = (await account()).rows[0]?.password_hash as string
+    expect(after).not.toBe(before)
+    expect(await verifyPassword('a new decent password', after)).toBe(true)
+  })
+
+  // The lockout is cleared with the password because this command is the way
+  // back in: an admin locked out at the form sets a new one and uses it at
+  // once, rather than waiting out a lock on a password that no longer exists.
+  it('clears a standing lockout, so the new password works at once', async () => {
+    await withPassword('a decent admin password', 'admin', 'create', 'admin@example.com')
+    await pg.query(
+      `UPDATE admin_account SET failed_logins = 9, last_failed_at = now(),
+                                locked_until = now() + interval '1 hour'`,
+    )
+    expect(await withPassword('a new decent password', 'admin', 'passwd')).toBe(0)
+    const r = await pg.query<{
+      failed_logins: number
+      last_failed_at: Date | null
+      locked_until: Date | null
+    }>('SELECT failed_logins, last_failed_at, locked_until FROM admin_account')
+    expect(r.rows[0]).toEqual({ failed_logins: 0, last_failed_at: null, locked_until: null })
+  })
+
+  it('mints an API key, shows it once, and stores only its digest', async () => {
+    await anAccount()
+    expect(await withPassword('', 'apikey', 'create', 'reporting', '--expires-days', '7')).toBe(0)
+    const key = lines[0] as string
+    expect(key).toMatch(/^cmk_[0-9a-f]{16}_[A-Za-z0-9_-]{43}$/)
+    // Split by the parser the authentication path itself uses. A key's secret
+    // is base64url, so it may contain an underscore of its own, and taking the
+    // third `_`-separated field truncates roughly one key in three.
+    const secret = (parseApiKey(key) as { secret: string }).secret
+    const r = await pg.query<{ secret_hash: string; expires_at: Date }>(
+      'SELECT secret_hash, expires_at FROM api_keys',
+    )
+    expect(r.rows[0]?.secret_hash).toBe(hashToken(secret))
+    // Not merely "hashed": the secret itself is nowhere in the row.
+    expect(r.rows[0]?.secret_hash).not.toContain(secret)
+    expect(r.rows[0]?.expires_at.toISOString()).toBe('2026-09-30T10:00:00.000Z')
+    expect(lines.join('\n')).toContain('only time this key is shown')
+  })
+
+  // 3651 and 0 are written out. Derived from the constant, these would move
+  // with a raised bound and pass against a command that had lost the check.
+  it('refuses a life that is not a whole number of days inside the bound', async () => {
+    await anAccount()
+    expect(MAX_KEY_DAYS).toBe(3650)
+    // No '-1' here: a leading dash is an option to the argument parser, which
+    // refuses it as a usage error before this bound is reached.
+    for (const days of ['3651', '0', '7.5', 'soon', '']) {
+      lines.length = 0
+      expect(await withPassword('', 'apikey', 'create', 'reporting', '--expires-days', days)).toBe(
+        2,
+      )
+      expect(lines.join('\n'), days).toContain('--expires-days takes a whole number of days')
+    }
+    expect((await pg.query('SELECT 1 FROM api_keys')).rowCount).toBe(0)
+    // The bound itself is a life a key may have.
+    expect(await withPassword('', 'apikey', 'create', 'reporting', '--expires-days', '3650')).toBe(
+      0,
+    )
+  })
+
+  it('refuses a key with no name, and one longer than the column takes', async () => {
+    await anAccount()
+    expect(MAX_KEY_NAME_LENGTH).toBe(100)
+    expect(await withPassword('', 'apikey', 'create')).toBe(2)
+    expect(await withPassword('', 'apikey', 'create', 'x'.repeat(101))).toBe(2)
+    expect((await pg.query('SELECT 1 FROM api_keys')).rowCount).toBe(0)
+    expect(await withPassword('', 'apikey', 'create', 'x'.repeat(100))).toBe(0)
+  })
+
+  it('lists keys without their secrets, and revokes one', async () => {
+    await anAccount()
+    expect(await withPassword('', 'apikey', 'create', 'reporting')).toBe(0)
+    const parsed = parseApiKey(lines[0] as string) as { id: string; secret: string }
+    const { id, secret } = parsed
+    lines.length = 0
+    expect(await withPassword('', 'apikey', 'list')).toBe(0)
+    // The whole line, so a secret could not hide at the end of it.
+    expect(lines).toEqual([`${id}  reporting: active; never used`])
+    expect(lines.join('\n')).not.toContain(secret)
+
+    lines.length = 0
+    expect(await withPassword('', 'apikey', 'revoke', id)).toBe(0)
+    const revoked = await pg.query<{ revoked_at: Date }>('SELECT revoked_at FROM api_keys')
+    expect(revoked.rows[0]?.revoked_at.toISOString()).toBe(NOW.toISOString())
+
+    lines.length = 0
+    expect(await withPassword('', 'apikey', 'revoke', id)).toBe(2)
+    expect(lines.join('\n')).toContain('already revoked')
+    // Revoking twice leaves the first time it happened, which is the record of
+    // when the key actually stopped working.
+    expect((await pg.query<{ revoked_at: Date }>('SELECT revoked_at FROM api_keys')).rows).toEqual(
+      revoked.rows,
+    )
+
+    lines.length = 0
+    expect(await withPassword('', 'apikey', 'revoke', 'nope')).toBe(2)
+    expect(lines.join('\n')).toContain('not a key id')
+
+    lines.length = 0
+    expect(await withPassword('', 'apikey', 'list')).toBe(0)
+    expect(lines).toEqual([`${id}  reporting: revoked ${NOW.toISOString()}; never used`])
+  })
+
+  // A key past its expiry is dead, and a listing that called it active would
+  // have an operator hunting for why a script stopped working.
+  it('says a key has run out rather than calling it active', async () => {
+    await anAccount()
+    expect(await withPassword('', 'apikey', 'create', 'reporting', '--expires-days', '7')).toBe(0)
+    const { id } = parseApiKey(lines[0] as string) as { id: string }
+    lines.length = 0
+    expect(await later(8, 'apikey', 'list')).toBe(0)
+    expect(lines).toEqual([`${id}  reporting: expired 2026-09-30T10:00:00.000Z; never used`])
+  })
+
+  it('says so when there are no keys', async () => {
+    expect(await withPassword('', 'apikey', 'list')).toBe(0)
+    expect(lines).toEqual(['no API keys yet (make one with "clickmonk apikey create <name>")'])
+  })
+
+  // A listing that stopped at the cap is a prefix, and an operator managing
+  // the wrong set would never find out. Rows go straight in: minting 201 keys
+  // would be 201 digests for nothing.
+  it('says when the listing was cut', async () => {
+    await anAccount()
+    expect(MAX_KEYS_LISTED).toBe(200)
+    await pg.query(
+      `INSERT INTO api_keys (id, name, secret_hash)
+       SELECT lpad(to_hex(n), 16, '0'), 'bulk-' || n, repeat('b', 64)
+         FROM generate_series(1, 200) AS n`,
+    )
+    expect(await withPassword('', 'apikey', 'list')).toBe(0)
+    expect(lines).toHaveLength(200)
+    expect(lines.at(-1)).not.toBe('(more keys than this list shows; revoke some)')
+    lines.length = 0
+    await pg.query(
+      "INSERT INTO api_keys (id, name, secret_hash) VALUES ('ffffffffffffffff', 'one more', repeat('b', 64))",
+    )
+    expect(await withPassword('', 'apikey', 'list')).toBe(0)
+    expect(lines).toHaveLength(201)
+    expect(lines.at(-1)).toBe('(more keys than this list shows; revoke some)')
+  })
+
+  it('names the new commands in its usage', async () => {
+    expect(await run('admin')).toBe(1)
+    expect(lines.join('\n')).toContain('clickmonk admin create <email>')
+    expect(lines.join('\n')).toContain('clickmonk apikey create <name>')
   })
 })
