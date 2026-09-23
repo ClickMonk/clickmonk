@@ -429,9 +429,12 @@ function comparisonsIn(file: string): { fn: string; expression: string; why: str
  * continuation chain breaks at the first line boundary even though a `return`
  * appears earlier in the body. When it is assigned, the name must be **read
  * again afterwards**, or the result is computed into a variable nothing looks
- * at. And a **length comparison must come first**: `timingSafeEqual` throws on
- * a length mismatch, so without one a value of the wrong length is a 500 rather
- * than a refusal.
+ * at. And the **two lengths must be compared to each other first**:
+ * `timingSafeEqual` throws on a length mismatch, so without that a value of the
+ * wrong length is a 500 rather than a refusal. The comparison has to be an
+ * equality one between two `.length`s — a bound on one length, which both call
+ * sites here also have, does not stop the two from differing, and counting it
+ * let the real check be deleted with this gate still green.
  *
  * "Returned or assigned" includes an `if` or `while` condition, which is how
  * both call sites in this package are written — `if (a.length !== b.length ||
@@ -443,10 +446,10 @@ function comparisonsIn(file: string): { fn: string; expression: string; why: str
 function whyTimingSafeEqualDoesNotDecide(strippedBody: string): string {
   const callIndex = strippedBody.indexOf('timingSafeEqual(')
   if (callIndex === -1) return 'timingSafeEqual is not called here'
-  const lengthCheck = /\.length\s*(?:!==|===|!=|==|<|>|<=|>=)/.exec(
+  const lengthCheck = /\.length\s*(?:!==|===|!=|==)\s*[\w$]+(?:\.[\w$]+)*\.length/.exec(
     strippedBody.slice(0, callIndex),
   )
-  if (!lengthCheck) return 'nothing compares a length before timingSafeEqual is called'
+  if (!lengthCheck) return 'the two lengths are not compared before timingSafeEqual is called'
   const anchorRe =
     /\breturn\b|\bif\s*\(|\bwhile\s*\(|(?:const|let|var)\s+([\w$]+)\s*=(?!=)|([\w$]+)\s*=(?!=)/g
   let anchor: RegExpExecArray | null
@@ -528,7 +531,12 @@ describe('crypto hygiene in the redirect', () => {
     // Per file, not one count over the package: a single call anywhere would
     // otherwise let a throwaway helper cover for the file whose comparison had
     // been taken out.
-    const comparers = gated.filter((file) => read(file).includes('timingSafeEqual('))
+    //
+    // A file counts as a comparer because it *imports* the primitive, not
+    // because its text happens to call it: keyed on the call, a file whose
+    // comparison was deleted outright simply left the set, and the other file's
+    // call covered for it.
+    const comparers = gated.filter((file) => importedNames(read(file)).includes('timingSafeEqual'))
     // And a floor under that: this package compares a signature somewhere.
     expect(comparers.length).toBeGreaterThan(0)
     for (const file of comparers) {
