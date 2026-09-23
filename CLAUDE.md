@@ -67,6 +67,15 @@ What does not exist yet, and must not be implied by any documentation:
 - **Password links, backup and restore.**
 - Segments ClickHouse rejects are set aside as `.bad` files, and nothing reports them.
 - One redirect process per spool directory.
+- A full spool stops recording without stopping redirects; the drop count is on
+  `/health` on the internal port and nowhere else.
+- The internal port (`redirect:9091`, which serves `/ask`) is published nowhere on the
+  host, but any container on the compose network can reach it, not only Caddy.
+- The worker has no healthcheck, so `docker compose up -d --wait` can return before its
+  boot migration has finished; a `domain add` run immediately after can hit a missing
+  relation.
+- The published-port IPv6 test is skipped on a host with no IPv6 address of its own;
+  see "The stack suites" below for what still runs when it is.
 
 **Upgrade the worker before the redirect.** A worker never deletes or sets aside a spool
 segment whose record version is newer than it reads: segments from a newer redirect wait
@@ -96,8 +105,15 @@ packages/redirect/  the service that answers link domains: an in-memory snapshot
                     the IP data and the per-address rate counter, the spool
                     writer, the click-cap counter.
 packages/worker/    ships the spool into ClickHouse; runs migrations on boot;
-                    updates the IP data.
+                    updates the IP data; checks domain DNS verification on a schedule.
 packages/cli/       `clickmonk migrate | domain add|list|verify | link add | settings | ipdata`.
+caddy/              the Caddyfile, and the tls.d/ and proxy.d/ drop-in directories an
+                    operator edits: where certificates come from, and a proxy in
+                    front of Caddy.
+install.sh          writes .env once, with fresh secrets, and starts the stack.
+test/stack/         brings the whole stack up against a local certificate authority
+                    and DNS server; proves TLS issuance, domain verification, and
+                    real client addresses over IPv4 and IPv6.
 ```
 
 Three properties of the product shape every change:
@@ -165,10 +181,12 @@ pnpm vitest run --config vitest.stack.config.ts   # starts the stack; a few minu
 ```
 
 They bring the whole stack up with a certificate authority and a DNS server of their own,
-so nothing reaches the internet: a domain gets no certificate until it publishes its
-verification record, the address every visitor arrives from is the visitor's, and
-`install.sh` writes its secrets once. They bind **80 and 443**; the durability suite binds
-8080 and 8123 and the test databases 8123 and 5433. Run one at a time.
+so no ACME traffic and no public DNS lookup leaves the machine (the images themselves
+are still pulled over the network, once): a domain gets no certificate until it
+publishes its verification record, the address every visitor arrives from is the
+visitor's, and `install.sh` writes its secrets once. They bind **80 and 443**; the
+durability suite binds 8080 and 8123 and the test databases 8123 and 5433. Run one at a
+time.
 
 The IPv6 half of the address suite is skipped on a host with no IPv6 address of its own,
 which is most CI runners. Run it by hand on a host that has one before a release.

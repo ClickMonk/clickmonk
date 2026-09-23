@@ -57,6 +57,8 @@ What does not work yet:
   change a link once it is added. The redirect supports per-device destinations, a
   returning-visitor destination, country rules, a link name and disabling a link, but
   the CLI cannot set any of them yet, so they need SQL written by hand.
+  Returning-visitor routing also needs HTTPS to do anything: its cookie is marked
+  `Secure`, so a browser drops it over plain HTTP.
 - **Reports.** Clicks are stored in ClickHouse, but there are no reports or exports.
 - **Proxy and VPN detection beyond Tor.** The anonymous class covers Tor exit relays
   only. The well-known lists of VPN and proxy ranges publish no licence, so they are not
@@ -68,13 +70,17 @@ What does not work yet:
 - **Rejected clicks are not reported.** A batch of clicks ClickHouse refuses is set aside
   as a `.bad` file in the spool, and nothing tells you it is there.
 - **More than one redirect process per spool directory.**
+- **A full spool stops recording without stopping redirects.** Above its size bound the
+  redirect keeps sending visitors on but drops the click; the running count of drops is
+  in `/health` on the internal port, and nowhere else yet.
 - **The internal port is reachable from the whole compose network.** `redirect:9091`,
   which serves the `ask` check, is published nowhere on the host, but any other
   container on the stack's own Docker network can reach it, not only Caddy.
-- **IPv6 is proven only on a unique-local address.** The test suite exercises Caddy's
-  handling of an IPv6 client end to end, but the container running it has no globally
-  routable IPv6 address of its own, only a unique-local one — so a real internet-routable
-  IPv6 visitor is untested.
+- **IPv6 coverage depends on the host the tests run on.** The published-port IPv6 test
+  is skipped when that host has no IPv6 address of its own — most CI runners — and is
+  meant to be run by hand, on a host that has one, before a release. A second,
+  always-run test proves the address Caddy passes on is the IPv6 client's own, but only
+  on the stack's unique-local subnet.
 
 If link tracking is a problem you have today, [open an issue](../../issues) describing
 it. That is the most useful contribution at this stage.
@@ -95,45 +101,70 @@ it never changes a value already in `.env`.
 
 `install.sh` waits for the services that declare a healthcheck; the worker does not
 declare one, so `install.sh` can return before its boot migration has finished. If a
-`domain add` run right after it fails oddly, give it a few seconds and try again.
+`domain add` run right after it fails with a Postgres error naming a missing relation
+(`domains` does not exist yet), that is why: wait a few seconds and try again.
 
 **Just trying it out?** A domain serves nothing until it is verified, so for a trial add
 one with `--verified`, which skips the DNS check and makes its links answer at once over
-plain HTTP on port 80:
+plain HTTP on port 80. A returning visitor is not one of them: the visitor cookie is
+marked `Secure`, so a browser drops it over plain HTTP, and returning-visitor routing
+needs a real HTTPS domain to do anything.
 
 ```sh
 docker compose exec worker node packages/cli/dist/index.js \
   domain add links.example.com --verified
+docker compose exec worker node packages/cli/dist/index.js \
+  link add links.example.com promo --target https://example.com/landing
+```
+
+Nothing points at this server yet, so ask for it by name instead of by DNS:
+
+```sh
+curl -H 'Host: links.example.com' http://localhost/promo
 ```
 
 ## Domains and TLS
 
-Add a domain, publish the two records it asks for, and wait:
+Add a domain:
 
 ```sh
 docker compose exec worker node packages/cli/dist/index.js domain add links.example.com
 ```
 
-It prints a TXT record at `_clickmonk.links.example.com`. Publish it, and point
-`links.example.com` at this server with an A record (and an AAAA record if you have
-IPv6). The worker checks every five minutes; `domain verify links.example.com` checks
-at once, and `domain list` shows where each domain stands.
+It prints the TXT record to publish, at `_clickmonk.links.example.com`, and reminds you
+to point `links.example.com` at this server yourself — an A or AAAA record, or a CNAME,
+whichever your DNS provider gives you. Publish both, then wait: the worker checks every
+five minutes, `domain verify links.example.com` checks at once, and `domain list` shows
+where each domain stands.
 
-**Until the TXT record is found the domain serves nothing.** Links on it answer 404 and
-no certificate is requested for it. That is what stops somebody else's hostname, pointed
-at your server, from getting a certificate out of your install. `domain add --verified` is
-the way round it, for a trial or for a domain you proved some other way; it says on screen
-that no DNS check was made.
+**Until the TXT record is found the domain serves nothing.** Over plain HTTP, links on it
+answer 404. Over HTTPS there is no certificate to present, so the connection never gets
+that far: the TLS handshake itself fails, an SSL error with no page behind it. That is
+what stops somebody else's hostname, pointed at your server, from getting a certificate
+out of your install. `domain add --verified` is the way round it, for a trial or for a
+domain you proved some other way; it says on screen that no DNS check was made.
 
 ClickMonk does not know its own public address, so it records what a domain resolves to
 rather than judging it — a host behind NAT, a load balancer or a CDN is normal. A domain
 that stops publishing its record is reported, never un-verified: taking live links down
 because a resolver hiccuped would be worse than the problem.
 
+**IPv6 visitors are only recorded by their own address if the Docker daemon NATs their
+connections to the published port**, rather than relaying them through its own userland
+proxy — that is what `docker-compose.yml`'s `enable_ipv6: true` network setting is for.
+Check it once you have an AAAA record published: a click from an IPv6 address should
+show that visitor's own address, not one on your Docker bridge. If it does not, your
+Docker install needs its own IPv6 NAT support turned on; this repository has not pinned
+a minimum Docker version for that, so consult your distribution's own Docker
+documentation.
+
 **Behind Cloudflare's proxy**, the challenge a certificate authority sends is answered by
 Cloudflare rather than by this server, so issuance fails. Either use a DNS-only (grey
-cloud) record, or turn the proxy on with Cloudflare set to Full (strict) and mount an
-Origin certificate — `caddy/tls.d/00-defaults.caddy` shows how. Flexible mode sends
+cloud) record, or turn the proxy on with Cloudflare set to Full (strict) and use an
+Origin certificate. Nothing mounts one into Caddy by default: add the mount in
+`docker-compose.override.yml` first, then name the file in
+`caddy/tls.d/00-defaults.caddy` — both are shown in that file's comments. Skip the mount
+and Caddy exits at boot, unable to find a file that was never there. Flexible mode sends
 traffic to your server in clear and is not an option.
 
 Certificates live in the `caddy-data` volume. Back it up with the rest.
@@ -148,17 +179,23 @@ the redirect's memory, and each has a fixed ceiling.
 The address looked up is the one Caddy passes on, which is the visitor's: Caddy is the
 only service with a published port, nothing outside the stack can open a connection to the
 redirect, and Caddy replaces an `X-Forwarded-For` a client sent for itself. That is why
-`CLICKMONK_TRUSTED_PROXIES` defaults to `uniquelocal,loopback` — the private and loopback
-ranges Caddy sits in — rather than to one address.
+the stack sets `CLICKMONK_TRUSTED_PROXIES` to `uniquelocal,loopback` in
+`docker-compose.yml` — the private and loopback ranges Caddy sits in — rather than to one
+address. (The redirect's own default, if you run it without this stack in front, is
+`127.0.0.1`.)
 
 Change it only if you publish the redirect's port yourself, in which case narrow it to the
 proxy you actually run: comma-separated addresses, ranges such as `172.17.0.0/16`, or
-`loopback`, `linklocal` and `uniquelocal`. A range ending in `/0` is refused, since it
-would let every visitor name its own address, and the redirect does not start with a value
-it cannot read. **If a CDN sits in front of Caddy**, name its ranges in
-`caddy/proxy.d/` instead — see the comments in that file. Left unnamed, visitors arriving
-through it are all recorded as the CDN: they share one request count, so all of them are
-classed as abusers once it passes the threshold, and the country looked up is the CDN's.
+`loopback`, `linklocal` and `uniquelocal`. For a proxy on the Docker host, that is the
+gateway of the stack's Docker network, such as `172.17.0.1` or `172.18.0.1`
+(`docker network inspect clickmonk_default` shows it), or that network's subnet — not
+`127.0.0.1`: the proxy's own connection to the redirect does not come from loopback. A
+range ending in `/0` is refused, since it would let every visitor name its own address,
+and the redirect does not start with a value it cannot read. **If a CDN sits in front of
+Caddy**, name its ranges in `caddy/proxy.d/` instead — see the comments in that file.
+Left unnamed, visitors arriving through it are all recorded as the CDN: they share one
+request count, so all of them are classed as abusers once it passes the threshold, and
+the country looked up is the CDN's.
 
 | Data | Source | Licence | Checked for updates |
 | --- | --- | --- | --- |

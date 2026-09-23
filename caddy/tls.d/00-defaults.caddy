@@ -17,9 +17,23 @@
 # answered by Cloudflare rather than by this server, so issuance here fails.
 # The two setups that work are a DNS-only (grey cloud) record, or the proxy on
 # with Cloudflare set to Full (strict) and an Origin certificate mounted into
-# this container:
+# this container.
+#
+# Nothing mounts /etc/caddy/certs by default. Add it first, in
+# docker-compose.override.yml (gitignored, machine-specific, and merged in
+# automatically):
+#
+#     services:
+#       caddy:
+#         volumes:
+#           - ./caddy/certs:/etc/caddy/certs:ro
+#
+# then drop your certificate and key in ./caddy/certs and name them here:
 #
 #     tls /etc/caddy/certs/origin.pem /etc/caddy/certs/origin.key
+#
+# Skip the mount and Caddy exits at boot: the path above names a file that
+# was never given to the container.
 #
 # Flexible mode is not one of them: it sends traffic to this server in clear.
 #
