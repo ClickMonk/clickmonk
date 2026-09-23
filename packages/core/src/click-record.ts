@@ -90,19 +90,34 @@ export const ClickRecordV2Schema = z
   })
   .strict()
 
+/**
+ * Version 3 adds the password step: `outcome` takes `password` and `step`
+ * takes `password`. Both lists are closed, so a new value in either needs a
+ * new version — an older worker reads an unknown outcome as a malformed line
+ * and would drop the click. Nothing else changes, and a version 2 record is
+ * still read exactly as before.
+ */
+export const ClickRecordV3Schema = ClickRecordV2Schema.extend({
+  v: z.literal(3),
+  outcome: z.enum([...V1_OUTCOMES, 'blocked', 'safe', 'password'] as const),
+  step: z.enum([...V1_STEPS, 'classify', 'password'] as const),
+}).strict()
+
 /** Every record version the worker ships. */
 export const SpoolRecordSchema = z.discriminatedUnion('v', [
   ClickRecordV1Schema,
   ClickRecordV2Schema,
+  ClickRecordV3Schema,
 ])
-export const MAX_RECORD_VERSION = 2
+export const MAX_RECORD_VERSION = 3
 
 export type ClickRecordV1 = z.infer<typeof ClickRecordV1Schema>
 export type ClickRecordV2 = z.infer<typeof ClickRecordV2Schema>
+export type ClickRecordV3 = z.infer<typeof ClickRecordV3Schema>
 export type SpoolRecord = z.infer<typeof SpoolRecordSchema>
 
 /** The version the redirect writes. */
-export const ClickRecordSchema = ClickRecordV2Schema
+export const ClickRecordSchema = ClickRecordV3Schema
 export type ClickRecord = z.infer<typeof ClickRecordSchema>
 
 /**

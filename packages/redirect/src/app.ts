@@ -134,6 +134,10 @@ export function buildRedirectApp(
       seenLink: link !== null && visitor.seen.includes(link.id),
       clickId,
       random: random(),
+      // Every link is answerable at this commit: there is no gate yet, and no
+      // cookie to read. The proof-cookie check replaces this when the gate
+      // lands, read only for a link that has a hash.
+      passwordOk: true,
     }
     const input = { facts, domain, link, traffic, settings: snapshot.settings }
     let decision: Decision = evaluate({ ...input, capExhausted: false })
@@ -150,7 +154,7 @@ export function buildRedirectApp(
     }
 
     const record: ClickRecord = {
-      v: 2,
+      v: 3,
       clickId,
       time: at.toISOString(),
       host,

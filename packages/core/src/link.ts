@@ -29,6 +29,13 @@ export interface Link {
   clickCap: number | null
   expiresAt: Date | null
   passthrough: boolean
+  /**
+   * The scrypt hash of the link's password, or null for a link anyone may
+   * follow. The redirect holds it so it can verify a visitor's answer on the
+   * link's own domain; it is never sent to a visitor, and a hash a verifier
+   * cannot parse behaves as a wrong password rather than as no password.
+   */
+  passwordHash: string | null
   /** Overrides of the install-wide traffic actions, per class. */
   trafficActions: LinkTrafficActions
 }

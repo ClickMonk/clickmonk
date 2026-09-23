@@ -125,6 +125,56 @@ describe('toClickhouseRow', () => {
     })
   })
 
+  // Version 3 carries exactly version 2's fields and differs only in the
+  // outcome and step it may name, so one mapping reads both. A mapping that
+  // tested `v === 2` would store every version 3 click unclassified — a
+  // silent loss of the class, the signals, the action, the ASN and the geo
+  // source on every click the current redirect writes.
+  it('reads a version 3 record exactly as a version 2 one, and keeps its password outcome', () => {
+    const base = rec({
+      clickId: '01920000-0000-7000-8000-0000000000c3',
+      time: '2026-09-19T12:34:56.789Z',
+    })
+    const r = toClickhouseRow({
+      ...base,
+      v: 3,
+      outcome: 'password',
+      step: 'password',
+      status: 200,
+    })
+    // The whole row, so a field silently dropped or blanked fails here.
+    expect(r).toEqual({
+      click_id: '01920000-0000-7000-8000-0000000000c3',
+      time: '2026-09-19 12:34:56.789',
+      host: 'go.example.test',
+      path: '/spring',
+      domain_id: ZERO_UUID,
+      link_id: ZERO_UUID,
+      outcome: 'password',
+      step: 'password',
+      status: 200,
+      destination: 'https://example.com/',
+      target_id: '',
+      visitor_id: 'v',
+      returning: 0,
+      country: '',
+      region: '',
+      city: '',
+      geo_source: 'dbip-country-lite/2026-01',
+      device: 'desktop',
+      user_agent: 'ua',
+      referrer: '',
+      ip: '192.0.2.1',
+      cap_unchecked: 0,
+      traffic_class: 'human',
+      signals: [],
+      action: '',
+      os: 'windows',
+      browser: 'chrome',
+      asn: 64500,
+    })
+  })
+
   it('stores a version 1 record unclassified, not as human', () => {
     expect(toClickhouseRow(recV1())).toMatchObject({
       traffic_class: '',
@@ -355,7 +405,7 @@ describe('shipOnce', () => {
     const newer = segment(dir, [
       JSON.stringify(rec()),
       '{"torn":',
-      JSON.stringify({ ...rec(), v: 3 }),
+      JSON.stringify({ ...rec(), v: 4 }),
     ])
     segment(dir, [JSON.stringify(rec())])
     const skipNewer = new Set<string>()
@@ -376,7 +426,7 @@ describe('shipOnce', () => {
   it('reports no work for a pass that found only newer segments, so the shipper waits its interval', async () => {
     const dir = tmp()
     for (let i = 0; i < MAX_SEGMENTS_PER_PASS; i++) {
-      writeFileSync(join(dir, segmentName(1 + i, 1, 0)), `${JSON.stringify({ ...rec(), v: 3 })}\n`)
+      writeFileSync(join(dir, segmentName(1 + i, 1, 0)), `${JSON.stringify({ ...rec(), v: 4 })}\n`)
     }
     expect(await shipOnce({ dir, ch, skipNewer: new Set() })).toEqual({
       segments: 0,
@@ -432,7 +482,7 @@ describe('startShipper', () => {
   it('ships a segment behind a full pass of newer segments', async () => {
     const dir = tmp()
     for (let i = 0; i < MAX_SEGMENTS_PER_PASS; i++) {
-      writeFileSync(join(dir, segmentName(1 + i, 1, 0)), `${JSON.stringify({ ...rec(), v: 3 })}\n`)
+      writeFileSync(join(dir, segmentName(1 + i, 1, 0)), `${JSON.stringify({ ...rec(), v: 4 })}\n`)
     }
     writeFileSync(join(dir, segmentName(1000, 1, 0)), `${JSON.stringify(rec())}\n`)
     const s = startShipper({ dir, ch, intervalMs: 20, log: () => {} })

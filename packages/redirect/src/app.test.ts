@@ -68,6 +68,7 @@ const link = (over: Partial<Link> = {}): Link => ({
   clickCap: null,
   expiresAt: null,
   passthrough: true,
+  passwordHash: null,
   trafficActions: {},
   ...over,
 })
@@ -576,11 +577,11 @@ describe('traffic classification', () => {
     safeUrl,
   })
 
-  it('records the class, signals, action, OS, browser, ASN and geo source, as version 2', async () => {
+  it('records the class, signals, action, OS, browser, ASN and geo source, as version 3', async () => {
     const { app, records } = harness([link()], { ipdata: IPDATA })
     await app.inject({ method: 'GET', url: '/spring', headers: from('192.0.2.7') })
     expect(records[0]).toMatchObject({
-      v: 2,
+      v: 3,
       country: 'DE',
       trafficClass: 'human',
       signals: [],

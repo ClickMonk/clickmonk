@@ -79,6 +79,7 @@ interface LinkRow {
   expires_at: Date | null
   passthrough: boolean
   traffic_actions: unknown
+  password_hash: string | null
   targets: { id: string; url: string; weight: number }[] | null
 }
 
@@ -172,6 +173,7 @@ export async function loadFromPostgres(
       const links = await client.query<LinkRow>(`
         SELECT l.id, l.domain_id, l.slug, l.enabled, l.backup_url, l.device_urls, l.returning_url,
                l.countries, l.click_cap, l.expires_at, l.passthrough, l.traffic_actions,
+               l.password_hash,
                json_agg(json_build_object('id', t.id, 'url', t.url, 'weight', t.weight)
                         ORDER BY t.position) FILTER (WHERE t.id IS NOT NULL) AS targets
           FROM links l
@@ -212,6 +214,10 @@ export async function loadFromPostgres(
             clickCap: r.click_cap === null ? null : Number(r.click_cap),
             expiresAt: r.expires_at,
             passthrough: r.passthrough,
+            // Carried so the gate can verify an answer without a query. It is
+            // a hash of a password, not a password, and it never leaves the
+            // process except into the snapshot file beside it.
+            passwordHash: r.password_hash,
             trafficActions: actionsOf(r),
           })),
         new Date(),
@@ -251,9 +257,10 @@ export function deserializeSnapshot(text: string, log: Log = () => {}): Snapshot
     loadedAt: string
     settings?: unknown
     domains: Domain[]
-    links: (Omit<Link, 'expiresAt' | 'trafficActions'> & {
+    links: (Omit<Link, 'expiresAt' | 'trafficActions' | 'passwordHash'> & {
       expiresAt: string | null
       trafficActions?: unknown
+      passwordHash?: string | null
     })[]
   }
   if (raw.v !== 1 && raw.v !== 2) throw new Error(`unknown snapshot version ${raw.v}`)
@@ -270,6 +277,10 @@ export function deserializeSnapshot(text: string, log: Log = () => {}): Snapshot
     return {
       ...l,
       expiresAt: l.expiresAt === null ? null : new Date(l.expiresAt),
+      // A file written before links had passwords has no such field, and
+      // `undefined` is not `null`: every link read from one would then look
+      // password-protected and the whole install would demand a password.
+      passwordHash: l.passwordHash ?? null,
       trafficActions: a.actions,
     }
   })
