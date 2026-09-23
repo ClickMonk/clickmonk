@@ -15,6 +15,7 @@ import {
   type Link,
   type LinkTrafficActions,
   LinkTrafficActionsSchema,
+  MAX_PASSWORD_HASH_LENGTH,
   type TrafficSettings,
   TrafficSettingsSchema,
 } from '@clickmonk/core'
@@ -130,6 +131,42 @@ export function linkActionsFromRow(raw: unknown): {
 } {
   const r = LinkTrafficActionsSchema.safeParse(raw)
   return r.success ? { actions: r.data, problem: null } : { actions: {}, problem: issues(r.error) }
+}
+
+const unreadableHashes = (n: number): string =>
+  `password hashes of ${n} link(s) are unreadable; those links stay locked`
+
+/**
+ * What a link's password hash becomes when the file's value is not one: no
+ * verifier parses it, so the link stays locked and every answer to it is
+ * wrong. Falling back to null instead would open a protected link to
+ * everyone, which is the one outcome a corrupt or foreign file must not
+ * produce.
+ */
+export const UNREADABLE_PASSWORD_HASH = 'unreadable'
+
+/**
+ * A link's password hash out of a snapshot file. Postgres has a CHECK on the
+ * column, so only a file — one written by another release, or damaged — can
+ * carry something else there. Absent is no password. A string within the
+ * bound is taken as it is: whether it parses is the verifier's judgement, and
+ * the verifier already treats one it cannot parse as a wrong password.
+ * Anything else keeps the link locked rather than losing its password.
+ */
+export function linkPasswordHashFromFile(raw: unknown): {
+  passwordHash: string | null
+  problem: string | null
+} {
+  if (raw === undefined || raw === null) return { passwordHash: null, problem: null }
+  if (typeof raw === 'string' && raw.length <= MAX_PASSWORD_HASH_LENGTH) {
+    return { passwordHash: raw, problem: null }
+  }
+  // Never the value itself: whatever was written where a hash belongs is not
+  // something to put in a log line.
+  return {
+    passwordHash: UNREADABLE_PASSWORD_HASH,
+    problem: `not a string of at most ${MAX_PASSWORD_HASH_LENGTH} characters`,
+  }
 }
 
 /**
@@ -260,7 +297,7 @@ export function deserializeSnapshot(text: string, log: Log = () => {}): Snapshot
     links: (Omit<Link, 'expiresAt' | 'trafficActions' | 'passwordHash'> & {
       expiresAt: string | null
       trafficActions?: unknown
-      passwordHash?: string | null
+      passwordHash?: unknown
     })[]
   }
   if (raw.v !== 1 && raw.v !== 2) throw new Error(`unknown snapshot version ${raw.v}`)
@@ -271,20 +308,24 @@ export function deserializeSnapshot(text: string, log: Log = () => {}): Snapshot
     settings = r.settings
   }
   let refused = 0
+  let unreadable = 0
   const links = raw.links.map((l) => {
     const a = linkActionsFromRow(l.trafficActions ?? {})
     if (a.problem) refused++
+    // A file written before links had passwords has no such field, and
+    // `undefined` is not `null`: every link read from one would otherwise look
+    // password-protected and the whole install would demand a password.
+    const h = linkPasswordHashFromFile(l.passwordHash)
+    if (h.problem) unreadable++
     return {
       ...l,
       expiresAt: l.expiresAt === null ? null : new Date(l.expiresAt),
-      // A file written before links had passwords has no such field, and
-      // `undefined` is not `null`: every link read from one would then look
-      // password-protected and the whole install would demand a password.
-      passwordHash: l.passwordHash ?? null,
+      passwordHash: h.passwordHash,
       trafficActions: a.actions,
     }
   })
   if (refused > 0) log(refusedOverrides(refused))
+  if (unreadable > 0) log(unreadableHashes(unreadable))
   return new Snapshot(raw.domains, links, new Date(raw.loadedAt), 'file', settings)
 }
 

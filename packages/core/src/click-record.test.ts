@@ -119,6 +119,17 @@ describe('ClickRecordV2Schema', () => {
   })
 })
 
+/**
+ * Why a line was refused, not merely that it was: a fixture broken in some
+ * other way would make a refusal test pass without exercising the rule it
+ * names.
+ */
+const refusedFor = (value: unknown): string[] => {
+  const r = SpoolRecordSchema.safeParse(value)
+  expect(r.success).toBe(false)
+  return r.success ? [] : r.error.issues.map((i) => `${i.code}:${i.path.join('.')}`)
+}
+
 describe('SpoolRecordSchema', () => {
   it('reads version 1 and version 2, each by its own rules', () => {
     expect(SpoolRecordSchema.safeParse(sampleRecord()).success).toBe(true)
@@ -132,23 +143,13 @@ describe('SpoolRecordSchema', () => {
     expect(ClickRecordV1Schema.safeParse(sampleV2()).success).toBe(false)
   })
 
-  it('reads no other version', () => {
-    expect(SpoolRecordSchema.safeParse({ ...sampleV2(), v: 4 }).success).toBe(false)
+  it('reads no other version, and refuses it on the version rather than its fields', () => {
+    expect(refusedFor({ ...sampleV2(), v: 4 })).toEqual(['invalid_union_discriminator:v'])
   })
 })
 
 describe('version 3: the password step', () => {
   const sampleV3 = (over: Record<string, unknown> = {}) => ({ ...sampleV2(), v: 3, ...over })
-  /**
-   * Why a line was refused, not merely that it was: a fixture broken in some
-   * other way would make a refusal test pass without exercising the rule it
-   * names.
-   */
-  const refusedFor = (value: unknown): string[] => {
-    const r = SpoolRecordSchema.safeParse(value)
-    expect(r.success).toBe(false)
-    return r.success ? [] : r.error.issues.map((i) => `${i.code}:${i.path.join('.')}`)
-  }
 
   it('is the version the redirect writes, and the newest the worker reads', () => {
     expect(MAX_RECORD_VERSION).toBe(3)

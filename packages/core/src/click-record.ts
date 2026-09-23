@@ -95,13 +95,14 @@ export const ClickRecordV2Schema = z
  * takes `password`. Both lists are closed, so a new value in either needs a
  * new version — an older worker reads an unknown outcome as a malformed line
  * and would drop the click. Nothing else changes, and a version 2 record is
- * still read exactly as before.
+ * still read exactly as before. Extending version 2 carries its strictness
+ * too, so an unknown field is refused here without saying so again.
  */
 export const ClickRecordV3Schema = ClickRecordV2Schema.extend({
   v: z.literal(3),
   outcome: z.enum([...V1_OUTCOMES, 'blocked', 'safe', 'password'] as const),
   step: z.enum([...V1_STEPS, 'classify', 'password'] as const),
-}).strict()
+})
 
 /** Every record version the worker ships. */
 export const SpoolRecordSchema = z.discriminatedUnion('v', [

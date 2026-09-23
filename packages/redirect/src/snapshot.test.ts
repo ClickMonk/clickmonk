@@ -1,7 +1,12 @@
 import { existsSync, mkdtempSync, readFileSync, writeFileSync, writeSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { DEFAULT_TRAFFIC_SETTINGS, type TrafficSettings } from '@clickmonk/core'
+import {
+  DEFAULT_TRAFFIC_SETTINGS,
+  LINK_SCRYPT,
+  type TrafficSettings,
+  hashPassword,
+} from '@clickmonk/core'
 import type { Pool } from '@clickmonk/db'
 import { TEST_PG_URL, resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
@@ -9,8 +14,10 @@ import {
   Snapshot,
   SnapshotStore,
   SnapshotTooLargeError,
+  UNREADABLE_PASSWORD_HASH,
   deserializeSnapshot,
   linkActionsFromRow,
+  linkPasswordHashFromFile,
   loadFromPostgres,
   readSnapshotFile,
   serializeSnapshot,
@@ -91,6 +98,28 @@ describe('loadFromPostgres', () => {
       ['https://example.com/first', 70],
       ['https://example.com/second', 30],
     ])
+  })
+
+  // A hash dropped between the column and the `Link` opens every
+  // password-protected link on the install, and nothing else in the snapshot
+  // changes shape when it happens.
+  it('carries a link password hash, and reads a link without one as no password', async () => {
+    const { domainId } = await seed()
+    // Derived here, never written out: the column's CHECK wants a real hash,
+    // and no hash-shaped literal belongs in this tree.
+    const hash = await hashPassword('correct horse battery', LINK_SCRYPT)
+    const l = await pool.query<{ id: string }>(
+      "INSERT INTO links (domain_id, slug, password_hash) VALUES ($1, 'locked', $2) RETURNING id",
+      [domainId, hash],
+    )
+    await pool.query(
+      "INSERT INTO link_targets (link_id, url, weight, position) VALUES ($1, 'https://example.com/', 100, 0)",
+      [l.rows[0]?.id as string],
+    )
+    const s = await loadFromPostgres(pool)
+    expect(s.link(domainId, 'locked')?.passwordHash).toBe(hash)
+    // The other direction too: a link with no password must not gain one.
+    expect(s.link(domainId, 'spring')?.passwordHash).toBeNull()
   })
 
   it("loads the install's traffic settings and each link's overrides", async () => {
@@ -217,54 +246,82 @@ describe('snapshot file', () => {
     expect(back.source).toBe('file')
   })
 
+  const FILE_DOMAIN_ID = '00000000-0000-4000-8000-0000000000d1'
+  /** One link in a version 2 file, with whatever the case under test adds. */
+  const fileWithLink = (over: Record<string, unknown>) =>
+    JSON.stringify({
+      v: 2,
+      loadedAt: new Date().toISOString(),
+      settings: DEFAULT_TRAFFIC_SETTINGS,
+      domains: [],
+      links: [
+        {
+          id: '00000000-0000-4000-8000-0000000000a1',
+          domainId: FILE_DOMAIN_ID,
+          slug: 'spring',
+          enabled: true,
+          targets: [
+            {
+              id: '00000000-0000-4000-8000-0000000000f1',
+              url: 'https://example.com/',
+              weight: 100,
+            },
+          ],
+          backupUrl: null,
+          deviceUrls: {},
+          returningUrl: null,
+          countries: { mode: 'all' },
+          clickCap: null,
+          expiresAt: null,
+          passthrough: true,
+          trafficActions: {},
+          ...over,
+        },
+      ],
+    })
+  const fileLink = (over: Record<string, unknown>, log?: (m: string) => void) =>
+    deserializeSnapshot(fileWithLink(over), log).link(FILE_DOMAIN_ID, 'spring')
+
   // `undefined` is not `null`, and the evaluator asks for a password for every
   // link whose hash is not null. A file written before links had passwords has
   // no such field, so reading one must produce null rather than undefined, or
   // every link on the install becomes unanswerable.
   it('reads a link with no password hash field as no password, and carries one that has it', () => {
-    const domainId = '00000000-0000-4000-8000-0000000000d1'
-    const file = (over: Record<string, unknown>) =>
-      JSON.stringify({
-        v: 2,
-        loadedAt: new Date().toISOString(),
-        settings: DEFAULT_TRAFFIC_SETTINGS,
-        domains: [],
-        links: [
-          {
-            id: '00000000-0000-4000-8000-0000000000a1',
-            domainId,
-            slug: 'spring',
-            enabled: true,
-            targets: [
-              {
-                id: '00000000-0000-4000-8000-0000000000f1',
-                url: 'https://example.com/',
-                weight: 100,
-              },
-            ],
-            backupUrl: null,
-            deviceUrls: {},
-            returningUrl: null,
-            countries: { mode: 'all' },
-            clickCap: null,
-            expiresAt: null,
-            passthrough: true,
-            trafficActions: {},
-            ...over,
-          },
-        ],
-      })
-    const older = deserializeSnapshot(file({})).link(domainId, 'spring')
+    const older = fileLink({})
     expect(older).not.toBeNull()
     // toBeNull, not a loose check: undefined is what the evaluator would read
     // as a password nobody can answer.
     expect(older?.passwordHash).toBeNull()
     // Deliberately not hash-shaped: nothing here parses it.
-    const carried = deserializeSnapshot(file({ passwordHash: 'no-verifier-accepts-this' })).link(
-      domainId,
-      'spring',
+    expect(fileLink({ passwordHash: 'no-verifier-accepts-this' })?.passwordHash).toBe(
+      'no-verifier-accepts-this',
     )
-    expect(carried?.passwordHash).toBe('no-verifier-accepts-this')
+  })
+
+  // The field is validated like the settings and the overrides beside it,
+  // because a file from another release is the only way something that is not
+  // a hash reaches it — Postgres has a CHECK on the column.
+  it('keeps a link locked when the file has something other than a hash, and says so', () => {
+    const logs: string[] = []
+    // Not the number, and not null: null would open a link somebody protected.
+    expect(fileLink({ passwordHash: 42 }, (m) => logs.push(m))?.passwordHash).toBe(
+      UNREADABLE_PASSWORD_HASH,
+    )
+    expect(logs).toEqual(['password hashes of 1 link(s) are unreadable; those links stay locked'])
+  })
+
+  it.each([
+    ['no field at all', undefined, null, false],
+    ['null', null, null, false],
+    ['a hash', 'no-verifier-accepts-this', 'no-verifier-accepts-this', false],
+    ['a number', 42, UNREADABLE_PASSWORD_HASH, true],
+    ['an object', { n: 1 }, UNREADABLE_PASSWORD_HASH, true],
+    ['a string past the bound', 'h'.repeat(201), UNREADABLE_PASSWORD_HASH, true],
+    ['a string at the bound', 'h'.repeat(200), 'h'.repeat(200), false],
+  ])('reads %s as a password hash', (_label, raw, passwordHash, refused) => {
+    const r = linkPasswordHashFromFile(raw)
+    expect(r.passwordHash).toBe(passwordHash)
+    expect(r.problem === null).toBe(!refused)
   })
 
   it('round-trips the traffic settings', () => {
