@@ -73,10 +73,30 @@ jobs:
         with: { node-version: 22, cache: pnpm }
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
+      # The pinned shellcheck image, never the runner's preinstalled binary:
+      # the two are different versions and they disagree, so a failure here
+      # has to be reproducible with the same command locally.
+      - run: pnpm lint:sh
       - run: pnpm typecheck
       - run: pnpm build
       - run: docker compose -f docker-compose.test.yml up -d --wait
       - run: pnpm test
+
+  # The suites that drive the whole Compose stack: TLS issuance against a
+  # local certificate authority, the addresses the redirect records, and the
+  # installer. Its own job because it binds 80 and 443, and because it and
+  # `durability` both call `down -v`.
+  stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm vitest run --config vitest.stack.config.ts
 
   durability:
     runs-on: ubuntu-latest

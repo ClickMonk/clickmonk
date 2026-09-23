@@ -1,0 +1,66 @@
+# The shipped stack, with a certificate authority and a DNS server of its own
+# so that nothing here reaches the internet. Everything else — the Caddyfile,
+# the service definitions, the image — is what an install runs.
+name: clickmonk-tls
+
+services:
+  caddy:
+    environment:
+      CLICKMONK_ACME_CA: https://pebble:14000/dir
+    depends_on:
+      pebble: { condition: service_started }
+    # Every volume restated: Compose merges them by target path, and only
+    # tls.d and the authority's root are being added.
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./test/stack/tls.d:/etc/caddy/tls.d:ro
+      - ./caddy/proxy.d:/etc/caddy/proxy.d:ro
+      - ./test/stack/tmp/acme-root.pem:/etc/caddy/acme-root.pem:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    # How the authority resolves the names it is asked to certify, and how a
+    # client container reaches Caddy by name.
+    networks:
+      default:
+        aliases:
+          - go.example.test
+          - pending.example.test
+
+  worker:
+    environment:
+      CLICKMONK_IPDATA_UPDATE: "off"
+      CLICKMONK_DNS_CHECK: "on"
+      CLICKMONK_DNS_SERVERS: 172.30.0.53
+      CLICKMONK_DNS_CHECK_INTERVAL_MS: "2000"
+
+  # A miniature ACME server. NOSLEEP and NONCEREJECT turn off the randomness
+  # it adds on purpose to shake out client bugs, which here would only make
+  # the suite slower and flakier.
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:2.10.1
+    command: ["-config", "/pebble-config.json"]
+    environment:
+      PEBBLE_VA_NOSLEEP: "1"
+      PEBBLE_WFE_NONCEREJECT: "0"
+    volumes:
+      - ./test/stack/pebble-config.json:/pebble-config.json:ro
+
+  # A fixed address, because the worker is pointed at it by address: a name
+  # would have to be resolved by the resolver this container is.
+  coredns:
+    image: coredns/coredns:1.13.1
+    command: ["-conf", "/Corefile"]
+    volumes:
+      - ./test/stack/Corefile:/Corefile:ro
+      - ./test/stack/tmp/zones:/zones:ro
+    networks:
+      default:
+        ipv4_address: 172.30.0.53
+
+networks:
+  default:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+        - subnet: fd00:c11c:7::/64

@@ -1,0 +1,31 @@
+# Directives dropped in here land inside the `reverse_proxy` block, one level
+# further in than tls.d's. Empty by default, which is right for a server
+# visitors reach directly.
+#
+# WHAT THIS IS FOR: another proxy in front of this one — a CDN is the common
+# case. The address Caddy sees on the incoming connection is then that
+# proxy's, not the visitor's, and Caddy will not believe a forwarded header
+# from a peer it has not been told to trust. That refusal is the right
+# default: any client can send `X-Forwarded-For`, so believing it from
+# everyone would let a visitor choose the address ClickMonk records, counts
+# and looks a country up from.
+#
+# Name the ranges your CDN sends traffic from:
+#
+#     trusted_proxies 198.51.100.0/24 203.0.113.0/24
+#
+# That is the `reverse_proxy` sub-directive spelling, which is what belongs in
+# this file. `static` is part of Caddy's *global* `servers { trusted_proxies
+# static ... }` option, one level up; written here it is read as an IP address
+# and Caddy exits at boot.
+#
+# Your CDN publishes its ranges and they change. A stale list does not fail
+# loudly: an unlisted range is simply not believed, and visitors arriving
+# through it are recorded as the CDN.
+#
+# LIST ONLY RANGES YOU ACTUALLY SIT BEHIND. A range covering everything is the
+# same as having no check at all: it lets any client claim any address.
+#
+# This file is not decoration. With an empty directory Caddy logs
+# "No files matching import glob pattern" on every start, which reads as a
+# misconfiguration to whoever is tailing the logs for the first time.

@@ -61,6 +61,8 @@ beforeAll(async () => {
   const deadline = Date.now() + 120_000
   for (;;) {
     try {
+      // --verified: this host name has no DNS anywhere, and the redirect
+      // serves a domain only once it is verified.
       composeSync(
         'exec',
         '-T',
@@ -70,6 +72,7 @@ beforeAll(async () => {
         'domain',
         'add',
         HOST,
+        '--verified',
       )
       break
     } catch (err) {

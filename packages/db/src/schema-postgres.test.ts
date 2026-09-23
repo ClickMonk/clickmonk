@@ -108,7 +108,7 @@ const TOUCH_COLUMN: Record<ConfigTable, string> = {
 // under test never touches). link_counters has no config_changed trigger of
 // its own but must be listed here because it references links.
 const TRUNCATE_STATEMENT: Record<ConfigTable, string> = {
-  domains: 'TRUNCATE domains, links, link_targets, link_counters',
+  domains: 'TRUNCATE domains, domain_dns_checks, links, link_targets, link_counters',
   links: 'TRUNCATE links, link_targets, link_counters',
   link_targets: 'TRUNCATE link_targets',
   settings: 'TRUNCATE settings',
@@ -205,4 +205,87 @@ describe('config_changed notifications', () => {
       }
     },
   )
+})
+
+describe('postgres schema 005', () => {
+  it('gives every domain a token of the right shape without being told one, and a different one each time', async () => {
+    const a = await pool.query<{ verification_token: string }>(
+      "INSERT INTO domains (host) VALUES ('token-a.example.test') RETURNING verification_token",
+    )
+    const b = await pool.query<{ verification_token: string }>(
+      "INSERT INTO domains (host) VALUES ('token-b.example.test') RETURNING verification_token",
+    )
+    expect(a.rows[0]?.verification_token).toMatch(/^[0-9a-f]{32}$/)
+    expect(b.rows[0]?.verification_token).toMatch(/^[0-9a-f]{32}$/)
+    expect(a.rows[0]?.verification_token).not.toBe(b.rows[0]?.verification_token)
+  })
+
+  it('refuses a token an outsider could guess', async () => {
+    // The host is a fixed lower-case name rather than one derived from the
+    // token: derived, the upper-case case would break the host CHECK first
+    // and the row would be refused for the wrong reason. The constraint is
+    // named in the assertion for the same reason.
+    const bad = ['', 'not-hex', 'A'.repeat(32), '0'.repeat(31)]
+    for (const [i, token] of bad.entries()) {
+      await expect(
+        pool.query('INSERT INTO domains (host, verification_token) VALUES ($1, $2)', [
+          `bad-${i}.example.test`,
+          token,
+        ]),
+      ).rejects.toThrow(/domains_verification_token_valid/)
+    }
+  })
+
+  it('allows at most one check per domain', async () => {
+    // A fresh domain_id, so this rejection is the primary key's, not a
+    // status or detail CHECK reachable only after the first row exists.
+    const d = await insertDomain('checks-pk.example.test')
+    await pool.query(
+      "INSERT INTO domain_dns_checks (domain_id, status, detail) VALUES ($1, 'verified', 'ok')",
+      [d],
+    )
+    await expect(
+      pool.query(
+        "INSERT INTO domain_dns_checks (domain_id, status, detail) VALUES ($1, 'error', 'x')",
+        [d],
+      ),
+    ).rejects.toThrow(/duplicate key value violates unique constraint "domain_dns_checks_pkey"/)
+  })
+
+  it('refuses a status outside the enum', async () => {
+    const d = await insertDomain('checks-status.example.test')
+    await expect(
+      pool.query(
+        "INSERT INTO domain_dns_checks (domain_id, status, detail) VALUES ($1, 'nonsense', 'x')",
+        [d],
+      ),
+    ).rejects.toThrow(/violates check constraint "domain_dns_checks_status_check"/)
+  })
+
+  it('accepts a detail of exactly 500 characters, and refuses one longer', async () => {
+    const ok = await insertDomain('checks-detail-ok.example.test')
+    await pool.query(
+      'INSERT INTO domain_dns_checks (domain_id, status, detail) VALUES ($1, $2, $3)',
+      [ok, 'verified', 'x'.repeat(500)],
+    )
+    const tooLong = await insertDomain('checks-detail-long.example.test')
+    await expect(
+      pool.query('INSERT INTO domain_dns_checks (domain_id, status, detail) VALUES ($1, $2, $3)', [
+        tooLong,
+        'verified',
+        'x'.repeat(501),
+      ]),
+    ).rejects.toThrow(/violates check constraint "domain_dns_checks_detail_check"/)
+  })
+
+  it('drops the check with its domain', async () => {
+    const d = await insertDomain('checks-cascade.example.test')
+    await pool.query(
+      "INSERT INTO domain_dns_checks (domain_id, status, detail) VALUES ($1, 'verified', 'ok')",
+      [d],
+    )
+    await pool.query('DELETE FROM domains WHERE id = $1', [d])
+    const left = await pool.query('SELECT 1 FROM domain_dns_checks WHERE domain_id = $1', [d])
+    expect(left.rowCount).toBe(0)
+  })
 })

@@ -5,6 +5,6 @@ describe('SCHEMA_VERSION', () => {
   it('is the highest migration version this build knows about', () => {
     // Bumped with every migration added. packages/db's
     // schema-version.test.ts ties it to the migration files on disk.
-    expect(SCHEMA_VERSION).toBe(4)
+    expect(SCHEMA_VERSION).toBe(5)
   })
 })

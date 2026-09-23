@@ -1,0 +1,43 @@
+# Caddy terminates TLS for every link domain and forwards to the redirect.
+#
+# A certificate is obtained on the first HTTPS request for a host name, and
+# only after the redirect has said yes to the `ask` check below: yes means a
+# domain an admin added and verified. Any other host name pointed at this
+# server gets no certificate, so nobody outside can make this install ask a
+# certificate authority for one.
+{
+	# HTTP/1.1 and HTTP/2 only. HTTP/3 runs over UDP, and docker-compose.yml
+	# publishes 443 as TCP alone, so advertising HTTP/3 would point clients
+	# at a port the host never forwards: they try it, get nothing, and fall
+	# back. To turn it on, publish `443:443/udp` for caddy as well and add
+	# h3 to the line below. The two only make sense together.
+	servers {
+		protocols h1 h2
+	}
+
+	on_demand_tls {
+		# The internal port, reachable on the stack's own network and
+		# published nowhere.
+		ask http://redirect:9091/ask
+	}
+}
+
+# Every host name. The redirect answers for the ones it knows and serves a
+# 404 page for the rest. Plain HTTP is proxied rather than redirected: a
+# domain that has not been verified has no certificate, and a local trial has
+# no domain at all.
+:443 {
+	tls {
+		on_demand
+		import /etc/caddy/tls.d/*.caddy
+	}
+	reverse_proxy redirect:8080 {
+		import /etc/caddy/proxy.d/*.caddy
+	}
+}
+
+:80 {
+	reverse_proxy redirect:8080 {
+		import /etc/caddy/proxy.d/*.caddy
+	}
+}

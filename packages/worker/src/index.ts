@@ -2,6 +2,7 @@ import { mkdirSync } from 'node:fs'
 import { createChClient, createPgPool, migrateToLatest } from '@clickmonk/db'
 import { startUpdater } from '@clickmonk/ipdata'
 import { loadConfig } from './config.js'
+import { createResolver, startDomainChecker } from './domains.js'
 import { startShipper } from './shipper.js'
 
 const config = loadConfig(process.env)
@@ -12,11 +13,12 @@ const log = (msg: string, err?: unknown) => console.error(`worker: ${msg}`, err 
 let stopping = false
 let shipper: { stop(): Promise<void> } | null = null
 let updater: { stop(): Promise<void> } | null = null
+let domains: { stop(): Promise<void> } | null = null
 
 async function shutdown(): Promise<void> {
   if (stopping) return
   stopping = true
-  await Promise.all([shipper?.stop(), updater?.stop()])
+  await Promise.all([shipper?.stop(), updater?.stop(), domains?.stop()])
   await Promise.allSettled([pg.end(), ch.close()])
 }
 process.on('SIGTERM', () => void shutdown())
@@ -45,5 +47,16 @@ if (!stopping) {
     log(`updating IP data in ${config.ipdataDir}`)
   } else {
     log('IP data updates are off: countries stay unknown and the IP checks do not run')
+  }
+  if (config.dnsCheck) {
+    domains = startDomainChecker({
+      resolver: createResolver(config.dnsServers),
+      pg,
+      intervalMs: config.dnsCheckIntervalMs,
+      log,
+    })
+    log('checking domain DNS verification')
+  } else {
+    log('domain DNS checks are off: a domain stays as it was added')
   }
 }

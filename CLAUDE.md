@@ -43,22 +43,24 @@ run it on their own infrastructure; their click data stays theirs.
 
 **Early, unreleased, not for production.** What exists: the redirect (in-memory snapshot,
 spool before response, click caps, traffic classification and actions, country rules
-from an in-memory IP lookup), the worker (spool to ClickHouse, migrations on boot, IP
-data updates), the CLI (`migrate`, `domain add`, `link add`, `settings show|set`,
-`ipdata status|update`), a Compose stack, and the restart durability suite.
+from an in-memory IP lookup), Caddy in front of it with on-demand TLS gated on a verified
+domain, the worker (spool to ClickHouse, migrations on boot, IP data updates, domain DNS
+verification), the CLI (`migrate`, `domain add|list|verify`, `link add`,
+`settings show|set`, `ipdata status|update`), `install.sh`, a Compose stack, and the
+restart durability and stack test suites.
 
 What does not exist yet, and must not be implied by any documentation:
 
-- **TLS.** The redirect serves plain HTTP on 8080. Visitor cookies are `Secure`, so
-  browsers drop them over HTTP and returning-visitor routing does not work until TLS.
-- **Admin API and UI.** Links and domains are added with the CLI. `domain add` marks a
-  domain verified without a DNS check.
+- **An admin hostname.** Caddy serves link domains only; there is no admin service to
+  route one to.
+- **Admin API and UI.** Links and domains are added with the CLI.
 - **Most link settings in the CLI.** `link add` takes `--target`, `--backup`, `--cap`,
   `--expires`, `--no-passthrough` and `--action` only, and no command changes a link
   after `link add`. `settings set` sets the install-wide traffic actions, the safe URL
   and the abuser threshold. The evaluator supports device URLs, a returning URL,
   country rules, a name and the disabled state; the CLI cannot set them yet, so they
-  need hand-written SQL.
+  need hand-written SQL. A returning URL also needs HTTPS to do anything: its cookie
+  is marked `Secure`, so a browser drops it over plain HTTP.
 - **Reporting.** Clicks reach ClickHouse; there are no reports or exports.
 - **Proxy/VPN detection beyond Tor exits, cloud providers' published ranges, and region
   or city.** No licensed VPN or proxy list has been found; datacenter traffic is
@@ -66,6 +68,15 @@ What does not exist yet, and must not be implied by any documentation:
 - **Password links, backup and restore.**
 - Segments ClickHouse rejects are set aside as `.bad` files, and nothing reports them.
 - One redirect process per spool directory.
+- A full spool stops recording without stopping redirects; the drop count is on
+  `/health` on the internal port and nowhere else.
+- The internal port (`redirect:9091`, which serves `/ask`) is published nowhere on the
+  host, but any container on the compose network can reach it, not only Caddy.
+- The worker has no healthcheck, so `docker compose up -d --wait` can return before its
+  boot migration has finished; a `domain add` run immediately after can hit a missing
+  relation.
+- The published-port IPv6 test is skipped on a host with no IPv6 address of its own;
+  see "The stack suites" below for what still runs when it is.
 
 **Upgrade the worker before the redirect.** A worker never deletes or sets aside a spool
 segment whose record version is newer than it reads: segments from a newer redirect wait
@@ -95,8 +106,15 @@ packages/redirect/  the service that answers link domains: an in-memory snapshot
                     the IP data and the per-address rate counter, the spool
                     writer, the click-cap counter.
 packages/worker/    ships the spool into ClickHouse; runs migrations on boot;
-                    updates the IP data.
-packages/cli/       `clickmonk migrate | domain add | link add | settings | ipdata`.
+                    updates the IP data; checks domain DNS verification on a schedule.
+packages/cli/       `clickmonk migrate | domain add|list|verify | link add | settings | ipdata`.
+caddy/              the Caddyfile, and the tls.d/ and proxy.d/ drop-in directories an
+                    operator edits: where certificates come from, and a proxy in
+                    front of Caddy.
+install.sh          writes .env once, with fresh secrets, and starts the stack.
+test/stack/         brings the whole stack up against a local certificate authority
+                    and DNS server; proves TLS issuance, domain verification, and
+                    real client addresses over IPv4 and IPv6.
 ```
 
 Three properties of the product shape every change:
@@ -132,7 +150,7 @@ test-only file that is not named `*.test.ts` must be excluded there too, or it s
 pull request, run the full gate in CI's order, so local red means CI red:
 
 ```sh
-pnpm lint && pnpm typecheck && pnpm build && pnpm test
+pnpm lint && pnpm lint:sh && pnpm typecheck && pnpm build && pnpm test
 ```
 
 **Run one test suite at a time.** Every database-backed test resets the shared test
@@ -155,6 +173,24 @@ The CI stack binds **8080 and 8123**; the test databases bind **8123 and 5433**.
 test databases before running it, or you get "port is already allocated", which reads
 like a broken test. Bring them back before the next `pnpm test`. The suite runs
 `down -v` on its own project only (`clickmonk-ci`).
+
+### The stack suites
+
+```sh
+pnpm build
+pnpm vitest run --config vitest.stack.config.ts   # starts the stack; a few minutes
+```
+
+They bring the whole stack up with a certificate authority and a DNS server of their own,
+so no ACME traffic and no public DNS lookup leaves the machine (the images themselves
+are still pulled over the network, once): a domain gets no certificate until it
+publishes its verification record, the address every visitor arrives from is the
+visitor's, and `install.sh` writes its secrets once. They bind **80 and 443**; the
+durability suite binds 8080 and 8123 and the test databases 8123 and 5433. Run one at a
+time.
+
+The IPv6 half of the address suite is skipped on a host with no IPv6 address of its own,
+which is most CI runners. Run it by hand on a host that has one before a release.
 
 ## License and its consequences
 
@@ -204,9 +240,10 @@ That rule is easy to satisfy badly, so:
 
 Anything that runs on an operator's host rather than in a container — an installer,
 backup or restore — targets **bash 3.2**, the version macOS still ships: no associative
-arrays, no `mapfile`. There is no such script yet. The first one to land also pins
-`shellcheck` in the repo and has CI run the pinned copy, never a runner's preinstalled
-binary, so a lint that fails in CI can be reproduced locally.
+arrays, no `mapfile`. `install.sh` is the first. `shellcheck` is pinned as a Docker image
+and run by `pnpm lint:sh` over every `*.sh` in the repository, so a new script is linted
+without anything being added to the script, and by CI with the same command, so a failure
+there is reproducible here.
 
 ## Conventions
 

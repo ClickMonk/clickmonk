@@ -42,3 +42,7 @@ coverage/
 # resource limits, ports and mounts end up: details about someone's hardware or
 # network that do not belong in a public repository.
 docker-compose.override.yml
+
+# The TLS suite writes the local certificate authority root and the test DNS
+# zone here before it starts the stack.
+test/stack/tmp/

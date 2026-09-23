@@ -1,0 +1,4 @@
+# The local certificate authority, so no test ever reaches a public one. Its
+# own HTTPS certificate is copied out of its image by the suite.
+ca {$CLICKMONK_ACME_CA}
+ca_root /etc/caddy/acme-root.pem

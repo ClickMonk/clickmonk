@@ -6,8 +6,11 @@ import {
   type TrafficSettings,
   TrafficSettingsSchema,
   isDomainUrl,
+  newVerificationToken,
   normaliseHost,
   parseLinkInput,
+  verificationRecordName,
+  verificationRecordValue,
 } from '@clickmonk/core'
 import { type ClickHouseClient, type Pool, migrateToLatest } from '@clickmonk/db'
 import {
@@ -18,6 +21,13 @@ import {
   readManifest,
   runUpdate,
 } from '@clickmonk/ipdata'
+import {
+  type DomainResolver,
+  checkDomain,
+  createResolver,
+  recordDomainCheck,
+  runDomainChecks,
+} from '@clickmonk/worker/domains'
 import type { ZodError } from 'zod'
 
 export interface CliDeps {
@@ -27,11 +37,26 @@ export interface CliDeps {
   out: (s: string) => void
   /** Where the IP data lives; `fetch` and `sources` are seams for tests. */
   ipdata: { dir: string; fetch?: Fetcher; sources?: SourceDef[] }
+  /**
+   * The resolver `domain verify` asks. A test passes its own; otherwise one
+   * is built from `dnsServers`. Either way, `domain verify` treats it as its
+   * own for the call's duration and cancels it when done — the same
+   * convention `startDomainChecker` uses for the resolver it is given — so a
+   * caller that wants to reuse one resolver across several `domain verify`
+   * calls should build a fresh one for each instead.
+   */
+  resolver?: DomainResolver
+  /** Resolver addresses for `domain verify`; the host's own when empty. */
+  dnsServers?: string[]
+  /** The clock a check is stamped with, so the worker and the CLI can be made to agree in a test. */
+  now?: () => Date
 }
 
 const USAGE = `usage:
   clickmonk migrate
-  clickmonk domain add <host> [--root-url <url>] [--not-found-url <url>]
+  clickmonk domain add <host> [--root-url <url>] [--not-found-url <url>] [--verified]
+  clickmonk domain list
+  clickmonk domain verify [<host>]
   clickmonk link add <host> <slug> --target [<weight>=]<url> ... [--backup <url>]
                      [--cap <n>] [--expires <iso-8601>] [--no-passthrough]
                      [--action <class>=<action> ...]
@@ -67,7 +92,11 @@ async function domainAdd(args: string[], d: CliDeps): Promise<void> {
   const { values, positionals } = parseArgs({
     args,
     allowPositionals: true,
-    options: { 'root-url': { type: 'string' }, 'not-found-url': { type: 'string' } },
+    options: {
+      'root-url': { type: 'string' },
+      'not-found-url': { type: 'string' },
+      verified: { type: 'boolean' },
+    },
   })
   const host = normaliseHost(positionals[0] ?? '')
   if (!host) throw new Rejected(`not a valid host name: ${positionals[0] ?? '(none)'}`)
@@ -76,15 +105,165 @@ async function domainAdd(args: string[], d: CliDeps): Promise<void> {
     if (u !== undefined && !isDomainUrl(u))
       throw new Rejected(`not an http(s) URL in printable ASCII without tokens: ${u}`)
   }
-  const r = await d.pg.query<{ id: string }>(
-    `INSERT INTO domains (host, verified, root_url, not_found_url) VALUES ($1, true, $2, $3)
-     ON CONFLICT (host) DO NOTHING RETURNING id`,
-    [host, values['root-url'] ?? null, values['not-found-url'] ?? null],
+  const token = newVerificationToken()
+  const verified = values.verified === true
+  const r = await d.pg.query<{ id: string; verification_token: string }>(
+    `INSERT INTO domains (host, verified, root_url, not_found_url, verification_token)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (host) DO NOTHING RETURNING id, verification_token`,
+    [host, verified, values['root-url'] ?? null, values['not-found-url'] ?? null, token],
   )
-  const id = r.rows[0]?.id
-  if (!id) throw new Rejected(`domain already exists: ${host}`)
-  d.out(`domain ${host} ${id}`)
-  d.out('note: marked verified without a DNS check; DNS verification is not built yet')
+  const row = r.rows[0]
+  if (!row) throw new Rejected(`domain already exists: ${host}`)
+  d.out(`domain ${host} ${row.id}`)
+  if (verified) {
+    d.out('marked verified without a DNS check, so it can be given a certificate at once')
+    return
+  }
+  printVerificationRecords(host, row.verification_token, d)
+}
+
+/**
+ * The record to publish, formatted exactly once so the standalone block
+ * below and `domain list`'s per-row line can never drift into two spacings.
+ */
+function formatVerificationRecord(host: string, token: string): string {
+  return `${verificationRecordName(host)}  TXT  "${verificationRecordValue(token)}"`
+}
+
+/**
+ * What the admin has to publish, and what happens next. Printed by `domain
+ * add` and `domain verify`.
+ *
+ * `alreadyServing` is for a domain that is already verified — marked so with
+ * `--verified`, or by an earlier successful check — whose *current* check
+ * did not find the token: the domain still serves and still keeps whatever
+ * certificate it has, so the usual "answers 404, gets no certificate"
+ * warning would be false for it.
+ */
+function printVerificationRecords(
+  host: string,
+  token: string,
+  d: CliDeps,
+  opts: { alreadyServing?: boolean } = {},
+): void {
+  d.out('')
+  d.out('Publish this TXT record, then the domain is verified within a few minutes:')
+  d.out(`  ${formatVerificationRecord(host, token)}`)
+  d.out('')
+  if (opts.alreadyServing) {
+    d.out(`${host} is already verified and serves as usual; this record is only needed`)
+    d.out('if it is ever reset to unverified, or to complete DNS verification for real.')
+    return
+  }
+  d.out(`Point ${host} at this server with an A or AAAA record (or a CNAME).`)
+  d.out('Until the TXT record is found, links on this domain answer 404 and it gets no')
+  d.out('certificate. Check it now with:')
+  d.out(`  clickmonk domain verify ${host}`)
+}
+
+interface DomainListRow {
+  host: string
+  verified: boolean
+  verification_token: string
+  status: string | null
+  detail: string | null
+  checked_at: Date | null
+}
+
+async function domainList(d: CliDeps): Promise<void> {
+  const r = await d.pg.query<DomainListRow>(
+    `SELECT d.host, d.verified, d.verification_token, c.status, c.detail, c.checked_at
+       FROM domains d
+       LEFT JOIN domain_dns_checks c ON c.domain_id = d.id
+      ORDER BY d.host`,
+  )
+  if (r.rows.length === 0) {
+    d.out('no domains yet (add one with "clickmonk domain add")')
+    return
+  }
+  for (const row of r.rows) {
+    const last = row.checked_at
+      ? `${row.status}, checked ${row.checked_at.toISOString()}`
+      : 'not checked yet'
+    d.out(`${row.host}: ${row.verified ? 'verified' : 'unverified'}; ${last}`)
+    if (row.detail) d.out(`  ${row.detail}`)
+    if (!row.verified) {
+      d.out(`  publish ${formatVerificationRecord(row.host, row.verification_token)}`)
+      d.out(`  point ${row.host} at this server with an A or AAAA record (or a CNAME)`)
+    }
+  }
+}
+
+/**
+ * Checks now rather than waiting for the worker's next pass. With a host,
+ * that one domain; without, every domain currently stored, oldest check
+ * first — no domains yet is not a failure. Returns false when a domain
+ * checked came back not verified and was not already verified some other
+ * way (`--verified`, or an earlier successful check); an already-verified
+ * domain whose token this check could not find is not a regression, so it
+ * does not turn this into a failure.
+ */
+async function domainVerify(args: string[], d: CliDeps): Promise<boolean> {
+  const { positionals } = parseArgs({ args, allowPositionals: true, options: {} })
+  const resolver = d.resolver ?? createResolver(d.dnsServers ?? [])
+  // One clock for both branches, and the same seam the worker's pass takes,
+  // so a check written here and one written there can never disagree about
+  // what `now` was.
+  const now = d.now?.() ?? new Date()
+  try {
+    if (positionals.length === 0) {
+      const total = await d.pg.query<{ n: number }>('SELECT count(*)::int AS n FROM domains')
+      const limit = total.rows[0]?.n ?? 0
+      if (limit === 0) {
+        d.out('no domains yet (add one with "clickmonk domain add")')
+        return true
+      }
+      const run = await runDomainChecks({
+        pg: d.pg,
+        resolver,
+        now: () => now,
+        // Every domain currently stored, not the worker's own default
+        // batch: an operator running this by hand means to check all of
+        // them, not wait several passes for the rest to come round.
+        limit,
+        // An operator typed this command, so every domain gets a line, not
+        // only the ones whose status changed since the last check. The
+        // worker's own pass leaves this off and logs transitions.
+        logEvery: true,
+        log: (m) => d.out(m),
+      })
+      return run.failed === 0 && run.checked > 0
+    }
+    const host = normaliseHost(positionals[0] ?? '')
+    if (!host) throw new Rejected(`not a valid host name: ${positionals[0] ?? '(none)'}`)
+    const r = await d.pg.query<{ id: string; verification_token: string; verified: boolean }>(
+      'SELECT id, verification_token, verified FROM domains WHERE host = $1',
+      [host],
+    )
+    const row = r.rows[0]
+    if (!row) throw new Rejected(`unknown domain: ${host} (add it with "clickmonk domain add")`)
+    const result = await checkDomain(resolver, host, row.verification_token)
+    await recordDomainCheck(d.pg, row, result, now)
+    if (result.status === 'verified') {
+      d.out(`${host}: verified (${result.detail})`)
+      return true
+    }
+    if (row.verified) {
+      // Already verified — by `--verified`, or by an earlier check — and
+      // this check's failure to find the token does not change that: the
+      // domain keeps serving and keeps whatever certificate it has, so this
+      // is not the same event as a domain that has never been verified.
+      d.out(`${host}: still verified (${result.detail})`)
+      printVerificationRecords(host, row.verification_token, d, { alreadyServing: true })
+      return true
+    }
+    d.out(`${host}: ${result.status} (${result.detail})`)
+    printVerificationRecords(host, row.verification_token, d)
+    return false
+  } finally {
+    resolver.cancel()
+  }
 }
 
 async function linkAdd(args: string[], d: CliDeps): Promise<void> {
@@ -308,7 +487,11 @@ function ipdataStatus(d: CliDeps): void {
   for (const a of attributions) d.out(a)
 }
 
-/** Returns the process exit code: 0 ok, 1 usage, 2 rejected input, 4 an IP data source failed to update. */
+/**
+ * Returns the process exit code: 0 ok, 1 usage, 2 rejected input, 4 an IP
+ * data source failed to update, 5 a domain is still not verified. (3 is the
+ * entry point's code for an unexpected error.)
+ */
 export async function runCli(argv: string[], d: CliDeps): Promise<number> {
   const [cmd, sub, ...rest] = argv
   try {
@@ -320,6 +503,13 @@ export async function runCli(argv: string[], d: CliDeps): Promise<number> {
     if (cmd === 'domain' && sub === 'add') {
       await domainAdd(rest, d)
       return 0
+    }
+    if (cmd === 'domain' && sub === 'list' && rest.length === 0) {
+      await domainList(d)
+      return 0
+    }
+    if (cmd === 'domain' && sub === 'verify' && rest.length <= 1) {
+      return (await domainVerify(rest, d)) ? 0 : 5
     }
     if (cmd === 'link' && sub === 'add') {
       await linkAdd(rest, d)

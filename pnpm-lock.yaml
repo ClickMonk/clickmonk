@@ -35,6 +35,9 @@ importers:
       '@clickmonk/ipdata':
         specifier: workspace:*
         version: link:../ipdata
+      '@clickmonk/worker':
+        specifier: workspace:*
+        version: link:../worker
       zod:
         specifier: ^3.25.0
         version: 3.25.76

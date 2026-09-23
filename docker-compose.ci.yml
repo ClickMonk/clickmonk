@@ -42,6 +42,8 @@ services:
       # CI downloads nothing: the suite runs without IP data, as an install
       # without internet access would.
       CLICKMONK_IPDATA_UPDATE: "off"
+      # And asks no DNS questions: this stack's domain is added verified.
+      CLICKMONK_DNS_CHECK: "off"
     volumes:
       - spool:/var/lib/clickmonk/spool
       - ipdata:/var/lib/clickmonk/ipdata
