@@ -512,6 +512,33 @@ describe('what the caller wrote', () => {
     const stored = await pg.query<{ slug: string }>('SELECT slug FROM links')
     expect(stored.rows[0]?.slug).not.toBe('planted')
   })
+
+  // The patch route reads the same two fields off its own body, so it strips
+  // the prototype off its own body too. One row per body, so removing either
+  // fails its own row.
+  it('takes the patched fields from the body, not from a poisoned prototype', async () => {
+    const created = (await create({ slug: 'keeps-its-slug', targets: [target] })).json()
+    Object.defineProperty(Object.prototype, 'slug', {
+      value: 'planted',
+      configurable: true,
+      writable: true,
+    })
+    try {
+      const r = await app.inject({
+        method: 'PATCH',
+        url: `/api/links/${created.id}`,
+        headers: write(cookie),
+        payload: { name: 'Renamed' },
+      })
+      expect(r.statusCode).toBe(200)
+      expect(r.json().slug).toBe('keeps-its-slug')
+    } finally {
+      // biome-ignore lint/performance/noDelete: the planted property has to go, not be set to undefined
+      delete (Object.prototype as unknown as Record<string, unknown>).slug
+    }
+    const stored = await pg.query<{ slug: string }>('SELECT slug FROM links')
+    expect(stored.rows[0]?.slug).toBe('keeps-its-slug')
+  })
 })
 
 describe('the client a handler holds', () => {
