@@ -83,6 +83,20 @@ describe('adding a domain', () => {
     expect(body.verificationRecord.value).toBe(
       verificationRecordValue(stored.rows[0]?.verification_token as string),
     )
+    // The column has a default that fills a token in too, so a token that
+    // merely exists proves nothing about who chose it — and who chose it is
+    // the whole of what the token is for. What separates the two is shape:
+    // the column's default is a UUID with its dashes dropped, which fixes the
+    // 13th hex digit to '4' and the 17th to one of 8, 9, a or b, while 16
+    // random bytes do not. One token could take that shape by chance; a
+    // score of them could not.
+    const uuidShaped = (t: string): boolean => t[12] === '4' && '89ab'.includes(t[16] ?? 'z')
+    for (let i = 0; i < 20; i++) await add({ host: `minted-${i}.example.test` })
+    const minted = await pg.query<{ verification_token: string }>(
+      'SELECT verification_token FROM domains',
+    )
+    expect(minted.rows).toHaveLength(21)
+    expect(minted.rows.filter((row) => uuidShaped(row.verification_token))).not.toHaveLength(21)
   })
 
   it('refuses a body that tries to mark it verified', async () => {
