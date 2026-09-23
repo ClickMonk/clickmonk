@@ -17,6 +17,7 @@
  * guessing gate, and the per-address limiter and the concurrency gate in front
  * of it are what stop that queue from growing.
  */
+import { randomBytes } from 'node:crypto'
 import {
   ADMIN_SCRYPT,
   type NewApiKey,
@@ -149,7 +150,10 @@ export interface SignInInput {
  */
 let dummyHashPromise: Promise<string> | null = null
 function dummyHash(): Promise<string> {
-  dummyHashPromise ??= hashPassword(`no-such-password-${Math.random()}-${Date.now()}`, ADMIN_SCRYPT)
+  dummyHashPromise ??= hashPassword(
+    `no-such-password-${randomBytes(32).toString('hex')}`,
+    ADMIN_SCRYPT,
+  )
   return dummyHashPromise
 }
 
@@ -194,6 +198,39 @@ async function spendRecoveryCode(
   return false
 }
 
+/**
+ * Verifies and spends whichever second factor was presented, inside a
+ * transaction that already holds the account row. One place, so the code path
+ * and the recovery-code path cannot drift apart in what "spent" means: both are
+ * one-time, and both are consumed by the act of checking them.
+ */
+async function spendSecondFactor(
+  client: PoolClient,
+  account: AdminAccount,
+  o: { code?: string | undefined; recoveryCode?: string | undefined; now: Date },
+): Promise<boolean> {
+  if (o.recoveryCode !== undefined) {
+    const normalised = normaliseRecoveryCode(o.recoveryCode)
+    // The same helper the sign-in uses, for the same reason: one place knows
+    // how a recovery code is stored and how it is spent.
+    return normalised !== null && (await spendRecoveryCode(client, normalised, o.now))
+  }
+  if (o.code === undefined) return false
+  const check = verifyTotp({
+    secret: account.totpSecret as string,
+    code: o.code,
+    atMs: o.now.getTime(),
+    lastStep: account.totpLastStep,
+  })
+  if (!check) return false
+  // The step is recorded so this code cannot be used again.
+  await client.query('UPDATE admin_account SET totp_last_step = $1, updated_at = $2', [
+    check.step,
+    o.now,
+  ])
+  return true
+}
+
 async function recordFailure(client: PoolClient, account: AdminAccount, now: Date): Promise<void> {
   const failed = account.failedLogins + 1
   const lock = lockoutMs(failed)
@@ -215,6 +252,12 @@ export async function signIn(pg: Pool, input: SignInInput, now: Date): Promise<S
     const r = await client.query<AccountRow>(`${SELECT_ACCOUNT} FOR UPDATE`)
     const row = r.rows[0]
     if (!row) {
+      // A full scrypt pass against a throwaway hash, exactly as a wrong address
+      // costs below. An install nobody has claimed yet must not be cheaper to
+      // probe than one that is, and the route answers it as a wrong password:
+      // the sign-in form is anonymous, so anything it says about whether the
+      // account exists is said to whoever asks.
+      await verifyPassword(input.password, await dummyHash())
       await client.query('COMMIT')
       return { ok: false, reason: 'no_admin' }
     }
@@ -301,6 +344,13 @@ export async function signIn(pg: Pool, input: SignInInput, now: Date): Promise<S
  * stolen cookie would otherwise be an unbounded oracle on the current password
  * at whatever rate the concurrency gate allows — which is the one thing the
  * lockout exists to stop, arrived at through a different door.
+ *
+ * It does **not** clear the count on success, and a sign-in does. A password
+ * check is half a credential: it is the first step of a request that still has
+ * its second factor to prove, so clearing here would let a caller who knows the
+ * password reset the count between guesses at the code and never reach the
+ * lockout at all. The count is cleared by a complete sign-in, which is the only
+ * thing that shows every factor the account has.
  */
 export async function checkAccountPassword(
   pg: Pool,
@@ -330,10 +380,6 @@ export async function checkAccountPassword(
       await client.query('COMMIT')
       return { ok: false, reason: 'invalid' }
     }
-    await client.query(
-      'UPDATE admin_account SET failed_logins = 0, locked_until = NULL, updated_at = $1',
-      [now],
-    )
     await client.query('COMMIT')
     return { ok: true }
   } catch (err) {
@@ -349,52 +395,53 @@ export async function checkAccountPassword(
  * the authenticator currently enrolled, or an unused recovery code. Same
  * transaction, so a code is spent exactly once here as it is at a sign-in.
  *
- * False when the account is not enrolled at all, because then there is no
+ * **A wrong code costs the account exactly what a wrong password costs**, and
+ * the lockout it earns is honoured here too. Without that, a caller holding a
+ * session and the password had an unbounded oracle on the second factor: the
+ * password check in front of this one succeeds every time, so nothing was
+ * counted and nothing ever locked, and a six-digit code is a million guesses
+ * whatever the authenticator app holds. It is the same argument that puts a
+ * password check behind a session under the lockout, one factor along.
+ *
+ * `invalid` when the account is not enrolled at all, because then there is no
  * second factor to spend and the caller must not treat "nothing to check" as
- * "checked".
+ * "checked" — and that case records nothing, since there was no credential to
+ * get wrong.
  */
 export async function useSecondFactor(
   pg: Pool,
   o: { code?: string | undefined; recoveryCode?: string | undefined; now: Date },
-): Promise<boolean> {
+): Promise<SignInRefusal | { ok: true }> {
   const client = await pg.connect()
   try {
     await client.query('BEGIN')
     const r = await client.query<AccountRow>(`${SELECT_ACCOUNT} FOR UPDATE`)
     const row = r.rows[0]
-    if (!row || row.totp_secret === null) {
+    if (!row) {
       await client.query('COMMIT')
-      return false
+      return { ok: false, reason: 'no_admin' }
+    }
+    if (row.totp_secret === null) {
+      await client.query('COMMIT')
+      return { ok: false, reason: 'invalid' }
     }
     const account = toAccount(row)
-    if (o.recoveryCode !== undefined) {
-      const normalised = normaliseRecoveryCode(o.recoveryCode)
-      // The same helper the sign-in uses, for the same reason: one place knows
-      // how a recovery code is stored and how it is spent.
-      const spent = normalised !== null && (await spendRecoveryCode(client, normalised, o.now))
+    if (account.lockedUntil && account.lockedUntil.getTime() > o.now.getTime()) {
       await client.query('COMMIT')
-      return spent
+      return {
+        ok: false,
+        reason: 'locked',
+        retryAfterSeconds: Math.ceil((account.lockedUntil.getTime() - o.now.getTime()) / 1000),
+      }
     }
-    if (o.code === undefined) {
+    const spent = await spendSecondFactor(client, account, o)
+    if (!spent) {
+      await recordFailure(client, account, o.now)
       await client.query('COMMIT')
-      return false
+      return { ok: false, reason: 'invalid' }
     }
-    const check = verifyTotp({
-      secret: account.totpSecret as string,
-      code: o.code,
-      atMs: o.now.getTime(),
-      lastStep: account.totpLastStep,
-    })
-    if (!check) {
-      await client.query('COMMIT')
-      return false
-    }
-    await client.query('UPDATE admin_account SET totp_last_step = $1, updated_at = $2', [
-      check.step,
-      o.now,
-    ])
     await client.query('COMMIT')
-    return true
+    return { ok: true }
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {})
     throw err

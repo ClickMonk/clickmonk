@@ -19,6 +19,7 @@ import { clientAddress } from './app.js'
 import {
   CLEARED_SESSION_COOKIE,
   SESSION_ABSOLUTE_MS,
+  SESSION_IDLE_MS,
   createSession,
   deleteExpiredSessions,
   requireCredential,
@@ -56,8 +57,6 @@ const ConfirmBody = z
     code: z.string().max(16),
   })
   .strict()
-
-const PasswordOnlyBody = z.object({ password: z.string().min(1).max(MAX_PASSWORD_LENGTH) }).strict()
 
 /**
  * The password plus, when a second factor is already enrolled, that factor.
@@ -150,9 +149,15 @@ async function confirmSecondFactor(
     recoveryCode: body.recoveryCode,
     now: ctx.now(),
   })
-  if (!used) {
-    fail(403, 'invalid_code', 'that code does not match this account')
+  if (used.ok) return
+  // A wrong code counts against the account and can lock it, exactly as a wrong
+  // password does, so this answers the lockout rather than swallowing it.
+  if (used.reason === 'locked') {
+    fail(429, 'locked', 'too many failed attempts; this account is locked for a while', {
+      'retry-after': String(used.retryAfterSeconds),
+    })
   }
+  fail(403, 'invalid_code', 'that code does not match this account')
 }
 
 export function registerSessionRoutes(app: FastifyInstance, ctx: AdminContext): void {
@@ -196,9 +201,13 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: AdminContext): 
     }
     if (!result.ok) {
       ctx.loginAttempts.fail(key, tick)
-      if (result.reason === 'no_admin') {
-        return fail(503, 'no_admin', 'this install has no admin account yet')
-      }
+      // `no_admin` is deliberately not answered here. This route is anonymous
+      // and Caddy serves it to the whole internet on the admin host, so saying
+      // "this install has no admin account yet" tells a stranger the account is
+      // still unclaimed — the one thing `/health` is careful not to say. It
+      // reads as a wrong password instead, and costs the same: `signIn` runs a
+      // full scrypt pass against a throwaway hash when there is no account.
+      // Whoever is setting the install up is at the CLI, not at this form.
       if (result.reason === 'locked') {
         return fail(429, 'locked', 'too many failed attempts; this account is locked for a while', {
           'retry-after': String(result.retryAfterSeconds),
@@ -232,6 +241,10 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: AdminContext): 
 
   app.get('/api/sessions', async (req) => {
     const credential = requireSession(req)
+    // The same two bounds `deleteExpiredSessions` deletes on. The sweep only
+    // runs at a sign-in, so between sign-ins this is what stops a session that
+    // one of its bounds has already ended from being listed as live.
+    const now = ctx.now()
     const r = await ctx.pg.query<{
       id: string
       created_at: Date
@@ -241,7 +254,9 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: AdminContext): 
       ip: string
     }>(
       `SELECT id, created_at, last_seen_at, expires_at, user_agent, ip
-         FROM sessions ORDER BY created_at DESC, id LIMIT 200`,
+         FROM sessions WHERE expires_at > $1 AND last_seen_at > $2
+         ORDER BY created_at DESC, id LIMIT 200`,
+      [now, new Date(now.getTime() - SESSION_IDLE_MS)],
     )
     return {
       sessions: r.rows.map((s) => ({
@@ -353,11 +368,20 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: AdminContext): 
     return { ok: true }
   })
 
-  /** A fresh set. Every code printed before this one stops working. */
+  /**
+   * A fresh set. Every code printed before this one stops working.
+   *
+   * The current factor is required, as it is to replace or remove the
+   * authenticator app — because this route issues one. A session and the
+   * password alone could otherwise mint a set of recovery codes and then spend
+   * one of them as the second factor on `DELETE /api/totp`: two requests, and
+   * the second factor is gone without the attacker ever holding it.
+   */
   app.post('/api/totp/recovery-codes', async (req) => {
     requireSession(req)
-    const body = readBody(PasswordOnlyBody, req.body)
+    const body = readBody(SecondFactorBody, req.body)
     await confirmPassword(ctx, body.password)
+    await confirmSecondFactor(ctx, body)
     const account = await loadAccount(ctx.pg)
     if (!account || account.totpSecret === null) {
       fail(400, 'totp_not_enabled', 'recovery codes are for an account with an authenticator app')

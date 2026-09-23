@@ -118,6 +118,12 @@ export function buildAdminApp(
     // by name, so this is the second gate rather than the first — and the
     // Compose network is not a boundary: any container in the install can
     // open a connection to this port and send whatever Host it likes.
+    //
+    // `normaliseHost` returns null for a name it cannot parse, which is never
+    // equal to a configured host, so a malformed Host is refused by the same
+    // line. A request with no Host header at all cannot be made through
+    // `inject`, which substitutes one: that case belongs to the suite that
+    // drives a real socket.
     if (normaliseHost(req.hostname ?? '') !== ctx.adminHost) {
       return reply.code(404).send({ error: 'not_found', message: 'no such host on this service' })
     }

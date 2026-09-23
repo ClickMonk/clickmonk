@@ -77,10 +77,15 @@ export const read = (cookie?: string): Record<string, string> => ({
   ...(cookie ? { cookie } : {}),
 })
 
-/** The `Cookie` header value for a session token taken from a `Set-Cookie`. */
+/**
+ * The `Cookie` header value for a session token taken from a `Set-Cookie`.
+ * Built from `SESSION_COOKIE` rather than from the name written out, so a
+ * change to the name — the `__Host-` prefix, say — cannot leave this reading
+ * one cookie and sending another.
+ */
 export function cookieFrom(setCookie: string | string[] | undefined): string {
   const first = Array.isArray(setCookie) ? setCookie[0] : setCookie
-  const value = /cm_admin=([^;]*)/.exec(first ?? '')?.[1] ?? ''
+  const value = new RegExp(`${SESSION_COOKIE}=([^;]*)`).exec(first ?? '')?.[1] ?? ''
   return `${SESSION_COOKIE}=${value}`
 }
 

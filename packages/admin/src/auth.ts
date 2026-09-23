@@ -19,7 +19,20 @@ import { fail, parseCookies } from './http.js'
  * account, owner or admin id in a body, a query or a path, and every body
  * schema is strict, so sending one is a 400.
  */
-export const SESSION_COOKIE = 'cm_admin'
+/**
+ * The `__Host-` prefix is not decoration. Without it, a sibling host under the
+ * same registrable domain — a link domain on a subdomain, a stray staging box,
+ * anything that can get a certificate — can set a cookie of this name scoped
+ * with `Domain=`, and the browser then sends two cookies of the same name. The
+ * request carries both, the parser keeps one, and the planted value can be the
+ * one that wins: session fixation that neither `SameSite=Strict` nor the
+ * `Origin` check touches, because the request really is same-site and really
+ * does come from the admin origin. A browser refuses to set a `__Host-` cookie
+ * that carries a `Domain` attribute at all, which is the only mechanism that
+ * closes it, so the prefix is what makes the name unforgeable from a sibling.
+ * It also requires `Secure` and `Path=/`, which this cookie already has.
+ */
+export const SESSION_COOKIE = '__Host-cm_admin'
 /** A session ends this long after it was created, whatever it has been doing. */
 export const SESSION_ABSOLUTE_MS = 30 * 24 * 60 * 60 * 1000
 /** And this long after its last request. */
@@ -62,9 +75,23 @@ export async function createSession(
   return { id: r.rows[0]?.id as string, token, expiresAt }
 }
 
-/** Removes every session whose absolute expiry has passed. Run after a sign-in. */
+/**
+ * Removes every session that is past either of its two bounds. Run after a
+ * sign-in.
+ *
+ * Both bounds, not just the absolute one: a session is dead the moment either
+ * has passed, and a row that only the idle bound has killed still carries a
+ * future `expires_at`. Deleting on the absolute bound alone left those rows to
+ * be listed as live, with an expiry weeks away, until the cookie happened to be
+ * presented again — which for an abandoned browser is never. The admin reading
+ * that list is reading it to decide whether anything is signed in that should
+ * not be, so a dead row shown as live is the one thing it must not do.
+ */
 export async function deleteExpiredSessions(pg: Pool, now: Date): Promise<number> {
-  const r = await pg.query('DELETE FROM sessions WHERE expires_at <= $1', [now])
+  const r = await pg.query('DELETE FROM sessions WHERE expires_at <= $1 OR last_seen_at <= $2', [
+    now,
+    new Date(now.getTime() - SESSION_IDLE_MS),
+  ])
   return r.rowCount ?? 0
 }
 

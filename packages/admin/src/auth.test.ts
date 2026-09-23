@@ -3,7 +3,7 @@ import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import type { FastifyInstance } from 'fastify'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { createAccount } from './account.js'
-import { SESSION_ABSOLUTE_MS, SESSION_IDLE_MS } from './auth.js'
+import { SESSION_ABSOLUTE_MS, SESSION_COOKIE, SESSION_IDLE_MS } from './auth.js'
 import {
   ADMIN_EMAIL,
   ADMIN_HOST,
@@ -139,6 +139,22 @@ describe('what the admin service answers at all', () => {
     expect(r.headers['strict-transport-security']).toBe('max-age=31536000')
   })
 
+  // The refusal headers are set in the request hook, before anything knows
+  // whether a route will match, so the answer a stranger is most likely to get
+  // carries them too. Pinned separately because the not-found handler is a
+  // different code path from every route above it.
+  it('puts the same headers on a route that does not exist', async () => {
+    const r = await app.inject({ method: 'GET', url: '/not-a-route', headers: read() })
+    expect(r.statusCode).toBe(404)
+    expect(r.json().error).toBe('not_found')
+    expect(r.headers['cache-control']).toBe('no-store')
+    expect(r.headers['x-frame-options']).toBe('DENY')
+    expect(r.headers['x-content-type-options']).toBe('nosniff')
+    expect(r.headers['referrer-policy']).toBe('no-referrer')
+    expect(r.headers['content-security-policy']).toContain("default-src 'none'")
+    expect(r.headers['strict-transport-security']).toBe('max-age=31536000')
+  })
+
   it('never answers a CORS header, so no other origin can read it', async () => {
     const cookie = await signedIn(app, pg)
     const r = await app.inject({
@@ -167,13 +183,21 @@ describe('the session cookie', () => {
     expect(cookie).toContain('SameSite=Strict')
     expect(cookie).toContain('Path=/')
     expect(cookie).not.toContain('Domain=')
+    // The `__Host-` prefix, which is what stops a sibling host under the same
+    // registrable domain from setting a `Domain=`-scoped cookie of this name
+    // and having the planted value be the one the parser keeps. A browser
+    // refuses a `__Host-` cookie that carries a `Domain` attribute, so the
+    // name cannot be forged from anywhere but this host — and the prefix only
+    // holds if the cookie is also `Secure` with `Path=/`, asserted above.
+    expect(cookie.startsWith('__Host-')).toBe(true)
+    expect(SESSION_COOKIE.startsWith('__Host-')).toBe(true)
   })
 
   // A stolen dump of `sessions` is not a way in: the row holds a digest, and
   // the cookie holds the token.
   it('stores only a digest of the token', async () => {
     const cookie = await signedIn(app, pg)
-    const token = cookie.split('=')[1] as string
+    const token = cookie.slice(cookie.indexOf('=') + 1)
     const r = await pg.query<{ token_hash: string }>('SELECT token_hash FROM sessions')
     expect(r.rows[0]?.token_hash).toBe(hashToken(token))
     expect(r.rows[0]?.token_hash).not.toContain(token)
@@ -234,7 +258,7 @@ describe('the session cookie', () => {
       const r = await app.inject({
         method: 'GET',
         url: '/api/me',
-        headers: read(`cm_admin=${value}`),
+        headers: read(`${SESSION_COOKIE}=${value}`),
       })
       expect(r.statusCode, value.slice(0, 8)).toBe(401)
     }
@@ -358,12 +382,28 @@ describe('an API key', () => {
   it('is refused once revoked, once expired, and when the secret is wrong', async () => {
     const live = await keyFor(pg, 'live')
     const revoked = await keyFor(pg, 'revoked')
+    // A third key, neither revoked nor expired, so the wrong-secret row below
+    // is refused by the secret check and by nothing else. Built from the
+    // expired key's id, the row would pass whether the secret was compared or
+    // not — which is what made this assertion pin nothing.
+    const good = await keyFor(pg, 'good')
     await pg.query('UPDATE api_keys SET revoked_at = now() WHERE name = $1', ['revoked'])
     await pg.query("UPDATE api_keys SET expires_at = now() - interval '1 day' WHERE name = $1", [
       'live',
     ])
     const expired = live
-    const wrongSecret = `${live.split('_').slice(0, 2).join('_')}_${'a'.repeat(43)}`
+    // That live key's own id, with 43 characters of the wrong secret.
+    const wrongSecret = `${good.split('_').slice(0, 2).join('_')}_${'a'.repeat(43)}`
+    // It really is live: presented whole, it authenticates.
+    expect(
+      (
+        await app.inject({
+          method: 'GET',
+          url: '/api/me',
+          headers: { host: ADMIN_HOST, authorization: `Bearer ${good}` },
+        })
+      ).statusCode,
+    ).toBe(200)
     for (const key of [revoked, expired, wrongSecret, 'cmk_not_a_key', 'garbage']) {
       const r = await app.inject({
         method: 'GET',
@@ -380,7 +420,7 @@ describe('an API key', () => {
     const viaCookie = await app.inject({
       method: 'GET',
       url: '/api/me',
-      headers: read(`cm_admin=${key}`),
+      headers: read(`${SESSION_COOKIE}=${key}`),
     })
     expect(viaCookie.statusCode).toBe(401)
     const viaQuery = await app.inject({

@@ -4,6 +4,7 @@ import type { FastifyInstance } from 'fastify'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { AccountExistsError, createAccount, lockoutMs, signIn } from './account.js'
 import { LOGIN_ATTEMPT_LIMIT, LOGIN_ATTEMPT_WINDOW_MS } from './app.js'
+import { SESSION_IDLE_MS } from './auth.js'
 import {
   ADMIN_EMAIL,
   ADMIN_PASSWORD,
@@ -73,10 +74,21 @@ describe('signing in', () => {
     expect(wrongEmail.headers['set-cookie']).toBeUndefined()
   })
 
-  it('says so when the install has no admin account yet', async () => {
-    const r = await signInWith({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
-    expect(r.statusCode).toBe(503)
-    expect(r.json().error).toBe('no_admin')
+  // An install nobody has claimed yet is the one thing `/health` refuses to
+  // say, because whoever reaches the CLI first becomes the admin. Saying it
+  // here instead would give it away to the same stranger: this route is
+  // anonymous and Caddy serves it on the admin host. So it reads exactly as a
+  // wrong password does, byte for byte.
+  it('answers an install with no admin exactly as it answers a wrong password', async () => {
+    const unclaimed = await signInWith({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+    expect(unclaimed.statusCode).toBe(401)
+    expect(unclaimed.json().error).toBe('invalid_credentials')
+    expect(unclaimed.body).not.toContain('no_admin')
+
+    await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+    const wrongPassword = await signInWith({ email: ADMIN_EMAIL, password: 'not the password' })
+    expect(wrongPassword.statusCode).toBe(401)
+    expect(unclaimed.json()).toEqual(wrongPassword.json())
   })
 
   it('locks the account after five failures, for longer each time', async () => {
@@ -213,6 +225,50 @@ describe('signing in', () => {
     await signInWith({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
     const rows = await pg.query<{ n: number }>('SELECT count(*)::int AS n FROM sessions')
     expect(rows.rows[0]?.n).toBe(1)
+  })
+
+  // A session dies at whichever of its two bounds comes first, and the idle
+  // one nearly always comes first: an abandoned browser stops asking long
+  // before the absolute bound. Sweeping on the absolute bound alone left those
+  // rows to be listed as live with an expiry weeks away — which is the exact
+  // opposite of what the admin is reading that list to find out.
+  it('treats a session idle past its bound as gone, in the sweep and in the list', async () => {
+    const mine = await signedIn(app, pg)
+    const theirs = cookieFrom(
+      (await signInWith({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD })).headers['set-cookie'],
+    )
+    const listFor = (cookie: string) =>
+      app.inject({ method: 'GET', url: '/api/sessions', headers: read(cookie) })
+    expect((await listFor(mine)).json().sessions).toHaveLength(2)
+
+    // Two steps just inside the idle bound, asking on mine each time: mine is
+    // touched and stays live, theirs is never touched and goes idle.
+    for (let i = 0; i < 2; i++) {
+      clock.advance(SESSION_IDLE_MS - 1000)
+      expect(
+        (await app.inject({ method: 'GET', url: '/api/me', headers: read(mine) })).statusCode,
+      ).toBe(200)
+    }
+    // Still on the table — nothing has swept yet — and already out of the list.
+    const staleRows = () =>
+      pg.query<{ n: number }>('SELECT count(*)::int AS n FROM sessions WHERE last_seen_at <= $1', [
+        new Date(clock.now().getTime() - SESSION_IDLE_MS),
+      ])
+    expect((await staleRows()).rows[0]?.n).toBe(1)
+    const listed = (await listFor(mine)).json().sessions
+    expect(listed).toHaveLength(1)
+    expect(listed[0].current).toBe(true)
+
+    // And the next sign-in sweeps it off the table, not merely out of the list:
+    // the row is not coming back, and leaving it lets the same cookie be tried
+    // against it for as long as the absolute bound has left to run.
+    await signInWith({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+    expect((await staleRows()).rows[0]?.n).toBe(0)
+    // The cookie for it is refused too, so the list, the sweep and the guard
+    // all say the same thing about the same session.
+    expect(
+      (await app.inject({ method: 'GET', url: '/api/me', headers: read(theirs) })).statusCode,
+    ).toBe(401)
   })
 })
 
@@ -463,6 +519,84 @@ describe('two-factor authentication', () => {
     }
   })
 
+  // The second factor is the one credential a session could otherwise guess at
+  // for free. The password check in front of it succeeds every time for a
+  // caller who holds the password, so without this nothing is counted and
+  // nothing ever locks — and a six-digit code at that rate is a million
+  // guesses. A wrong code behind a session costs what a wrong password behind a
+  // session costs.
+  it('counts a wrong second factor behind a session, and locks the account on it', async () => {
+    const cookie = await signedIn(app, pg)
+    const { secret } = await enrol(cookie)
+    for (let i = 0; i < 5; i++) {
+      const r = await app.inject({
+        method: 'DELETE',
+        url: '/api/totp',
+        headers: write(cookie),
+        // The password is right every time: it is the code that is being
+        // guessed, which is exactly the case that used to cost nothing.
+        payload: { password: ADMIN_PASSWORD, code: '000000' },
+      })
+      expect(r.statusCode, `attempt ${i}`).toBe(403)
+      expect(r.json().error, `attempt ${i}`).toBe('invalid_code')
+    }
+    const row = await pg.query<{ failed_logins: number; locked_until: Date | null }>(
+      'SELECT failed_logins, locked_until FROM admin_account',
+    )
+    expect(row.rows[0]?.failed_logins).toBe(5)
+    expect(row.rows[0]?.locked_until).not.toBeNull()
+
+    // And the lock is the account's, so a right code does not get through it...
+    clock.advance(60_000)
+    const locked = await app.inject({
+      method: 'DELETE',
+      url: '/api/totp',
+      headers: write(cookie),
+      payload: {
+        password: ADMIN_PASSWORD,
+        code: totpCode(secret, totpStep(clock.now().getTime())),
+      },
+    })
+    expect(locked.statusCode).toBe(429)
+    expect(locked.json().error).toBe('locked')
+    // ...nor does the sign-in form: one lockout, not three.
+    const signIn_ = await signInWith({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+    expect(signIn_.statusCode).toBe(429)
+    expect(signIn_.json().error).toBe('locked')
+  })
+
+  // A session and the password could otherwise mint a set of recovery codes
+  // and spend one of them as "the current factor" on the next request, which
+  // is the second factor removed by someone who never held it.
+  it('needs the current factor to replace the recovery codes', async () => {
+    const cookie = await signedIn(app, pg)
+    const { secret } = await enrol(cookie)
+    const withoutFactor = await app.inject({
+      method: 'POST',
+      url: '/api/totp/recovery-codes',
+      headers: write(cookie),
+      payload: { password: ADMIN_PASSWORD },
+    })
+    expect(withoutFactor.statusCode).toBe(403)
+    expect(withoutFactor.json().error).toBe('totp_required')
+    expect(
+      (await pg.query('SELECT 1 FROM admin_recovery_codes WHERE used_at IS NULL')).rowCount,
+    ).toBe(10)
+
+    clock.advance(60_000)
+    const withFactor = await app.inject({
+      method: 'POST',
+      url: '/api/totp/recovery-codes',
+      headers: write(cookie),
+      payload: {
+        password: ADMIN_PASSWORD,
+        code: totpCode(secret, totpStep(clock.now().getTime())),
+      },
+    })
+    expect(withFactor.statusCode).toBe(200)
+    expect(withFactor.json().recoveryCodes).toHaveLength(10)
+  })
+
   it('then asks for a code at every sign-in', async () => {
     const cookie = await signedIn(app, pg)
     const { secret } = await enrol(cookie)
@@ -544,18 +678,22 @@ describe('two-factor authentication', () => {
 
   it('refuses a recovery code this install never issued, and one from an old set', async () => {
     const cookie = await signedIn(app, pg)
-    const { recoveryCodes } = await enrol(cookie)
+    const { secret, recoveryCodes } = await enrol(cookie)
     const stranger = await signInWith({
       email: ADMIN_EMAIL,
       password: ADMIN_PASSWORD,
       recoveryCode: newRecoveryCode(),
     })
     expect(stranger.statusCode).toBe(401)
+    clock.advance(60_000)
     const replaced = await app.inject({
       method: 'POST',
       url: '/api/totp/recovery-codes',
       headers: write(cookie),
-      payload: { password: ADMIN_PASSWORD },
+      payload: {
+        password: ADMIN_PASSWORD,
+        code: totpCode(secret, totpStep(clock.now().getTime())),
+      },
     })
     expect(replaced.statusCode).toBe(200)
     const old = await signInWith({
