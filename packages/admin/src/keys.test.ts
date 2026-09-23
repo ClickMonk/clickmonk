@@ -45,10 +45,23 @@ describe('minting an API key', () => {
     const secret = key.slice(`cmk_${id}_`.length)
     expect(stored.rows[0]?.secret_hash).toBe(hashToken(secret))
 
-    // And no later read gives it back.
+    // And no later read gives it back. The whole field set is pinned, not just
+    // the absence of the secret itself: a listing that carried `secret_hash`
+    // would pass a "does not contain the secret" check — the digest is not the
+    // secret — while handing out the material an offline guess is checked
+    // against. So what a listed key may say is exactly these six fields.
     const list = await app.inject({ method: 'GET', url: '/api/keys', headers: read(cookie) })
     expect(list.statusCode).toBe(200)
     expect(JSON.stringify(list.json())).not.toContain(secret)
+    expect(JSON.stringify(list.json())).not.toContain(hashToken(secret))
+    expect(Object.keys(list.json().keys[0]).sort()).toEqual([
+      'createdAt',
+      'expiresAt',
+      'id',
+      'lastUsedAt',
+      'name',
+      'revokedAt',
+    ])
     expect(list.json().keys[0]).toMatchObject({ id, name: 'scripting', revokedAt: null })
   })
 
