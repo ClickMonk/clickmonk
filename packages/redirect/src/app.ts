@@ -136,6 +136,14 @@ export function buildRedirectApp(
    * own answers carry its internal error codes and no `Cache-Control`, and the
    * bounds here are reachable by anyone: a body over the limit, or in a media
    * type this service does not read.
+   *
+   * **Where this does not reach.** Node's own HTTP parser answers before any of
+   * this runs, so an over-long header block is a `431` and a malformed request
+   * line a `400`, both as Fastify's JSON with no `Cache-Control`. Nothing about
+   * a link is in either answer and neither depends on any link's state, so there
+   * is nothing to leak and no oracle in them — but a reader comparing this
+   * handler against what the service actually answers should not have to
+   * discover that by testing it.
    */
   app.setErrorHandler((err: { statusCode?: number }, req, reply) => {
     const status = typeof err.statusCode === 'number' ? err.statusCode : 500

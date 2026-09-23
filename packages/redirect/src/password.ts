@@ -148,14 +148,31 @@ export function passwordPage(o: { wrong: boolean } = { wrong: false }): string {
 `
 }
 
-function plainPage(title: string, message: string): string {
+/**
+ * Both arguments are escaped, though both call sites pass a literal today. A
+ * function that interpolates unescaped text into HTML is safe only for as long
+ * as nobody gives it anything from a request, and the third caller is the one
+ * that would.
+ */
+export function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+export function plainPage(title: string, message: string): string {
+  const safeTitle = escapeHtml(title)
+  const safeMessage = escapeHtml(message)
   return `<!doctype html>
 <html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>${title}</title>
-<p>${message}</p>
+<title>${safeTitle}</title>
+<p>${safeMessage}</p>
 </html>
 `
 }

@@ -113,6 +113,28 @@ describe('storing a password', () => {
     )
   })
 
+  it('verifies a stored hash whose key is shorter than this build writes', async () => {
+    // Every hash `hashPassword` writes carries a 32-byte key, so nothing else
+    // here notices whether verification derives its candidate at the *stored*
+    // key's length or at a constant 32. A hash written by a build with a
+    // different key length, or by another implementation, is the case that does:
+    // at a constant, the candidate is 32 bytes against a 16-byte stored key,
+    // `timingSafeEqual` throws on the mismatch, and the right password is read
+    // as wrong. The length is also why this call needs no length comparison in
+    // front of it, which is a claim nothing else in this suite tests.
+    const salt = Buffer.from('a-salt-of-sixteen')
+    const key = await scryptRaw('correct horse battery', salt, 16, {
+      N: 16384,
+      r: 8,
+      p: 1,
+      maxmem: MAX_SCRYPT_MEMORY_BYTES,
+    })
+    expect(key).toHaveLength(16)
+    const stored = frame(`16384$8$1$${salt.toString('base64url')}$${key.toString('base64url')}`)
+    expect(await verifyPassword('correct horse battery', stored)).toBe(true)
+    expect(await verifyPassword('correct horse batterz', stored)).toBe(false)
+  })
+
   it('refuses a stored hash whose key is too short to trust a match', async () => {
     // Built from the exact byte scrypt derives for this password under this
     // salt and cost, at a one-byte key length: without a floor on the stored

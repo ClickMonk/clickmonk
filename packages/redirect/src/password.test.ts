@@ -15,6 +15,7 @@ import {
   passwordFromBody,
   passwordPage,
   passwordProofCookie,
+  plainPage,
   serverBusyPage,
   tooManyAttemptsPage,
 } from './password.js'
@@ -238,6 +239,19 @@ describe('the pages beside it', () => {
       expect(page).toContain('noindex')
       expect(page).not.toContain('name="password"')
     }
+  })
+})
+
+describe('the plain pages\u2019 own escaping', () => {
+  it('escapes both of its arguments', () => {
+    // Both call sites pass a literal, so this is not reachable today; it is here
+    // because the next caller is the one that would pass something from a
+    // request, and a function that interpolates raw text is a trap by then.
+    const page = plainPage('<script>t</script>', '<img src=x onerror="a&b">')
+    expect(page).not.toContain('<script>')
+    expect(page).not.toContain('<img')
+    expect(page).toContain('&lt;script&gt;t&lt;/script&gt;')
+    expect(page).toContain('&lt;img src=x onerror=&quot;a&amp;b&quot;&gt;')
   })
 })
 
