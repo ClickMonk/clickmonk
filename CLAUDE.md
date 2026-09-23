@@ -132,7 +132,7 @@ test-only file that is not named `*.test.ts` must be excluded there too, or it s
 pull request, run the full gate in CI's order, so local red means CI red:
 
 ```sh
-pnpm lint && pnpm typecheck && pnpm build && pnpm test
+pnpm lint && pnpm lint:sh && pnpm typecheck && pnpm build && pnpm test
 ```
 
 **Run one test suite at a time.** Every database-backed test resets the shared test
@@ -204,9 +204,9 @@ That rule is easy to satisfy badly, so:
 
 Anything that runs on an operator's host rather than in a container — an installer,
 backup or restore — targets **bash 3.2**, the version macOS still ships: no associative
-arrays, no `mapfile`. There is no such script yet. The first one to land also pins
-`shellcheck` in the repo and has CI run the pinned copy, never a runner's preinstalled
-binary, so a lint that fails in CI can be reproduced locally.
+arrays, no `mapfile`. `install.sh` is the first. `shellcheck` is pinned as a Docker image
+and run by `pnpm lint:sh`, in CI and locally with the same command, so a failure there is
+reproducible here.
 
 ## Conventions
 

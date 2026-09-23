@@ -11,6 +11,7 @@
     "test:watch": "vitest",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
+    "lint:sh": "docker run --rm -v \"$PWD:/mnt:ro\" -w /mnt koalaman/shellcheck:v0.10.0 --shell=bash install.sh",
     "typecheck": "tsc -b"
   },
   "devDependencies": {

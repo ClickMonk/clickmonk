@@ -73,6 +73,10 @@ jobs:
         with: { node-version: 22, cache: pnpm }
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
+      # The pinned shellcheck image, never the runner's preinstalled binary:
+      # the two are different versions and they disagree, so a failure here
+      # has to be reproducible with the same command locally.
+      - run: pnpm lint:sh
       - run: pnpm typecheck
       - run: pnpm build
       - run: docker compose -f docker-compose.test.yml up -d --wait
