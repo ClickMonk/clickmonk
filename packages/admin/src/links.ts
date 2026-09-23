@@ -150,14 +150,54 @@ function asInput(l: LinkRow): Record<string, unknown> {
   }
 }
 
-async function linkById(ctx: AdminContext, id: string): Promise<LinkRow> {
+/**
+ * Anything a query can be sent through: the pool, or one client taken from it.
+ *
+ * Which one matters. A handler holding a client from a pool of four must not
+ * ask that pool for a second one — it would wait behind itself, and four such
+ * requests at once take the pool to zero with nobody left to release. So a
+ * read that happens while a client is held is sent through that client.
+ */
+type Queryable = Pick<PoolClient, 'query'>
+
+async function linkById(q: Queryable, id: string): Promise<LinkRow> {
   if (!z.string().uuid().safeParse(id).success) fail(404, 'not_found', 'no such link')
-  const r = await ctx.pg.query<LinkRow>(`${SELECT_LINKS} WHERE l.id = $1 GROUP BY l.id, d.host`, [
-    id,
-  ])
+  const r = await q.query<LinkRow>(`${SELECT_LINKS} WHERE l.id = $1 GROUP BY l.id, d.host`, [id])
   const row = r.rows[0]
   if (!row) fail(404, 'not_found', 'no such link')
   return row as LinkRow
+}
+
+/**
+ * A body as its own top-level properties and nothing else, with no prototype
+ * behind it.
+ *
+ * Two reads here decide something: whether the caller named a slug, and
+ * whether they mentioned the password — the second decides whether a stored
+ * hash survives a patch. Both are answers about what the caller *wrote*, and a
+ * plain object cannot give one on its own. A property planted on
+ * `Object.prototype` is returned by `data[key]` and reported by `key in data`,
+ * which is how zod decides a key was present: it reads the planted value and
+ * copies it into its output as an own property, where a later `Object.hasOwn`
+ * agrees that the caller sent it. So the prototype has to be stripped *before*
+ * the parse and the own-property read has to happen after it; either half
+ * alone answers nothing.
+ *
+ * It is shallow, deliberately: it covers the fields this module branches on.
+ * Everything nested is validated by `core` against a strict schema rather than
+ * decided here.
+ */
+function ownFields(body: unknown): unknown {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return body
+  return Object.assign(Object.create(null), body)
+}
+
+/**
+ * The value the caller wrote for a field, or `undefined` when they did not
+ * write it at all. The own-property half of the pair `ownFields` describes.
+ */
+function written<T, K extends keyof T & string>(body: T, key: K): T[K] | undefined {
+  return Object.hasOwn(body as object, key) ? body[key] : undefined
 }
 
 /** Validates through `core`, and turns its ZodError into a 400 that names the field. */
@@ -195,7 +235,7 @@ async function writeTargets(
 export function registerLinkRoutes(app: FastifyInstance, ctx: AdminContext): void {
   app.get('/api/links', async (req) => {
     requireCredential(req)
-    const q = readBody(ListQuery, req.query)
+    const q = readBody(ListQuery, ownFields(req.query))
     const host = q.domain === undefined ? null : normaliseHost(q.domain)
     if (q.domain !== undefined && host === null) fail(400, 'invalid_host', 'not a valid host name')
     const r = await ctx.pg.query<LinkRow>(
@@ -217,24 +257,23 @@ export function registerLinkRoutes(app: FastifyInstance, ctx: AdminContext): voi
 
   app.get<{ Params: { id: string } }>('/api/links/:id', async (req) => {
     requireCredential(req)
-    return asLink(await linkById(ctx, req.params.id))
+    return asLink(await linkById(ctx.pg, req.params.id))
   })
 
   app.post('/api/links', async (req, reply) => {
     requireCredential(req)
-    const body = readBody(CreateBody, req.body)
+    const body = readBody(CreateBody, ownFields(req.body))
     const host = normaliseHost(body.host)
     if (!host) fail(400, 'invalid_host', 'not a valid host name')
     // Whether the caller named a slug decides whether a collision is their
-    // problem or ours, so it is asked of the object itself: a property read
-    // off a parsed body can otherwise be answered by `Object.prototype`.
-    const typedSlug = Object.hasOwn(body, 'slug')
+    // problem or ours, so it is read with `written`, and the slug itself comes
+    // from that same read rather than from a second one.
+    const typedSlug = written(body, 'slug')
+    const password = written(body, 'password')
     // LINK_SCRYPT, not the admin's cost: this hash is verified on the
     // redirect's own request path, where the attempt limiter is the bound.
     const passwordHash =
-      body.password === undefined || body.password === null
-        ? null
-        : await hashPassword(body.password, LINK_SCRYPT)
+      password === undefined || password === null ? null : await hashPassword(password, LINK_SCRYPT)
 
     const client = await ctx.pg.connect()
     try {
@@ -249,7 +288,7 @@ export function registerLinkRoutes(app: FastifyInstance, ctx: AdminContext): voi
       // unknown key to it, so they are left out rather than blanked.
       const { host: _host, password: _password, ...fields } = body
       for (let attempt = 0; attempt < SLUG_ATTEMPTS && id === undefined; attempt++) {
-        input = validate({ ...fields, slug: body.slug ?? newSlug() })
+        input = validate(ownFields({ ...fields, slug: typedSlug ?? newSlug() }))
         const l = await client.query<{ id: string }>(
           `INSERT INTO links (domain_id, slug, name, enabled, backup_url, device_urls,
                               returning_url, countries, click_cap, expires_at, passthrough,
@@ -274,7 +313,7 @@ export function registerLinkRoutes(app: FastifyInstance, ctx: AdminContext): voi
         )
         id = l.rows[0]?.id
         // A slug the admin typed is theirs: it is not silently replaced.
-        if (id === undefined && typedSlug) {
+        if (id === undefined && typedSlug !== undefined) {
           fail(409, 'slug_taken', `${host} already has a link at ${input.slug}`)
         }
       }
@@ -283,7 +322,10 @@ export function registerLinkRoutes(app: FastifyInstance, ctx: AdminContext): voi
       }
       await writeTargets(client, id as string, (input as ParsedLinkInput).targets)
       await client.query('COMMIT')
-      return reply.code(201).send(asLink(await linkById(ctx, id as string)))
+      // Through the client this handler is already holding, not through the
+      // pool: asking the pool for a second client here is a wait that can
+      // never end, because the client that would satisfy it is this one.
+      return reply.code(201).send(asLink(await linkById(client, id as string)))
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {})
       throw err
@@ -296,9 +338,12 @@ export function registerLinkRoutes(app: FastifyInstance, ctx: AdminContext): voi
     requireCredential(req)
     // The body first, as on the domain patch: a malformed body is a 400
     // whether the id exists or not.
-    const body = readBody(PatchBody, req.body)
-    const existing = await linkById(ctx, req.params.id)
-    const merged: Record<string, unknown> = { ...asInput(existing) }
+    const body = readBody(PatchBody, ownFields(req.body))
+    const existing = await linkById(ctx.pg, req.params.id)
+    // Every stored field, then the ones this patch names over the top: what
+    // `core` validates is the whole link as it will be, so a field nobody
+    // mentioned keeps its stored value instead of falling back to a default.
+    const merged: Record<string, unknown> = Object.assign(Object.create(null), asInput(existing))
     for (const [key, value] of Object.entries(body)) {
       if (key === 'password' || value === undefined) continue
       merged[key] = value
@@ -306,9 +351,8 @@ export function registerLinkRoutes(app: FastifyInstance, ctx: AdminContext): voi
     const input = validate(merged)
     // Absent leaves the password as it is; null clears it; a string replaces
     // it, which changes the hash and so stops every proof a visitor holds.
-    // Whether the field was mentioned is asked of the object rather than read
-    // as a property, for the reason the create route gives.
-    const password = Object.hasOwn(body, 'password') ? (body.password ?? null) : undefined
+    // `written`, so that "absent" means the caller left it out.
+    const password = written(body, 'password')
     const passwordHash =
       password === undefined
         ? existing.password_hash
@@ -354,12 +398,12 @@ export function registerLinkRoutes(app: FastifyInstance, ctx: AdminContext): voi
     } finally {
       client.release()
     }
-    return asLink(await linkById(ctx, existing.id))
+    return asLink(await linkById(ctx.pg, existing.id))
   })
 
   app.delete<{ Params: { id: string } }>('/api/links/:id', async (req) => {
     requireCredential(req)
-    const existing = await linkById(ctx, req.params.id)
+    const existing = await linkById(ctx.pg, req.params.id)
     // Targets and the click counter go with it, by cascade.
     await ctx.pg.query('DELETE FROM links WHERE id = $1', [existing.id])
     return { ok: true }

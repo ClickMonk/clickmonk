@@ -1,5 +1,6 @@
 import { LINK_SCRYPT, SCRYPT_PREFIX, verifyPassword } from '@clickmonk/core'
-import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
+import { createPgPool } from '@clickmonk/db'
+import { TEST_PG_URL, resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import type { FastifyInstance } from 'fastify'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { MAX_LINK_PAGE } from './links.js'
@@ -94,38 +95,81 @@ describe('creating a link', () => {
   // The same validator the CLI uses and the snapshot loader trusts. A link the
   // API accepted but core would reject would not be served at all, and the
   // operator would hear nothing about it.
+  //
+  // Each row names the code it expects, because the two schemas answer
+  // differently and which one refused is the point: `invalid_link` is core's,
+  // `invalid_body` is this module's own bound in front of it. Accepting either
+  // would let a row move from one schema to the other — the bound in front
+  // dropped, the rule behind it doing the work — without a test noticing.
   it.each([
-    ['no targets', { targets: [] }],
-    ['a target that is not a URL', { targets: [{ url: 'not a url' }] }],
-    ['a javascript URL', { targets: [{ url: 'javascript:alert(1)' }] }],
-    ['a non-ASCII destination', { targets: [{ url: 'https://example.com/café' }] }],
-    ['a token in the host', { targets: [{ url: 'https://{param:h}/x' }] }],
-    [
-      'weights that do not sum to 100',
-      {
+    { what: 'no targets', payload: { targets: [] }, error: 'invalid_link' },
+    {
+      what: 'a target that is not a URL',
+      payload: { targets: [{ url: 'not a url' }] },
+      error: 'invalid_link',
+    },
+    {
+      what: 'a javascript URL',
+      payload: { targets: [{ url: 'javascript:alert(1)' }] },
+      error: 'invalid_link',
+    },
+    {
+      what: 'a non-ASCII destination',
+      payload: { targets: [{ url: 'https://example.com/café' }] },
+      error: 'invalid_link',
+    },
+    {
+      what: 'a token in the host',
+      payload: { targets: [{ url: 'https://{param:h}/x' }] },
+      error: 'invalid_link',
+    },
+    {
+      what: 'weights that do not sum to 100',
+      payload: {
         targets: [
           { url: target.url, weight: 40 },
           { url: 'https://example.com/b', weight: 40 },
         ],
       },
-    ],
-    [
-      'a weight missing from one of several',
-      { targets: [{ url: target.url, weight: 100 }, { url: 'https://example.com/b' }] },
-    ],
-    ['a slug with a slash', { slug: 'a/b', targets: [target] }],
-    [
-      'a country that is not an alpha-2 code',
-      { targets: [target], countries: { mode: 'allow', list: ['usa'] } },
-    ],
-    ['a traffic action nobody knows', { targets: [target], trafficActions: { bot: 'drop' } }],
-    ['a class nobody knows', { targets: [target], trafficActions: { human: 'flag' } }],
-    ['a cap of zero', { targets: [target], clickCap: 0 }],
-    ['21 targets', { targets: Array.from({ length: 21 }, () => ({ url: target.url, weight: 5 })) }],
-  ])('refuses %s', async (_label, payload) => {
+      error: 'invalid_link',
+    },
+    {
+      what: 'a weight missing from one of several',
+      payload: { targets: [{ url: target.url, weight: 100 }, { url: 'https://example.com/b' }] },
+      error: 'invalid_link',
+    },
+    {
+      what: 'a slug with a slash',
+      payload: { slug: 'a/b', targets: [target] },
+      error: 'invalid_link',
+    },
+    {
+      what: 'a country that is not an alpha-2 code',
+      payload: { targets: [target], countries: { mode: 'allow', list: ['usa'] } },
+      error: 'invalid_link',
+    },
+    {
+      what: 'a traffic action nobody knows',
+      payload: { targets: [target], trafficActions: { bot: 'drop' } },
+      error: 'invalid_link',
+    },
+    {
+      what: 'a class nobody knows',
+      payload: { targets: [target], trafficActions: { human: 'flag' } },
+      error: 'invalid_link',
+    },
+    { what: 'a cap of zero', payload: { targets: [target], clickCap: 0 }, error: 'invalid_link' },
+    {
+      what: '21 targets',
+      payload: { targets: Array.from({ length: 21 }, () => ({ url: target.url, weight: 5 })) },
+      // This module's own cap, refused before core is asked: 21 never reaches
+      // the validator, and the body bound is what says so.
+      error: 'invalid_body',
+    },
+  ])('refuses $what', async ({ payload, error }) => {
     const r = await create(payload)
     expect(r.statusCode).toBe(400)
-    expect(['invalid_link', 'invalid_body']).toContain(r.json().error)
+    expect(r.json().error).toBe(error)
     expect((await pg.query('SELECT 1 FROM links')).rowCount).toBe(0)
   })
 
@@ -271,6 +315,46 @@ describe('changing a link', () => {
     expect(after.json().targets).toHaveLength(1)
   })
 
+  it('keeps every stored field a patch does not mention', async () => {
+    const expiresAt = new Date(clock.now().getTime() + 86_400_000).toISOString()
+    const created = (
+      await create({
+        slug: 'full',
+        targets: [target],
+        enabled: false,
+        clickCap: 500,
+        countries: { mode: 'allow', list: ['US', 'GB'] },
+        expiresAt,
+        backupUrl: 'https://example.com/backup',
+        returningUrl: 'https://example.com/again',
+        passthrough: false,
+        trafficActions: { bot: 'block' },
+      })
+    ).json()
+    const r = await app.inject({
+      method: 'PATCH',
+      url: `/api/links/${created.id}`,
+      headers: write(cookie),
+      payload: { name: 'Renamed' },
+    })
+    expect(r.statusCode).toBe(200)
+    // Read back from the row, field by field: a merge that dropped what the
+    // patch did not mention answers 200 with ten fields quietly back at the
+    // validator's defaults — enabled, passthrough and the rest.
+    const body = r.json()
+    expect(body.name).toBe('Renamed')
+    expect(body.slug).toBe('full')
+    expect(body.enabled).toBe(false)
+    expect(body.clickCap).toBe(500)
+    expect(body.countries).toEqual({ mode: 'allow', list: ['US', 'GB'] })
+    expect(body.expiresAt).toBe(expiresAt)
+    expect(body.backupUrl).toBe('https://example.com/backup')
+    expect(body.returningUrl).toBe('https://example.com/again')
+    expect(body.passthrough).toBe(false)
+    expect(body.trafficActions).toEqual({ bot: 'block' })
+    expect(body.targets).toEqual([{ id: expect.any(String), url: target.url, weight: 100 }])
+  })
+
   it('replaces the targets in order, leaving none behind', async () => {
     const created = (await create({ targets: [target] })).json()
     await app.inject({
@@ -362,12 +446,20 @@ describe('listing links', () => {
       headers: read(cookie),
     })
     expect(tooBig.statusCode).toBe(400)
+    // The code and the whole body, because the interesting failure is a 500:
+    // a bound the schema no longer applies sends the value on to Postgres,
+    // which raises, and the route answers 500 — a refusal of a kind, and not
+    // this one. A test that read only "it did not work" would accept it.
+    expect(tooBig.json().error).toBe('invalid_body')
+    expect(Object.keys(tooBig.json()).sort()).toEqual(['error', 'message'])
     const badCursor = await app.inject({
       method: 'GET',
       url: '/api/links?cursor=not-a-uuid',
       headers: read(cookie),
     })
     expect(badCursor.statusCode).toBe(400)
+    expect(badCursor.json().error).toBe('invalid_body')
+    expect(Object.keys(badCursor.json()).sort()).toEqual(['error', 'message'])
   })
 
   it('filters by domain', async () => {
@@ -390,6 +482,68 @@ describe('listing links', () => {
       headers: read(cookie),
     })
     expect(r.json().links.map((l: { slug: string }) => l.slug)).toEqual(['two'])
+  })
+})
+
+describe('what the caller wrote', () => {
+  it('takes the slug from the body, not from a poisoned prototype', async () => {
+    // A property planted on Object.prototype answers for every plain object
+    // that has none of its own, which is how "the caller did not name a slug"
+    // turns into "the caller named this one". Non-enumerable, because that is
+    // the shape that survives a spread and a JSON round trip unnoticed.
+    //
+    // `slug` and not `password`: a pool reads `password` off its own options
+    // when it opens a connection, so planting that name would test the
+    // database driver rather than this route. The two fields are read the same
+    // way, by the same helper.
+    Object.defineProperty(Object.prototype, 'slug', {
+      value: 'planted',
+      configurable: true,
+      writable: true,
+    })
+    try {
+      const r = await create({ targets: [target] })
+      expect(r.statusCode).toBe(201)
+      expect(r.json().slug).toMatch(/^[A-Za-z0-9]{7}$/)
+    } finally {
+      // biome-ignore lint/performance/noDelete: the planted property has to go, not be set to undefined
+      delete (Object.prototype as unknown as Record<string, unknown>).slug
+    }
+    const stored = await pg.query<{ slug: string }>('SELECT slug FROM links')
+    expect(stored.rows[0]?.slug).not.toBe('planted')
+  })
+})
+
+describe('the client a handler holds', () => {
+  it('reads the new link back through it, so a pool of one still answers', async () => {
+    // One client, and a bounded wait for it. Both halves matter: with one
+    // client, a handler that asks the pool for a second while holding the
+    // first can never be given one; with the wait bounded, that shows up as a
+    // failed request in a known time instead of a hang that only the suite's
+    // own timeout ends. The bound is what makes this deterministic.
+    const tight = createPgPool(TEST_PG_URL, { max: 1, connectTimeoutMs: 1000 })
+    const tightApp = testApp(tight, clock)
+    try {
+      const r = await tightApp.inject({
+        method: 'POST',
+        url: '/api/links',
+        headers: write(cookie),
+        payload: { host: 'go.example.test', slug: 'tight', targets: [target] },
+      })
+      expect(r.statusCode).toBe(201)
+      expect(r.json().slug).toBe('tight')
+      // And it went back afterwards: the next request gets the same one.
+      const after = await tightApp.inject({
+        method: 'GET',
+        url: '/api/links',
+        headers: read(cookie),
+      })
+      expect(after.statusCode).toBe(200)
+      expect(after.json().links.map((l: { slug: string }) => l.slug)).toEqual(['tight'])
+    } finally {
+      await tightApp.close()
+      await tight.end()
+    }
   })
 })
 
