@@ -1,9 +1,12 @@
+import { scrypt as nodeScrypt } from 'node:crypto'
+import { promisify } from 'node:util'
 import { describe, expect, it } from 'vitest'
 import {
   ADMIN_SCRYPT,
   API_KEY_PREFIX,
   LINK_SCRYPT,
   MAX_PASSWORD_LENGTH,
+  MAX_SCRYPT_MEMORY_BYTES,
   SCRYPT_PREFIX,
   digestsMatch,
   hashPassword,
@@ -17,6 +20,13 @@ import {
   passwordFingerprint,
   verifyPassword,
 } from './secrets.js'
+
+const scryptRaw = promisify(nodeScrypt) as (
+  password: string,
+  salt: Buffer,
+  keylen: number,
+  options: Record<string, unknown>,
+) => Promise<Buffer>
 
 /**
  * A stored-hash frame built rather than written out. Nothing in this
@@ -74,28 +84,69 @@ describe('storing a password', () => {
   })
 
   it('refuses a stored value it cannot parse, rather than throwing', async () => {
+    const b64salt = Buffer.from('salt').toString('base64url')
+    const b64hash = Buffer.from('hash').toString('base64url')
     for (const bad of [
       '',
       'not-a-hash',
       frame('16384$8$1$only-five-parts'),
-      'argon2$16384$8$1$c2FsdA$aGFzaA',
-      frame('0$8$1$c2FsdA$aGFzaA'),
-      frame('16384$8$1$c2FsdA$'),
-      frame('16384$8$1$!!!$aGFzaA'),
+      `argon2$16384$8$1$${b64salt}$${b64hash}`,
+      frame(`0$8$1$${b64salt}$${b64hash}`),
+      frame(`16384$8$1$${b64salt}$`),
+      frame(`16384$8$1$!!!$${b64hash}`),
+      // N must be a power of two: scrypt's own algorithm requires it, and a
+      // row that names one that is not must be refused by the parser, not by
+      // whatever the underlying scrypt call happens to validate.
+      frame(
+        `3$8$1$${Buffer.from('salt').toString('base64url')}$${Buffer.alloc(32).toString('base64url')}`,
+      ),
     ]) {
       expect(await verifyPassword('correct horse battery', bad), bad).toBe(false)
     }
   })
 
+  it('refuses a stored hash whose key is too short to trust a match', async () => {
+    // Built from the exact byte scrypt derives for this password under this
+    // salt and cost, at a one-byte key length: without a floor on the stored
+    // key's length, this is not a row the parser merely tolerates — it is one
+    // that would verify as this password's hash, because a one-byte key is a
+    // coin flip, not because it is the right password.
+    const salt = Buffer.from('salt')
+    const shortKey = await scryptRaw('correct horse battery', salt, 1, {
+      N: 16384,
+      r: 8,
+      p: 1,
+      maxmem: MAX_SCRYPT_MEMORY_BYTES,
+    })
+    const hostile = frame(
+      `16384$8$1$${salt.toString('base64url')}$${shortKey.toString('base64url')}`,
+    )
+    await expect(verifyPassword('correct horse battery', hostile)).resolves.toBe(false)
+  })
+
   it('refuses a stored hash that asks for more memory than the bound allows', async () => {
     // 128 · 2^20 · 8 = 1 GiB. A row written by hand could otherwise stall
-    // whichever process verifies against it. What discriminates is that this
-    // RESOLVES to false: without the bound, scrypt itself refuses by throwing,
-    // and a sign-in or a click becomes a 500. Nothing here times the call —
-    // a clock on a machine that is also building images is a flake.
+    // whichever process verifies against it, so this is refused before the
+    // scrypt call rather than left to it: the catch around that call means
+    // this now resolves false either way, so this pins the *outcome*, not
+    // which of the two guards produced it — see the mutation notes for why
+    // that pairing cannot be told apart by a fixture. Nothing here times the
+    // call — a clock on a machine that is also building images is a flake.
     const salt = Buffer.from('salt').toString('base64url')
     const key = Buffer.alloc(32).toString('base64url')
     const hostile = frame(`${1024 * 1024}$8$1$${salt}$${key}`)
+    await expect(verifyPassword('correct horse battery', hostile)).resolves.toBe(false)
+  })
+
+  it('never rejects, even when scrypt itself refuses parameters our own bound accepts', async () => {
+    // 128 · 2 · 262144 · 1 = 67108864, exactly MAX_SCRYPT_MEMORY_BYTES — this
+    // build's own bound lets it through, but scrypt's internal accounting has
+    // overhead ours does not model, so the call itself still throws. That gap
+    // is why verifyPassword needs its own catch rather than trusting that
+    // whatever passes this build's checks is safe to hand to scrypt.
+    const salt = Buffer.from('salt').toString('base64url')
+    const key = Buffer.alloc(32).toString('base64url')
+    const hostile = frame(`2$262144$1$${salt}$${key}`)
     await expect(verifyPassword('correct horse battery', hostile)).resolves.toBe(false)
   })
 
@@ -130,6 +181,13 @@ describe('tokens this install mints', () => {
     expect(digestsMatch(digest, hashToken('b'))).toBe(false)
     expect(digestsMatch(digest, digest.slice(0, 63))).toBe(false)
     expect(digestsMatch('', '')).toBe(false)
+    // One multibyte character keeps the same UTF-16 length (64) as a real
+    // digest but not the same byte length: a length check on .length rather
+    // than on bytes would let this pair through to timingSafeEqual, which
+    // throws for buffers of different length rather than returning false.
+    const multibyte = `${digest.slice(0, 63)}é`
+    expect(multibyte).toHaveLength(64)
+    expect(digestsMatch(digest, multibyte)).toBe(false)
   })
 })
 
@@ -173,5 +231,16 @@ describe('recovery codes', () => {
     expect(normaliseRecoveryCode('ABCDEFGHJKL')).toBeNull()
     expect(normaliseRecoveryCode('ABCDEFGHJI')).toBeNull()
     expect(normaliseRecoveryCode('x'.repeat(40))).toBeNull()
+  })
+
+  it('is verified as a password, at the admin cost, not as a token', async () => {
+    // A stored recovery code is hashPassword(normalised, ADMIN_SCRYPT), never
+    // hashToken: a code is checked at most once, ever, so the cost is paid a
+    // single time, and an unsalted single SHA-256 pass would put a stolen
+    // dump's fifty bits of randomness within reach of an offline attacker.
+    const code = normaliseRecoveryCode(newRecoveryCode()) as string
+    const stored = await hashPassword(code, ADMIN_SCRYPT)
+    expect(await verifyPassword(code, stored)).toBe(true)
+    expect(await verifyPassword('WRONGWRONG', stored)).toBe(false)
   })
 })

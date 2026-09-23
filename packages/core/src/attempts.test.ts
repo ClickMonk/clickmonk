@@ -21,12 +21,17 @@ describe('counting failed attempts', () => {
     expect(c.check('b', 0).allowed).toBe(true)
   })
 
-  it('forgets a key that got the secret right', () => {
+  it('forgets a key that got the secret right, and only that key', () => {
     const c = new AttemptCounter(1, 60_000)
     c.fail('k', 0)
+    // A second key with its own failure: a link password page's counter is
+    // shared across addresses and links, so one address getting a password
+    // right must not clear anyone else's lockout.
+    c.fail('other', 0)
     expect(c.check('k', 0).allowed).toBe(false)
     c.succeed('k')
     expect(c.check('k', 0).allowed).toBe(true)
+    expect(c.check('other', 0).allowed).toBe(false)
   })
 
   it('starts a new window on time, and on a clock that stepped backwards', () => {

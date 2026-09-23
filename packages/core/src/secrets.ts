@@ -73,6 +73,14 @@ export const LINK_SCRYPT: ScryptCost = { N: 16_384, r: 8, p: 1 }
 export const SCRYPT_PREFIX = 'scrypt'
 const SCRYPT_SALT_BYTES = 16
 const SCRYPT_KEY_BYTES = 32
+/**
+ * Shortest key a *stored* hash may carry, well below what this build ever
+ * writes (`SCRYPT_KEY_BYTES`). A key this short turns `timingSafeEqual` into
+ * a coin flip: an unrelated password's derived key of the same short length
+ * has a real chance of matching it by coincidence, not by being the right
+ * password.
+ */
+const MIN_SCRYPT_KEY_BYTES = 16
 
 /**
  * The most memory a *stored* hash may ask for when it is verified: 64 MiB.
@@ -148,12 +156,16 @@ function parseStoredHash(stored: string): StoredHash | null {
   for (const v of [n, r, p]) {
     if (!Number.isInteger(v) || v < 1) return null
   }
+  // scrypt's own cost parameter, and the only one required to be a power of
+  // two: refusing it here keeps that requirement ours to state, rather than
+  // relying on whatever the underlying scrypt call happens to validate.
+  if (!(n >= 2 && (n & (n - 1)) === 0)) return null
   if (scryptMemory(n, r, p) > MAX_SCRYPT_MEMORY_BYTES) return null
   const [saltText, keyText] = [parts[4] as string, parts[5] as string]
   if (!B64.test(saltText) || !B64.test(keyText)) return null
   const salt = Buffer.from(saltText, 'base64url')
   const key = Buffer.from(keyText, 'base64url')
-  if (salt.length === 0 || key.length === 0 || key.length > 64) return null
+  if (salt.length === 0 || key.length < MIN_SCRYPT_KEY_BYTES || key.length > 64) return null
   return { n, r, p, salt, key }
 }
 
@@ -167,13 +179,21 @@ export async function verifyPassword(password: string, stored: string): Promise<
   if (password.length === 0 || password.length > MAX_PASSWORD_LENGTH) return false
   const parsed = parseStoredHash(stored)
   if (!parsed) return false
-  const key = await scrypt(password, parsed.salt, parsed.key.length, {
-    N: parsed.n,
-    r: parsed.r,
-    p: parsed.p,
-    maxmem: MAX_SCRYPT_MEMORY_BYTES,
-  })
-  return timingSafeEqual(key, parsed.key)
+  // parseStoredHash already refuses every shape this build knows makes scrypt
+  // itself throw; this catches whatever it does not — a future scrypt with a
+  // narrower or different validation than today's — so the promise this
+  // function returns never rejects, whatever the stored row contains.
+  try {
+    const key = await scrypt(password, parsed.salt, parsed.key.length, {
+      N: parsed.n,
+      r: parsed.r,
+      p: parsed.p,
+      maxmem: MAX_SCRYPT_MEMORY_BYTES,
+    })
+    return timingSafeEqual(key, parsed.key)
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -201,8 +221,13 @@ export function hashToken(token: string): string {
 
 /** Constant-time comparison of two lower-case hex digests of the same length. */
 export function digestsMatch(a: string, b: string): boolean {
-  if (a.length !== b.length || a.length === 0) return false
-  return timingSafeEqual(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'))
+  // Bounded on the shorter argument's *byte* length, not `.length`: a string's
+  // `.length` counts UTF-16 code units, which is not the byte length a
+  // multibyte character encodes to, and timingSafeEqual compares bytes.
+  const bufA = Buffer.from(a, 'utf8')
+  const bufB = Buffer.from(b, 'utf8')
+  if (bufA.length !== bufB.length || bufA.length === 0) return false
+  return timingSafeEqual(bufA, bufB)
 }
 
 /** An API key as the admin sees it once: `cmk_<16 hex id>_<token>`. */
@@ -246,6 +271,14 @@ export function parseApiKey(presented: string): { id: string; secret: string } |
  * Recovery codes: what the admin uses when the authenticator app is gone.
  * Crockford's base32 alphabet without I, L, O and U, so a code read off
  * paper has no character pairs to confuse, in two groups of five.
+ *
+ * A code is stored and verified with `hashPassword`/`verifyPassword` at
+ * `ADMIN_SCRYPT`, the same as the admin's password — never `hashToken`. Fifty
+ * bits under one unsalted SHA-256 pass is a stolen dump away from a TOTP
+ * bypass measured in GPU-hours; a code is checked at most once, ever, so the
+ * scrypt cost is paid a single time and is free at that rate. `newRecoveryCode`
+ * stays at 10 characters either way — the cost of guessing it, not its
+ * length, is what changes.
  */
 const RECOVERY_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
 export const RECOVERY_CODE_COUNT = 10
