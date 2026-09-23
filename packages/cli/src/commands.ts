@@ -366,8 +366,24 @@ async function linkAdd(args: string[], d: CliDeps): Promise<void> {
 }
 
 /**
- * Reads standard input whole, bounded, and says so first when there is nobody
- * piping into it.
+ * The one way these commands take a password, spelled out, because it is what
+ * the refusal below has to leave the operator holding.
+ */
+const PIPE_IT_IN = `standard input is a terminal, and a password typed at one is echoed on screen and left in the shell's history. Pipe it in instead, with -T so that no terminal is allocated:
+  printf '%s' '<the password>' | docker compose exec -T worker node packages/cli/dist/index.js admin create <email>`
+
+/**
+ * Reads standard input whole and bounded, and refuses outright when standard
+ * input is a terminal.
+ *
+ * The refusal is the point. Left to read a terminal this would wait for a
+ * password nobody has been asked for — a command that looks hung — and the two
+ * ways out of that are both worse than refusing: a prompt saying "type it"
+ * puts the password on screen and into the scrollback, because a terminal
+ * echoes by default and nothing here turns that off; and the documented
+ * invocation passes `-T`, so there is no terminal on this end anyway and any
+ * prompt would be dead in the one path it was for. What is left is to say that
+ * the password has to be piped, and to show how.
  *
  * Bounded as it reads rather than after: a command whose refusal is "that is
  * longer than a password may be" cannot get there by buffering the whole of
@@ -376,16 +392,12 @@ async function linkAdd(args: string[], d: CliDeps): Promise<void> {
  * character, which is the most UTF-8 spends on one, so no password this build
  * would accept is cut short by it; anything past the cap stops the read, and
  * what was read is over the bound and refused by the caller.
- *
- * The notice goes to whoever is watching rather than to standard output: at a
- * terminal, with nothing piped in, this waits for a password nobody has been
- * asked for, and a command that looks hung is a command an operator kills.
  */
 export async function readStdin(
   stream: AsyncIterable<Uint8Array | string>,
-  o: { isTty: boolean; notify: (s: string) => void },
+  o: { isTty: boolean },
 ): Promise<string> {
-  if (o.isTty) o.notify('Reading the password from standard input; type it and press Ctrl-D.')
+  if (o.isTty) throw new Rejected(PIPE_IT_IN)
   const cap = (MAX_PASSWORD_LENGTH + 1) * 4
   const chunks: Buffer[] = []
   let bytes = 0
@@ -426,7 +438,19 @@ async function requireAccount(d: CliDeps): Promise<void> {
  */
 async function readPassword(d: CliDeps): Promise<string> {
   if (!d.stdin) throw new Rejected('no way to read the password: standard input is not available')
-  const raw = await d.stdin()
+  let raw: string
+  try {
+    raw = await d.stdin()
+  } catch (err) {
+    // Converted here because this is the only place that knows the failure came
+    // from reading a password, and it lands in the one classifying catch below
+    // rather than as a stack trace. A stream's error message says what went
+    // wrong with the stream and carries nothing that was read from it.
+    if (err instanceof Rejected) throw err
+    throw new Rejected(
+      `could not read the password from standard input: ${err instanceof Error ? err.message : 'unknown error'}`,
+    )
+  }
   const password = raw.replace(/\r?\n$/, '')
   if (password.length < MIN_ADMIN_PASSWORD_LENGTH) {
     throw new Rejected(
@@ -769,6 +793,24 @@ export async function runCli(argv: string[], d: CliDeps): Promise<number> {
     ) {
       d.out(`error: ${err.message}\n${USAGE}`)
       return 1
+    }
+    // A command run before the migrations. `42P01` is Postgres saying the table
+    // is not there, and the answer is always the same one command, so this is a
+    // refusal rather than an unexpected error. The database's own wording — the
+    // relation it could not find — is not repeated: it names an internal table
+    // to an operator who can do nothing with the name.
+    if (err instanceof Error && 'code' in err && err.code === '42P01') {
+      d.out('error: this database has not been migrated yet; run "clickmonk migrate" first')
+      return 2
+    }
+    // A bound inside a function shared with the admin API, which refuses by
+    // throwing the error that API answers with. By name, for the same reason the
+    // ZodError above is: the class belongs to a module this package does not
+    // import. Its message is written for a person and carries no secret — that
+    // is the rule the API answers by — so it is printed as it stands.
+    if (err instanceof Error && err.name === 'HttpError') {
+      d.out(`error: ${err.message}`)
+      return 2
     }
     throw err
   }

@@ -51,11 +51,12 @@ describe('loadConfig', () => {
   })
 })
 
-// This service's admin host schema is a second copy of the redirect's, and the
-// two have to agree: the redirect approves a certificate for exactly this name
-// and this service refuses every other Host. The rows below are the same rows
-// the redirect's own test uses, so a change to one that is not made to the
-// other fails here rather than at an install that looks configured.
+// This service and the redirect read this variable through one schema, held in
+// core: the redirect approves a certificate for exactly this name and this
+// service refuses every other Host, so they cannot be allowed to disagree about
+// what the name is. What is checked here is that this service's loader actually
+// applies that schema and maps its result — the rows are the redirect's rows,
+// so a change to the shared schema fails both files together.
 describe('the admin host', () => {
   it('is null when it is not set, so every route answers 503 until it is', () => {
     expect(loadConfig(base).adminHost).toBeNull()

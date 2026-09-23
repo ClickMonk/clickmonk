@@ -53,14 +53,11 @@ async function main(): Promise<number> {
       pg,
       ch,
       out: (s) => console.log(s),
-      // Never echoed. A password on the command line would be visible in `ps`
-      // and left in the shell's history. The notice goes to standard error so
-      // that piping this command's output somewhere never carries it along.
-      stdin: () =>
-        readStdin(process.stdin, {
-          isTty: process.stdin.isTTY === true,
-          notify: (s) => console.error(s),
-        }),
+      // Never echoed, and never typed: a password on the command line would be
+      // visible in `ps` and left in the shell's history, and one typed at a
+      // terminal would be on screen. `isTTY` is undefined when there is no
+      // terminal on this end, which is what `docker compose exec -T` arranges.
+      stdin: () => readStdin(process.stdin, { isTty: process.stdin.isTTY === true }),
       ipdata: { dir: process.env.CLICKMONK_IPDATA_DIR || DEFAULT_IPDATA_DIR },
       // Normalised rather than validated: the services parse this variable
       // strictly and refuse to boot on a value that is not a bare lower-case

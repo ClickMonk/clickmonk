@@ -235,19 +235,29 @@ describe('install.sh', () => {
 
   // Every documented invocation of the CLI, in the script and in the README,
   // has to be one an operator can pipe a password into: `admin create` and
-  // `admin passwd` read it from standard input and take it from nowhere else.
-  // Without `-T`, `docker compose exec` allocates a TTY and the pipe never
-  // reaches the command — so the one supported way of giving it a password
-  // would not work as documented.
+  // `admin passwd` read it from standard input, take it from nowhere else, and
+  // refuse outright when standard input is a terminal. Compose allocates one
+  // unless it is told not to, so a documented line without that flag is a
+  // command that cannot be given a password at all.
+  //
+  // A line counts as an invocation by naming the CLI's entry point, not by the
+  // compose subcommand: `exec` and `run` both take a password and both take the
+  // flag, and an unrelated `exec -T postgres psql` is not one of these. Either
+  // spelling of the flag passes, because they are the same instruction.
+  //
+  // The per-file minimum catches this file's invocations disappearing from the
+  // filter — the entry point renamed, or the examples dropped — which is the
+  // way the loop would otherwise pass by checking nothing.
   it('invokes the CLI in a way a password can be piped into, everywhere it is documented', () => {
     for (const file of ['install.sh', 'README.md']) {
       const lines = readFileSync(join(ROOT, file), 'utf8')
         .split('\n')
-        .filter((l) => l.includes('docker compose exec'))
-      // The loop would pass vacuously on a file where the invocation had been
-      // renamed or moved out, which is the case it is least likely to survive.
+        .filter((l) => /docker compose\b.*\b(exec|run)\b/.test(l))
+        .filter((l) => l.includes('packages/cli/dist/index.js'))
       expect(lines.length, `${file}: documented CLI invocations`).toBeGreaterThan(0)
-      for (const line of lines) expect(line, `${file}: ${line.trim()}`).toContain('exec -T ')
+      for (const line of lines) {
+        expect(line, `${file}: ${line.trim()}`).toMatch(/\s(?:-T|--no-TTY)\s/)
+      }
     }
   })
 

@@ -669,6 +669,13 @@ describe('the admin account and API keys from the CLI', () => {
   /** The moment the clock reads for every command below, so an expiry is exact. */
   const NOW = new Date('2026-09-23T10:00:00.000Z')
 
+  /**
+   * How many times a command reached for standard input. A guard that has to
+   * refuse *before* the password is read — every one that answers "there is no
+   * account yet" — is only pinned by something that notices the read.
+   */
+  const stdin = { reads: 0 }
+
   /** The CLI with a password on standard input, which is the only way it takes one. */
   const withPassword = (password: string, ...argv: string[]) =>
     runCli(argv, {
@@ -676,7 +683,10 @@ describe('the admin account and API keys from the CLI', () => {
       ch: () => ch,
       out: (s) => lines.push(s),
       ipdata: { dir: ipdataDir },
-      stdin: async () => password,
+      stdin: async () => {
+        stdin.reads++
+        return password
+      },
       now: () => NOW,
     })
 
@@ -718,6 +728,7 @@ describe('the admin account and API keys from the CLI', () => {
 
   beforeEach(async () => {
     lines.length = 0
+    stdin.reads = 0
     await pg.query('TRUNCATE admin_account, admin_recovery_codes, sessions, api_keys')
   })
 
@@ -837,8 +848,9 @@ describe('the admin account and API keys from the CLI', () => {
     lines.length = 0
     expect(await withPassword('a decent admin password', 'admin', 'passwd')).toBe(2)
     expect(lines.join('\n')).toContain('run "clickmonk admin create <email>" first')
-    // The password reached nothing: there is no account, so nothing was
-    // written, and nothing that was already signed in was signed out.
+    // Refused before the password was asked for, not after: the operator is not
+    // made to hand one over to a command that was never going to use it.
+    expect(stdin.reads).toBe(0)
     expect((await account()).rowCount).toBe(0)
 
     lines.length = 0
@@ -1042,10 +1054,10 @@ describe('reading the password from standard input', () => {
     } as AsyncIterable<Uint8Array> & { read: number }
   }
 
-  const quiet = { isTty: false, notify: () => {} }
+  const piped = { isTty: false }
 
   it('reads every chunk of a password that fits', async () => {
-    expect(await readStdin(chunks(['a decent ', 'admin password\n']), quiet)).toBe(
+    expect(await readStdin(chunks(['a decent ', 'admin password\n']), piped)).toBe(
       'a decent admin password\n',
     )
   })
@@ -1058,7 +1070,7 @@ describe('reading the password from standard input', () => {
     // Eleven chunks of 100 bytes: the cap falls inside the ninth, so a reader
     // that stops at the cap never pulls the last two.
     const stream = chunks(Array.from({ length: 11 }, () => 'p'.repeat(100)))
-    const read = await readStdin(stream, quiet)
+    const read = await readStdin(stream, piped)
     expect(stream.read).toBe(9)
     // Exactly the nine it pulled, so it stopped at the chunk that crossed the
     // cap rather than reading on and cutting the result back afterwards.
@@ -1078,25 +1090,113 @@ describe('reading the password from standard input', () => {
   it('does not cut a password of allowed length short because its characters are wide', async () => {
     const wide = Array.from({ length: MAX_PASSWORD_LENGTH }, () => '\u4e2d')
     expect(Buffer.byteLength(wide.join(''), 'utf8')).toBe(MAX_PASSWORD_LENGTH * 3)
-    expect(await readStdin(chunks(wide), quiet)).toBe(wide.join(''))
+    expect(await readStdin(chunks(wide), piped)).toBe(wide.join(''))
   })
 
-  it('says it is waiting when there is a terminal on the other end, and nothing when there is not', async () => {
-    const said: string[] = []
-    await readStdin(chunks(['a decent admin password']), {
-      isTty: true,
-      notify: (s) => said.push(s),
-    })
-    expect(said).toHaveLength(1)
-    expect(said[0]).toContain('standard input')
-    // The password itself is never part of what it says.
-    expect(said.join('\n')).not.toContain('a decent admin password')
+  // A terminal echoes what is typed at it and nothing here turns that off, so
+  // there is no reading a password from one: it would be on screen and in the
+  // shell's history before this ever saw it. The documented invocation passes
+  // -T and has no terminal on this end at all, so nothing correct is refused.
+  it('refuses a terminal outright, and shows the piped form instead', async () => {
+    const stream = chunks(['a decent admin password'])
+    await expect(readStdin(stream, { isTty: true })).rejects.toThrow(/terminal/)
+    // Refused without reading: a password typed before the refusal arrived
+    // would already be on screen, and this must not be what consumes it.
+    expect(stream.read).toBe(0)
+    await expect(readStdin(stream, { isTty: true })).rejects.toThrow(/-T/)
+  })
+})
 
-    const silent: string[] = []
-    await readStdin(chunks(['a decent admin password']), {
-      isTty: false,
-      notify: (s) => silent.push(s),
+// Three faults that used to leave `runCli` as an unexpected error — exit 3 and
+// a stack trace — where what an operator needs is one sentence saying what to
+// do. Each is provoked at the seam it comes through, because none of them is
+// reachable from a correct command: that is what made them exit 3 for so long.
+describe('a fault an operator can act on', () => {
+  // The last case reads `admin_account` back, and describes above this one
+  // leave accounts behind. Cleared once here rather than depending on which of
+  // them ran last.
+  beforeAll(async () => {
+    await pg.query('TRUNCATE admin_account, admin_recovery_codes, sessions, api_keys')
+  })
+
+  /**
+   * A pool whose every query throws. Cast because only `query` is reached here
+   * and a whole `Pool` is a large interface to stub for one method; anything
+   * else this touched would be a TypeError the test would show.
+   */
+  const throwingPg = (err: unknown) =>
+    ({
+      query: async () => {
+        throw err
+      },
+    }) as unknown as Parameters<typeof runCli>[1]['pg']
+
+  const withPg = (pgLike: Parameters<typeof runCli>[1]['pg'], ...argv: string[]) =>
+    runCli(argv, {
+      pg: pgLike,
+      ch: () => ch,
+      out: (s) => lines.push(s),
+      ipdata: { dir: ipdataDir },
+      stdin: async () => 'a decent admin password',
     })
-    expect(silent).toEqual([])
+
+  it('says to migrate when a command runs before the migrations have', async () => {
+    // What Postgres answers for a table that is not there. The code is what is
+    // classified; the message is what must not be repeated back.
+    const missing = Object.assign(new Error('relation "admin_account" does not exist'), {
+      code: '42P01',
+    })
+    lines.length = 0
+    expect(await withPg(throwingPg(missing), 'apikey', 'create', 'reporting')).toBe(2)
+    expect(lines.join('\n')).toContain('run "clickmonk migrate" first')
+    // The name of the table it could not find is no use to an operator and is
+    // not theirs to read.
+    expect(lines.join('\n')).not.toContain('admin_account')
+  })
+
+  // The bound lives inside a function shared with the admin API, which refuses
+  // by throwing what that API answers with. No command can reach it — the CLI's
+  // own bounds are strictly inside it — so what is pinned here is that such an
+  // error is a refusal rather than a crash if a later change ever lets one out.
+  it('answers a bound from the shared writer as a refusal, in its own words', async () => {
+    const bound = Object.assign(new Error('a key lives at most 3650 days'), { name: 'HttpError' })
+    lines.length = 0
+    expect(await withPg(throwingPg(bound), 'apikey', 'create', 'reporting')).toBe(2)
+    expect(lines).toEqual(['error: a key lives at most 3650 days'])
+  })
+
+  it('says so when standard input could not be read at all', async () => {
+    lines.length = 0
+    const code = await runCli(['admin', 'create', 'admin@example.com'], {
+      pg,
+      ch: () => ch,
+      out: (s) => lines.push(s),
+      ipdata: { dir: ipdataDir },
+      stdin: async () => {
+        throw Object.assign(new Error('read EIO'), { code: 'EIO' })
+      },
+    })
+    expect(code).toBe(2)
+    expect(lines.join('\n')).toContain('could not read the password from standard input')
+    expect(lines.join('\n')).toContain('read EIO')
+  })
+
+  // The refusal an operator at a terminal gets, through a real command rather
+  // than through the reader alone: exit 2, and the piped form to copy.
+  it('refuses a password typed at a terminal, and shows the command that works', async () => {
+    lines.length = 0
+    const code = await runCli(['admin', 'create', 'admin@example.com'], {
+      pg,
+      ch: () => ch,
+      out: (s) => lines.push(s),
+      ipdata: { dir: ipdataDir },
+      stdin: () => readStdin((async function* () {})(), { isTty: true }),
+    })
+    expect(code).toBe(2)
+    const out = lines.join('\n')
+    expect(out).toContain('standard input is a terminal')
+    expect(out).toContain("printf '%s'")
+    expect(out).toContain('docker compose exec -T worker')
+    expect((await pg.query('SELECT 1 FROM admin_account')).rowCount).toBe(0)
   })
 })
