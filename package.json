@@ -16,7 +16,9 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
+    "@clickmonk/admin": "workspace:*",
     "@clickmonk/db": "workspace:*",
+    "@clickmonk/redirect": "workspace:*",
     "@types/node": "^22.10.0",
     "typescript": "^5.9.0",
     "vitest": "^4.1.11"

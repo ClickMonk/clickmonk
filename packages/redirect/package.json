@@ -4,6 +4,10 @@
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./password": { "types": "./dist/password.d.ts", "default": "./dist/password.js" }
+  },
   "engines": { "node": ">=22 <23" },
   "scripts": { "build": "tsc -b", "build:image": "tsc -b tsconfig.build.json" },
   "dependencies": {
