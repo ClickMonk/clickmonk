@@ -315,10 +315,15 @@ describe('createDomain', () => {
     await expect(
       createDomain(pool, { host: 'admin.example.test', adminHost: 'admin.example.test' }),
     ).rejects.toThrow(AdminHostDomainError)
-    // As an operator would type it. Both sides are normalised, because a host
-    // name is matched without regard to case or a trailing dot.
+    // Both sides are normalised, because a host name is matched without regard
+    // to case or a trailing dot — the host as an operator typed it, and the
+    // configured name, which this function's callers are not all obliged to
+    // have normalised before they get here.
     await expect(
       createDomain(pool, { host: 'Admin.Example.TEST.', adminHost: 'admin.example.test' }),
+    ).rejects.toThrow(AdminHostDomainError)
+    await expect(
+      createDomain(pool, { host: 'admin.example.test', adminHost: 'Admin.Example.TEST.' }),
     ).rejects.toThrow(AdminHostDomainError)
     expect((await pool.query('SELECT 1 FROM domains')).rowCount).toBe(0)
   })
