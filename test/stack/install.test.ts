@@ -19,6 +19,14 @@ const SCRIPT = join(ROOT, 'install.sh')
 /** A real bash 3.2, pinned: the version macOS ships, and the oldest this script supports. */
 const BASH32_IMAGE = 'bash:3.2.57'
 const KEYS = ['POSTGRES_PASSWORD', 'CLICKHOUSE_PASSWORD', 'CLICKMONK_SECRET']
+/**
+ * Run a container as whoever is running this suite. A container defaults to
+ * root, so what it writes into a mounted directory lands root-owned, and a
+ * non-root run of this suite then cannot read back the file it asserts on —
+ * `EACCES` on a directory it created itself. `-1:-1` is refused by Docker
+ * rather than quietly falling back to root.
+ */
+const AS_US = ['--user', `${process.getuid?.() ?? -1}:${process.getgid?.() ?? -1}`]
 
 // Every test gets its own copy of the script in its own empty directory. The
 // script writes .env beside itself and this repository's own .env is not the
@@ -249,16 +257,17 @@ describe('install.sh', () => {
   it('runs under a real bash 3.2', () => {
     const version = execFileSync(
       'docker',
-      ['run', '--rm', BASH32_IMAGE, 'bash', '-c', 'echo $BASH_VERSION'],
+      ['run', '--rm', ...AS_US, BASH32_IMAGE, 'bash', '-c', 'echo $BASH_VERSION'],
       { encoding: 'utf8', timeout: 60_000 },
     )
     expect(version, 'the pinned image is not bash 3.2').toMatch(/^3\.2\./)
-    // Writable, unlike the mount `pnpm lint:sh` uses: the run writes .env.
+    // Writable, unlike the mount `pnpm lint:sh` uses: this run writes .env.
     const r = spawnSync(
       'docker',
       [
         'run',
         '--rm',
+        ...AS_US,
         '-v',
         `${dir}:/mnt`,
         '-w',
@@ -272,6 +281,12 @@ describe('install.sh', () => {
     )
     expect(r.status, r.stderr).toBe(0)
     expect(r.stderr).toBe('')
-    expect(readFileSync(join(dir, '.env'), 'utf8')).toMatch(/^CLICKMONK_SECRET=[0-9a-f]{64}$/m)
+    // Read back from the host, as every other test here does, which is only
+    // possible because the run wrote as us: see AS_US.
+    const written = statSync(join(dir, '.env'))
+    expect(written.uid, 'the container wrote .env as somebody else').toBe(process.getuid?.() ?? -1)
+    expect(written.mode & 0o777).toBe(0o600)
+    const env = readFileSync(join(dir, '.env'), 'utf8')
+    for (const k of KEYS) expect(settingOf(env, k), k).toMatch(/^[0-9a-f]{64}$/)
   })
 })
