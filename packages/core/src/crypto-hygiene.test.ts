@@ -18,6 +18,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   type HygieneConfig,
+  callSites,
+  callText,
   decisionProblems,
   findDisallowedComparisons,
   gatedFiles,
@@ -26,7 +28,7 @@ import {
   staleExemptions,
   staleLengthExemptions,
   unexemptedComparisons,
-  whyDeciderDoesNotDecide,
+  whyOneCallDoesNotDecide,
 } from './testing.js'
 
 import { dirname } from 'node:path'
@@ -50,6 +52,7 @@ const CONFIG: HygieneConfig = {
     {
       file: 'secrets.ts',
       fn: 'verifyPassword',
+      call: 'timingSafeEqual(key, parsed.key)',
       because:
         'it derives the candidate key at the stored key\u2019s own length, so the ' +
         'two lengths are equal by construction and there is no mismatch for ' +
@@ -98,7 +101,9 @@ describe('crypto hygiene in the credential primitives', () => {
  * checker rather than to any one package.
  */
 describe('the shared checker on a body that only looks careful', () => {
-  const why = (body: string): string => whyDeciderDoesNotDecide(CONFIG, body)
+  /** The first call in a body, which is what these fixtures each hold. */
+  const why = (body: string): string =>
+    whyOneCallDoesNotDecide(CONFIG, body, callSites(body, 'timingSafeEqual')[0] ?? -1)
 
   it('accepts the two shapes this tree actually writes', () => {
     expect(
@@ -160,8 +165,46 @@ describe('the shared checker on a body that only looks careful', () => {
     ).toBe('timingSafeEqual is neither returned nor assigned')
   })
 
-  it('says so when the call is not there at all', () => {
-    expect(why('{ return a === b }')).toBe('timingSafeEqual is not called here')
+  it('refuses a condition that cannot be taken', () => {
+    // The name appears in an `if`, and the branch is dead: a comparison against
+    // a number written in the source, beside the result, is how a decision is
+    // made to look live while deciding nothing.
+    expect(
+      why(`{
+      if (a.length !== b.length) return false
+      const equal = timingSafeEqual(a, b)
+      if (!equal && a.length < 0) return false
+      return true
+    }`),
+    ).toBe("timingSafeEqual's result is consumed by a branch that cannot be taken")
+    // And the same shape where the call is consumed in place.
+    expect(
+      why(`{
+      if (a.length !== b.length) return false
+      if (!timingSafeEqual(a, b) && a.length < 0) return false
+      return true
+    }`),
+    ).toBe("timingSafeEqual's result is consumed by a branch that cannot be taken")
+  })
+
+  it('inspects every call, not only the first', () => {
+    // A guarded call followed by an unguarded one: reading only the first left
+    // the second invisible.
+    const body = `{
+      if (a.length !== b.length) return false
+      const first = timingSafeEqual(a, b)
+      const second = timingSafeEqual(c, d)
+      return first && second
+    }`
+    const sites = callSites(body, 'timingSafeEqual')
+    expect(sites).toHaveLength(2)
+    expect(whyOneCallDoesNotDecide(CONFIG, body, sites[0] as number)).toBe('')
+    expect(whyOneCallDoesNotDecide(CONFIG, body, sites[1] as number)).toBe(
+      'the two lengths are not compared before timingSafeEqual is called',
+    )
+    // The exemption is the call's, not the function's, so it does not travel to
+    // the second call.
+    expect(callText(body, sites[1] as number, 'timingSafeEqual')).toBe('timingSafeEqual(c, d)')
   })
 
   it('finds the comparisons it is there to find', () => {

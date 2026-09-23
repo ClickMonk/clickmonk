@@ -29,8 +29,8 @@
  *   exempted by exact text in one named function.
  * - `staleExemptions` — an exemption that no longer matches anything, so the
  *   list cannot rot.
- * - `whyDeciderDoesNotDecide` — whether the result of the deciding call
- *   actually decides the answer, in each function that calls it, plus a floor:
+ * - `decisionProblems` — whether the result of the deciding call actually
+ *   decides the answer, at **every** call in every function, plus a floor:
  *   `expectedComparers` names the files that must compare, whatever their text
  *   says today. Without that floor, deleting a call *and its import* left the
  *   file out of the set and another file's call covered for it.
@@ -57,6 +57,17 @@
  * - It says nothing about randomness. A package that mints a credential needs
  *   its own check for that; `Math.random` is legitimate in a package that picks
  *   a weighted target with it.
+ * - **Two full bypasses a gated file can still hold, and they are the cheapest
+ *   ones.** A `switch` on a digest with the expected value as a `case` compares
+ *   exactly as early-exitingly as `===` and contains no operator to find. And
+ *   `if (!given.startsWith(want)) return false` beside a real, correctly guarded
+ *   `timingSafeEqual` call passes everything here: the comparison check finds no
+ *   banned operator, and the decision check finds a call that does decide — the
+ *   `startsWith` simply decides first. Both need a rule about what *else* a
+ *   function may do with the material it is comparing, which this does not have.
+ *   They are named here because a reader who trusts this file should know what
+ *   it does not read, and because naming them is cheaper than implying they are
+ *   covered.
  * - **Every package but this one runs the built copy of this file.** They import
  *   it by package name, which resolves to `dist`, so weakening this source
  *   without rebuilding leaves their gates green on the previous version. The
@@ -95,6 +106,14 @@ export interface HygieneConfig {
   dir: string
   /** Importing one of these makes a file a starting point. */
   primitives: string[]
+  /**
+   * Files that seed the walk whatever they import — the package's entry point,
+   * so the set is "everything this service runs" rather than "everything that
+   * happens to import a primitive today". Without it, a `===` between two
+   * secrets in a file no seed reached was invisible, and the `expectedGated`
+   * floor cannot notice a file the walk never visits.
+   */
+  alwaysSeed?: string[]
   /** Files the walk must reach. A floor, never trimmed to pass. */
   expectedGated: string[]
   /** Files that must compare with `decider`, whatever their text says today. */
@@ -110,12 +129,14 @@ export interface HygieneConfig {
   scope: ComparisonScope
   allowed: Exemption[]
   /**
-   * Functions exempt from the length requirement, because they make the two
-   * lengths equal instead of comparing them — deriving a key at the stored
-   * key's own length, say, where a mismatch cannot arise. Each is checked for
-   * staleness like any other exemption.
+   * Calls exempt from the length requirement, because they make the two lengths
+   * equal instead of comparing them — deriving a key at the stored key's own
+   * length, say, where a mismatch cannot arise. Keyed to the call's own text, not
+   * to its function: a second call added beside an exempt one inherited the
+   * exemption while it was keyed to the function. Each is checked for staleness
+   * like any other exemption.
    */
-  lengthExempt?: { file: string; fn: string; because: string }[]
+  lengthExempt?: { file: string; fn: string; call: string; because: string }[]
   /** Files never scanned: a test-only helper, say. */
   skip?: string[]
 }
@@ -208,8 +229,10 @@ export function localImports(dir: string, file: string, source: string): string[
 export function gatedFiles(c: HygieneConfig): string[] {
   const all = new Set(sourceFiles(c))
   const primitives = new Set(c.primitives)
-  const queue = [...all].filter((f) =>
-    importedNames(readSource(c, f)).some((n) => primitives.has(n)),
+  const queue = [...all].filter(
+    (f) =>
+      (c.alwaysSeed ?? []).includes(f) ||
+      importedNames(readSource(c, f)).some((n) => primitives.has(n)),
   )
   const gated = new Set(queue)
   while (queue.length > 0) {
@@ -506,17 +529,118 @@ function chainedToCall(text: string, anchorEnd: number, call: number): boolean {
   return linesBefore.every((line) => /(?:&&|\|\||=)\s*$/.test(line.trimEnd()))
 }
 
-/** A statement comparing two lengths to each other that also returns or throws. */
-const GUARDING_LENGTH_CHECK =
-  /\.length\s*(?:!==|===|!=|==)\s*[\w$]+(?:\??\.[\w$]+)*\.length[^\n]*\b(?:return|throw)\b/
-const TWO_LENGTHS = /\.length\s*(?:!==|===|!=|==)\s*[\w$]+(?:\??\.[\w$]+)*\.length/
+/**
+ * The two arguments of a call, as the identifiers each of them mentions.
+ *
+ * Mentions rather than *is*, because an argument is not always a plain name:
+ * `timingSafeEqual(Buffer.from(expected, 'utf8'), Buffer.from(code, 'utf8'))`
+ * guards itself with `expected.length === code.length`, and the guard names what
+ * the arguments are built from. The cost of that looseness is that a name
+ * appearing in both arguments would satisfy the guard against itself; nothing in
+ * this tree writes that, and it is recorded here rather than guessed at.
+ */
+function argumentNames(call: string, decider: string): [string[], string[]] | null {
+  const inner = call.slice(decider.length + 1, -1)
+  let depth = 0
+  let split = -1
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i]
+    if (ch === '(' || ch === '[' || ch === '{') depth++
+    else if (ch === ')' || ch === ']' || ch === '}') depth--
+    else if (ch === ',' && depth === 0) {
+      split = i
+      break
+    }
+  }
+  if (split === -1) return null
+  const names = (text: string): string[] => [...text.matchAll(/[A-Za-z_$][\w$]*/g)].map((m) => m[0])
+  return [names(inner.slice(0, split)), names(inner.slice(split + 1))]
+}
+
+/** Every `A.length <equality> B.length` this call's own two arguments could use. */
+function lengthPatterns(call: string, decider: string): RegExp[] {
+  const args = argumentNames(call, decider)
+  if (!args) return []
+  const out: RegExp[] = []
+  for (const a of args[0]) {
+    for (const b of args[1]) {
+      if (a === b) continue
+      out.push(new RegExp(`\\b${a}\\.length\\s*(?:!==|===|!=|==)\\s*${b}\\.length`))
+      out.push(new RegExp(`\\b${b}\\.length\\s*(?:!==|===|!=|==)\\s*${a}\\.length`))
+    }
+  }
+  return out
+}
 
 /**
- * Why a function body's use of the deciding call does not decide anything, or
- * the empty string when it does.
+ * Whether the two lengths **this call** compares are compared to each other in
+ * `text`. Tied to the call's own arguments, not to "a length check appeared
+ * somewhere above": a second call on other buffers, placed after a guarded one,
+ * otherwise inherited the first call's guard and was invisible.
+ */
+function lengthsCompared(text: string, patterns: RegExp[]): boolean {
+  return patterns.length > 0 && patterns.some((re) => re.test(text))
+}
+
+/** …and on a statement that also returns or throws, which is the guard's shape. */
+function guardsBefore(body: string, at: number, patterns: RegExp[]): boolean {
+  for (const line of body.slice(0, at).split('\n')) {
+    if (!/\b(?:return|throw)\b/.test(line)) continue
+    if (lengthsCompared(line, patterns)) return true
+  }
+  return false
+}
+
+/**
+ * A comparison against a number written in the source. Banned in the statement
+ * that consumes the deciding call's result, because that is how a live-looking
+ * branch is made dead: `if (!equal && given.length < 0) return false` reads as a
+ * decision and is one that can never be taken. A comparison of two `.length`s
+ * carries no literal and is not matched; nor is one against `null`.
+ */
+const NUMERIC_COMPARISON = /(?:===|!==|==|!=|<=|>=|<|>)\s*-?\d|-?\d+\s*(?:===|!==|==|!=|<=|>=|<|>)/
+
+const ANCHOR =
+  /\breturn\b|\bif\s*\(|\bwhile\s*\(|(?:const|let|var)\s+([\w$]+)\s*=(?!=)|([\w$]+)\s*=(?!=)/g
+
+/** Every offset in a body at which the decider is called. */
+export function callSites(body: string, decider: string): number[] {
+  const call = `${decider}(`
+  const out: number[] = []
+  for (let i = body.indexOf(call); i !== -1; i = body.indexOf(call, i + 1)) out.push(i)
+  return out
+}
+
+/** The call's own text, from its name to the parenthesis that closes it. */
+export function callText(body: string, at: number, decider: string): string {
+  let i = at + decider.length
+  let depth = 0
+  for (; i < body.length; i++) {
+    if (body[i] === '(') depth++
+    else if (body[i] === ')') {
+      depth--
+      if (depth === 0) {
+        i++
+        break
+      }
+    }
+  }
+  return body.slice(at, i).replace(/\s+/g, ' ')
+}
+
+/** The whole line an offset sits on. */
+function lineAt(body: string, index: number): string {
+  const from = body.lastIndexOf('\n', index) + 1
+  const to = body.indexOf('\n', index)
+  return body.slice(from, to === -1 ? body.length : to)
+}
+
+/**
+ * Why one call of the decider does not decide the answer, or the empty string
+ * when it does.
  *
- * Three things have to hold, and each was a way past one of the copies this
- * replaces.
+ * Four things have to hold, and each was a way past one of the copies this
+ * replaces or past an earlier version of this file.
  *
  * The call must be **returned, assigned or used as a condition**. One written as
  * its own statement with the result thrown away decides nothing, and the line
@@ -526,110 +650,130 @@ const TWO_LENGTHS = /\.length\s*(?:!==|===|!=|==)\s*[\w$]+(?:\??\.[\w$]+)*\.leng
  *
  * When it is assigned, the name must go on to **decide the answer**: appear in a
  * later `return`, or in an `if`/`while` condition. A result read only by a log
- * line, or by nothing at all, decides nothing — and reading it *somewhere* was
- * all the earlier rule asked for.
+ * line, or by nothing at all, decides nothing.
+ *
+ * The statement that consumes it must be **live**. A condition that ANDs the
+ * result with a comparison against a number written in the source — the shape
+ * `if (!equal && given.length < 0) return false` — is a branch that can never be
+ * taken, and "the name appears in a condition" was satisfied by it.
  *
  * And where the call throws on a length mismatch, **the two lengths must be
  * compared to each other first**, either on the way from the anchor to the call
- * or on a statement that returns or throws. A bound on one length — which the
- * callers here also have — does not stop the two from differing, and counting it
- * let the real check be deleted with the gate still green. A dead
- * `const sameLength = a.length === b.length` that nothing reads satisfies
- * neither form.
+ * or on a statement that returns or throws. A bound on one length does not stop
+ * the two from differing, and a dead `const sameLength = a.length === b.length`
+ * satisfies neither form.
  */
-export function whyDeciderDoesNotDecide(
+export function whyOneCallDoesNotDecide(
   c: HygieneConfig,
   body: string,
+  at: number,
   o: { lengthExempt?: boolean } = {},
 ): string {
-  const call = `${c.decider}(`
-  const callIndex = body.indexOf(call)
-  if (callIndex === -1) return `${c.decider} is not called here`
   const needsLength = c.lengthCheckedFirst && o.lengthExempt !== true
-  const guarded = GUARDING_LENGTH_CHECK.test(body.slice(0, callIndex))
-  const anchorRe =
-    /\breturn\b|\bif\s*\(|\bwhile\s*\(|(?:const|let|var)\s+([\w$]+)\s*=(?!=)|([\w$]+)\s*=(?!=)/g
-  let anchor: RegExpExecArray | null
+  const text = callText(body, at, c.decider)
+  const patterns = lengthPatterns(text, c.decider)
+  const guarded = guardsBefore(body, at, patterns)
+  const callEnd = at + text.length
   let sawUnread = false
   let sawUnguarded = false
+  let sawDead = false
+  ANCHOR.lastIndex = 0
+  let anchor: RegExpExecArray | null
   // biome-ignore lint/suspicious/noAssignInExpressions: exec's own idiom for a global regex
-  while ((anchor = anchorRe.exec(body))) {
+  while ((anchor = ANCHOR.exec(body))) {
     const anchorEnd = anchor.index + anchor[0].length
-    const at = body.indexOf(call, anchorEnd)
-    if (at === -1) continue
+    if (anchorEnd > at) break
     if (!chainedToCall(body, anchorEnd, at)) continue
-    if (needsLength && !guarded && !TWO_LENGTHS.test(body.slice(anchor.index, at))) {
+    if (needsLength && !guarded && !lengthsCompared(body.slice(anchor.index, at), patterns)) {
       sawUnguarded = true
       continue
     }
     const assignedTo = anchor[1] ?? anchor[2]
-    if (assignedTo === undefined) return ''
-    const rest = body.slice(at)
-    const decides =
-      new RegExp(`\\breturn\\b[^\\n;]*\\b${assignedTo}\\b`).test(rest) ||
-      new RegExp(`\\b(?:if|while)\\s*\\([^)]*\\b${assignedTo}\\b`).test(rest)
-    if (decides) return ''
-    sawUnread = true
+    if (assignedTo === undefined) {
+      // Consumed where it is written: the statement running from the anchor to
+      // the end of the call's own line has to be a live one.
+      if (NUMERIC_COMPARISON.test(body.slice(anchorEnd, callEnd) + lineAt(body, callEnd))) {
+        sawDead = true
+        continue
+      }
+      return ''
+    }
+    const rest = body.slice(callEnd)
+    const use =
+      new RegExp(`\\breturn\\b[^\\n;]*\\b${assignedTo}\\b`).exec(rest) ??
+      new RegExp(`\\b(?:if|while)\\s*\\([^)]*\\b${assignedTo}\\b`).exec(rest)
+    if (use === null) {
+      sawUnread = true
+      continue
+    }
+    if (NUMERIC_COMPARISON.test(lineAt(rest, use.index))) {
+      sawDead = true
+      continue
+    }
+    return ''
   }
   if (sawUnguarded) return `the two lengths are not compared before ${c.decider} is called`
+  if (sawDead) return `${c.decider}'s result is consumed by a branch that cannot be taken`
   return sawUnread
     ? `${c.decider}'s result is assigned to a name that decides nothing`
     : `${c.decider} is neither returned nor assigned`
 }
 
-const lengthExempt = (c: HygieneConfig, file: string, fn: string): boolean =>
-  (c.lengthExempt ?? []).some((e) => e.file === file && e.fn === fn)
+const exemptCall = (c: HygieneConfig, file: string, fn: string, call: string): boolean =>
+  (c.lengthExempt ?? []).some((e) => e.file === file && e.fn === fn && e.call === call)
 
-/** Every function in a file that calls the decider without letting it decide. */
+/**
+ * Every call of the decider in a file that does not decide the answer, as a line
+ * each. **Every** call: reading only the first left a second, unguarded one in
+ * the same function invisible, and in a package with a length exemption let any
+ * call placed inside that function inherit it.
+ */
 export function decisionProblems(c: HygieneConfig, file: string): string[] {
-  const call = `${c.decider}(`
   const out: string[] = []
   for (const fn of functionBodies(readSource(c, file))) {
-    if (!fn.body.includes(call)) continue
-    const why = whyDeciderDoesNotDecide(c, fn.body, {
-      lengthExempt: lengthExempt(c, file, fn.name),
-    })
-    if (why) out.push(`${file}#${fn.name}: ${why}`)
+    for (const at of callSites(fn.body, c.decider)) {
+      const text = callText(fn.body, at, c.decider)
+      const why = whyOneCallDoesNotDecide(c, fn.body, at, {
+        lengthExempt: exemptCall(c, file, fn.name, text),
+      })
+      if (why) out.push(`${file}#${fn.name} ${text}: ${why}`)
+    }
   }
   return out
 }
 
 /**
- * Every length exemption that no longer names a function calling the decider, so
- * one left behind by a rename or a deletion fails rather than sitting there.
+ * Every length exemption that no longer names a call of the decider in the
+ * function it names, so one left behind by a rename, a deletion or a rewritten
+ * argument list fails rather than sitting there.
  */
 export function staleLengthExemptions(c: HygieneConfig): string[] {
-  const call = `${c.decider}(`
+  const gated = gatedFiles(c)
   return (c.lengthExempt ?? [])
     .filter((e) => {
-      const gated = gatedFiles(c)
       if (!gated.includes(e.file)) return true
       const fn = functionBodies(readSource(c, e.file)).find((f) => f.name === e.fn)
-      return fn === undefined || !fn.body.includes(call)
+      if (fn === undefined) return true
+      return !callSites(fn.body, c.decider).some(
+        (at) => callText(fn.body, at, c.decider) === e.call,
+      )
     })
-    .map((e) => `${e.file}#${e.fn} (${e.because})`)
+    .map((e) => `${e.file}#${e.fn} ${e.call} (${e.because})`)
 }
 
 /**
  * The files that must compare and do not, as a line each. Declared rather than
  * inferred from the imports: a file whose call *and* import were both deleted
- * simply left an inferred set, and another file's call covered for it — which
- * is what a real edit looks like, since an unused import is a lint error.
+ * simply left an inferred set, and another file's call covered for it — which is
+ * what a real edit looks like, since an unused import is a lint error.
  */
 export function missingComparers(c: HygieneConfig): string[] {
-  const call = `${c.decider}(`
   return c.expectedComparers
     .filter((file) => {
-      const functions = functionBodies(readSource(c, file)).filter((fn) => fn.body.includes(call))
-      return (
-        functions.length === 0 ||
-        functions.some(
-          (fn) =>
-            whyDeciderDoesNotDecide(c, fn.body, {
-              lengthExempt: lengthExempt(c, file, fn.name),
-            }) !== '',
-        )
+      const functions = functionBodies(readSource(c, file)).filter(
+        (fn) => callSites(fn.body, c.decider).length > 0,
       )
+      return functions.length === 0 || decisionProblems(c, file).length > 0
     })
     .map((file) => `${file} no longer decides a match with ${c.decider}`)
 }

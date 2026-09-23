@@ -22,6 +22,7 @@ import {
   readSource,
   sourceFiles,
   staleExemptions,
+  staleLengthExemptions,
   unexemptedComparisons,
 } from '@clickmonk/core/testing'
 import { describe, expect, it } from 'vitest'
@@ -82,6 +83,9 @@ describe('crypto hygiene in the admin service', () => {
 
   it('has no exemption that stopped matching anything', () => {
     expect(staleExemptions(CONFIG)).toEqual([])
+    // Both lists, in every package: asserting this in one package left an
+    // exemption added in another checked by nothing.
+    expect(staleLengthExemptions(CONFIG)).toEqual([])
   })
 
   it('lets the result of digestsMatch decide the answer, file by file', () => {

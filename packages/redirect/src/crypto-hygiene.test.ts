@@ -15,14 +15,24 @@ import { fileURLToPath } from 'node:url'
 import {
   type Exemption,
   type HygieneConfig,
+  MODULE_LEVEL,
   decisionProblems,
   gatedFiles,
   localImports,
   missingComparers,
   staleExemptions,
+  staleLengthExemptions,
   unexemptedComparisons,
 } from '@clickmonk/core/testing'
 import { describe, expect, it } from 'vitest'
+
+/**
+ * Both of these sit in a class method, which the checker attributes to
+ * `(module)` because it finds `function` declarations and not methods. The
+ * expression text is still exact, so the exemption is narrow; what it does not
+ * do is distinguish two methods of the same class.
+ */
+const IN_A_CLASS_METHOD = MODULE_LEVEL
 
 /**
  * Comparisons of things that are not secret, each exempt by exact text in one
@@ -45,6 +55,22 @@ const ALLOWED: Exemption[] = [
       'keeps one link id from appearing twice in the seen list; both are ids ' +
       'the visitor was already sent',
   },
+  {
+    file: 'snapshot.ts',
+    fn: IN_A_CLASS_METHOD,
+    expression: 'gen === this.reloadGen',
+    because:
+      'a reload compares its own generation number with the latest, to drop a ' +
+      'result a newer reload has already superseded; a counter is not a secret',
+  },
+  {
+    file: 'snapshot.ts',
+    fn: IN_A_CLASS_METHOD,
+    expression: 'this.listener === client',
+    because:
+      'the config listener checks whether the connection that dropped is still ' +
+      'the one it holds; an object identity, not a secret',
+  },
 ]
 
 const CONFIG: HygieneConfig = {
@@ -55,11 +81,32 @@ const CONFIG: HygieneConfig = {
    */
   primitives: ['timingSafeEqual', 'createHmac', 'passwordFingerprint', 'verifyPassword'],
   /**
+   * The entry point, so the set is every file this service runs rather than
+   * every file that happens to import a primitive. With only the primitives as
+   * seeds the set was four files, and `return presented === stored` added to
+   * `internal.ts` — the endpoint that decides whether this install asks for a
+   * certificate — was invisible to the gate, which the floor below cannot notice
+   * because the walk never reached the file.
+   */
+  alwaysSeed: ['index.ts'],
+  /**
    * `cap.ts` is on the floor because the walk reaches it: `app.ts` imports it
    * for a value, so it is scanned, and a file that is scanned belongs on the
    * floor or the floor is not one.
    */
-  expectedGated: ['app.ts', 'cap.ts', 'password.ts', 'visitor.ts'],
+  expectedGated: [
+    'app.ts',
+    'cap.ts',
+    'config.ts',
+    'index.ts',
+    'internal.ts',
+    'password.ts',
+    'rate.ts',
+    'snapshot.ts',
+    'spool.ts',
+    'visitor.ts',
+    'write-all.ts',
+  ],
   expectedComparers: ['password.ts', 'visitor.ts'],
   decider: 'timingSafeEqual',
   lengthCheckedFirst: true,
@@ -83,6 +130,9 @@ describe('crypto hygiene in the redirect', () => {
 
   it('has no exemption that stopped matching anything', () => {
     expect(staleExemptions(CONFIG)).toEqual([])
+    // Both lists, in every package: asserting this in one package left an
+    // exemption added in another checked by nothing.
+    expect(staleLengthExemptions(CONFIG)).toEqual([])
   })
 
   it('lets the result of timingSafeEqual decide the answer, file by file', () => {
