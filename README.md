@@ -254,25 +254,29 @@ bad-asn-list's licence:
 
 ## Upgrading
 
-Three things change for an install that was running before TLS was added.
+Four things change for an install that was running before TLS was added.
 
-**The redirect no longer publishes a port.** Caddy takes 80 and 443 instead, and nothing
-answers on `127.0.0.1:8080` any more, so anything you put in front of it — your own
-nginx, a tunnel, an uptime check — stops working. Point it at Caddy on port 80, or at
-443 once the domain is verified.
+**Ports 80 and 443 on the host have to be free, and the redirect publishes nothing.**
+Caddy binds both, so the stack does not start while something else holds either one —
+and nothing answers on `127.0.0.1:8080` any more, so whatever you had in front of the
+redirect (your own nginx, a tunnel, an uptime check) stops working either way. If that
+was a proxy on port 80, it has to give the port up: retire it and let Caddy answer
+directly, or leave it in place only if it can hand 80 and 443 through to Caddy
+untouched. Certificates are obtained on those two ports, so a proxy that terminates TLS
+itself breaks issuance rather than passing it on — that case needs a certificate you
+already hold, which `caddy/tls.d/00-defaults.caddy` explains.
 
-**Remove `CLICKMONK_TRUSTED_PROXIES` from `.env` unless you run a proxy of your own.**
+**Remove `CLICKMONK_TRUSTED_PROXIES` from `.env`.**
 The previous release told you to set it to the Docker network's gateway or subnet. A
 value in `.env` overrides the `uniquelocal,loopback` the stack now sets. The old value
 named the proxy you ran then — a gateway address, usually — and Caddy's container is not
 that, so unless what you set covers the whole of the stack's own network the redirect
 stops believing the address Caddy forwards. Every visitor is then recorded as Caddy's
 container address: they share one request count, so all of them are classed as abusers
-once it passes the threshold, and one country is looked up for the lot. If you do run
-something in front of Caddy, this variable is not where it goes: whatever it holds still
-has to cover the range Caddy's container sits in, which is what `uniquelocal,loopback`
-is for. Name your own proxy's ranges in `caddy/proxy.d/` instead, as the "IP data"
-section above describes.
+once it passes the threshold, and one country is looked up for the lot. A proxy of your
+own in front of Caddy is not this variable's business any more: name its ranges in
+`caddy/proxy.d/` instead. The one case left for a value here is publishing the
+redirect's port yourself, which the "IP data" section above describes.
 
 **Domains you added before this release stay verified.** The migration deliberately
 leaves the `verified` column alone — clearing it would 404 every live link on your
@@ -280,6 +284,19 @@ install until each domain published a TXT record. But verified is also what make
 domain eligible for a certificate, so each of those domains gets one on its first HTTPS
 request without ever having proved anything in DNS. `clickmonk domain list` shows them
 as verified with no check recorded.
+
+**The stack's own Docker network now has IPv6 on it**, with the unique-local subnet
+`CLICKMONK_IPV6_SUBNET` names, so that IPv6 visitors arrive as themselves. Your existing
+network does not have it, and Compose cannot change a network in place: `docker compose
+up -d --build` stops the containers, removes `clickmonk_default`, creates it again and
+starts them, so that step is a short outage and the addresses on that network can come
+back different. Two things can go wrong. If the range collides with a network this host
+already has, set `CLICKMONK_IPV6_SUBNET` in `.env` to one that does not. If your Docker
+daemon has no IPv6 support turned on, creating the network fails outright and nothing
+starts: turn it on in the daemon — your distribution's Docker documentation covers it,
+and it is the same setting the "Domains and TLS" section above asks for — or, if you
+cannot, delete the `networks:` block at the end of `docker-compose.yml` and accept that
+every IPv6 visitor is recorded as your Docker bridge's address rather than their own.
 
 Upgrade the worker before the redirect. Each release's redirect writes clicks in the
 record version it knows, and a worker older than the redirect does not read a newer

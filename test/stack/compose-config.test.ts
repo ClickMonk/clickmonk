@@ -59,18 +59,34 @@ function serviceNames(cfg: string): string[] {
   return [...servicesSection(cfg).matchAll(/\n {2}(\w[\w-]*):\n/g)].map((m) => m[1] as string)
 }
 
-/** The `published:` lines of one service block in the resolved configuration. */
+/**
+ * What one service publishes in the resolved configuration, each entry as
+ * `port/protocol`. The protocol is kept rather than dropped because the same
+ * port number on TCP and on UDP are two different publications: `443/udp` is
+ * the one an operator adds to turn HTTP/3 back on, and it must not read as a
+ * change to what is published on TCP. Compose prints `protocol:` directly
+ * under each `published:`.
+ */
 function published(cfg: string, service: string): string[] {
-  return [...serviceBlock(cfg, service).matchAll(/published: "?([0-9.:]+)"?/g)].map(
-    (m) => m[1] as string,
-  )
+  return [
+    ...serviceBlock(cfg, service).matchAll(/published: "?([0-9.:]+)"?\n\s*protocol: (\w+)/g),
+  ].map((m) => `${m[1]}/${m[2]}`)
+}
+
+/** Just the port numbers of those, whatever protocol each is published on. */
+function publishedPorts(cfg: string, service: string): string[] {
+  return published(cfg, service).map((p) => p.split('/')[0] as string)
 }
 
 describe('what the stack publishes', () => {
   const cfg = config('docker-compose.yml')
 
-  it('puts caddy on 80 and 443', () => {
-    expect(published(cfg, 'caddy')).toEqual(['80', '443'])
+  // The TCP publications exactly, so an added `443:443/udp` — the documented
+  // way to turn HTTP/3 back on, pinned further down — is not read here as a
+  // third port appearing. Anything else, on either protocol, still is.
+  it('puts caddy on 80 and 443, and publishes nothing else', () => {
+    expect(published(cfg, 'caddy').filter((p) => p.endsWith('/tcp'))).toEqual(['80/tcp', '443/tcp'])
+    expect(publishedPorts(cfg, 'caddy').filter((p) => p !== '80' && p !== '443')).toEqual([])
   })
 
   // The redirect's internal port answers Caddy's on-demand TLS question. It
@@ -88,7 +104,7 @@ describe('what the stack publishes', () => {
     expect(published(cfg, 'redirect')).toEqual([])
     expect(cfg, 'a service shares the host’s network namespace').not.toContain('network_mode')
     for (const service of serviceNames(cfg)) {
-      expect(published(cfg, service), service).not.toContain('9091')
+      expect(publishedPorts(cfg, service), service).not.toContain('9091')
     }
   })
 
@@ -192,7 +208,7 @@ describe('the restart-durability stack', () => {
   // redirect's dropped.
   it('still publishes nothing on the internal port', () => {
     const block = serviceBlock(cfg, 'redirect')
-    expect(published(cfg, 'redirect')).toEqual(['8080'])
+    expect(published(cfg, 'redirect')).toEqual(['8080/tcp'])
     expect(block, 'the redirect is published on every interface').toContain('host_ip: 127.0.0.1')
   })
 })
