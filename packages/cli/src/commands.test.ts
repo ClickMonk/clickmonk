@@ -1071,10 +1071,14 @@ describe('reading the password from standard input', () => {
   // A password of exactly the longest allowed length, every character three
   // bytes of UTF-8: the cap counts bytes, so a cap set at the character bound
   // would cut this one short and the command would hash the wrong password.
+  //
+  // One chunk per character, which is both what a terminal delivers and what
+  // makes this able to fail: the cap is checked after each chunk is taken, so
+  // the whole password arriving in one chunk is never cut whatever the cap is.
   it('does not cut a password of allowed length short because its characters are wide', async () => {
-    const wide = '\u4e2d'.repeat(MAX_PASSWORD_LENGTH)
-    expect(Buffer.byteLength(wide, 'utf8')).toBe(MAX_PASSWORD_LENGTH * 3)
-    expect(await readStdin(chunks([wide]), quiet)).toBe(wide)
+    const wide = Array.from({ length: MAX_PASSWORD_LENGTH }, () => '\u4e2d')
+    expect(Buffer.byteLength(wide.join(''), 'utf8')).toBe(MAX_PASSWORD_LENGTH * 3)
+    expect(await readStdin(chunks(wide), quiet)).toBe(wide.join(''))
   })
 
   it('says it is waiting when there is a terminal on the other end, and nothing when there is not', async () => {
