@@ -1,7 +1,7 @@
 import { LINK_SCRYPT, SCRYPT_PREFIX, verifyPassword } from '@clickmonk/core'
 import { createPgPool } from '@clickmonk/db'
 import { TEST_PG_URL, resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
-import type { FastifyInstance } from 'fastify'
+import type { FastifyInstance, LightMyRequestResponse } from 'fastify'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { MAX_LINK_PAGE } from './links.js'
 import { clockFrom, read, signedIn, testApp, write } from './testing.js'
@@ -504,6 +504,9 @@ describe('what the caller wrote', () => {
     try {
       const r = await create({ targets: [target] })
       expect(r.statusCode).toBe(201)
+      // Both, and the row below: `planted` is itself seven characters a
+      // generated slug could be, so the pattern alone accepts the attack.
+      expect(r.json().slug).not.toBe('planted')
       expect(r.json().slug).toMatch(/^[A-Za-z0-9]{7}$/)
     } finally {
       // biome-ignore lint/performance/noDelete: the planted property has to go, not be set to undefined
@@ -538,6 +541,155 @@ describe('what the caller wrote', () => {
     }
     const stored = await pg.query<{ slug: string }>('SELECT slug FROM links')
     expect(stored.rows[0]?.slug).toBe('keeps-its-slug')
+  })
+
+  /**
+   * The sharper half. A destination is where somebody's traffic goes, and it
+   * sits one level down — inside a target, inside `deviceUrls` — where a copy
+   * of the body's own top-level fields does not reach. Each row asserts the
+   * stored row rather than the response: a planted value that happens to look
+   * like a real one passes a response check, and the database is what says
+   * what the redirect will actually serve.
+   */
+  describe('a value one level down', () => {
+    const plant = (key: string, value: unknown): void => {
+      Object.defineProperty(Object.prototype, key, { value, configurable: true, writable: true })
+    }
+    const unplant = (key: string): void => {
+      delete (Object.prototype as unknown as Record<string, unknown>)[key]
+    }
+
+    it('is not taken from the prototype for a target with no url', async () => {
+      plant('url', 'https://example.com/planted')
+      try {
+        // A target object of the caller's own with nothing in it but a weight:
+        // the destination would be the planted one, and `core` would validate
+        // it as though it had been sent.
+        const r = await create({ slug: 'no-url', targets: [{ weight: 100 }] })
+        expect(r.statusCode).toBe(400)
+        // This module's own bound refuses it first: a target needs a url, and
+        // with the prototype gone there is none.
+        expect(r.json().error).toBe('invalid_body')
+      } finally {
+        unplant('url')
+      }
+      expect((await pg.query('SELECT 1 FROM links')).rowCount).toBe(0)
+      expect((await pg.query('SELECT 1 FROM link_targets')).rowCount).toBe(0)
+    })
+
+    it('is not taken from the prototype for a patched target with no url', async () => {
+      const created = (await create({ slug: 'keeps-its-target', targets: [target] })).json()
+      plant('url', 'https://example.com/planted')
+      try {
+        const r = await app.inject({
+          method: 'PATCH',
+          url: `/api/links/${created.id}`,
+          headers: write(cookie),
+          payload: { targets: [{ weight: 100 }] },
+        })
+        expect(r.statusCode).toBe(400)
+        expect(r.json().error).toBe('invalid_body')
+      } finally {
+        unplant('url')
+      }
+      const stored = await pg.query<{ url: string }>('SELECT url FROM link_targets')
+      expect(stored.rows.map((t) => t.url)).toEqual([target.url])
+    })
+
+    it('is not taken from the prototype for a device URL nobody set', async () => {
+      plant('ios', 'https://example.com/planted')
+      try {
+        const r = await create({ slug: 'no-device', targets: [target], deviceUrls: {} })
+        expect(r.statusCode).toBe(201)
+      } finally {
+        unplant('ios')
+      }
+      const stored = await pg.query<{ device_urls: Record<string, string> }>(
+        'SELECT device_urls FROM links',
+      )
+      expect(stored.rows[0]?.device_urls).toEqual({})
+    })
+
+    it('is not taken from the prototype for a device URL a patch never mentions', async () => {
+      // Half of what a patch validates comes from the stored row, and that
+      // half is read the same way: an empty `device_urls` column with an `ios`
+      // on the prototype is a platform sent somewhere nobody chose.
+      const created = (
+        await create({ slug: 'no-device', targets: [target], deviceUrls: {} })
+      ).json()
+      plant('ios', 'https://example.com/planted')
+      try {
+        const r = await app.inject({
+          method: 'PATCH',
+          url: `/api/links/${created.id}`,
+          headers: write(cookie),
+          payload: { name: 'Renamed' },
+        })
+        expect(r.statusCode).toBe(200)
+      } finally {
+        unplant('ios')
+      }
+      const stored = await pg.query<{ device_urls: Record<string, string> }>(
+        'SELECT device_urls FROM links',
+      )
+      expect(stored.rows[0]?.device_urls).toEqual({})
+    })
+
+    it('refuses a body nested deeper than the rebuild goes', async () => {
+      // The rebuild walks the body, so how deep it may go is bounded, and the
+      // bound answers 400 rather than unwinding the stack into a 500.
+      let deep: unknown = 'https://example.com/'
+      for (let i = 0; i < 20; i++) deep = [deep]
+      const r = await create({ targets: deep })
+      expect(r.statusCode).toBe(400)
+      expect(r.json().error).toBe('invalid_body')
+      // The message, not only the code: a body this shape is refused by the
+      // field schema too, with the same code, so the code alone would pass
+      // whether the bound existed or not.
+      expect(r.json().message).toBe('the body is nested too deeply')
+      expect((await pg.query('SELECT 1 FROM links')).rowCount).toBe(0)
+    })
+  })
+
+  /**
+   * The listing reads two optional fields off what zod returned, and an
+   * optional field the caller left out is exactly the read a prototype
+   * answers. One row per field.
+   */
+  describe('a listing filter nobody asked for', () => {
+    it('lists the links when a domain is planted', async () => {
+      await create({ slug: 'listed', targets: [target] })
+      Object.defineProperty(Object.prototype, 'domain', {
+        value: 'nowhere.example.test',
+        configurable: true,
+        writable: true,
+      })
+      try {
+        const r = await app.inject({ method: 'GET', url: '/api/links', headers: read(cookie) })
+        expect(r.statusCode).toBe(200)
+        expect(r.json().links.map((l: { slug: string }) => l.slug)).toEqual(['listed'])
+      } finally {
+        // biome-ignore lint/performance/noDelete: the planted property has to go, not be set to undefined
+        delete (Object.prototype as unknown as Record<string, unknown>).domain
+      }
+    })
+
+    it('lists the links when a cursor is planted', async () => {
+      await create({ slug: 'listed', targets: [target] })
+      Object.defineProperty(Object.prototype, 'cursor', {
+        value: 'not-a-uuid',
+        configurable: true,
+        writable: true,
+      })
+      try {
+        const r = await app.inject({ method: 'GET', url: '/api/links', headers: read(cookie) })
+        expect(r.statusCode).toBe(200)
+        expect(r.json().links.map((l: { slug: string }) => l.slug)).toEqual(['listed'])
+      } finally {
+        // biome-ignore lint/performance/noDelete: the planted property has to go, not be set to undefined
+        delete (Object.prototype as unknown as Record<string, unknown>).cursor
+      }
+    })
   })
 })
 
@@ -580,38 +732,73 @@ describe('the client a handler holds', () => {
   // certain to be the same connection; the state is read from the other pool,
   // because asking the connection itself would be another statement in the
   // transaction under test.
-  it.each([
+  interface InTransaction {
+    what: string
+    status: number
+    /** The refusal to make, given the app on the single client and a link to patch. */
+    send: (a: FastifyInstance, otherId: string) => Promise<LightMyRequestResponse>
+  }
+
+  const refusals: InTransaction[] = [
     {
       what: 'refuses an unknown domain',
-      payload: { host: 'nowhere.example.test', targets: [target] },
       status: 404,
+      send: (a) =>
+        a.inject({
+          method: 'POST',
+          url: '/api/links',
+          headers: write(cookie),
+          payload: { host: 'nowhere.example.test', targets: [target] },
+        }),
     },
     {
-      what: 'refuses a slug that is taken',
-      payload: { host: 'go.example.test', slug: 'taken', targets: [target] },
+      what: 'refuses a slug a create asked for',
       status: 409,
+      send: (a) =>
+        a.inject({
+          method: 'POST',
+          url: '/api/links',
+          headers: write(cookie),
+          payload: { host: 'go.example.test', slug: 'taken', targets: [target] },
+        }),
     },
-  ])(
+    {
+      // The patch's conflict is the one refusal Postgres raises rather than
+      // this code deciding it: the transaction is already aborted when the
+      // 409 is chosen, and it still has to be ended before the client goes
+      // back.
+      what: 'refuses a slug a patch moved onto',
+      status: 409,
+      send: (a, otherId) =>
+        a.inject({
+          method: 'PATCH',
+          url: `/api/links/${otherId}`,
+          headers: write(cookie),
+          payload: { slug: 'taken' },
+        }),
+    },
+  ]
+
+  it.each(refusals)(
     'gives the client back with no transaction open when it $what',
-    async ({ payload, status }) => {
+    async ({ send, status }) => {
       const tight = createPgPool(TEST_PG_URL, { max: 1, connectTimeoutMs: 1000 })
       const tightApp = testApp(tight, clock)
       try {
         expect((await create({ slug: 'taken', targets: [target] })).statusCode).toBe(201)
+        const other = (await create({ slug: 'other', targets: [target] })).json()
         const pid = (await tight.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]
           ?.pid
-        const r = await tightApp.inject({
-          method: 'POST',
-          url: '/api/links',
-          headers: write(cookie),
-          payload,
-        })
+        const r = await send(tightApp, other.id)
         expect(r.statusCode).toBe(status)
         const state = await pg.query<{ state: string }>(
           'SELECT state FROM pg_stat_activity WHERE pid = $1',
           [pid],
         )
         expect(state.rows[0]?.state).toBe('idle')
+        // And the refusal left both links as they were.
+        const slugs = await pg.query<{ slug: string }>('SELECT slug FROM links ORDER BY slug')
+        expect(slugs.rows.map((l) => l.slug)).toEqual(['other', 'taken'])
       } finally {
         await tightApp.close()
         await tight.end()

@@ -61,15 +61,24 @@ export async function createLink(
      * the only case where a collision is tried again instead of refused.
      */
     generatedSlug?: boolean
+    /**
+     * Where a retry's slug comes from. Neither caller passes one: it exists so
+     * that a collision, the retry, and giving up are all reachable from a test
+     * without waiting for two random seven-character slugs to agree. An
+     * unreachable branch in the one function that decides where traffic goes is
+     * worse than an option nobody sets.
+     */
+    slugSource?: () => string
   },
 ): Promise<CreateLinkResult> {
-  // Own properties, not inherited ones, for the two that decide something: a
+  // Own properties, not inherited ones, for the three that decide something: a
   // property planted on `Object.prototype` would otherwise set a password on
-  // every link written through here, or turn a refusal into a link at a slug
-  // nobody asked for. `o` is an object literal a caller builds, and a plain
-  // read of it walks the prototype chain.
+  // every link written through here, turn a refusal into a link at a slug
+  // nobody asked for, or choose the slug itself. `o` is an object literal a
+  // caller builds, and a plain read of it walks the prototype chain.
   const passwordHash = (Object.hasOwn(o, 'passwordHash') ? o.passwordHash : null) ?? null
   const generated = Object.hasOwn(o, 'generatedSlug') && o.generatedSlug === true
+  const nextSlug = (Object.hasOwn(o, 'slugSource') ? o.slugSource : undefined) ?? newSlug
 
   const client = await pg.connect()
   try {
@@ -87,7 +96,7 @@ export async function createLink(
       // one that collided is replaced. `ON CONFLICT DO NOTHING` leaves the
       // transaction usable, so the next attempt is another statement rather
       // than another transaction.
-      if (attempt > 0) slug = newSlug()
+      if (attempt > 0) slug = nextSlug()
       const l = await client.query<{ id: string }>(
         `INSERT INTO links (domain_id, slug, name, enabled, backup_url, device_urls,
                             returning_url, countries, click_cap, expires_at, passthrough,

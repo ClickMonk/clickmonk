@@ -21,7 +21,7 @@ import {
   normaliseHost,
   parseLinkInput,
 } from '@clickmonk/core'
-import type { PoolClient } from '@clickmonk/db'
+import type { Pool, PoolClient } from '@clickmonk/db'
 import { createLink } from '@clickmonk/worker/links'
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
@@ -149,51 +149,54 @@ function asInput(l: LinkRow): Record<string, unknown> {
   }
 }
 
-/**
- * Anything a query can be sent through: the pool, or one client taken from it.
- *
- * Which one matters. A handler holding a client from a pool of four must not
- * ask that pool for a second one — it would wait behind itself, and four such
- * requests at once take the pool to zero with nobody left to release. So a
- * read that happens while a client is held is sent through that client.
- */
-type Queryable = Pick<PoolClient, 'query'>
-
-async function linkById(q: Queryable, id: string): Promise<LinkRow> {
+async function linkById(pg: Pool, id: string): Promise<LinkRow> {
   if (!z.string().uuid().safeParse(id).success) fail(404, 'not_found', 'no such link')
-  const r = await q.query<LinkRow>(`${SELECT_LINKS} WHERE l.id = $1 GROUP BY l.id, d.host`, [id])
+  const r = await pg.query<LinkRow>(`${SELECT_LINKS} WHERE l.id = $1 GROUP BY l.id, d.host`, [id])
   const row = r.rows[0]
   if (!row) fail(404, 'not_found', 'no such link')
   return row as LinkRow
 }
 
 /**
- * A body as its own top-level properties and nothing else, with no prototype
- * behind it.
- *
- * Two reads here decide something: whether the caller named a slug, and
- * whether they mentioned the password — the second decides whether a stored
- * hash survives a patch. Both are answers about what the caller *wrote*, and a
- * plain object cannot give one on its own. A property planted on
- * `Object.prototype` is returned by `data[key]` and reported by `key in data`,
- * which is how zod decides a key was present: it reads the planted value and
- * copies it into its output as an own property, where a later `Object.hasOwn`
- * agrees that the caller sent it. So the prototype has to be stripped *before*
- * the parse and the own-property read has to happen after it; either half
- * alone answers nothing.
- *
- * It is shallow, deliberately: it covers the fields this module branches on.
- * Everything nested is validated by `core` against a strict schema rather than
- * decided here.
+ * How deep a body may nest. A link's is three or four: the body, its
+ * `targets` array, a target, its values. The bound exists because the rebuild
+ * below walks the body, and a walk with no bound is a stack to overflow with
+ * 64KB of nothing but brackets.
  */
-function ownFields(body: unknown): unknown {
-  if (typeof body !== 'object' || body === null || Array.isArray(body)) return body
-  return Object.assign(Object.create(null), body)
+const MAX_BODY_DEPTH = 8
+
+/**
+ * A body rebuilt with no prototype anywhere in it, all the way down.
+ *
+ * Every value this module later reads is read out of something zod produced
+ * from this. A property planted on `Object.prototype` is returned by
+ * `data[key]` and reported by `key in data`, which is how zod decides a key was
+ * present: it reads the planted value and copies it into its output as an own
+ * property, where a later `Object.hasOwn` agrees the caller sent it. So the
+ * prototype has to be gone *before* the parse, and every read after it has to
+ * be an own-property read — `written` below. Either half alone answers nothing.
+ *
+ * All the way down, because the field a planted property decides is not only
+ * the password. `targets: [{ weight: 100 }]` with a `url` on the prototype is a
+ * link whose destination nobody sent, and a destination is where the traffic
+ * goes; `deviceUrls: {}` with an `ios` on it is the same thing for one platform.
+ * Stripping the outer object alone left both.
+ */
+function ownFields(value: unknown, depth = 0): unknown {
+  if (depth > MAX_BODY_DEPTH) fail(400, 'invalid_body', 'the body is nested too deeply')
+  if (Array.isArray(value)) return value.map((v) => ownFields(v, depth + 1))
+  if (typeof value !== 'object' || value === null) return value
+  const out = Object.create(null) as Record<string, unknown>
+  // Own enumerable properties, which is what `Object.entries` gives.
+  for (const [k, v] of Object.entries(value)) out[k] = ownFields(v, depth + 1)
+  return out
 }
 
 /**
  * The value the caller wrote for a field, or `undefined` when they did not
- * write it at all. The own-property half of the pair `ownFields` describes.
+ * write it at all. The own-property half of the pair `ownFields` describes:
+ * zod's output is an ordinary object, so a plain read of a field the caller
+ * left out is answered by whatever is on `Object.prototype`.
  */
 function written<T, K extends keyof T & string>(body: T, key: K): T[K] | undefined {
   return Object.hasOwn(body as object, key) ? body[key] : undefined
@@ -235,8 +238,14 @@ export function registerLinkRoutes(app: FastifyInstance, ctx: AdminContext): voi
   app.get('/api/links', async (req) => {
     requireCredential(req)
     const q = readBody(ListQuery, ownFields(req.query))
-    const host = q.domain === undefined ? null : normaliseHost(q.domain)
-    if (q.domain !== undefined && host === null) fail(400, 'invalid_host', 'not a valid host name')
+    // `written`, not `q.domain` and `q.cursor`: both are optional, so a caller
+    // who sent neither has nothing of their own under either name, and a plain
+    // read is answered by the prototype — a filter nobody asked for, or a
+    // cursor that is not an id reaching the query as one.
+    const domain = written(q, 'domain')
+    const cursor = written(q, 'cursor')
+    const host = domain === undefined ? null : normaliseHost(domain)
+    if (domain !== undefined && host === null) fail(400, 'invalid_host', 'not a valid host name')
     const r = await ctx.pg.query<LinkRow>(
       `${SELECT_LINKS}
         WHERE ($1::text IS NULL OR d.host = $1)
@@ -244,7 +253,7 @@ export function registerLinkRoutes(app: FastifyInstance, ctx: AdminContext): voi
         GROUP BY l.id, d.host
         ORDER BY l.id
         LIMIT $3`,
-      [host, q.cursor ?? null, q.limit],
+      [host, cursor ?? null, q.limit],
     )
     return {
       links: r.rows.map(asLink),
@@ -320,7 +329,10 @@ export function registerLinkRoutes(app: FastifyInstance, ctx: AdminContext): voi
       if (key === 'password' || value === undefined) continue
       merged[key] = value
     }
-    const input = validate(merged)
+    // The merge is rebuilt as well: half of it comes from the row and half from
+    // the body, and `core` reads every field of it the same way zod read this
+    // body — `data[key]`.
+    const input = validate(ownFields(merged))
     // Absent leaves the password as it is; null clears it; a string replaces
     // it, which changes the hash and so stops every proof a visitor holds.
     // `written`, so that "absent" means the caller left it out.
