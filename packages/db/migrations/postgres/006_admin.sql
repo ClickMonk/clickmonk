@@ -74,9 +74,17 @@ CREATE TABLE admin_account (
   -- already spent.
   totp_last_step bigint      NOT NULL DEFAULT 0
                              CONSTRAINT admin_account_totp_last_step_valid CHECK (totp_last_step >= 0),
-  -- Failed sign-ins since the last success, and the lockout they earned.
+  -- Failed sign-ins since the last success, when the last of them was, and the
+  -- lockout they earned. `last_failed_at` is what lets the count decay: without
+  -- it the count is permanent, so an admin who mistypes their password once a
+  -- quarter and gets it right the second time is locked out on the fourth
+  -- occasion, months after the first, with no way to clear it short of a
+  -- sign-in the lock itself refuses. An attempt whose last failure is older
+  -- than the application's decay window starts from zero; a run of failures
+  -- inside the window still locks, which is the bound that was wanted.
   failed_logins  integer     NOT NULL DEFAULT 0
                              CONSTRAINT admin_account_failed_logins_valid CHECK (failed_logins >= 0),
+  last_failed_at timestamptz,
   locked_until   timestamptz,
   created_at     timestamptz NOT NULL DEFAULT now(),
   updated_at     timestamptz NOT NULL DEFAULT now()

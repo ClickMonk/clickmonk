@@ -2,6 +2,7 @@ import { MAX_PASSWORD_LENGTH, MIN_ADMIN_PASSWORD_LENGTH, totpUri } from '@clickm
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import {
+  activeFailures,
   checkAccountPassword,
   disableTotp,
   enrolTotp,
@@ -287,10 +288,20 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: AdminContext): 
     const account = await loadAccount(ctx.pg)
     if (!account) fail(503, 'no_admin', 'this install has no admin account yet')
     const a = account as NonNullable<typeof account>
+    const now = ctx.now()
     return {
       email: a.email,
       totpEnabled: a.totpSecret !== null,
       recoveryCodesLeft: await unusedRecoveryCodeCount(ctx.pg),
+      // The failure count as an attempt right now would read it, and the
+      // lockout if one is standing. Nothing else surfaces either, so an admin
+      // whose count is creeping up has no way to see it before the lock lands —
+      // which is the whole complaint against a count that never decays.
+      failedLogins: activeFailures(a, now),
+      lockedUntil:
+        a.lockedUntil && a.lockedUntil.getTime() > now.getTime()
+          ? a.lockedUntil.toISOString()
+          : null,
       credential: credential.kind,
     }
   })

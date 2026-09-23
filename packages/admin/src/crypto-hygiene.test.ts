@@ -1,6 +1,6 @@
 /**
- * A gate on every function in this package that decides whether a presented
- * secret matches a stored one.
+ * A gate on the source of every file in this package that could compare a
+ * credential.
  *
  * It is here because the equivalent gate over the credential primitives does
  * not travel: it reads the source of its own package's files and nothing else,
@@ -10,49 +10,87 @@
  * pin it. This reads the source text instead, and fails at the commit that
  * introduces the regression rather than waiting on a measurement.
  *
- * **It finds its own subjects.** An earlier version named the one function it
- * gated, which meant a file added later was simply not covered and nothing
- * said so. This instead walks every non-test source file in the package and
- * gates every function whose body calls `hashToken(` or `digestsMatch(` — the
- * two calls that turn a presented credential into something comparable and
- * compare it. A new module that authenticates a key is gated the moment it is
- * written, without anyone remembering to add it; and `EXPECTED_SUBJECTS` below
- * fails if the discovery itself stops finding what it found before, so a
- * rename that empties the gate is a failure rather than a silent pass.
+ * **It follows the imports.** Earlier versions asked which functions called a
+ * credential primitive, which meant a comparison moved one file sideways —
+ * `compare.ts` holding `a === b`, called from `authenticateKey` — was gated by
+ * nothing, and that is ordinary refactoring rather than an attack. Instead:
+ * start from every file that imports a credential primitive from the core
+ * package, follow its relative imports transitively, and scan **every one of
+ * those files whole**. A helper split out of a gated file is gated by the act
+ * of importing it.
  *
- * Functions that compare something which is not a secret are deliberately out
- * of scope — the cross-site `Origin` check compares two strings with `!==` and
- * should, since neither is secret and the answer is public either way.
+ * Scanning whole files rather than selected functions also means an arrow
+ * function, a class method or a module-level expression is covered, none of
+ * which a "find the function declarations" pass sees.
+ *
+ * **Holes that remain**, stated rather than implied:
+ *
+ * - It reads text, not semantics. A comparison that avoids `==`, `!=` and
+ *   `.equals(` — bitwise work on two buffers, a hand-rolled loop, a comparison
+ *   method this file has never heard of — is invisible to it.
+ * - It does not prove the comparison it finds runs in constant time, only that
+ *   the source calls the function this codebase uses for that.
+ * - It follows relative imports. A comparison moved into another workspace
+ *   package, or reached through a dynamic `import()`, is outside its reach —
+ *   though a new package holding credential logic would need its own gate
+ *   anyway, which is the same reason this one exists.
+ * - `ALLOWED_COMPARISONS` below exempts specific expressions by their exact
+ *   text. Each is a comparison of something that is not secret. The exemption
+ *   is the expression, not the function around it, so a secret comparison added
+ *   beside an exempt one still fails — and an entry that no longer matches
+ *   anything fails too, so the list cannot rot.
+ * - `digestsMatch`'s result is traced from `return` and assignment through
+ *   continuation lines. A result routed through a data structure, or through a
+ *   second function, is not followed.
  *
  * A session token is not compared in JavaScript anywhere in this package: its
  * digest is the indexed key its row is found by, so the comparison is
  * Postgres's, against a fixed-width digest, and there is no branch here that
  * could return early on a differing byte.
- *
- * What this is, and is not: a tripwire for a careless edit — a rename, a
- * "simplify this" pass, a copy-paste from the wrong function — not a proof
- * against a determined author. It reads text, not semantics, so a hand-rolled
- * byte loop is invisible to it, and it does not prove the comparison it finds
- * actually runs in constant time, only that the source calls the function this
- * codebase uses for that.
  */
 import { readFileSync, readdirSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
-/** The calls that mark a function as deciding whether a credential matches. */
-const CREDENTIAL_CALLS = ['hashToken(', 'digestsMatch(']
+/**
+ * Importing one of these is what makes a file a starting point. They are the
+ * primitives whose output is compared *in this process*: a digest to check, the
+ * comparison itself, the parse that splits a presented key, and the mint that
+ * produces the value on the other side of one. Password and one-time-code
+ * verification are not here because they never return something this package
+ * compares — the comparison happens inside the core package, which has its own
+ * gate over exactly that.
+ */
+const CREDENTIAL_PRIMITIVES = new Set([
+  'digestsMatch',
+  'hashToken',
+  'parseApiKey',
+  'newOpaqueToken',
+  'newApiKey',
+])
 
 /**
- * What discovery must find. Not the gate's input — the gate reads the
- * directory — but a floor under it: if a refactor moves or renames these, this
- * list fails and someone has to look, rather than the gate quietly covering
- * nothing. Add to it when a module joins; never trim it to make it pass.
+ * A floor under discovery: if a refactor stops this file being reached, the
+ * gate covers less than it did and someone has to look, rather than passing
+ * over an empty set. Add to it when a module joins; never trim it to pass.
  */
-const EXPECTED_SUBJECTS = ['auth.ts#authenticateKey']
+const EXPECTED_GATED_FILES = ['auth.ts']
+
+/**
+ * Comparisons of things that are not secret, exempt by exact text. Every entry
+ * must still match something, so a stale exemption is a failure.
+ */
+const ALLOWED_COMPARISONS: { expression: string; because: string }[] = [
+  {
+    expression: 'o.origin !== expected',
+    because:
+      'the cross-site write guard compares a request header to the admin origin; ' +
+      'neither is secret, and the answer is the same to everyone',
+  },
+]
 
 /**
  * Removes line and block comments, so a check further down never counts dead,
@@ -62,11 +100,186 @@ function stripComments(text: string): string {
   return text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')
 }
 
-/** Every non-test source file in the package, excluding the test helper. */
-function sourceFiles(): string[] {
-  return readdirSync(here)
-    .filter((n) => n.endsWith('.ts') && !n.endsWith('.test.ts') && n !== 'testing.ts')
-    .sort()
+/** Every source file in the package and its subdirectories, as relative paths. */
+function sourceFiles(dir = here): string[] {
+  const out: string[] = []
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name)
+    if (entry.isDirectory()) {
+      out.push(...sourceFiles(full))
+      continue
+    }
+    if (!entry.name.endsWith('.ts') || entry.name.endsWith('.test.ts')) continue
+    if (entry.name === 'testing.ts') continue
+    out.push(relative(here, full))
+  }
+  return out.sort()
+}
+
+const read = (file: string): string => stripComments(readFileSync(join(here, file), 'utf8'))
+
+/** The names a file imports from the core package, `type` specifiers dropped. */
+function coreImports(source: string): string[] {
+  const names: string[] = []
+  for (const match of source.matchAll(/import\s*\{([^}]*)\}\s*from\s*'@clickmonk\/core'/g)) {
+    for (const part of (match[1] as string).split(',')) {
+      const name = part
+        .trim()
+        .replace(/^type\s+/, '')
+        .split(/\s+as\s+/)[0]
+        ?.trim()
+      if (name) names.push(name)
+    }
+  }
+  return names
+}
+
+/** The package-relative files a file imports, as `sourceFiles()` names them. */
+function localImports(file: string, source: string): string[] {
+  const from = dirname(join(here, file))
+  const out: string[] = []
+  for (const match of source.matchAll(/from\s*'(\.[^']*)'/g)) {
+    const target = resolve(from, (match[1] as string).replace(/\.js$/, '.ts'))
+    out.push(relative(here, target))
+  }
+  return out
+}
+
+/**
+ * Every file that imports a credential primitive, plus everything those files
+ * import, transitively. A helper is gated because something gated reaches it.
+ */
+function gatedFiles(): string[] {
+  const all = new Set(sourceFiles())
+  const queue = [...all].filter((f) =>
+    coreImports(read(f)).some((n) => CREDENTIAL_PRIMITIVES.has(n)),
+  )
+  const gated = new Set(queue)
+  while (queue.length > 0) {
+    const file = queue.shift() as string
+    for (const next of localImports(file, read(file))) {
+      if (!all.has(next) || gated.has(next)) continue
+      gated.add(next)
+      queue.push(next)
+    }
+  }
+  return [...gated].sort()
+}
+
+interface Comparison {
+  /** The whole expression, whitespace collapsed: what an exemption names. */
+  expression: string
+  why: string
+}
+
+/** Where an operand stops, scanning outward from the operator. */
+const BOUNDARY = /[(){}[\];,\n?:]/
+
+/**
+ * The operand to the right of an operator, as raw text. Its extent has to be
+ * found by scanning: a call has its own balanced parentheses, so it does not
+ * end at the first `)` — it ends at the `)` that returns depth to zero, or at
+ * `&&`, `||`, `;`, `,` or a newline at depth zero, whichever comes first.
+ */
+function rhsText(text: string, opEnd: number): string {
+  let i = opEnd
+  let depth = 0
+  const start = i
+  for (; i < text.length; i++) {
+    const ch = text[i] as string
+    if (ch === '(' || ch === '[') {
+      depth++
+      continue
+    }
+    if (ch === ')' || ch === ']') {
+      if (depth === 0) break
+      depth--
+      continue
+    }
+    if (depth === 0 && (text.startsWith('&&', i) || text.startsWith('||', i))) break
+    if (depth === 0 && BOUNDARY.test(ch)) break
+  }
+  return text.slice(start, i).trim()
+}
+
+/** The operand to the left, by the mirrored rules. */
+function lhsText(text: string, opStart: number): string {
+  let i = opStart - 1
+  let depth = 0
+  for (; i >= 0; i--) {
+    const ch = text[i] as string
+    if (ch === ')' || ch === ']') {
+      depth++
+      continue
+    }
+    if (ch === '(' || ch === '[') {
+      if (depth === 0) break
+      depth--
+      continue
+    }
+    if (depth === 0 && (text.startsWith('&&', i - 1) || text.startsWith('||', i - 1))) break
+    if (depth === 0 && (ch === '=' || ch === '!')) break
+    if (depth === 0 && BOUNDARY.test(ch)) break
+  }
+  return text.slice(i + 1, opStart).trim()
+}
+
+/**
+ * Equality inside a gated file is not banned outright: this code legitimately
+ * compares a value to `null` or `undefined`, a length to a number, or a tag to
+ * a string literal, long before it reaches any secret. Neither operand there is
+ * the thing being verified, and a literal written in the source cannot be a
+ * stored digest.
+ *
+ * Loose `==` and `!=` are matched as well as the strict pair: they compare just
+ * as early-exitingly, and a "tidy up" that drops a character must not walk out
+ * of the gate.
+ *
+ * Banned regardless of what is on the other side: `.equals(`, which has no
+ * legitimate use here; an operand that is a call or template result, which
+ * routes the comparison around whatever it looks like as plain text
+ * (`hashToken(x) === row.secret_hash` compares strings built from the secret
+ * material); and an operand that is an expression rather than one whole value —
+ * `presented === '' + stored` is a concatenation whose first piece is an
+ * innocent-looking literal.
+ */
+function findDisallowedComparisons(body: string): Comparison[] {
+  const violations: Comparison[] = []
+  for (const match of body.matchAll(/[\w$]+\.equals\(/g)) {
+    violations.push({ expression: match[0], why: 'compares with .equals(' })
+  }
+
+  const isWholeValue = (token: string): boolean =>
+    /^[\w$]+(?:\.[\w$]+)*$/.test(token) || /^(['"]).*\1$/.test(token) || /^-?\d+$/.test(token)
+  const isSafeOperand = (token: string): boolean =>
+    isWholeValue(token) &&
+    (token === 'null' ||
+      token === 'undefined' ||
+      /\.length$/.test(token) ||
+      /^-?\d+$/.test(token) ||
+      /^(['"]).*\1$/.test(token))
+
+  const opRe = /!==|===|!=|==/g
+  let match: RegExpExecArray | null
+  // biome-ignore lint/suspicious/noAssignInExpressions: exec's own idiom for a global regex
+  while ((match = opRe.exec(body))) {
+    const op = match[0]
+    const lhs = lhsText(body, match.index).replace(/\s+/g, ' ')
+    const rhs = rhsText(body, match.index + op.length).replace(/\s+/g, ' ')
+    const expression = `${lhs} ${op} ${rhs}`.trim()
+    if (lhs.endsWith(')') || lhs.endsWith('`') || rhs.endsWith(')') || rhs.endsWith('`')) {
+      violations.push({ expression, why: 'an operand is a call or template result' })
+      continue
+    }
+    if (!isWholeValue(lhs) || !isWholeValue(rhs)) {
+      violations.push({ expression, why: 'an operand is an expression, not one whole value' })
+      continue
+    }
+    if (!(isSafeOperand(lhs) || isSafeOperand(rhs))) {
+      violations.push({ expression, why: 'neither operand is a literal, a length or null' })
+    }
+  }
+  return violations
 }
 
 interface FunctionBody {
@@ -75,11 +288,9 @@ interface FunctionBody {
 }
 
 /**
- * Every named function in a file, with its body, found by brace-balance from
- * each declaration rather than by "the first `{` after the name": a parameter
- * may itself be an inline object type, whose `{` comes first. Parentheses are
- * balanced to the end of the parameter list, then braces from the first `{`
- * after that.
+ * Every declared function in a file, with its body, found by brace-balance from
+ * the declaration rather than by "the first `{` after the name": a parameter may
+ * itself be an inline object type, whose `{` comes first.
  */
 function functionBodies(source: string): FunctionBody[] {
   const out: FunctionBody[] = []
@@ -116,120 +327,20 @@ function functionBodies(source: string): FunctionBody[] {
   return out
 }
 
-/** The last non-whitespace character of the operand left of an operator. */
-function lhsEndChar(text: string, opStart: number): string {
-  let i = opStart - 1
-  while (i >= 0 && /\s/.test(text[i] as string)) i--
-  return i >= 0 ? (text[i] as string) : ''
-}
-
 /**
- * The last non-whitespace character of the operand right of an operator. The
- * right operand's extent has to be found by scanning forward: a call has its
- * own balanced parentheses, so it does not end at the first `)` — it ends at
- * the `)` that returns depth to zero, or at `&&`, `||`, `;`, `,` or a newline
- * at depth zero, whichever comes first.
- */
-function rhsEndChar(text: string, opEnd: number): string {
-  let i = opEnd
-  while (i < text.length && /\s/.test(text[i] as string)) i++
-  let depth = 0
-  let last = ''
-  for (; i < text.length; i++) {
-    const ch = text[i] as string
-    if (ch === '(') {
-      depth++
-      last = ch
-      continue
-    }
-    if (ch === ')') {
-      if (depth === 0) break
-      depth--
-      last = ch
-      continue
-    }
-    if (depth === 0 && (text.startsWith('&&', i) || text.startsWith('||', i))) break
-    if (depth === 0 && (ch === ';' || ch === ',' || ch === '\n')) break
-    if (!/\s/.test(ch)) last = ch
-  }
-  return last
-}
-
-/**
- * Equality inside a gated body is not banned outright: these functions
- * legitimately compare a value to `null`, a length to a number, or a tag to a
- * string literal before they ever reach the secret material. Neither operand
- * there is the thing being verified, and a literal written in this file cannot
- * be a stored digest.
+ * Why a body's use of `digestsMatch(` does not decide anything, or the empty
+ * string when it does.
  *
- * Loose `==` and `!=` are matched as well as the strict pair: they compare
- * just as early-exitingly, and a "tidy up" that drops a character must not
- * walk out of the gate.
- *
- * Two things are banned regardless of what is on the other side. `.equals(`,
- * which has no legitimate use here. And a comparison where either operand ends
- * in `)` or a backtick: a call result or a template result, which routes the
- * comparison around whatever the operand looks like as plain text —
- * `hashToken(x) === row.secret_hash` compares strings built from the secret
- * material, and no identifier-based check can tell that from a length check.
- */
-function findDisallowedComparisons(body: string): string[] {
-  const violations: string[] = []
-  for (const match of body.matchAll(/[\w$]+\.equals\(/g)) violations.push(match[0])
-
-  const isSafeOperand = (token: string): boolean =>
-    token === 'null' ||
-    token === 'undefined' ||
-    /\.length$/.test(token) ||
-    /^-?\d+$/.test(token) ||
-    /^(['"]).*\1$/.test(token)
-  // A chain of identifiers, or a quoted string literal with no quote inside it.
-  const operand = `(?:[\\w$]+(?:\\.[\\w$]+)*|'[^']*'|"[^"]*")`
-  const opRe = /!==|===|!=|==/g
-  let match: RegExpExecArray | null
-  // biome-ignore lint/suspicious/noAssignInExpressions: exec's own idiom for a global regex
-  while ((match = opRe.exec(body))) {
-    const opStart = match.index
-    const opEnd = opStart + match[0].length
-    const snippet = (): string =>
-      body
-        .slice(Math.max(0, opStart - 30), Math.min(body.length, opEnd + 30))
-        .replace(/\s+/g, ' ')
-        .trim()
-
-    const lhsLast = lhsEndChar(body, opStart)
-    const rhsLast = rhsEndChar(body, opEnd)
-    if (lhsLast === ')' || lhsLast === '`' || rhsLast === ')' || rhsLast === '`') {
-      violations.push(snippet())
-      continue
-    }
-
-    const lhsToken = new RegExp(`(${operand})\\s*$`).exec(body.slice(0, opStart))?.[1] ?? ''
-    const rhsToken = new RegExp(`^\\s*(${operand})`).exec(body.slice(opEnd))?.[1] ?? ''
-    if (!(isSafeOperand(lhsToken) || isSafeOperand(rhsToken))) {
-      violations.push(snippet())
-    }
-  }
-  return violations
-}
-
-/**
- * Why a body's use of `digestsMatch(` does not count, or the empty string when
- * it does.
- *
- * Two things have to hold, and the second is the one an earlier version of
- * this gate missed. The call must be **returned or assigned** — a
- * `digestsMatch(...)` written as its own statement with the result thrown away
- * decides nothing, and the line before it ends in whatever the previous
- * statement ended in, so the continuation chain breaks at the first line
- * boundary even though a `return` appears earlier in the body. And when it is
- * assigned, the name it was assigned to must be **read again afterwards**: a
- * result computed into a variable that nothing goes on to look at decides
- * nothing either, which is exactly what deleting the name from the condition
- * below it leaves behind.
+ * Two things have to hold. The call must be **returned or assigned** — one
+ * written as its own statement with the result thrown away decides nothing, and
+ * the line before it ends in whatever the previous statement ended in, so the
+ * continuation chain breaks at the first line boundary even though a `return`
+ * appears earlier in the body. And when it is assigned, the name must be
+ * **read again afterwards**: a result computed into a variable nothing goes on
+ * to look at decides nothing either, which is exactly what deleting the name
+ * from the condition below it leaves behind.
  */
 function whyDigestsMatchDoesNotDecide(strippedBody: string): string {
-  if (!strippedBody.includes('digestsMatch(')) return 'digestsMatch is never called'
   const anchorRe = /\breturn\b|(?:const|let|var)\s+([\w$]+)\s*=(?!=)|([\w$]+)\s*=(?!=)/g
   let anchor: RegExpExecArray | null
   let sawUnread = false
@@ -245,8 +356,7 @@ function whyDigestsMatchDoesNotDecide(strippedBody: string): string {
       .filter((line) => line.trim().length > 0)
     if (!linesBeforeCall.every((line) => /(?:&&|\|\||=)\s*$/.test(line.trimEnd()))) continue
     const assignedTo = anchor[1] ?? anchor[2]
-    if (assignedTo === undefined) return '' // returned directly
-    // Assigned: the name has to be read somewhere after the assignment.
+    if (assignedTo === undefined) return ''
     const rest = strippedBody.slice(callIndex)
     if (new RegExp(`\\b${assignedTo}\\b`).test(rest)) return ''
     sawUnread = true
@@ -257,60 +367,50 @@ function whyDigestsMatchDoesNotDecide(strippedBody: string): string {
 }
 
 describe('crypto hygiene in the admin service', () => {
-  const subjects = sourceFiles().flatMap((file) => {
-    const source = readFileSync(join(here, file), 'utf8')
-    return functionBodies(stripComments(source))
-      .filter((fn) => CREDENTIAL_CALLS.some((call) => fn.body.includes(call)))
-      .map((fn) => ({ label: `${file}#${fn.name}`, body: fn.body }))
-  })
+  const gated = gatedFiles()
 
-  // Nothing in this package has a use for a non-cryptographic random number,
-  // and one file here mints a throwaway password hash that a sign-in against an
-  // unknown address is measured against. `Math.random` is not a weakness in
-  // that particular spot, but it is the wrong reach in a package about
-  // credentials, and the next person to copy the line will be somewhere it is.
   it('never reaches for Math.random', () => {
+    // Nothing in this package has a use for a non-cryptographic random number,
+    // and one file here mints a throwaway password hash that a sign-in against
+    // an unknown address is measured against.
     for (const file of sourceFiles()) {
-      const source = stripComments(readFileSync(join(here, file), 'utf8'))
-      expect(source.includes('Math.random'), file).toBe(false)
+      expect(read(file).includes('Math.random'), file).toBe(false)
     }
   })
 
-  it('finds every function that handles a presented credential', () => {
-    const labels = subjects.map((s) => s.label)
-    // A superset: discovery may find more than this, never less.
-    expect(labels).toEqual(expect.arrayContaining(EXPECTED_SUBJECTS))
+  it('gates every file that can reach a credential primitive', () => {
+    // A superset: following the imports may find more than this, never less.
+    expect(gated).toEqual(expect.arrayContaining(EXPECTED_GATED_FILES))
   })
 
-  // Discovery reads `function` declarations. A file that reaches for a
-  // credential call from an arrow function, or from anywhere else this cannot
-  // see, would otherwise be gated by nothing at all and say nothing about it.
-  it('leaves no file that handles a credential ungated', () => {
-    for (const file of sourceFiles()) {
-      const source = stripComments(readFileSync(join(here, file), 'utf8'))
-      if (!CREDENTIAL_CALLS.some((call) => source.includes(call))) continue
-      const gated = subjects.filter((s) => s.label.startsWith(`${file}#`))
+  it('compares a credential, in every gated file, only with digestsMatch', () => {
+    const exempt = new Set(ALLOWED_COMPARISONS.map((a) => a.expression))
+    for (const file of gated) {
+      const found = findDisallowedComparisons(read(file))
       expect(
-        gated.length,
-        `${file} calls a credential primitive outside any gated function`,
-      ).toBeGreaterThan(0)
-      // And every one of those calls sits inside a function this gate read.
-      for (const call of CREDENTIAL_CALLS) {
-        const inSource = source.split(call).length - 1
-        const inGated = gated.reduce((n, g) => n + g.body.split(call).length - 1, 0)
-        expect(inGated, `${file}: ${call} outside a gated function`).toBe(inSource)
-      }
+        found.filter((c) => !exempt.has(c.expression)),
+        file,
+      ).toEqual([])
     }
   })
 
-  it('decides a match, inside every such function, only with digestsMatch', () => {
-    for (const { label, body } of subjects) {
-      expect(findDisallowedComparisons(body), label).toEqual([])
+  it('has no exemption that stopped matching anything', () => {
+    const found = gated.flatMap((file) =>
+      findDisallowedComparisons(read(file)).map((c) => c.expression),
+    )
+    for (const { expression, because } of ALLOWED_COMPARISONS) {
+      expect(found, `${expression} (${because})`).toContain(expression)
     }
   })
 
   it('lets the result of digestsMatch decide the answer wherever it is called', () => {
-    for (const { label, body } of subjects.filter((s) => s.body.includes('digestsMatch('))) {
+    const subjects = gated.flatMap((file) =>
+      functionBodies(read(file))
+        .filter((fn) => fn.body.includes('digestsMatch('))
+        .map((fn) => ({ label: `${file}#${fn.name}`, body: fn.body })),
+    )
+    expect(subjects.length).toBeGreaterThan(0)
+    for (const { label, body } of subjects) {
       expect(whyDigestsMatchDoesNotDecide(body), label).toBe('')
     }
   })

@@ -38,6 +38,8 @@ export interface AdminAccount {
   totpSecret: string | null
   totpLastStep: number
   failedLogins: number
+  /** When the last of those failures was, or null if there have been none. */
+  lastFailedAt: Date | null
   lockedUntil: Date | null
 }
 
@@ -47,6 +49,7 @@ interface AccountRow {
   totp_secret: string | null
   totp_last_step: string
   failed_logins: number
+  last_failed_at: Date | null
   locked_until: Date | null
 }
 
@@ -56,11 +59,12 @@ const toAccount = (r: AccountRow): AdminAccount => ({
   totpSecret: r.totp_secret,
   totpLastStep: Number(r.totp_last_step),
   failedLogins: r.failed_logins,
+  lastFailedAt: r.last_failed_at,
   lockedUntil: r.locked_until,
 })
 
 const SELECT_ACCOUNT = `SELECT email, password_hash, totp_secret, totp_last_step,
-                               failed_logins, locked_until FROM admin_account`
+                               failed_logins, last_failed_at, locked_until FROM admin_account`
 
 export async function loadAccount(pg: Pool): Promise<AdminAccount | null> {
   const r = await pg.query<AccountRow>(SELECT_ACCOUNT)
@@ -100,12 +104,21 @@ export async function createAccount(
 /**
  * Replaces the password. Returns the new stored hash, whose fingerprint is
  * what every proof issued under the old password was bound to.
+ *
+ * The failure count, its clock and any lockout go with it, in the same
+ * statement: those failures were guesses at a password that no longer exists,
+ * so carrying them forward punishes the new one for the old one's history. It
+ * is also the way back in from the CLI — an admin locked out at the form can
+ * set a new password and use it immediately, rather than waiting out a lock
+ * whose only purpose was to protect the password they have just replaced.
  */
 export async function setAccountPassword(pg: Pool, password: string): Promise<string> {
   const hash = await hashPassword(password, ADMIN_SCRYPT)
-  const r = await pg.query('UPDATE admin_account SET password_hash = $1, updated_at = now()', [
-    hash,
-  ])
+  const r = await pg.query(
+    `UPDATE admin_account SET password_hash = $1, updated_at = now(),
+                              failed_logins = 0, last_failed_at = NULL, locked_until = NULL`,
+    [hash],
+  )
   if ((r.rowCount ?? 0) === 0) throw new Error('this install has no admin account yet')
   return hash
 }
@@ -119,6 +132,40 @@ export const LOCKOUT_MAX_MS = 60 * 60 * 1000
 export function lockoutMs(failedLogins: number): number {
   if (failedLogins < LOCKOUT_AFTER) return 0
   return Math.min((failedLogins - LOCKOUT_AFTER + 1) * LOCKOUT_STEP_MS, LOCKOUT_MAX_MS)
+}
+
+/**
+ * How long a quiet account waits before its failures are forgotten: the longest
+ * lockout, measured from the last failure.
+ *
+ * Without a decay the count is permanent, and four typos spread over a year —
+ * each one immediately followed by the right password — lock the admin out on
+ * the fifth, with nothing surfacing the count and a lock that refuses the
+ * sign-in that would clear it. Forgetting costs an attacker almost nothing:
+ * they were already held to a handful of guesses per lockout and the lockout
+ * already grows to an hour, so what this concedes — a few guesses an hour,
+ * indefinitely — is the bound the lockout had already chosen.
+ */
+export const FAILED_DECAY_MS = LOCKOUT_MAX_MS
+
+/**
+ * The failures this attempt counts on top of: the stored count, unless the last
+ * failure is older than `FAILED_DECAY_MS`, in which case the run has lapsed and
+ * this attempt starts from zero.
+ *
+ * Read on both doors — the sign-in form and the password check behind a session
+ * — because the second is the one that strands a count: it is where a typo is
+ * followed immediately by the right password, so the failure is recorded and
+ * nothing ever clears it.
+ */
+export function activeFailures(
+  account: Pick<AdminAccount, 'failedLogins' | 'lastFailedAt'>,
+  now: Date,
+): number {
+  if (!account.lastFailedAt) return 0
+  return now.getTime() - account.lastFailedAt.getTime() >= FAILED_DECAY_MS
+    ? 0
+    : account.failedLogins
 }
 
 export type SignInRefusal =
@@ -231,11 +278,18 @@ async function spendSecondFactor(
   return true
 }
 
-async function recordFailure(client: PoolClient, account: AdminAccount, now: Date): Promise<void> {
-  const failed = account.failedLogins + 1
+/**
+ * Records one wrong credential on top of the failures that are still current,
+ * and stamps the clock the decay is measured from. `locked_until` stays a wall
+ * clock rather than an elapsed count: it has to survive a restart, and a
+ * process that forgot its lockouts every deploy would be no lockout at all.
+ */
+async function recordFailure(client: PoolClient, failures: number, now: Date): Promise<void> {
+  const failed = failures + 1
   const lock = lockoutMs(failed)
   await client.query(
-    'UPDATE admin_account SET failed_logins = $1, locked_until = $2, updated_at = $3',
+    `UPDATE admin_account SET failed_logins = $1, last_failed_at = $3,
+                              locked_until = $2, updated_at = $3`,
     [failed, lock > 0 ? new Date(now.getTime() + lock) : null, now],
   )
 }
@@ -270,6 +324,9 @@ export async function signIn(pg: Pool, input: SignInInput, now: Date): Promise<S
         retryAfterSeconds: Math.ceil((account.lockedUntil.getTime() - now.getTime()) / 1000),
       }
     }
+    // Failures older than `FAILED_DECAY_MS` have lapsed: a typo last quarter
+    // must not be half of a lockout today.
+    const failures = activeFailures(account, now)
     const emailOk = normaliseEmail(input.email) === account.email
     // Always a real scrypt pass, against this account's hash or a throwaway
     // one, so the time taken says nothing about whether the address was right.
@@ -278,7 +335,7 @@ export async function signIn(pg: Pool, input: SignInInput, now: Date): Promise<S
       emailOk ? account.passwordHash : await dummyHash(),
     )
     if (!emailOk || !passwordOk) {
-      await recordFailure(client, account, now)
+      await recordFailure(client, failures, now)
       await client.query('COMMIT')
       return { ok: false, reason: 'invalid' }
     }
@@ -291,7 +348,7 @@ export async function signIn(pg: Pool, input: SignInInput, now: Date): Promise<S
         // holds the account row, then spends the one that matched.
         const spent = normalised !== null && (await spendRecoveryCode(client, normalised, now))
         if (!spent) {
-          await recordFailure(client, account, now)
+          await recordFailure(client, failures, now)
           await client.query('COMMIT')
           return { ok: false, reason: 'invalid' }
         }
@@ -303,7 +360,7 @@ export async function signIn(pg: Pool, input: SignInInput, now: Date): Promise<S
           lastStep: account.totpLastStep,
         })
         if (!check) {
-          await recordFailure(client, account, now)
+          await recordFailure(client, failures, now)
           await client.query('COMMIT')
           return { ok: false, reason: 'invalid' }
         }
@@ -322,7 +379,8 @@ export async function signIn(pg: Pool, input: SignInInput, now: Date): Promise<S
     }
 
     await client.query(
-      'UPDATE admin_account SET failed_logins = 0, locked_until = NULL, updated_at = $1',
+      `UPDATE admin_account SET failed_logins = 0, last_failed_at = NULL,
+                                locked_until = NULL, updated_at = $1`,
       [now],
     )
     await client.query('COMMIT')
@@ -376,7 +434,7 @@ export async function checkAccountPassword(
       }
     }
     if (!(await verifyPassword(password, account.passwordHash))) {
-      await recordFailure(client, account, now)
+      await recordFailure(client, activeFailures(account, now), now)
       await client.query('COMMIT')
       return { ok: false, reason: 'invalid' }
     }
@@ -436,7 +494,7 @@ export async function useSecondFactor(
     }
     const spent = await spendSecondFactor(client, account, o)
     if (!spent) {
-      await recordFailure(client, account, o.now)
+      await recordFailure(client, activeFailures(account, o.now), o.now)
       await client.query('COMMIT')
       return { ok: false, reason: 'invalid' }
     }

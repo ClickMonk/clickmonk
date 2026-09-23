@@ -2,9 +2,9 @@ import { AttemptCounter, newRecoveryCode, newTotpSecret, totpCode, totpStep } fr
 import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import type { FastifyInstance } from 'fastify'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { AccountExistsError, createAccount, lockoutMs, signIn } from './account.js'
+import { AccountExistsError, FAILED_DECAY_MS, createAccount, lockoutMs, signIn } from './account.js'
 import { LOGIN_ATTEMPT_LIMIT, LOGIN_ATTEMPT_WINDOW_MS } from './app.js'
-import { SESSION_IDLE_MS } from './auth.js'
+import { SESSION_COOKIE, SESSION_IDLE_MS } from './auth.js'
 import {
   ADMIN_EMAIL,
   ADMIN_PASSWORD,
@@ -220,7 +220,11 @@ describe('signing in', () => {
 
   it('removes sessions that have run out, when someone signs in', async () => {
     const cookie = await signedIn(app, pg)
-    expect(cookie).toContain('cm_admin=')
+    // Named by the constant, and carrying a token: a substring check against
+    // the name written out passes on a cookie the helper failed to read, since
+    // the name is still there in front of an empty value.
+    expect(cookie.startsWith(`${SESSION_COOKIE}=`)).toBe(true)
+    expect(cookie.slice(SESSION_COOKIE.length + 1).length).toBeGreaterThan(20)
     await pg.query("UPDATE sessions SET expires_at = now() - interval '1 day'")
     await signInWith({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
     const rows = await pg.query<{ n: number }>('SELECT count(*)::int AS n FROM sessions')
@@ -490,6 +494,96 @@ describe('two-factor authentication', () => {
       payload: { currentPassword: ADMIN_PASSWORD, newPassword: 'a new decent password' },
     })
     expect(changed.statusCode).toBe(200)
+  })
+
+  // A count that never decays is a trap with a long fuse: four typos at this
+  // form, each one immediately followed by the right password, can be months
+  // apart and still add up to a lockout — with nothing showing the admin the
+  // count and a lock that refuses the sign-in that would clear it. A run of
+  // failures inside the window is what the lockout is for; a scatter of them
+  // across a year is not.
+  it('forgets failures older than the decay window, and locks on ones inside it', async () => {
+    const cookie = await signedIn(app, pg)
+    const mistype = () =>
+      app.inject({
+        method: 'POST',
+        url: '/api/password',
+        headers: write(cookie),
+        payload: { currentPassword: 'not the password', newPassword: 'a new decent password' },
+      })
+    const failedLogins = async () =>
+      (await pg.query<{ failed_logins: number }>('SELECT failed_logins FROM admin_account')).rows[0]
+        ?.failed_logins
+
+    // Four typos, each one long enough after the last to have lapsed.
+    for (let i = 0; i < 4; i++) {
+      expect((await mistype()).statusCode, `typo ${i}`).toBe(403)
+      expect(await failedLogins(), `typo ${i}`).toBe(1)
+      clock.advance(FAILED_DECAY_MS + 1000)
+    }
+    // Still not locked, and the fifth typo is still the first as far as the
+    // account is concerned.
+    expect((await mistype()).statusCode).toBe(403)
+    expect(await failedLogins()).toBe(1)
+    expect(
+      (await pg.query<{ locked_until: Date | null }>('SELECT locked_until FROM admin_account'))
+        .rows[0]?.locked_until,
+    ).toBeNull()
+
+    // Four more inside the window do lock, so the bound is still there.
+    for (let i = 0; i < 4; i++) {
+      clock.advance(60_000)
+      expect((await mistype()).statusCode, `run ${i}`).toBe(403)
+    }
+    expect(await failedLogins()).toBe(5)
+    const locked = await app.inject({
+      method: 'POST',
+      url: '/api/password',
+      headers: write(cookie),
+      payload: { currentPassword: ADMIN_PASSWORD, newPassword: 'a new decent password' },
+    })
+    expect(locked.statusCode).toBe(429)
+    expect(locked.json().error).toBe('locked')
+  })
+
+  // The count and the lock are invisible everywhere else, which is half of why
+  // the trap above went unnoticed until it sprang.
+  it('reports the failure count and any lockout on the account', async () => {
+    const cookie = await signedIn(app, pg)
+    const me = () => app.inject({ method: 'GET', url: '/api/me', headers: read(cookie) })
+    expect((await me()).json().failedLogins).toBe(0)
+    expect((await me()).json().lockedUntil).toBeNull()
+
+    for (let i = 0; i < 3; i++) {
+      await app.inject({
+        method: 'POST',
+        url: '/api/password',
+        headers: write(cookie),
+        payload: { currentPassword: 'not the password', newPassword: 'a new decent password' },
+      })
+      clock.advance(1000)
+    }
+    expect((await me()).json().failedLogins).toBe(3)
+    expect((await me()).json().lockedUntil).toBeNull()
+
+    for (let i = 0; i < 2; i++) {
+      await app.inject({
+        method: 'POST',
+        url: '/api/password',
+        headers: write(cookie),
+        payload: { currentPassword: 'not the password', newPassword: 'a new decent password' },
+      })
+      clock.advance(1000)
+    }
+    const body = (await me()).json()
+    expect(body.failedLogins).toBe(5)
+    expect(new Date(body.lockedUntil).getTime()).toBeGreaterThan(clock.now().getTime())
+
+    // And once the window has passed the count reads zero again, without any
+    // write having happened in between.
+    clock.advance(FAILED_DECAY_MS + 1000)
+    expect((await me()).json().failedLogins).toBe(0)
+    expect((await me()).json().lockedUntil).toBeNull()
   })
 
   // The other bound on the same path, shown on its own with a counter of one.
@@ -834,6 +928,41 @@ describe('changing the password', () => {
     expect(
       (await signInWith({ email: ADMIN_EMAIL, password: 'a new decent password' })).statusCode,
     ).toBe(200)
+  })
+
+  // The failures were guesses at a password that no longer exists, so they do
+  // not follow the new one. This is also the way back in from the command line
+  // after a lockout: nothing else clears a lock but waiting it out or a
+  // complete sign-in, and a lock refuses the sign-in.
+  it('clears the failure count and any lockout when the password is replaced', async () => {
+    const cookie = await signedIn(app, pg)
+    for (let i = 0; i < 3; i++) {
+      await app.inject({
+        method: 'POST',
+        url: '/api/password',
+        headers: write(cookie),
+        payload: { currentPassword: 'not the password', newPassword: 'a new decent password' },
+      })
+      clock.advance(1000)
+    }
+    expect(
+      (await app.inject({ method: 'GET', url: '/api/me', headers: read(cookie) })).json()
+        .failedLogins,
+    ).toBe(3)
+
+    const changed = await app.inject({
+      method: 'POST',
+      url: '/api/password',
+      headers: write(cookie),
+      payload: { currentPassword: ADMIN_PASSWORD, newPassword: 'a new decent password' },
+    })
+    expect(changed.statusCode).toBe(200)
+    const row = await pg.query<{
+      failed_logins: number
+      last_failed_at: Date | null
+      locked_until: Date | null
+    }>('SELECT failed_logins, last_failed_at, locked_until FROM admin_account')
+    expect(row.rows[0]).toEqual({ failed_logins: 0, last_failed_at: null, locked_until: null })
   })
 
   it('refuses a new password shorter than the floor', async () => {
