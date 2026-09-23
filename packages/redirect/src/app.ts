@@ -368,7 +368,11 @@ export function buildRedirectApp(
     const domain = snapshot.domain(host)
     const slug = slugFromPath(path)
     const link = domain?.verified && slug ? snapshot.link(domain.id, slug) : null
-    if (!link || !link.enabled || link.passwordHash === null) {
+    // A host this install does not serve, a slug with no link, and a link with no
+    // password are not found here at all, and not recorded — exactly as a POST to
+    // them was before the gate existed, and exactly what a GET of them answers.
+    // Everything else is the decision's to answer.
+    if (!link || link.passwordHash === null) {
       return reply.code(404).header('cache-control', NO_STORE).send(BODIES[404])
     }
 
@@ -378,9 +382,16 @@ export function buildRedirectApp(
     const referrer = String(req.headers.referer ?? '').slice(0, MAX_REFERRER_LENGTH)
     const visitor = readVisitor(req.headers.cookie, deps.secret)
     const clickId = uuidv7()
-    // The same decision a GET runs, asked with the password already answered:
-    // would this visitor reach the destination if they had? Anything else and
-    // there is nothing here worth verifying — see the refusal below.
+    // The same decision a GET runs, asked for the visitor as they are: with no
+    // proof. That matters more than it looks. `evaluate` puts the password step
+    // in front of the country rule, and reads no cap for a decision it does not
+    // reach, so a visitor who cannot answer the password is never told either —
+    // and neither is a poster. Asking with `passwordOk: true` instead answered
+    // 410 for a link whose cap was used up and 403 for one closed to the
+    // caller's country, to a body carrying no password at all: a state oracle on
+    // every protected link, over exactly the states the page itself hides. It
+    // also made a capped link cost one cap query per POST, which this asks for
+    // never, because a decision that does not reach never reads the counter.
     const resolved = await resolveClick({
       snapshot,
       domain,
@@ -393,7 +404,10 @@ export function buildRedirectApp(
       userAgent,
       head: false,
       seen: visitor.seen,
-      passwordOk: true,
+      passwordOk: false,
+      // Unreachable as long as the line above is `false` — a decision that does
+      // not reach a destination reads no cap — and kept so that if it ever is
+      // not, the form still cannot spend a link's cap by being posted to.
       consumeCap: false,
     })
 
@@ -439,15 +453,16 @@ export function buildRedirectApp(
     const recordPassword = (status: number): void =>
       record({ status, outcome: 'password', step: 'password', destination: null, targetId: null })
 
-    // Every gate the GET applies is applied here first. A link closed by its
-    // class's action, its expiry, its cap or a country rule is closed to the
-    // form too: verifying a password for it would spend a scrypt pass on a link
-    // that is going nowhere, and minting a proof would hand out a credential
-    // that outlives the reason the link was shut. The answer is the GET's own,
-    // so a visitor learns nothing here they could not learn by reloading, and
-    // the only `Location` this route ever sends of its own is the link's own
-    // URL after a right answer.
-    if (!resolved.decision.reached) {
+    // Anything the decision settles before the password is the decision's to
+    // answer, in the decision's own words: the invariant is that a POST answers
+    // exactly what a GET of the same link answers, so that posting reveals no
+    // state a visitor could not already see. A link the password does not decide
+    // — disabled, expired, or closed by its class's action — is closed to the
+    // form for the same reason and with the same words the page uses. A link
+    // whose cap is used up or whose country rule refuses this caller is *not*
+    // among them: the password decides first for both, so both are answered
+    // below, identically to a healthy link.
+    if (resolved.decision.step !== 'password') {
       const d = resolved.decision
       record({
         status: d.status,

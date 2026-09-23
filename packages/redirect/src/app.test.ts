@@ -1273,9 +1273,20 @@ describe('a password-protected link', () => {
       },
       payload: `password=${PASSWORD}`,
     })
+    // The same answer a GET of it gets, body and all: an unverified domain is a
+    // host this install does not serve, and posting to it says no more than
+    // asking for it does.
+    const get = await app.inject({
+      method: 'GET',
+      url: '/spring',
+      headers: { ...from('192.0.2.7'), host: unverifiedDomain.host },
+    })
     expect(r.statusCode).toBe(404)
+    expect(r.statusCode).toBe(get.statusCode)
+    expect(r.body).toBe(get.body)
+    expect(r.headers['cache-control']).toBe(get.headers['cache-control'])
     expect(r.headers['set-cookie']).toBeUndefined()
-    expect(records).toHaveLength(0)
+    expect(records.filter((x) => x.outcome === 'password')).toHaveLength(0)
   })
 
   it('ignores a proof issued for the password it used to have', async () => {
@@ -1323,81 +1334,150 @@ describe('a password-protected link', () => {
   })
 
   /**
-   * A refusal from one of the gates the GET applies: the form verified nothing,
-   * so no proof was minted, and the click is recorded as the step that refused
-   * it rather than as a password answer.
+   * The invariant this route has to hold: **for every state, an unauthenticated
+   * POST answers exactly what a GET of the same link answers.** Anything else is
+   * a state oracle, because the form is reachable by a stranger who cannot
+   * answer the password, and the page they can see is all they are entitled to
+   * know. An earlier version answered 410 for a link whose cap was used up and
+   * 403 for one closed to the caller's country, to a body with no password in
+   * it, while the page for both is the ordinary password form.
+   *
+   * Each state below is driven twice against the same app: a GET with no cookie,
+   * and a POST whose body carries no password field, so the verifier is never
+   * reached and only the state can account for a difference.
    */
-  const expectNoProof = (
-    r: { headers: Record<string, unknown> },
-    records: ClickRecord[],
-    outcome: string,
-    step: string,
-  ) => {
-    const cookies = [(r.headers['set-cookie'] as string | string[] | undefined) ?? []].flat()
-    expect(cookies.some((c) => c.startsWith('cm_pw_'))).toBe(false)
-    expect(records.map((x) => [x.outcome, x.step])).toEqual([[outcome, step]])
-    expect(records.filter((x) => x.outcome === 'password')).toHaveLength(0)
-    expect(records.filter((x) => x.status === 302)).toHaveLength(0)
+  interface State {
+    label: string
+    link: Partial<Link>
+    opts?: Parameters<typeof harness>[1]
+    url?: string
   }
 
-  it('does not answer the password of an expired link', async () => {
-    const { app, records } = harness([
-      link({ passwordHash: hash, expiresAt: new Date(Date.now() - 1000), backupUrl: null }),
-    ])
-    const r = await post(app, `password=${PASSWORD}`)
-    expect(r.statusCode).toBe(410)
-    expectNoProof(r, records, 'expired', 'limits')
+  const blocked = (action: 'block' | 'safe'): TrafficSettings => ({
+    ...DEFAULT_TRAFFIC_SETTINGS,
+    actions: { ...DEFAULT_TRAFFIC_SETTINGS.actions, abuser: action },
+    safeUrl: action === 'safe' ? 'https://example.com/safe' : null,
+    // Every request is over it, so the GET and the POST are classified alike
+    // whichever runs first.
+    abuserThreshold: 0,
   })
 
-  it('sends a right answer on an expired link where its GET would send it, and mints nothing', async () => {
-    // With a backup configured the GET answers 302 to it, so this does too:
-    // the visitor learns nothing here they would not learn by reloading, and
-    // the URL is the install's own, never anything from the request.
-    const { app, records } = harness([
-      link({ passwordHash: hash, expiresAt: new Date(Date.now() - 1000) }),
-    ])
-    const r = await post(app, `password=${PASSWORD}`)
-    expect(r.statusCode).toBe(302)
-    expect(r.headers.location).toBe('https://example.com/backup')
-    const cookies = [r.headers['set-cookie'] ?? []].flat()
-    expect(cookies.some((c) => c.startsWith('cm_pw_'))).toBe(false)
-    expect(records.map((x) => [x.outcome, x.step, x.status])).toEqual([['expired', 'limits', 302]])
-  })
-
-  it('does not answer the password of a link whose cap is used up', async () => {
-    const full = link({
+  it('answers a POST exactly as it answers a GET, in every state', async () => {
+    const capped = {
       id: '00000000-0000-4000-8000-0000000000c1',
       slug: 'locked-full',
-      passwordHash: hash,
-      clickCap: 1,
-      backupUrl: null,
-    })
+    }
     await pool.query(
       "INSERT INTO domains (id, host, verified) VALUES ($1, 'go.example.test', true) ON CONFLICT DO NOTHING",
       [domain.id],
     )
     await pool.query(
       'INSERT INTO links (id, domain_id, slug, click_cap) VALUES ($1, $2, $3, 1) ON CONFLICT DO NOTHING',
-      [full.id, domain.id, full.slug],
+      [capped.id, domain.id, capped.slug],
     )
     await pool.query(
       'INSERT INTO link_counters (link_id, clicks) VALUES ($1, 1) ON CONFLICT (link_id) DO UPDATE SET clicks = 1',
-      [full.id],
+      [capped.id],
     )
-    const { app, records } = harness([full])
-    const r = await post(app, `password=${PASSWORD}`, {}, '/locked-full')
-    expect(r.statusCode).toBe(410)
-    expectNoProof(r, records, 'capped', 'limits')
-    // Read, never consumed: a guesser cannot spend a link's cap by posting to it.
-    const c = await pool.query<{ clicks: string }>(
-      'SELECT clicks FROM link_counters WHERE link_id = $1',
-      [full.id],
-    )
-    expect(c.rows[0]?.clicks).toBe('1')
+    const expired = new Date(Date.now() - 1000)
+    const states: State[] = [
+      { label: 'healthy', link: {} },
+      { label: 'disabled', link: { enabled: false } },
+      { label: 'expired, with a backup', link: { expiresAt: expired } },
+      { label: 'expired, with none', link: { expiresAt: expired, backupUrl: null } },
+      {
+        label: 'its cap used up',
+        link: { ...capped, clickCap: 1, backupUrl: null },
+        url: `/${capped.slug}`,
+      },
+      { label: 'closed to this country', link: { countries: { mode: 'allow', list: ['DE'] } } },
+      {
+        label: 'closed to this country, with no backup',
+        link: { countries: { mode: 'allow', list: ['DE'] }, backupUrl: null },
+      },
+      { label: 'a blocked class', link: {}, opts: { ipdata: IPDATA, settings: blocked('block') } },
+      {
+        label: 'a class sent to the safe URL',
+        link: {},
+        opts: { ipdata: IPDATA, settings: blocked('safe') },
+      },
+    ]
+    for (const state of states) {
+      const url = state.url ?? '/spring'
+      const { app } = harness([link({ passwordHash: hash, ...state.link })], state.opts)
+      const get = await app.inject({ method: 'GET', url, headers: from('192.0.2.7') })
+      const posted = await post(app, 'nothing=here', {}, url)
+      expect(posted.statusCode, state.label).toBe(get.statusCode)
+      expect(posted.headers['cache-control'], state.label).toBe(get.headers['cache-control'])
+      expect(posted.headers.location ?? null, state.label).toBe(get.headers.location ?? null)
+      if (get.statusCode === 200) {
+        // The password is what decides, so the form does its job: the same page,
+        // with the one line a wrong answer adds and nothing else.
+        expect(posted.body, state.label).toBe(
+          get.body.replace(
+            '<p class="h">This link is password protected.</p>',
+            '<p class="e">That password is not right.</p>',
+          ),
+        )
+      } else {
+        expect(posted.body, state.label).toBe(get.body)
+      }
+      // Nothing is handed out on a body with no password in it, in any state.
+      const cookies = [posted.headers['set-cookie'] ?? []].flat()
+      expect(
+        cookies.some((c) => c.startsWith('cm_pw_')),
+        state.label,
+      ).toBe(false)
+    }
   })
 
-  it('reads the cap without consuming it when the password is right', async () => {
-    const open = link({
+  it('answers the same thing whether a link is healthy, capped out or country-blocked', async () => {
+    // The oracle, stated as one assertion: these three states differ in what the
+    // install knows and must not differ in what a stranger is told. Posting a
+    // body with no password reaches none of them past the password step.
+    const cappedId = '00000000-0000-4000-8000-0000000000c3'
+    await pool.query(
+      "INSERT INTO domains (id, host, verified) VALUES ($1, 'go.example.test', true) ON CONFLICT DO NOTHING",
+      [domain.id],
+    )
+    await pool.query(
+      "INSERT INTO links (id, domain_id, slug, click_cap) VALUES ($1, $2, 'locked-cap', 1) ON CONFLICT DO NOTHING",
+      [cappedId, domain.id],
+    )
+    await pool.query(
+      'INSERT INTO link_counters (link_id, clicks) VALUES ($1, 1) ON CONFLICT (link_id) DO UPDATE SET clicks = 1',
+      [cappedId],
+    )
+    const answers = new Set<string>()
+    for (const over of [
+      {},
+      { id: cappedId, slug: 'locked-cap', clickCap: 1 },
+      { countries: { mode: 'allow' as const, list: ['DE'] } },
+    ]) {
+      const l = link({ passwordHash: hash, ...over })
+      const { app } = harness([l])
+      const r = await post(app, 'nothing=here', {}, `/${l.slug}`)
+      answers.add(`${r.statusCode} ${r.headers['cache-control']} ${r.body}`)
+    }
+    expect(answers.size).toBe(1)
+    // And that one answer is the password form with the wrong-answer line: the
+    // three are alike because each is answered by the password step, not because
+    // each is refused alike.
+    expect([...answers][0]).toContain('That password is not right.')
+  })
+
+  it('never reads the cap counter when it is posted to', async () => {
+    // Not "reads it without consuming it": not at all. The form is reachable by
+    // anyone, and a query per POST is I/O a stranger meters. The decision it asks
+    // for cannot reach a destination, so it never looks at the counter.
+    let queries = 0
+    const counting = {
+      query: (...args: unknown[]) => {
+        queries++
+        return pool.query(...(args as Parameters<typeof pool.query>))
+      },
+    } as unknown as Pool
+    const capped = link({
       id: '00000000-0000-4000-8000-0000000000c2',
       slug: 'locked-open',
       passwordHash: hash,
@@ -1409,34 +1489,51 @@ describe('a password-protected link', () => {
     )
     await pool.query(
       'INSERT INTO links (id, domain_id, slug, click_cap) VALUES ($1, $2, $3, 5) ON CONFLICT DO NOTHING',
-      [open.id, domain.id, open.slug],
+      [capped.id, domain.id, capped.slug],
     )
-    const { app } = harness([open])
-    const r = await post(app, `password=${PASSWORD}`, {}, '/locked-open')
-    expect(r.statusCode).toBe(302)
-    expect(String(r.headers['set-cookie'])).toContain(`cm_pw_${open.id}=`)
-    const c = await pool.query('SELECT 1 FROM link_counters WHERE link_id = $1', [open.id])
-    expect(c.rowCount).toBe(0)
+    const { app } = harness([capped], { capPool: counting })
+    expect((await post(app, 'nothing=here', {}, '/locked-open')).statusCode).toBe(200)
+    expect((await post(app, `password=${PASSWORD}`, {}, '/locked-open')).statusCode).toBe(302)
+    expect(queries).toBe(0)
+    // The counting pool is real: a GET of the same link does read it, so zero
+    // above is the form not asking rather than the spy not counting.
+    const proof = String(
+      (await post(app, `password=${PASSWORD}`, {}, '/locked-open')).headers['set-cookie'],
+    ).split(';')[0] as string
+    await app.inject({
+      method: 'GET',
+      url: '/locked-open',
+      headers: { ...from('192.0.2.7'), cookie: proof },
+    })
+    expect(queries).toBeGreaterThan(0)
   })
 
-  it('does not answer the password of a disabled link', async () => {
-    const { app, records } = harness([link({ passwordHash: hash, enabled: false })])
-    const r = await post(app, `password=${PASSWORD}`)
-    expect(r.statusCode).toBe(404)
-    const cookies = [r.headers['set-cookie'] ?? []].flat()
-    expect(cookies.some((c) => c.startsWith('cm_pw_'))).toBe(false)
-    // As unanswerable as an unknown slug, and recorded as one is: not at all.
-    expect(records).toHaveLength(0)
-  })
-
-  it('does not answer the password of a link closed to this country', async () => {
-    // No IP data, so the country is unknown, which an allow-list refuses.
+  it('sends a right answer on an expired link where its GET would send it, and mints nothing', async () => {
+    // Expiry is decided before the password, so the form answers it in the words
+    // the page uses — here a 302 to the backup, whose URL is the install's own.
     const { app, records } = harness([
-      link({ passwordHash: hash, countries: { mode: 'allow', list: ['DE'] }, backupUrl: null }),
+      link({ passwordHash: hash, expiresAt: new Date(Date.now() - 1000) }),
     ])
     const r = await post(app, `password=${PASSWORD}`)
-    expect(r.statusCode).toBe(403)
-    expectNoProof(r, records, 'country_blocked', 'country')
+    expect(r.statusCode).toBe(302)
+    expect(r.headers.location).toBe('https://example.com/backup')
+    expect(r.headers['cache-control']).toBe('no-store, no-cache, must-revalidate, max-age=0')
+    const cookies = [r.headers['set-cookie'] ?? []].flat()
+    expect(cookies.some((c) => c.startsWith('cm_pw_'))).toBe(false)
+    expect(records.map((x) => [x.outcome, x.step, x.status])).toEqual([['expired', 'limits', 302]])
+    expect(records.filter((x) => x.outcome === 'password')).toHaveLength(0)
+  })
+
+  it('answers an expired link in the same words as its page, body and all', async () => {
+    const { app, records } = harness([
+      link({ passwordHash: hash, expiresAt: new Date(Date.now() - 1000), backupUrl: null }),
+    ])
+    const r = await post(app, `password=${PASSWORD}`)
+    expect(r.statusCode).toBe(410)
+    expect(r.body).toBe('This link has expired.\n')
+    expect(r.headers['content-type']).toContain('text/plain')
+    expect(r.headers['cache-control']).toBe('no-store, no-cache, must-revalidate, max-age=0')
+    expect(records.map((x) => [x.outcome, x.status])).toEqual([['expired', 410]])
   })
 
   it('classifies the answer, so a blocked class cannot answer and a flood is visible', async () => {
