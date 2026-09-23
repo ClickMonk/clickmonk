@@ -9,6 +9,7 @@ import {
 } from '@clickmonk/admin/keys'
 import {
   DEFAULT_TRAFFIC_SETTINGS,
+  MAX_PASSWORD_LENGTH,
   MIN_ADMIN_PASSWORD_LENGTH,
   NON_HUMAN_CLASSES,
   type TrafficActions,
@@ -371,6 +372,15 @@ async function readPassword(d: CliDeps): Promise<string> {
   if (password.length < MIN_ADMIN_PASSWORD_LENGTH) {
     throw new Rejected(
       `the password must be at least ${MIN_ADMIN_PASSWORD_LENGTH} characters (read ${password.length} from standard input)`,
+    )
+  }
+  // The ceiling as well as the floor, because what is on the far side of it is
+  // not a refusal: the hash function throws, which reaches the operator as an
+  // unexpected error and a stack trace rather than as something they can act
+  // on. A whole file piped in by mistake is exactly how that happens.
+  if (password.length > MAX_PASSWORD_LENGTH) {
+    throw new Rejected(
+      `the password must be at most ${MAX_PASSWORD_LENGTH} characters (read ${password.length} from standard input)`,
     )
   }
   return password

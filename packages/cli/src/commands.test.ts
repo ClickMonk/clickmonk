@@ -6,6 +6,7 @@ import { MAX_KEYS_LISTED, MAX_KEY_DAYS, MAX_KEY_NAME_LENGTH } from '@clickmonk/a
 import {
   ADMIN_SCRYPT,
   LINK_SCRYPT,
+  MAX_PASSWORD_LENGTH,
   SCRYPT_PREFIX,
   hashPassword,
   hashToken,
@@ -767,6 +768,17 @@ describe('the admin account and API keys from the CLI', () => {
     // The refusal is not enough on its own: the account it would have replaced
     // may be the only way into this install, so the row is read back whole.
     expect((await account()).rows).toEqual(first.rows)
+  })
+
+  // 201 is written out. Derived from the constant, this would move with a
+  // raised bound and pass against a command that had lost the check.
+  it('refuses a password longer than anything it can hash, rather than throwing', async () => {
+    expect(MAX_PASSWORD_LENGTH).toBe(200)
+    expect(await withPassword('p'.repeat(201), 'admin', 'create', 'admin@example.com')).toBe(2)
+    expect(lines.join('\n')).toContain('at most 200 characters')
+    expect((await account()).rowCount).toBe(0)
+    // The bound itself is a password this install accepts.
+    expect(await withPassword('p'.repeat(200), 'admin', 'create', 'admin@example.com')).toBe(0)
   })
 
   it('takes a password with a trailing newline, as a shell pipe sends one', async () => {
