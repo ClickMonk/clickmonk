@@ -3,7 +3,7 @@ import { createPgPool } from '@clickmonk/db'
 import { TEST_PG_URL, resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import type { FastifyInstance, LightMyRequestResponse } from 'fastify'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { MAX_LINK_PAGE } from './links.js'
+import { MAX_LINK_PAGE, ownFields } from './links.js'
 import { clockFrom, read, signedIn, testApp, write } from './testing.js'
 
 const pg = testPg()
@@ -76,6 +76,37 @@ describe('creating a link', () => {
     expect(again.statusCode).toBe(409)
     expect(again.json().error).toBe('slug_taken')
     expect((await pg.query('SELECT 1 FROM links')).rowCount).toBe(1)
+  })
+
+  // The generated-slug path ends somewhere when every attempt collides, and
+  // what it ends in is this service's own answer rather than the writer's
+  // reason. Driven by handing the app a slug source that only ever offers a
+  // slug that is taken; nothing in the product passes one.
+  it('answers 503 when it cannot find a free slug, and writes nothing', async () => {
+    const crowded = testApp(pg, clock, { slugSource: () => 'crowded' })
+    try {
+      const first = await crowded.inject({
+        method: 'POST',
+        url: '/api/links',
+        headers: write(cookie),
+        payload: { host: 'go.example.test', targets: [target] },
+      })
+      expect(first.statusCode).toBe(201)
+      expect(first.json().slug).toBe('crowded')
+      const r = await crowded.inject({
+        method: 'POST',
+        url: '/api/links',
+        headers: write(cookie),
+        payload: { host: 'go.example.test', targets: [target] },
+      })
+      expect(r.statusCode).toBe(503)
+      expect(r.json().error).toBe('no_slug')
+      expect(Object.keys(r.json()).sort()).toEqual(['error', 'message'])
+      // The refusal, and no second link at a slug nobody would have asked for.
+      expect((await pg.query('SELECT 1 FROM links')).rowCount).toBe(1)
+    } finally {
+      await crowded.close()
+    }
   })
 
   it('refuses a domain this install does not have', async () => {
@@ -485,6 +516,46 @@ describe('listing links', () => {
   })
 })
 
+/**
+ * The rebuild copies **own** properties, and that choice is not observable
+ * through any route, which is why it is tested here directly.
+ *
+ * Above it, two things decide an enumerable planted property before this code
+ * can: the framework copies one into an own property of `req.query` while
+ * parsing a query string, so by the time a route sees it, it is
+ * indistinguishable from something the caller sent; and a schema marked strict
+ * settles its unrecognised keys with `for…in`, which walks the prototype, so an
+ * enumerable planted key on a body is refused there. A plain assignment to
+ * `Object.prototype` — the shape pollution actually has — is therefore
+ * unreachable from outside, and only this test can say which properties the
+ * rebuild copies.
+ */
+describe('the rebuild itself', () => {
+  it('copies own properties, and not what the prototype offers', () => {
+    Object.defineProperty(Object.prototype, 'planted', {
+      value: 'from the prototype',
+      configurable: true,
+      writable: true,
+      // Enumerable: what an assignment produces, and what a walk of everything
+      // reachable would copy in while a walk of own properties would not.
+      enumerable: true,
+    })
+    try {
+      const out = ownFields({ real: 'from the caller', nested: {} }) as Record<string, unknown>
+      expect(Object.keys(out)).toEqual(['real', 'nested'])
+      expect(Object.hasOwn(out, 'planted')).toBe(false)
+      expect(Object.keys(out.nested as object)).toEqual([])
+      expect(Object.hasOwn(out.nested as object, 'planted')).toBe(false)
+      // And nothing answers for a key nobody wrote, at either level.
+      expect((out as { planted?: unknown }).planted).toBeUndefined()
+      expect((out.nested as { planted?: unknown }).planted).toBeUndefined()
+    } finally {
+      // biome-ignore lint/performance/noDelete: the planted property has to go, not be set to undefined
+      delete (Object.prototype as unknown as Record<string, unknown>).planted
+    }
+  })
+})
+
 describe('what the caller wrote', () => {
   it('takes the slug from the body, not from a poisoned prototype', async () => {
     // A property planted on Object.prototype answers for every plain object
@@ -496,6 +567,12 @@ describe('what the caller wrote', () => {
     // when it opens a connection, so planting that name would test the
     // database driver rather than this route. The two fields are read the same
     // way, by the same helper.
+    //
+    // Not enumerable here: the listing rows below carry that half. A schema
+    // marked strict decides its unrecognised keys with `for…in`, which walks
+    // the prototype, so an enumerable plant of any name is refused by the
+    // validator before it reaches the value this test is about — a refusal,
+    // and the wrong one to be pinning here.
     Object.defineProperty(Object.prototype, 'slug', {
       value: 'planted',
       configurable: true,

@@ -17,7 +17,6 @@ import {
   MIN_LINK_PASSWORD_LENGTH,
   type ParsedLinkInput,
   hashPassword,
-  newSlug,
   normaliseHost,
   parseLinkInput,
 } from '@clickmonk/core'
@@ -168,21 +167,41 @@ const MAX_BODY_DEPTH = 8
 /**
  * A body rebuilt with no prototype anywhere in it, all the way down.
  *
- * Every value this module later reads is read out of something zod produced
- * from this. A property planted on `Object.prototype` is returned by
- * `data[key]` and reported by `key in data`, which is how zod decides a key was
- * present: it reads the planted value and copies it into its output as an own
- * property, where a later `Object.hasOwn` agrees the caller sent it. So the
- * prototype has to be gone *before* the parse, and every read after it has to
- * be an own-property read — `written` below. Either half alone answers nothing.
+ * A property planted on `Object.prototype` is returned by `data[key]` and
+ * reported by `key in data`, which is how zod decides a key was present: it
+ * reads the planted value and copies it into its output as an own property,
+ * where a later `Object.hasOwn` agrees the caller sent it. So the prototype has
+ * to be gone *before* the parse, and every read of what the parse produced has
+ * to be an own-property read — `written` below. Either half alone answers
+ * nothing.
  *
  * All the way down, because the field a planted property decides is not only
  * the password. `targets: [{ weight: 100 }]` with a `url` on the prototype is a
  * link whose destination nobody sent, and a destination is where the traffic
  * goes; `deviceUrls: {}` with an `ios` on it is the same thing for one platform.
  * Stripping the outer object alone left both.
+ *
+ * **What this covers, exactly: the body the schemas read.** Not the values the
+ * schemas produce. Two known ways past it, both still ending in a stored row:
+ *
+ * - A schema that reads its *own* output. `core` normalises target weights by
+ *   reading `weight` back off the objects it just built, and those are ordinary
+ *   objects, so a planted `weight` is read there — turning a pair of targets
+ *   that should be refused into a link, with a share of the traffic on a target
+ *   nobody weighted.
+ * - `JSON.stringify`, which calls a `toJSON` it finds on the prototype like any
+ *   other. A value written to a `jsonb` column goes through it, so a planted
+ *   `toJSON` decides what is stored rather than the value this code passed.
+ *
+ * Neither is closed by rebuilding the input, and neither is closed by rebuilding
+ * it a fifth time somewhere else: what they have in common is reading an object
+ * this process built, not one the request did. The precondition for all of it,
+ * this half included, is code already running in this process — nothing a
+ * request can send plants a property. The rebuild is worth its cost because it
+ * closes the half that a request's own shape reaches; it is not a claim that a
+ * planted property can no longer reach a row.
  */
-function ownFields(value: unknown, depth = 0): unknown {
+export function ownFields(value: unknown, depth = 0): unknown {
   if (depth > MAX_BODY_DEPTH) fail(400, 'invalid_body', 'the body is nested too deeply')
   if (Array.isArray(value)) return value.map((v) => ownFields(v, depth + 1))
   if (typeof value !== 'object' || value === null) return value
@@ -290,7 +309,7 @@ export function registerLinkRoutes(app: FastifyInstance, ctx: AdminContext): voi
     // schema is strict: a key present with an undefined value is still an
     // unknown key to it, so they are left out rather than blanked.
     const { host: _host, password: _password, ...fields } = body
-    const link = validate(ownFields({ ...fields, slug: typedSlug ?? newSlug() }))
+    const link = validate(ownFields({ ...fields, slug: typedSlug ?? ctx.slugSource() }))
     // The write itself is one function, shared with the command line, because
     // a link decides where somebody's traffic goes and two copies of that
     // statement are two places for it to be got wrong. What stays here is how
@@ -302,6 +321,7 @@ export function registerLinkRoutes(app: FastifyInstance, ctx: AdminContext): voi
       // A slug the admin typed is theirs: a collision on it is a 409, never a
       // different slug than the one they asked for.
       generatedSlug: typedSlug === undefined,
+      slugSource: ctx.slugSource,
     })
     if (!created.ok) {
       if (created.reason === 'unknown_domain') {

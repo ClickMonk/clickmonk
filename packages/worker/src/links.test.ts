@@ -119,6 +119,50 @@ describe('the one writer for a link', () => {
     expect((await links()).rowCount).toBe(1)
   })
 
+  /**
+   * Every way out of the transaction, from this side. The admin package has
+   * rows of its own for two of these, but the writer no longer lives in that
+   * package: a caller's suite is not cover for a function it imports.
+   *
+   * A pool of one, so the connection the writer used is the connection read
+   * back. Its state is read through the other pool: asking this one would be
+   * another statement inside the transaction under test.
+   */
+  it.each([
+    {
+      what: 'refuses an unknown domain',
+      refuse: (pg: ReturnType<typeof testPg>) =>
+        createLink(pg, { host: 'nowhere.example.test', link: link() }),
+      expected: { ok: false, reason: 'unknown_domain' },
+    },
+    {
+      what: 'refuses a slug that is taken',
+      refuse: (pg: ReturnType<typeof testPg>) => createLink(pg, { host, link: link() }),
+      expected: { ok: false, reason: 'slug_taken', slug: 'spring' },
+    },
+  ])(
+    'hands the client back with no transaction open when it $what',
+    async ({ refuse, expected }) => {
+      const tight = createPgPool(TEST_PG_URL, { max: 1, connectTimeoutMs: 1000 })
+      try {
+        expect((await createLink(tight, { host, link: link() })).ok).toBe(true)
+        const pid = (await tight.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]
+          ?.pid
+        expect(await refuse(tight)).toEqual(expected)
+        const state = await pool.query<{ state: string }>(
+          'SELECT state FROM pg_stat_activity WHERE pid = $1',
+          [pid],
+        )
+        expect(state.rows[0]?.state).toBe('idle')
+        // And the refusal wrote nothing: the one link from the setup.
+        expect((await links()).rowCount).toBe(1)
+      } finally {
+        await tight.query('ROLLBACK').catch(() => {})
+        await tight.end()
+      }
+    },
+  )
+
   it('hands the client back with no transaction open when it gives up', async () => {
     // A pool of one, so the connection the writer used is the connection read
     // back. Its state is read through the other pool: asking this one would be

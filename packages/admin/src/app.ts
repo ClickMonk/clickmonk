@@ -1,4 +1,4 @@
-import { AttemptCounter, ConcurrencyGate, normaliseHost } from '@clickmonk/core'
+import { AttemptCounter, ConcurrencyGate, newSlug, normaliseHost } from '@clickmonk/core'
 import type { Pool } from '@clickmonk/db'
 import type { DomainResolver } from '@clickmonk/worker/domains'
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify'
@@ -57,6 +57,13 @@ export interface AdminDeps {
   loginAttempts?: AttemptCounter
   passwordGate?: ConcurrencyGate
   checkGate?: ConcurrencyGate
+  /**
+   * Where a link with no slug of its own gets one. `newSlug` unless a caller
+   * says otherwise, and nothing in the product says otherwise: it is here so
+   * that a test can hand out a slug that is already taken, which is the only
+   * way to reach what this service answers when it runs out of attempts.
+   */
+  slugSource?: () => string
   /** `false` silences Fastify's logger (tests); omitted, it logs. */
   log?: false
 }
@@ -68,6 +75,7 @@ export interface AdminContext extends AdminDeps {
   passwordGate: ConcurrencyGate
   /** How many on-demand DNS checks this process runs at once. */
   checkGate: ConcurrencyGate
+  slugSource: () => string
 }
 
 declare module 'fastify' {
@@ -94,6 +102,7 @@ export function buildAdminApp(
       deps.loginAttempts ?? new AttemptCounter(LOGIN_ATTEMPT_LIMIT, LOGIN_ATTEMPT_WINDOW_MS),
     passwordGate: deps.passwordGate ?? new ConcurrencyGate(PASSWORD_CHECKS_IN_FLIGHT),
     checkGate: deps.checkGate ?? new ConcurrencyGate(DNS_CHECKS_IN_FLIGHT),
+    slugSource: deps.slugSource ?? newSlug,
   }
 
   const app = Fastify({
