@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import { z } from 'zod'
 import { type LinkTrafficActions, LinkTrafficActionsSchema } from './traffic.js'
 
@@ -44,6 +45,28 @@ export interface Domain {
 export const SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
 export const MAX_URL_LENGTH = 2048
 export const MAX_TARGETS = 20
+
+/** Characters a generated slug is drawn from: no look-alikes, so one read aloud is the one typed. */
+const SLUG_ALPHABET = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+export const GENERATED_SLUG_LENGTH = 7
+
+/**
+ * A slug for a link whose owner did not choose one. Seven characters from an
+ * alphabet with no `0`/`O`, `1`/`l`/`I` pair in it, so a slug read down a phone
+ * is the slug that gets typed. 57^7 is about 1.6 × 10^12, and the caller
+ * retries on the unique constraint rather than trusting that number.
+ *
+ * `b % 57` is very slightly biased towards the first 28 characters — 256 is not
+ * a multiple of 57. That is deliberate: this is a name, not a secret, and
+ * rejection sampling here would buy nothing.
+ */
+export function newSlug(): string {
+  const bytes = randomBytes(GENERATED_SLUG_LENGTH)
+  let out = ''
+  for (const b of bytes) out += SLUG_ALPHABET[b % SLUG_ALPHABET.length]
+  return out
+}
+
 const MAX_CLICK_CAP = 1_000_000_000
 
 /**

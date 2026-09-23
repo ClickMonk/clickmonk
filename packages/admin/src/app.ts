@@ -6,6 +6,7 @@ import { type Credential, authenticate, checkCsrf, hasBearer } from './auth.js'
 import { registerDomainRoutes } from './domains.js'
 import { HttpError, MAX_BODY_BYTES, securityHeaders } from './http.js'
 import { registerKeyRoutes } from './keys.js'
+import { registerLinkRoutes } from './links.js'
 import { registerSessionRoutes } from './session-routes.js'
 import { registerSettingsRoutes } from './settings-routes.js'
 
@@ -179,6 +180,7 @@ export function buildAdminApp(
   registerSessionRoutes(app, ctx)
   registerKeyRoutes(app, ctx)
   registerDomainRoutes(app, ctx)
+  registerLinkRoutes(app, ctx)
   registerSettingsRoutes(app, ctx)
 
   return app
