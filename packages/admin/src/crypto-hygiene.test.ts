@@ -42,6 +42,12 @@
  *   runtime, so no comparison can run through it, and importing a type from a
  *   module must not drag that module's whole import graph into the gate. A
  *   module a gated file imports for a *value* is gated as it always was.
+ * - A side-effect import — `import './x.js'`, with no bindings and so no
+ *   `from` — is not followed at all, and never has been. The module it runs
+ *   could hold a comparison at its top level. Closing it means matching a
+ *   second statement shape rather than adjusting the one below, so it is
+ *   recorded here instead: nothing in this package imports that way, and a
+ *   file that starts to is the moment to write it.
  * - `ALLOWED_COMPARISONS` below exempts specific expressions by their exact
  *   text, **each keyed to the file and the declared function it was granted
  *   for**. Each is a comparison of something that is not secret. Keying is what
@@ -162,6 +168,10 @@ function coreImports(source: string): string[] {
  * The package-relative files a file imports **for a value**, as `sourceFiles()`
  * names them.
  *
+ * A statement starts at the beginning of a line or after a `;`, so a second
+ * statement sharing a line is read as its own rather than being swallowed by
+ * the first.
+ *
  * A type-only import — `import type { X } from './x.js'`, or a clause whose
  * every specifier is `type`-prefixed — is left out. Nothing it names survives
  * compilation, so no comparison can be reached through it, and following one
@@ -180,7 +190,7 @@ function localImports(file: string, source: string): string[] {
   // is what stops a match running past its own module specifier into the next
   // statement's.
   for (const match of source.matchAll(
-    /^[ \t]*(?:import|export)\b([^'"]*?)\bfrom\s*'(\.[^']*)'/gm,
+    /(?:^|;)[ \t]*(?:import|export)\b([^'"]*?)\bfrom\s*'(\.[^']*)'/gm,
   )) {
     const clause = match[1] as string
     const specifiers = clause
@@ -495,6 +505,11 @@ describe('crypto hygiene in the admin service', () => {
     // A module specifier that is not relative is not mistaken for the next
     // statement's, whichever kind of statement follows it.
     expect(localImports('keys.ts', `import { z } from 'zod'\n${reExport}`)).toEqual(['helper.ts'])
+    // And a statement that shares a line with the one before it is still its
+    // own. The formatter would split these, so this is not a shape that
+    // survives a commit — but the parser must not depend on the formatter.
+    expect(localImports('keys.ts', `import type { A } from './app.js'; ${reExport}`)) //
+      .toEqual(['helper.ts'])
   })
 
   it('compares a credential, in every gated file, only with digestsMatch', () => {

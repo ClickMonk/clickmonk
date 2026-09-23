@@ -437,6 +437,29 @@ describe('an API key', () => {
     }
   })
 
+  // A key nobody ever minted: the shape is right and the id is in no row. The
+  // refusal has to come from the lookup finding nothing — a lookup that
+  // answered with a credential built from the presented id would make any
+  // correctly shaped string an admin key, and the checks after it never run,
+  // because there is no stored digest to compare against.
+  it('refuses a well-formed key whose id is in no row', async () => {
+    const neverStored = newApiKey()
+    const rows = await pg.query('SELECT 1 FROM api_keys WHERE id = $1', [neverStored.id])
+    expect(rows.rowCount).toBe(0)
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/me',
+      headers: { host: ADMIN_HOST, authorization: `Bearer ${neverStored.display}` },
+    })
+    expect(r.statusCode).toBe(401)
+    expect(r.json().error).toBe('unauthenticated')
+    // Word for word what a request carrying no credential at all is told:
+    // nothing here says the id was the part that did not match.
+    const anonymous = await app.inject({ method: 'GET', url: '/api/me', headers: read() })
+    expect(anonymous.statusCode).toBe(401)
+    expect(r.json()).toEqual(anonymous.json())
+  })
+
   it('is never read from a cookie or the query string', async () => {
     const key = await keyFor(pg)
     const viaCookie = await app.inject({
