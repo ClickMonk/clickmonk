@@ -28,6 +28,7 @@ import {
   recordDomainCheck,
   runDomainChecks,
 } from '@clickmonk/worker/domains'
+import { createLink } from '@clickmonk/worker/links'
 import type { ZodError } from 'zod'
 
 export interface CliDeps {
@@ -296,49 +297,21 @@ async function linkAdd(args: string[], d: CliDeps): Promise<void> {
     passthrough: !values['no-passthrough'],
   })
 
-  const client = await d.pg.connect()
-  try {
-    await client.query('BEGIN')
-    const dom = await client.query<{ id: string }>('SELECT id FROM domains WHERE host = $1', [host])
-    const domainId = dom.rows[0]?.id
-    if (!domainId)
-      throw new Rejected(`unknown domain: ${host} (add it with "clickmonk domain add")`)
-    const l = await client.query<{ id: string }>(
-      `INSERT INTO links (domain_id, slug, name, enabled, backup_url, device_urls, returning_url,
-                          countries, click_cap, expires_at, passthrough, traffic_actions)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-       ON CONFLICT (domain_id, slug) DO NOTHING RETURNING id`,
-      [
-        domainId,
-        input.slug,
-        input.name,
-        input.enabled,
-        input.backupUrl,
-        JSON.stringify(input.deviceUrls),
-        input.returningUrl,
-        JSON.stringify(input.countries),
-        input.clickCap,
-        input.expiresAt,
-        input.passthrough,
-        JSON.stringify(input.trafficActions),
-      ],
+  // One writer, shared with the API: a link decides where somebody's traffic
+  // goes, so the statement that writes one exists once. This command answers
+  // its own refusals, and it never asks for a generated slug — the slug is a
+  // positional argument here, so a collision is a refusal.
+  const created = await createLink(d.pg, { host, link: input })
+  if (!created.ok) {
+    throw new Rejected(
+      created.reason === 'unknown_domain'
+        ? `unknown domain: ${host} (add it with "clickmonk domain add")`
+        : created.reason === 'slug_taken'
+          ? `slug already exists on ${host}: ${created.slug}`
+          : 'could not find an unused slug; try again',
     )
-    const linkId = l.rows[0]?.id
-    if (!linkId) throw new Rejected(`slug already exists on ${host}: ${input.slug}`)
-    for (const [i, t] of input.targets.entries()) {
-      await client.query(
-        'INSERT INTO link_targets (link_id, url, weight, position) VALUES ($1, $2, $3, $4)',
-        [linkId, t.url, t.weight, i],
-      )
-    }
-    await client.query('COMMIT')
-    d.out(`link ${host}/${input.slug} ${linkId}`)
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {})
-    throw err
-  } finally {
-    client.release()
   }
+  d.out(`link ${host}/${created.link.slug} ${created.link.id}`)
 
   const safe = NON_HUMAN_CLASSES.filter((c) => input.trafficActions[c] === 'safe')
   if (safe.length > 0 && (await servedSettings(d)).settings.safeUrl === null) {

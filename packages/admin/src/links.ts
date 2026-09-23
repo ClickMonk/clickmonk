@@ -22,6 +22,7 @@ import {
   parseLinkInput,
 } from '@clickmonk/core'
 import type { PoolClient } from '@clickmonk/db'
+import { createLink } from '@clickmonk/worker/links'
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import type { AdminContext } from './app.js'
@@ -31,8 +32,6 @@ import { fail, readBody } from './http.js'
 /** Links in one page, and the ceiling a caller may ask for. */
 export const DEFAULT_LINK_PAGE = 50
 export const MAX_LINK_PAGE = 200
-/** Attempts to find an unused generated slug before giving up. */
-const SLUG_ATTEMPTS = 5
 
 const LinkPassword = z.string().min(MIN_LINK_PASSWORD_LENGTH).max(MAX_PASSWORD_LENGTH)
 
@@ -264,7 +263,10 @@ export function registerLinkRoutes(app: FastifyInstance, ctx: AdminContext): voi
     requireCredential(req)
     const body = readBody(CreateBody, ownFields(req.body))
     const host = normaliseHost(body.host)
-    if (!host) fail(400, 'invalid_host', 'not a valid host name')
+    // `return fail(…)`, as the domain routes write it: a bare call does not
+    // narrow `host` away from null, because the narrowing a never-returning
+    // function gives depends on how its declaration is annotated.
+    if (!host) return fail(400, 'invalid_host', 'not a valid host name')
     // Whether the caller named a slug decides whether a collision is their
     // problem or ours, so it is read with `written`, and the slug itself comes
     // from that same read rather than from a second one.
@@ -275,63 +277,33 @@ export function registerLinkRoutes(app: FastifyInstance, ctx: AdminContext): voi
     const passwordHash =
       password === undefined || password === null ? null : await hashPassword(password, LINK_SCRYPT)
 
-    const client = await ctx.pg.connect()
-    try {
-      await client.query('BEGIN')
-      const d = await client.query<{ id: string }>('SELECT id FROM domains WHERE host = $1', [host])
-      const domainId = d.rows[0]?.id
-      if (!domainId) fail(404, 'unknown_domain', `this install has no domain ${host}`)
-      let id: string | undefined
-      let input: ParsedLinkInput | undefined
-      // `host` and `password` are this API's, not the link schema's, and the
-      // schema is strict: a key present with an undefined value is still an
-      // unknown key to it, so they are left out rather than blanked.
-      const { host: _host, password: _password, ...fields } = body
-      for (let attempt = 0; attempt < SLUG_ATTEMPTS && id === undefined; attempt++) {
-        input = validate(ownFields({ ...fields, slug: typedSlug ?? newSlug() }))
-        const l = await client.query<{ id: string }>(
-          `INSERT INTO links (domain_id, slug, name, enabled, backup_url, device_urls,
-                              returning_url, countries, click_cap, expires_at, passthrough,
-                              traffic_actions, password_hash)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-           ON CONFLICT (domain_id, slug) DO NOTHING RETURNING id`,
-          [
-            domainId,
-            input.slug,
-            input.name,
-            input.enabled,
-            input.backupUrl,
-            JSON.stringify(input.deviceUrls),
-            input.returningUrl,
-            JSON.stringify(input.countries),
-            input.clickCap,
-            input.expiresAt,
-            input.passthrough,
-            JSON.stringify(input.trafficActions),
-            passwordHash,
-          ],
-        )
-        id = l.rows[0]?.id
-        // A slug the admin typed is theirs: it is not silently replaced.
-        if (id === undefined && typedSlug !== undefined) {
-          fail(409, 'slug_taken', `${host} already has a link at ${input.slug}`)
-        }
+    // `host` and `password` are this API's, not the link schema's, and that
+    // schema is strict: a key present with an undefined value is still an
+    // unknown key to it, so they are left out rather than blanked.
+    const { host: _host, password: _password, ...fields } = body
+    const link = validate(ownFields({ ...fields, slug: typedSlug ?? newSlug() }))
+    // The write itself is one function, shared with the command line, because
+    // a link decides where somebody's traffic goes and two copies of that
+    // statement are two places for it to be got wrong. What stays here is how
+    // this surface answers each refusal.
+    const created = await createLink(ctx.pg, {
+      host,
+      link,
+      passwordHash,
+      // A slug the admin typed is theirs: a collision on it is a 409, never a
+      // different slug than the one they asked for.
+      generatedSlug: typedSlug === undefined,
+    })
+    if (!created.ok) {
+      if (created.reason === 'unknown_domain') {
+        fail(404, 'unknown_domain', `this install has no domain ${host}`)
       }
-      if (id === undefined || input === undefined) {
-        fail(503, 'no_slug', 'could not find an unused slug; try again')
+      if (created.reason === 'slug_taken') {
+        fail(409, 'slug_taken', `${host} already has a link at ${created.slug}`)
       }
-      await writeTargets(client, id as string, (input as ParsedLinkInput).targets)
-      await client.query('COMMIT')
-      // Through the client this handler is already holding, not through the
-      // pool: asking the pool for a second client here is a wait that can
-      // never end, because the client that would satisfy it is this one.
-      return reply.code(201).send(asLink(await linkById(client, id as string)))
-    } catch (err) {
-      await client.query('ROLLBACK').catch(() => {})
-      throw err
-    } finally {
-      client.release()
+      return fail(503, 'no_slug', 'could not find an unused slug; try again')
     }
+    return reply.code(201).send(asLink(await linkById(ctx.pg, created.link.id)))
   })
 
   app.patch<{ Params: { id: string } }>('/api/links/:id', async (req) => {

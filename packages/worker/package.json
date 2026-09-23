@@ -6,7 +6,8 @@
   "main": "./dist/index.js",
   "exports": {
     ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
-    "./domains": { "types": "./dist/domains.d.ts", "default": "./dist/domains.js" }
+    "./domains": { "types": "./dist/domains.d.ts", "default": "./dist/domains.js" },
+    "./links": { "types": "./dist/links.d.ts", "default": "./dist/links.js" }
   },
   "engines": { "node": ">=22 <23" },
   "scripts": { "build": "tsc -b", "build:image": "tsc -b tsconfig.build.json" },
