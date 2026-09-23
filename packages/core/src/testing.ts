@@ -487,6 +487,13 @@ export function comparisonsIn(
  * while that name means one function — a second declaration of it would
  * otherwise inherit the exemption, so an exemption over a duplicated name
  * applies nowhere and the file fails until the names are distinct again.
+ *
+ * `(module)` is the exception to that rule, and has to be: nothing declares a
+ * function of that name, so requiring one meant an exemption written for an
+ * expression outside any declared function — in a class method, for instance,
+ * which this checker does not attribute — could never apply, while the staleness
+ * check said it matched. The two disagreed, and the disagreement is what found
+ * this.
  */
 export function unexemptedComparisons(
   c: HygieneConfig,
@@ -495,7 +502,11 @@ export function unexemptedComparisons(
   const declared = functionBodies(readSource(c, file)).map((fn) => fn.name)
   const exempt = new Set(
     c.allowed
-      .filter((a) => a.file === file && declared.filter((n) => n === a.fn).length === 1)
+      .filter(
+        (a) =>
+          a.file === file &&
+          (a.fn === MODULE_LEVEL || declared.filter((n) => n === a.fn).length === 1),
+      )
       .map((a) => `${a.fn}: ${a.expression}`),
   )
   return comparisonsIn(c, file).filter((v) => !exempt.has(`${v.fn}: ${v.expression}`))
