@@ -57,6 +57,18 @@
  * - It says nothing about randomness. A package that mints a credential needs
  *   its own check for that; `Math.random` is legitimate in a package that picks
  *   a weighted target with it.
+ * - **A `functions` scope reads only the functions it names.** A package that
+ *   uses it has to name every function that touches secret material, and a
+ *   comparison in a top-level arrow or a class method of such a file is read by
+ *   nothing. The one that was missing this way was `verifyPassword`. A
+ *   `whole-file` scope has no such gap; the decision check has none in either,
+ *   because it reads blocks rather than declarations.
+ * - **A branch made dead any way but one is not noticed.** The decision check
+ *   refuses a result consumed beside a comparison against a number written in the
+ *   source, which is one spelling of a dead branch. `if (!equal && x === null)`,
+ *   or the same literal moved into a module constant, decides just as little and
+ *   passes. Knowing whether a branch can be taken needs the semantics of the
+ *   expression; this reads text.
  * - **Two full bypasses a gated file can still hold, and they are the cheapest
  *   ones.** A `switch` on a digest with the expected value as a `case` compares
  *   exactly as early-exitingly as `===` and contains no operator to find. And
@@ -93,13 +105,15 @@ export interface Exemption {
 /**
  * Which text a package's comparison check reads. `whole-file` covers an arrow
  * function, a class method and a module-level expression, none of which a "find
- * the function declarations" pass sees. `functions` reads one named function per
- * file, for a package where the rest of the file legitimately compares
- * parameters, lengths and prefixes that are not secret.
+ * the function declarations" pass sees. `functions` reads the named functions of
+ * a file, for a package where the rest of the file legitimately compares
+ * parameters, lengths and prefixes that are not secret — every function that
+ * touches the secret material has to be named, and the one that was missing was
+ * the one the whole password gate rests on.
  */
 export type ComparisonScope =
   | { kind: 'whole-file' }
-  | { kind: 'functions'; functions: Record<string, string> }
+  | { kind: 'functions'; functions: Record<string, string[]> }
 
 export interface HygieneConfig {
   /** The package's source directory. */
@@ -316,16 +330,30 @@ const isWholeValue = (token: string): boolean =>
   /^(['"]).*\1$/.test(token) ||
   /^-?\d+$/.test(token)
 
-const isSafeOperand = (token: string): boolean =>
-  isWholeValue(token) &&
-  (token === 'null' ||
-    token === 'undefined' ||
-    token === 'true' ||
-    token === 'false' ||
-    /^typeof\s/.test(token) ||
-    /\.length$/.test(token) ||
-    /^-?\d+$/.test(token) ||
-    /^(['"]).*\1$/.test(token))
+/**
+ * An operand that settles the comparison on its own, whatever is on the other
+ * side: a number, a keyword or a length. **A secret is never any of these.** No
+ * stored digest equals `0`, `null` or `true`, and a length is a length — so
+ * `(r.rowCount ?? 0) === 0` needs no exemption however it is parenthesised, and
+ * six identical exemptions for six identical row counts were the wrong tool.
+ */
+const settlesOnItsOwn = (token: string): boolean =>
+  token === 'null' ||
+  token === 'undefined' ||
+  token === 'true' ||
+  token === 'false' ||
+  /^typeof\s/.test(token) ||
+  /\.length$/.test(token) ||
+  /^-?\d+$/.test(token)
+
+/**
+ * A string written in the source. Enough to make a comparison innocent when the
+ * other side is one whole value — `kind === 'totp'` compares a tag — and *not*
+ * enough when the other side is a call or a template, because
+ * `hashToken(x) === 'a…'` is a digest compared against a hard-coded expectation
+ * and no reader should have to guess which of those two they are looking at.
+ */
+const isStringLiteral = (token: string): boolean => /^(['"]).*\1$/.test(token)
 
 /**
  * Equality is not banned outright: this code legitimately compares a value to
@@ -334,6 +362,12 @@ const isSafeOperand = (token: string): boolean =>
  * the thing being verified, and a literal written in the source cannot be a
  * stored digest. `typeof x` is a whole value too — one of a handful of fixed
  * words, never secret material.
+ *
+ * The order the three questions are asked in matters. A side that settles the
+ * comparison on its own — a number, a keyword, a length — is asked about first,
+ * because it makes the other side's *shape* irrelevant: a row count wrapped in
+ * parentheses ends in `)` without being a call result, and asking about the shape
+ * first wanted an exemption per row count.
  *
  * Loose `==` and `!=` are matched as well as the strict pair. They compare just
  * as early-exitingly, and a "tidy up" that drops a character must not walk out
@@ -367,6 +401,11 @@ export function findDisallowedComparisons(body: string): Comparison[] {
     const rhs = rhsText(body, match.index + op.length).replace(/\s+/g, ' ')
     const expression = `${lhs} ${op} ${rhs}`.trim()
     const at = match.index
+    // Asked before anything else: a side that settles the comparison on its own
+    // makes the other side's shape irrelevant. Asking about the shape first
+    // called a parenthesised row count a call result and wanted an exemption for
+    // each one.
+    if (settlesOnItsOwn(lhs) || settlesOnItsOwn(rhs)) continue
     if (lhs.endsWith(')') || lhs.endsWith('`') || rhs.endsWith(')') || rhs.endsWith('`')) {
       violations.push({ expression, why: 'an operand is a call or template result', at })
       continue
@@ -375,7 +414,7 @@ export function findDisallowedComparisons(body: string): Comparison[] {
       violations.push({ expression, why: 'an operand is an expression, not one whole value', at })
       continue
     }
-    if (!(isSafeOperand(lhs) || isSafeOperand(rhs))) {
+    if (!(isStringLiteral(lhs) || isStringLiteral(rhs))) {
       violations.push({ expression, why: 'neither operand is a literal, a length or null', at })
     }
   }
@@ -454,15 +493,20 @@ export function enclosingFunction(functions: FunctionBody[], at: number): string
   return name
 }
 
-/** The text a package's comparison check reads for one file, and its offset base. */
-function scanned(c: HygieneConfig, file: string): { text: string; offset: number } {
+/** The texts a package's comparison check reads for one file, with their offsets. */
+function scanned(c: HygieneConfig, file: string): { text: string; offset: number }[] {
   const source = readSource(c, file)
-  if (c.scope.kind === 'whole-file') return { text: source, offset: 0 }
-  const name = c.scope.functions[file]
-  if (name === undefined) return { text: '', offset: 0 }
-  const fn = functionBodies(source).find((f) => f.name === name)
-  if (!fn) throw new Error(`${file}: ${name} not found, so nothing was scanned`)
-  return { text: fn.body, offset: fn.start }
+  if (c.scope.kind === 'whole-file') return [{ text: source, offset: 0 }]
+  const names = c.scope.functions[file]
+  if (names === undefined) return []
+  const bodies = functionBodies(source)
+  return names.map((name) => {
+    const fn = bodies.find((f) => f.name === name)
+    // Loudly, not silently: a named function that has been renamed away would
+    // otherwise narrow the scope to nothing and take the gate with it.
+    if (!fn) throw new Error(`${file}: ${name} not found, so nothing was scanned`)
+    return { text: fn.body, offset: fn.start }
+  })
 }
 
 /** Every disallowed comparison in a file, each named by the function it sits in. */
@@ -471,12 +515,13 @@ export function comparisonsIn(
   file: string,
 ): { fn: string; expression: string; why: string }[] {
   const functions = functionBodies(readSource(c, file))
-  const { text, offset } = scanned(c, file)
-  return findDisallowedComparisons(text).map((v) => ({
-    fn: enclosingFunction(functions, v.at + offset),
-    expression: v.expression,
-    why: v.why,
-  }))
+  return scanned(c, file).flatMap(({ text, offset }) =>
+    findDisallowedComparisons(text).map((v) => ({
+      fn: enclosingFunction(functions, v.at + offset),
+      expression: v.expression,
+      why: v.why,
+    })),
+  )
 }
 
 /**
@@ -603,16 +648,66 @@ function guardsBefore(body: string, at: number, patterns: RegExp[]): boolean {
 }
 
 /**
- * A comparison against a number written in the source. Banned in the statement
- * that consumes the deciding call's result, because that is how a live-looking
- * branch is made dead: `if (!equal && given.length < 0) return false` reads as a
- * decision and is one that can never be taken. A comparison of two `.length`s
- * carries no literal and is not matched; nor is one against `null`.
+ * A comparison against a number written in the source, in the statement that
+ * consumes the deciding call's result.
+ *
+ * **This is not a liveness check and must not be described as one.** It matches
+ * one spelling of a dead branch — the one that was found:
+ * `if (!equal && given.length < 0) return false`, which reads as a decision and
+ * is one that can never be taken. `if (!equal && given === null)` is the same
+ * defeat and is not matched, and neither is the same literal moved into a module
+ * constant. Adding those two spellings would be the third entry in a ban-list,
+ * which is the point at which a ban-list is the wrong tool: deciding whether a
+ * branch can be taken needs the semantics of the expression, which nothing here
+ * reads. So this stays as the narrow thing it is, named for what it checks, and
+ * the general hole is listed with the others at the top of this file.
  */
 const NUMERIC_COMPARISON = /(?:===|!==|==|!=|<=|>=|<|>)\s*-?\d|-?\d+\s*(?:===|!==|==|!=|<=|>=|<|>)/
 
 const ANCHOR =
   /\breturn\b|\bif\s*\(|\bwhile\s*\(|(?:const|let|var)\s+([\w$]+)\s*=(?!=)|([\w$]+)\s*=(?!=)/g
+
+/**
+ * The innermost brace-balanced block containing an offset, with the offset of
+ * its opening brace.
+ *
+ * This is what the decision check reads, instead of "the declared function this
+ * call sits in". A `function name(…)` pass sees neither an arrow function, a
+ * class method, nor a callback, so a `timingSafeEqual` in any of those was
+ * examined by nothing at all — and a bypass could keep one real, correctly
+ * guarded call in a declared function while what actually decided the answer sat
+ * in an arrow beside it. Asking for the enclosing *block* asks nothing about what
+ * kind of construct it is, so there is no shape left to hide in.
+ *
+ * It also fails in the safe direction: a block is never wider than the function
+ * around it, so a guard or a `return` outside the block is not credited to a call
+ * inside it.
+ */
+export function enclosingBlock(source: string, at: number): { text: string; start: number } {
+  let depth = 0
+  let open = -1
+  for (let i = at; i >= 0; i--) {
+    const ch = source[i]
+    if (ch === '}') depth++
+    else if (ch === '{') {
+      if (depth === 0) {
+        open = i
+        break
+      }
+      depth--
+    }
+  }
+  if (open === -1) return { text: source, start: 0 }
+  depth = 0
+  for (let j = open; j < source.length; j++) {
+    if (source[j] === '{') depth++
+    else if (source[j] === '}') {
+      depth--
+      if (depth === 0) return { text: source.slice(open, j + 1), start: open }
+    }
+  }
+  return { text: source.slice(open), start: open }
+}
 
 /** Every offset in a body at which the decider is called. */
 export function callSites(body: string, decider: string): number[] {
@@ -663,10 +758,12 @@ function lineAt(body: string, index: number): string {
  * later `return`, or in an `if`/`while` condition. A result read only by a log
  * line, or by nothing at all, decides nothing.
  *
- * The statement that consumes it must be **live**. A condition that ANDs the
- * result with a comparison against a number written in the source — the shape
- * `if (!equal && given.length < 0) return false` — is a branch that can never be
- * taken, and "the name appears in a condition" was satisfied by it.
+ * The statement that consumes it must not AND the result with **a comparison
+ * against a number written in the source** — the shape
+ * `if (!equal && given.length < 0) return false`, a branch that can never be
+ * taken, which "the name appears in a condition" was satisfied by. That is one
+ * spelling of a dead branch and not a liveness check; the general case is listed
+ * as a hole at the top of this file.
  *
  * And where the call throws on a length mismatch, **the two lengths must be
  * compared to each other first**, either on the way from the anchor to the call
@@ -724,7 +821,9 @@ export function whyOneCallDoesNotDecide(
     return ''
   }
   if (sawUnguarded) return `the two lengths are not compared before ${c.decider} is called`
-  if (sawDead) return `${c.decider}'s result is consumed by a branch that cannot be taken`
+  if (sawDead) {
+    return `${c.decider}'s result is consumed beside a comparison against a number written in the source`
+  }
   return sawUnread
     ? `${c.decider}'s result is assigned to a name that decides nothing`
     : `${c.decider} is neither returned nor assigned`
@@ -740,34 +839,50 @@ const exemptCall = (c: HygieneConfig, file: string, fn: string, call: string): b
  * call placed inside that function inherit it.
  */
 export function decisionProblems(c: HygieneConfig, file: string): string[] {
+  const source = readSource(c, file)
+  const functions = functionBodies(source)
   const out: string[] = []
-  for (const fn of functionBodies(readSource(c, file))) {
-    for (const at of callSites(fn.body, c.decider)) {
-      const text = callText(fn.body, at, c.decider)
-      const why = whyOneCallDoesNotDecide(c, fn.body, at, {
-        lengthExempt: exemptCall(c, file, fn.name, text),
-      })
-      if (why) out.push(`${file}#${fn.name} ${text}: ${why}`)
-    }
+  for (const at of callSites(source, c.decider)) {
+    const block = enclosingBlock(source, at)
+    const text = callText(source, at, c.decider)
+    // The name is for the message and for keying an exemption; the *analysis*
+    // reads the block, so a call in an arrow or a method is examined either way.
+    // A call outside every declared function is named `(module)`, which is a key
+    // an exemption may use.
+    const fn = enclosingFunction(functions, at)
+    const why = whyOneCallDoesNotDecide(c, block.text, at - block.start, {
+      lengthExempt: exemptCall(c, file, fn, text),
+    })
+    if (why) out.push(`${file}#${fn} ${text}: ${why}`)
   }
   return out
 }
 
 /**
- * Every length exemption that no longer names a call of the decider in the
- * function it names, so one left behind by a rename, a deletion or a rewritten
- * argument list fails rather than sitting there.
+ * Every length exemption that no longer names a call of the decider where it says
+ * it does, so one left behind by a rename, a deletion or a rewritten argument
+ * list fails rather than sitting there.
+ *
+ * `(module)` is handled here as it is for a comparison exemption — the whole file
+ * is the search space, since nothing declares a function of that name. Without
+ * that, such an exemption was reported stale, which is the safe direction: it
+ * could never quietly exempt anything. It could not be *written* either, which is
+ * the mirror of a bug already fixed on the comparison side, and closing it here
+ * means the two sides cannot disagree again.
  */
 export function staleLengthExemptions(c: HygieneConfig): string[] {
   const gated = gatedFiles(c)
   return (c.lengthExempt ?? [])
     .filter((e) => {
       if (!gated.includes(e.file)) return true
-      const fn = functionBodies(readSource(c, e.file)).find((f) => f.name === e.fn)
-      if (fn === undefined) return true
-      return !callSites(fn.body, c.decider).some(
-        (at) => callText(fn.body, at, c.decider) === e.call,
-      )
+      const source = readSource(c, e.file)
+      let where = source
+      if (e.fn !== MODULE_LEVEL) {
+        const fn = functionBodies(source).find((f) => f.name === e.fn)
+        if (fn === undefined) return true
+        where = fn.body
+      }
+      return !callSites(where, c.decider).some((at) => callText(where, at, c.decider) === e.call)
     })
     .map((e) => `${e.file}#${e.fn} ${e.call} (${e.because})`)
 }
@@ -780,11 +895,10 @@ export function staleLengthExemptions(c: HygieneConfig): string[] {
  */
 export function missingComparers(c: HygieneConfig): string[] {
   return c.expectedComparers
-    .filter((file) => {
-      const functions = functionBodies(readSource(c, file)).filter(
-        (fn) => callSites(fn.body, c.decider).length > 0,
-      )
-      return functions.length === 0 || decisionProblems(c, file).length > 0
-    })
+    .filter(
+      (file) =>
+        callSites(readSource(c, file), c.decider).length === 0 ||
+        decisionProblems(c, file).length > 0,
+    )
     .map((file) => `${file} no longer decides a match with ${c.decider}`)
 }

@@ -20,6 +20,7 @@ import {
   gatedFiles,
   localImports,
   missingComparers,
+  sourceFiles,
   staleExemptions,
   staleLengthExemptions,
   unexemptedComparisons,
@@ -117,9 +118,13 @@ const CONFIG: HygieneConfig = {
 describe('crypto hygiene in the redirect', () => {
   const gated = gatedFiles(CONFIG)
 
-  it('gates every file that can reach a credential primitive', () => {
-    // A superset: following the imports may find more than the floor, never less.
-    expect(gated).toEqual(expect.arrayContaining(CONFIG.expectedGated))
+  it('gates every file in the package', () => {
+    // Every file, exactly — not a superset. Seeded from the entry point the walk
+    // reaches all of them, so `arrayContaining` would no longer be pinning
+    // anything: a file that left the set could only be one that stopped being
+    // reachable, and this says so directly.
+    expect(gated).toEqual(sourceFiles(CONFIG))
+    expect(gated).toEqual(CONFIG.expectedGated)
   })
 
   it('compares a secret, in every gated file, only with timingSafeEqual', () => {

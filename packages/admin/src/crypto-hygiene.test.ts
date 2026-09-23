@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url'
 import {
   type Exemption,
   type HygieneConfig,
+  MODULE_LEVEL,
   decisionProblems,
   gatedFiles,
   localImports,
@@ -28,6 +29,42 @@ import {
 import { describe, expect, it } from 'vitest'
 
 const ALLOWED: Exemption[] = [
+  {
+    file: 'account.ts',
+    fn: 'signIn',
+    expression: 'normaliseEmail(input.email) === account.email',
+    because:
+      'a sign-in checks the address it was given against the one address this ' +
+      'install has; an email is an identifier, not a secret, and the password ' +
+      'below it is measured against a throwaway hash either way, so the answer ' +
+      'takes the same work whether the address matched',
+  },
+  {
+    file: 'app.ts',
+    fn: 'buildAdminApp',
+    expression: "normaliseHost(req.hostname ?? '') !== ctx.adminHost",
+    because:
+      'the admin host guard compares the requested host to the configured one; ' +
+      'neither is secret, and which host this service answers on is visible to ' +
+      'anyone who connects to it',
+  },
+  {
+    file: 'config.ts',
+    fn: MODULE_LEVEL,
+    expression: 'normaliseHost(value) !== value',
+    because:
+      'configuration validation, refusing a host that is not already in its ' +
+      'normal form; it runs at boot on a value from the environment',
+  },
+  {
+    file: 'session-routes.ts',
+    fn: 'registerSessionRoutes',
+    expression: 's.id === credential.id',
+    because:
+      "marks which row in the admin's own list of sessions is the one they are " +
+      'signed in with; a session id is not its token, and the token is never ' +
+      'compared in this process at all',
+  },
   {
     file: 'auth.ts',
     fn: 'checkCsrf',
@@ -49,7 +86,27 @@ const CONFIG: HygieneConfig = {
    * which configures the same checker over exactly that.
    */
   primitives: ['digestsMatch', 'hashToken', 'parseApiKey', 'newOpaqueToken', 'newApiKey'],
-  expectedGated: ['auth.ts', 'http.ts', 'keys.ts'],
+  /**
+   * The entry point, so the set is every file this service runs rather than the
+   * three that import a primitive. Seeded from the primitives alone it was 3 of
+   * 11, and `return presented === stored` in `session-routes.ts` was invisible —
+   * the same defeat the redirect's gate now fails on, in the package that owns
+   * sessions, recovery codes and API keys.
+   */
+  alwaysSeed: ['index.ts'],
+  expectedGated: [
+    'account.ts',
+    'app.ts',
+    'auth.ts',
+    'config.ts',
+    'domains.ts',
+    'http.ts',
+    'index.ts',
+    'keys.ts',
+    'links.ts',
+    'session-routes.ts',
+    'settings-routes.ts',
+  ],
   expectedComparers: ['auth.ts'],
   decider: 'digestsMatch',
   /** `digestsMatch` does its own length check and does not throw on a mismatch. */

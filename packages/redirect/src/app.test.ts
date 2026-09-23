@@ -1431,6 +1431,25 @@ describe('a password-protected link', () => {
     }
   })
 
+  it('records a POST to a disabled link once, as the decision that refused it', async () => {
+    // The old test asserted no record at all, and went when the early return for
+    // a disabled link went: the decision answers it now, so it is a click like
+    // the GET's, and one of them — nothing pinned that number.
+    const { app, records } = harness([link({ passwordHash: hash, enabled: false })])
+    const r = await post(app, `password=${PASSWORD}`)
+    expect(r.statusCode).toBe(404)
+    expect(records).toHaveLength(1)
+    expect(records[0]?.outcome).toBe('not_found')
+    expect(records[0]?.step).toBe('resolve')
+    expect(records[0]?.status).toBe(404)
+    expect(records[0]?.destination).toBeNull()
+    // A link with no password at all is still not recorded: that POST is a flat
+    // 404 before any decision, as it was before the gate existed.
+    const open = harness([link()])
+    expect((await post(open.app, `password=${PASSWORD}`)).statusCode).toBe(404)
+    expect(open.records).toHaveLength(0)
+  })
+
   it('answers the same thing whether a link is healthy, capped out or country-blocked', async () => {
     // The oracle, stated as one assertion: these three states differ in what the
     // install knows and must not differ in what a stranger is told. Posting a

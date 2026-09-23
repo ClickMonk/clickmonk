@@ -18,6 +18,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   type HygieneConfig,
+  MODULE_LEVEL,
   callSites,
   callText,
   decisionProblems,
@@ -43,9 +44,16 @@ const CONFIG: HygieneConfig = {
   decider: 'timingSafeEqual',
   /** It throws on a length mismatch, so the two lengths come first. */
   lengthCheckedFirst: true,
+  /**
+   * Every function that touches secret material, not one per file. `digestsMatch`
+   * was the only one named in secrets.ts, so `verifyPassword` — the function the
+   * whole link password gate and every sign-in rest on — was read by nothing:
+   * `if (password === stored) return true` at its top left this gate green, and
+   * anyone holding a stored hash could present it as the password.
+   */
   scope: {
     kind: 'functions',
-    functions: { 'secrets.ts': 'digestsMatch', 'totp.ts': 'verifyTotp' },
+    functions: { 'secrets.ts': ['digestsMatch', 'verifyPassword'], 'totp.ts': ['verifyTotp'] },
   },
   allowed: [],
   lengthExempt: [
@@ -101,6 +109,9 @@ describe('crypto hygiene in the credential primitives', () => {
  * checker rather than to any one package.
  */
 describe('the shared checker on a body that only looks careful', () => {
+  const DEAD =
+    "timingSafeEqual's result is consumed beside a comparison against a number written in the source"
+
   /** The first call in a body, which is what these fixtures each hold. */
   const why = (body: string): string =>
     whyOneCallDoesNotDecide(CONFIG, body, callSites(body, 'timingSafeEqual')[0] ?? -1)
@@ -165,10 +176,11 @@ describe('the shared checker on a body that only looks careful', () => {
     ).toBe('timingSafeEqual is neither returned nor assigned')
   })
 
-  it('refuses a condition that cannot be taken', () => {
-    // The name appears in an `if`, and the branch is dead: a comparison against
-    // a number written in the source, beside the result, is how a decision is
-    // made to look live while deciding nothing.
+  it('refuses a result consumed beside a comparison against a written number', () => {
+    // The name appears in an `if`, and the branch is dead. This is one spelling
+    // of that, not a liveness check: `if (!equal && a === null)` decides just as
+    // little and is not matched, which the checker's own header says plainly
+    // rather than implying otherwise.
     expect(
       why(`{
       if (a.length !== b.length) return false
@@ -176,7 +188,7 @@ describe('the shared checker on a body that only looks careful', () => {
       if (!equal && a.length < 0) return false
       return true
     }`),
-    ).toBe("timingSafeEqual's result is consumed by a branch that cannot be taken")
+    ).toBe(DEAD)
     // And the same shape where the call is consumed in place.
     expect(
       why(`{
@@ -184,7 +196,17 @@ describe('the shared checker on a body that only looks careful', () => {
       if (!timingSafeEqual(a, b) && a.length < 0) return false
       return true
     }`),
-    ).toBe("timingSafeEqual's result is consumed by a branch that cannot be taken")
+    ).toBe(DEAD)
+    // The spelling it does not catch, asserted as not caught: a reader comparing
+    // this suite with the header should find them saying the same thing.
+    expect(
+      why(`{
+      if (a.length !== b.length) return false
+      const equal = timingSafeEqual(a, b)
+      if (!equal && a === null) return false
+      return true
+    }`),
+    ).toBe('')
   })
 
   it('inspects every call, not only the first', () => {
@@ -205,6 +227,37 @@ describe('the shared checker on a body that only looks careful', () => {
     // The exemption is the call's, not the function's, so it does not travel to
     // the second call.
     expect(callText(body, sites[1] as number, 'timingSafeEqual')).toBe('timingSafeEqual(c, d)')
+  })
+
+  it('checks a length exemption written for an expression outside any function', () => {
+    // Nothing declares a function called `(module)`, so looking one up reported
+    // every such exemption stale — the mirror of a bug already fixed on the
+    // comparison side. It failed in the safe direction, which is why it sat
+    // unnoticed: the exemption could not hide anything, it just could not be
+    // written. Both sides search the whole file for it now.
+    const asModule: HygieneConfig = {
+      ...CONFIG,
+      lengthExempt: [
+        {
+          file: 'secrets.ts',
+          fn: MODULE_LEVEL,
+          call: 'timingSafeEqual(bufA, bufB)',
+          because: 'a fixture: this call is real, and it is not in a function of that name',
+        },
+      ],
+    }
+    expect(staleLengthExemptions(asModule)).toEqual([])
+    // And it is still checked, rather than waved through for being `(module)`.
+    const gone: HygieneConfig = {
+      ...asModule,
+      lengthExempt: [
+        {
+          ...(asModule.lengthExempt?.[0] as NonNullable<HygieneConfig['lengthExempt']>[number]),
+          call: 'timingSafeEqual(nothing, missing)',
+        },
+      ],
+    }
+    expect(staleLengthExemptions(gone)).toHaveLength(1)
   })
 
   it('finds the comparisons it is there to find', () => {

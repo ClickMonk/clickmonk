@@ -462,9 +462,11 @@ export function buildRedirectApp(
       record({ status, outcome: 'password', step: 'password', destination: null, targetId: null })
 
     // Anything the decision settles before the password is the decision's to
-    // answer, in the decision's own words: the invariant is that a POST answers
-    // exactly what a GET of the same link answers, so that posting reveals no
-    // state a visitor could not already see. A link the password does not decide
+    // answer, in the decision's own words: the invariant is that a POST to a
+    // **password-protected** link answers exactly what a GET of it answers, so
+    // that posting reveals no state a visitor could not already see. A link with
+    // no password is the flat 404 above and deliberately not the GET's answer —
+    // making those equal would turn a POST into a path that consumes a cap. A link the password does not decide
     // — disabled, expired, or closed by its class's action — is closed to the
     // form for the same reason and with the same words the page uses. A link
     // whose cap is used up or whose country rule refuses this caller is *not*
