@@ -217,6 +217,56 @@ describe('snapshot file', () => {
     expect(back.source).toBe('file')
   })
 
+  // `undefined` is not `null`, and the evaluator asks for a password for every
+  // link whose hash is not null. A file written before links had passwords has
+  // no such field, so reading one must produce null rather than undefined, or
+  // every link on the install becomes unanswerable.
+  it('reads a link with no password hash field as no password, and carries one that has it', () => {
+    const domainId = '00000000-0000-4000-8000-0000000000d1'
+    const file = (over: Record<string, unknown>) =>
+      JSON.stringify({
+        v: 2,
+        loadedAt: new Date().toISOString(),
+        settings: DEFAULT_TRAFFIC_SETTINGS,
+        domains: [],
+        links: [
+          {
+            id: '00000000-0000-4000-8000-0000000000a1',
+            domainId,
+            slug: 'spring',
+            enabled: true,
+            targets: [
+              {
+                id: '00000000-0000-4000-8000-0000000000f1',
+                url: 'https://example.com/',
+                weight: 100,
+              },
+            ],
+            backupUrl: null,
+            deviceUrls: {},
+            returningUrl: null,
+            countries: { mode: 'all' },
+            clickCap: null,
+            expiresAt: null,
+            passthrough: true,
+            trafficActions: {},
+            ...over,
+          },
+        ],
+      })
+    const older = deserializeSnapshot(file({})).link(domainId, 'spring')
+    expect(older).not.toBeNull()
+    // toBeNull, not a loose check: undefined is what the evaluator would read
+    // as a password nobody can answer.
+    expect(older?.passwordHash).toBeNull()
+    // Deliberately not hash-shaped: nothing here parses it.
+    const carried = deserializeSnapshot(file({ passwordHash: 'no-verifier-accepts-this' })).link(
+      domainId,
+      'spring',
+    )
+    expect(carried?.passwordHash).toBe('no-verifier-accepts-this')
+  })
+
   it('round-trips the traffic settings', () => {
     const settings: TrafficSettings = {
       actions: { bot: 'block', abuser: 'flag', anonymous: 'safe', datacenter: 'nothing' },
