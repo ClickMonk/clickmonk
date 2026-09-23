@@ -73,9 +73,15 @@ What does not work yet:
 - **A full spool stops recording without stopping redirects.** Above its size bound the
   redirect keeps sending visitors on but drops the click; the running count of drops is
   in `/health` on the internal port, and nowhere else yet.
-- **The internal port is reachable from the whole compose network.** `redirect:9091`,
-  which serves the `ask` check, is published nowhere on the host, but any other
-  container on the stack's own Docker network can reach it, not only Caddy.
+- **The redirect is reachable from the whole compose network.** Neither of its ports is
+  published on the host, but any other container on the stack's own Docker network can
+  reach both, not only Caddy. On `redirect:9091` that means reading the `ask` check,
+  which lists this install's verified domains. On `redirect:8080` it means more: the
+  stack trusts a forwarded address from that network (`CLICKMONK_TRUSTED_PROXIES` is
+  `uniquelocal,loopback`), so a container inside the install can set `X-Forwarded-For`
+  and choose the address recorded, counted and looked up for every click it sends. Every
+  container on that network is one you put there, which is what keeps this a limit
+  rather than a way in.
 - **IPv6 coverage depends on the host the tests run on.** The published-port IPv6 test
   is skipped when that host has no IPv6 address of its own — most CI runners — and is
   meant to be run by hand, on a host that has one, before a release. A second,
@@ -147,7 +153,11 @@ domain you proved some other way; it says on screen that no DNS check was made.
 ClickMonk does not know its own public address, so it records what a domain resolves to
 rather than judging it — a host behind NAT, a load balancer or a CDN is normal. A domain
 that stops publishing its record is reported, never un-verified: taking live links down
-because a resolver hiccuped would be worse than the problem.
+because a resolver hiccuped would be worse than the problem. If you take a domain back
+down yourself — there is no command for it yet, so that means deleting its row or
+setting `verified` back to false in Postgres — the certificate it already has stays in
+the `caddy-data` volume and Caddy keeps presenting it until it expires. What stops is
+the renewal, and any new certificate for it.
 
 **IPv6 visitors are only recorded by their own address if the Docker daemon NATs their
 connections to the published port**, rather than relaying them through its own userland
@@ -243,6 +253,33 @@ bad-asn-list's licence:
     SOFTWARE.
 
 ## Upgrading
+
+Three things change for an install that was running before TLS was added.
+
+**The redirect no longer publishes a port.** Caddy takes 80 and 443 instead, and nothing
+answers on `127.0.0.1:8080` any more, so anything you put in front of it — your own
+nginx, a tunnel, an uptime check — stops working. Point it at Caddy on port 80, or at
+443 once the domain is verified.
+
+**Remove `CLICKMONK_TRUSTED_PROXIES` from `.env` unless you run a proxy of your own.**
+The previous release told you to set it to the Docker network's gateway or subnet. A
+value in `.env` overrides the `uniquelocal,loopback` the stack now sets. The old value
+named the proxy you ran then — a gateway address, usually — and Caddy's container is not
+that, so unless what you set covers the whole of the stack's own network the redirect
+stops believing the address Caddy forwards. Every visitor is then recorded as Caddy's
+container address: they share one request count, so all of them are classed as abusers
+once it passes the threshold, and one country is looked up for the lot. If you do run
+something in front of Caddy, this variable is not where it goes: whatever it holds still
+has to cover the range Caddy's container sits in, which is what `uniquelocal,loopback`
+is for. Name your own proxy's ranges in `caddy/proxy.d/` instead, as the "IP data"
+section above describes.
+
+**Domains you added before this release stay verified.** The migration deliberately
+leaves the `verified` column alone — clearing it would 404 every live link on your
+install until each domain published a TXT record. But verified is also what makes a
+domain eligible for a certificate, so each of those domains gets one on its first HTTPS
+request without ever having proved anything in DNS. `clickmonk domain list` shows them
+as verified with no check recorded.
 
 Upgrade the worker before the redirect. Each release's redirect writes clicks in the
 record version it knows, and a worker older than the redirect does not read a newer
