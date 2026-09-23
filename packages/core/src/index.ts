@@ -2,7 +2,7 @@
  * The highest migration version this build understands. Every migration bumps
  * it; `migrate()` refuses to run against a database whose ledger is newer.
  */
-export const SCHEMA_VERSION = 5
+export const SCHEMA_VERSION = 6
 
 export * from './attempts.js'
 export * from './click-id.js'
