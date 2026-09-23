@@ -57,6 +57,24 @@ const ALLOWED: Exemption[] = [
       'the visitor was already sent',
   },
   {
+    file: 'internal.ts',
+    fn: 'buildInternalApp',
+    expression: 'host === deps.adminHost',
+    because:
+      'the certificate check approves the configured admin host as well as a ' +
+      'verified link domain; a host name is not secret, and which names this ' +
+      'install answers for is exactly what the check exists to tell the proxy',
+  },
+  {
+    file: 'config.ts',
+    fn: MODULE_LEVEL,
+    expression: 'normaliseHost(value) !== value',
+    because:
+      'configuration validation, refusing a host that is not already in its ' +
+      'normal form; it runs at boot on a value from the environment, and the ' +
+      'admin service carries the identical check with the identical reason',
+  },
+  {
     file: 'snapshot.ts',
     fn: IN_A_CLASS_METHOD,
     expression: 'gen === this.reloadGen',
@@ -95,19 +113,14 @@ const CONFIG: HygieneConfig = {
    * for a value, so it is scanned, and a file that is scanned belongs on the
    * floor or the floor is not one.
    */
-  expectedGated: [
-    'app.ts',
-    'cap.ts',
-    'config.ts',
-    'index.ts',
-    'internal.ts',
-    'password.ts',
-    'rate.ts',
-    'snapshot.ts',
-    'spool.ts',
-    'visitor.ts',
-    'write-all.ts',
-  ],
+  /**
+   * Empty because the floor is not a list any more: seeded from the entry point
+   * the walk reaches every file in the package, so the test asserts exactly that
+   * and there is no list to keep in step. A list would have had to be edited
+   * every time the package gained a file, which is a tripwire that teaches
+   * nothing — the assertion below already fails if a file stops being reachable.
+   */
+  expectedGated: [],
   expectedComparers: ['password.ts', 'visitor.ts'],
   decider: 'timingSafeEqual',
   lengthCheckedFirst: true,
@@ -124,7 +137,6 @@ describe('crypto hygiene in the redirect', () => {
     // anything: a file that left the set could only be one that stopped being
     // reachable, and this says so directly.
     expect(gated).toEqual(sourceFiles(CONFIG))
-    expect(gated).toEqual(CONFIG.expectedGated)
   })
 
   it('compares a secret, in every gated file, only with timingSafeEqual', () => {

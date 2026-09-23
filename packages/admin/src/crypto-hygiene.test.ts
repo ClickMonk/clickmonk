@@ -94,19 +94,14 @@ const CONFIG: HygieneConfig = {
    * sessions, recovery codes and API keys.
    */
   alwaysSeed: ['index.ts'],
-  expectedGated: [
-    'account.ts',
-    'app.ts',
-    'auth.ts',
-    'config.ts',
-    'domains.ts',
-    'http.ts',
-    'index.ts',
-    'keys.ts',
-    'links.ts',
-    'session-routes.ts',
-    'settings-routes.ts',
-  ],
+  /**
+   * Empty because the floor is not a list any more: seeded from the entry point
+   * the walk reaches every file in the package, so the test asserts exactly that
+   * and there is no list to keep in step. A list would have had to be edited
+   * every time the package gained a file, which is a tripwire that teaches
+   * nothing — the assertion below already fails if a file stops being reachable.
+   */
+  expectedGated: [],
   expectedComparers: ['auth.ts'],
   decider: 'digestsMatch',
   /** `digestsMatch` does its own length check and does not throw on a mismatch. */
@@ -128,8 +123,12 @@ describe('crypto hygiene in the admin service', () => {
     }
   })
 
-  it('gates every file that can reach a credential primitive', () => {
-    expect(gated).toEqual(expect.arrayContaining(CONFIG.expectedGated))
+  it('gates every file in the package', () => {
+    // Every file, exactly. Seeded from the entry point the walk reaches all of
+    // them, so `arrayContaining` over a hand-kept list would pin less than this
+    // and rot faster: a file that left the set could only be one that stopped
+    // being reachable, and this says so directly.
+    expect(gated).toEqual(sourceFiles(CONFIG))
   })
 
   it('compares a credential, in every gated file, only with digestsMatch', () => {
