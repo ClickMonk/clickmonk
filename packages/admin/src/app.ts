@@ -1,7 +1,11 @@
 import { AttemptCounter, ConcurrencyGate, newSlug, normaliseHost } from '@clickmonk/core'
 import type { Pool } from '@clickmonk/db'
 import type { DomainResolver } from '@clickmonk/worker/domains'
-import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify'
+import Fastify, {
+  type FastifyInstance,
+  type FastifyRequest,
+  type FastifyServerOptions,
+} from 'fastify'
 import { type Credential, authenticate, checkCsrf, hasBearer } from './auth.js'
 import { registerDomainRoutes } from './domains.js'
 import { HttpError, MAX_BODY_BYTES, securityHeaders } from './http.js'
@@ -64,8 +68,12 @@ export interface AdminDeps {
    * way to reach what this service answers when it runs out of attempts.
    */
   slugSource?: () => string
-  /** `false` silences Fastify's logger (tests); omitted, it logs. */
-  log?: false
+  /**
+   * Fastify's logger option. `false` silences it, which is what every test
+   * that does not care what was logged passes; omitted, it logs. A test that
+   * has to read the log passes a destination stream here instead.
+   */
+  log?: FastifyServerOptions['logger']
 }
 
 export interface AdminContext extends AdminDeps {
@@ -107,7 +115,7 @@ export function buildAdminApp(
 
   const app = Fastify({
     trustProxy: opts.trustProxy,
-    logger: deps.log !== false,
+    logger: deps.log ?? true,
     bodyLimit: MAX_BODY_BYTES,
     requestTimeout: 20_000,
     // Nothing here answers a HEAD usefully, and a generated HEAD route on a
@@ -132,12 +140,33 @@ export function buildAdminApp(
     // Compose network is not a boundary: any container in the install can
     // open a connection to this port and send whatever Host it likes.
     //
+    // `req.headers.host`, never `req.hostname`: with a trusted proxy
+    // configured — and the stack configures one — Fastify takes `req.hostname`
+    // from `X-Forwarded-Host` when the peer is trusted, and every container on
+    // the bridge network is a trusted peer. That would let any of them claim
+    // this host name over a connection that was never sent to it, which is the
+    // one thing this gate exists to stop. `Host` is what the connection
+    // actually carried.
+    //
+    // `X-Forwarded-For` stays trusted from those same peers, and that is not
+    // the same bargain: Caddy replaces that header rather than appending to
+    // it, so a value reaching here came from Caddy, and the only way to forge
+    // one is to already be a container inside the install. The limiter below
+    // still counts by `req.ip`.
+    //
+    // The port is stripped here rather than by Fastify, which is the one thing
+    // `req.hostname` did for free: a browser sends `Host: name:443` and that is
+    // the same name. Nothing legitimate ends in a colon and digits, and an
+    // IPv6 literal — `[::1]:9100`, which is not a host name either way — is
+    // left as something the parse below refuses.
+    //
     // `normaliseHost` returns null for a name it cannot parse, which is never
     // equal to a configured host, so a malformed Host is refused by the same
     // line. A request with no Host header at all cannot be made through
     // `inject`, which substitutes one: that case belongs to the suite that
     // drives a real socket.
-    if (normaliseHost(req.hostname ?? '') !== ctx.adminHost) {
+    const claimed = (req.headers.host ?? '').replace(/:\d+$/, '')
+    if (normaliseHost(claimed) !== ctx.adminHost) {
       return reply.code(404).send({ error: 'not_found', message: 'no such host on this service' })
     }
     checkCsrf({
@@ -184,7 +213,11 @@ export function buildAdminApp(
   // `admin_account` would fail on a cold install until the worker's boot
   // migration created it, and `up --wait` would then be gated on a migration
   // this service does not run.
-  app.get('/health', async () => ({ status: 'ok' }))
+  //
+  // `logLevel: 'silent'` because Compose probes this every five seconds for
+  // the life of the install, and two lines a probe is the whole log. Only this
+  // route is silenced; everything else still logs.
+  app.get('/health', { logLevel: 'silent' }, async () => ({ status: 'ok' }))
 
   registerSessionRoutes(app, ctx)
   registerKeyRoutes(app, ctx)

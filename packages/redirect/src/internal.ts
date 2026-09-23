@@ -39,8 +39,14 @@ export function buildInternalApp(deps: {
   // domain the admin added and verified, and for the admin host name this
   // install is configured with. Nothing else, ever: a host name pointed at
   // this server by somebody else gets no certificate and no ACME request.
-  app.get<{ Querystring: { domain?: string } }>('/ask', async (req, reply) => {
-    const host = req.query.domain ? normaliseHost(req.query.domain) : null
+  app.get<{ Querystring: { domain?: string | string[] } }>('/ask', async (req, reply) => {
+    // A repeated `?domain=` arrives as an array, which is not a host name and
+    // is refused with the other malformed shapes. Typed and checked rather
+    // than assumed: this is an unauthenticated request on the port that
+    // decides certificate issuance, and calling a string method on the array
+    // made it a 500.
+    const asked = req.query.domain
+    const host = typeof asked === 'string' ? normaliseHost(asked) : null
     if (!host) return reply.code(400).send()
     if (deps.adminHost && host === deps.adminHost) return reply.code(200).send()
     const d = deps.snapshot()?.domain(host)

@@ -42,7 +42,7 @@ const ALLOWED: Exemption[] = [
   {
     file: 'app.ts',
     fn: 'buildAdminApp',
-    expression: "normaliseHost(req.hostname ?? '') !== ctx.adminHost",
+    expression: 'normaliseHost(claimed) !== ctx.adminHost',
     because:
       'the admin host guard compares the requested host to the configured one; ' +
       'neither is secret, and which host this service answers on is visible to ' +

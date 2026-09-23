@@ -1,6 +1,6 @@
 import { hashToken, newApiKey } from '@clickmonk/core'
 import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
-import type { FastifyInstance } from 'fastify'
+import Fastify, { type FastifyInstance } from 'fastify'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { createAccount } from './account.js'
 import { SESSION_ABSOLUTE_MS, SESSION_COOKIE, SESSION_IDLE_MS } from './auth.js'
@@ -8,6 +8,7 @@ import {
   ADMIN_EMAIL,
   ADMIN_HOST,
   ADMIN_PASSWORD,
+  SHIPPED_TRUSTED_PROXIES,
   clockFrom,
   read,
   signInAs,
@@ -115,6 +116,92 @@ describe('what the admin service answers at all', () => {
       })
       expect(r.statusCode, host).toBe(404)
       expect(r.json().error, host).toBe('not_found')
+    }
+  })
+
+  // The guard above decides on `Host`, and the reason it may not decide on
+  // `req.hostname` is this: the stack runs this service with a trusted-proxy
+  // list that covers the whole bridge network, and Fastify then takes
+  // `req.hostname` from `X-Forwarded-Host`. Every other test here builds the
+  // app with `trustProxy: false`, where that header is ignored and this attack
+  // cannot be expressed at all — so the app here is built the way Compose
+  // builds it.
+  it('refuses a forwarded host claim from a trusted peer, on the stack’s own settings', async () => {
+    // First, that the fixture is the dangerous one. A bare Fastify on the same
+    // settings does take its hostname from the header, from this same peer —
+    // so a guard reading `req.hostname` would have been fooled, and a 404
+    // below is the guard working rather than the header being ignored.
+    const probe = Fastify({ trustProxy: SHIPPED_TRUSTED_PROXIES, logger: false })
+    probe.get('/hostname', async (req) => ({ hostname: req.hostname }))
+    try {
+      const seen = await probe.inject({
+        method: 'GET',
+        url: '/hostname',
+        headers: { host: 'go.example.test', 'x-forwarded-host': ADMIN_HOST },
+      })
+      expect(seen.json().hostname, 'the forwarded header is not in play').toBe(ADMIN_HOST)
+    } finally {
+      await probe.close()
+    }
+
+    const trusting = testApp(pg, clock, {}, { trustProxy: SHIPPED_TRUSTED_PROXIES })
+    try {
+      const cookie = await signedIn(trusting, pg, ADMIN_PASSWORD)
+      const me = await trusting.inject({
+        method: 'GET',
+        url: '/api/me',
+        headers: { host: 'go.example.test', 'x-forwarded-host': ADMIN_HOST, cookie },
+      })
+      expect(me.statusCode).toBe(404)
+      expect(me.json().error).toBe('not_found')
+
+      // And a write, because a refusal that only covers reads is not a gate.
+      // Pinned by what did not happen as well as by the status: no session was
+      // handed out and none was written, so the sign-in path was never
+      // reached rather than reached and refused later.
+      const sessionsBefore = (await pg.query('SELECT count(*) AS n FROM sessions')).rows[0].n
+      const signIn = await trusting.inject({
+        method: 'POST',
+        url: '/api/session',
+        headers: {
+          host: 'go.example.test',
+          'x-forwarded-host': ADMIN_HOST,
+          origin: `https://${ADMIN_HOST}`,
+        },
+        payload: { email: ADMIN_EMAIL, password: ADMIN_PASSWORD },
+      })
+      expect(signIn.statusCode).toBe(404)
+      expect(signIn.json().error).toBe('not_found')
+      expect(signIn.headers['set-cookie']).toBeUndefined()
+      expect((await pg.query('SELECT count(*) AS n FROM sessions')).rows[0].n).toBe(sessionsBefore)
+    } finally {
+      await trusting.close()
+    }
+  })
+
+  // Compose probes /health every five seconds for the life of the install. At
+  // two lines a probe that is the entire log, and the log is where an actual
+  // fault has to be findable.
+  it('logs nothing for the healthcheck, and still logs everything else', async () => {
+    const lines: string[] = []
+    const stream = {
+      write(line: string) {
+        lines.push(line)
+      },
+    }
+    const logging = testApp(pg, clock, { log: { level: 'info', stream } })
+    try {
+      expect((await logging.inject({ method: 'GET', url: '/health' })).statusCode).toBe(200)
+      expect(lines, lines.join('')).toEqual([])
+      // The other half: the stream is wired up and this level does log, so the
+      // empty list above is the route being silent rather than the logger
+      // being off.
+      expect(
+        (await logging.inject({ method: 'GET', url: '/api/me', headers: read() })).statusCode,
+      ).toBe(401)
+      expect(lines.length, 'nothing was logged for any route').toBeGreaterThan(0)
+    } finally {
+      await logging.close()
     }
   })
 

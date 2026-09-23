@@ -125,6 +125,11 @@ describe('install.sh', () => {
     const values = KEYS.map((k) => settingOf(env, k))
     for (const v of values) expect(v).toMatch(/^[0-9a-f]{64}$/)
     expect(new Set(values).size).toBe(3)
+    // The one setting the installer writes with no value, so an operator finds
+    // it where the others are rather than only in .env.example.
+    expect(env, 'the optional setting the installer writes empty').toMatch(
+      /^CLICKMONK_ADMIN_HOST=$/m,
+    )
   })
 
   // The run that generates the secrets is the run that could print one, and in

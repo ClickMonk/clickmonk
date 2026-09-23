@@ -128,9 +128,12 @@ describe('what the stack publishes', () => {
   // sends that name to the admin service instead of to the redirect.
   it('gives the same admin host name to caddy, the admin API and the redirect', () => {
     const named = config('docker-compose.yml', 'CLICKMONK_ADMIN_HOST=admin.example.test\n')
+    // Anchored to the end of the line, not `toContain`: a service given
+    // `${CLICKMONK_ADMIN_HOST:-}.internal` resolves to a name that starts with
+    // this one, and a substring match reads that as agreement.
     for (const service of ['caddy', 'admin', 'redirect']) {
-      expect(serviceBlock(named, service), service).toContain(
-        'CLICKMONK_ADMIN_HOST: admin.example.test',
+      expect(serviceBlock(named, service), service).toMatch(
+        /\n {6}CLICKMONK_ADMIN_HOST: admin\.example\.test\n/,
       )
     }
   })
@@ -369,10 +372,15 @@ describe('the shipped Caddy configuration', () => {
     for (const m of matchers) {
       // Never `host {$CLICKMONK_ADMIN_HOST…}`: Compose sets that variable to
       // the empty string on a default install, and Caddy refuses an empty
-      // `host` value at boot. The expression form is empty-safe, which the
-      // validate rows above prove rather than assert.
+      // `host` value at boot. `expression` is what makes the empty case safe,
+      // and the validate rows above prove that rather than assert it.
+      //
+      // Which variable the matcher reads is asserted; how the rest of the
+      // expression is spelled is not. The `!= ""` clause in the Caddyfile
+      // changes no behaviour — an expression with it removed still starts and
+      // still routes every name to the redirect — so pinning its text would
+      // pin a spelling, and this suite asks the tool what a file does.
       expect(m[1], 'the admin matcher must not be a bare host matcher').toBe('expression')
-      expect(m[2]).toContain('{env.CLICKMONK_ADMIN_HOST} != ""')
       expect(m[2]).toContain('host({env.CLICKMONK_ADMIN_HOST})')
     }
     expect(caddyfile).toContain('reverse_proxy admin:9100')

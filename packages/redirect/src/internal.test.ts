@@ -115,6 +115,24 @@ describe('the ask check and the admin host', () => {
     }
   })
 
+  // Caddy sends one `domain`; anything else reaching this port is not Caddy.
+  // A repeated parameter is an array, and it answers 400 with the other
+  // malformed shapes rather than throwing its way to a 500 — this is
+  // unauthenticated, and it is the port that decides certificate issuance.
+  it.each([
+    ['a name repeated', 'go.example.test&domain=go.example.test'],
+    ['a verified name beside another', 'go.example.test&domain=other.example.test'],
+    ['the admin host repeated', 'admin.example.test&domain=admin.example.test'],
+  ])('refuses %s with 400', async (_label, query) => {
+    const a = app('admin.example.test')
+    try {
+      const r = await a.inject({ method: 'GET', url: `/ask?domain=${query}` })
+      expect(r.statusCode).toBe(400)
+    } finally {
+      await a.close()
+    }
+  })
+
   // The admin host is one name an operator put in the configuration, not a
   // suffix, a wildcard or anything a request can choose.
   it('approves nothing else, with or without an admin host', async () => {

@@ -45,11 +45,27 @@ export function clockFrom(start: Date): TestClock {
   }
 }
 
-/** An app on the admin host, silent, with the test's own clock. */
+/**
+ * The trusted-proxy list the Compose file gives the admin service, which is
+ * also the redirect's. Named here so a test can build the app the way the
+ * stack actually runs it rather than the way that happens to be convenient:
+ * with these, every peer on the bridge network is trusted, and a test built on
+ * `trustProxy: false` cannot see what that costs.
+ */
+export const SHIPPED_TRUSTED_PROXIES = ['uniquelocal', 'loopback']
+
+/**
+ * An app on the admin host, silent, with the test's own clock.
+ *
+ * `trustProxy: false` by default, because most suites are not about forwarded
+ * headers and a false here keeps them reading what they were sent. A suite
+ * that is about them passes `SHIPPED_TRUSTED_PROXIES`.
+ */
 export function testApp(
   pg: Pool,
   clock: TestClock,
   extra: Partial<AdminDeps> = {},
+  opts: { trustProxy: string | string[] | boolean } = { trustProxy: false },
 ): FastifyInstance {
   return buildAdminApp(
     {
@@ -60,7 +76,7 @@ export function testApp(
       log: false,
       ...extra,
     },
-    { trustProxy: false },
+    opts,
   )
 }
 

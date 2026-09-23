@@ -30,15 +30,20 @@
 # make Caddy try to obtain a certificate for that name at boot, which fails
 # loudly on an install that has not set CLICKMONK_ADMIN_HOST yet.
 #
-# The admin matcher is a CEL expression rather than `host {$CLICKMONK_ADMIN_HOST}`
-# because Compose sets that variable either way, and Caddy refuses a `host`
-# matcher whose value is the empty string — "module value cannot be null" — at
-# boot as well as under `caddy validate`. Under `restart: unless-stopped` that
-# is a crash-loop, and Caddy is the only service with a published port, so it
-# would be the whole install. The expression reads the variable per request and
-# calls Caddy's own host matcher only when it is set, so with nothing set every
-# name goes to the redirect and there is no admin site at all. The match is
-# Caddy's own: case-insensitive, and a port in Host does not defeat it.
+# The admin matcher is a CEL expression rather than `host {$CLICKMONK_ADMIN_HOST}`,
+# and the word `expression` is the whole of what makes an unset install safe.
+# Compose sets that variable either way, and a `host` matcher whose value is the
+# empty string is refused — "module value cannot be null" — at boot as well as
+# under `caddy validate`. Under `restart: unless-stopped` that is a crash-loop,
+# and Caddy is the only service with a published port, so it would be the whole
+# install. An expression is evaluated per request instead, and `host("")`
+# simply matches nothing, so with nothing set every name goes to the redirect.
+#
+# The `!= ""` clause is not what saves it — drop it and an empty variable still
+# starts and still routes everything to the redirect. It is here to say the
+# empty case is intended, and to skip the host match when there is nothing to
+# match. The match itself is Caddy's own: case-insensitive, and a port in Host
+# does not defeat it.
 #
 # Plain HTTP is proxied rather than redirected for a link: a domain that has
 # not been verified has no certificate, and a local trial has no domain at all.

@@ -67,11 +67,18 @@ describe('the admin host', () => {
   // A value with a scheme or a port would match no Host header and no `ask`
   // query, so the install would look configured and quietly have no admin
   // interface. It fails the configuration instead, naming the variable.
+  // The two wildcards are the ones worth stating: Caddy's own `host` matcher
+  // would honour `*.example.test`, so an operator who wrote one here would be
+  // routing every link domain under it to the admin API. Both services parse
+  // this variable with this schema and refuse to boot instead, which is a
+  // crash-loop an operator sees rather than a mis-route nobody sees.
   it.each([
     'https://admin.example.test',
     'admin.example.test:443',
     'Admin.Example.Test',
     'not a host',
+    '*',
+    '*.example.test',
   ])('refuses %s', (value) => {
     expect(() => loadConfig({ ...base, CLICKMONK_ADMIN_HOST: value })).toThrow(
       /CLICKMONK_ADMIN_HOST/,

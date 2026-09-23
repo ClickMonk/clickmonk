@@ -64,9 +64,10 @@ services:
     depends_on: [redirect, admin]
     environment:
       # Read by the Caddyfile's @admin expression. Empty is expected and safe:
-      # the expression tests for it and the admin branch then matches nothing,
-      # so an install that never named a host serves exactly what it did
-      # before. This is why that matcher is not `host {$CLICKMONK_ADMIN_HOST}`.
+      # an expression matcher evaluates `host("")`, which matches nothing, so
+      # an install that never named a host serves exactly what it did before.
+      # A `host` matcher would instead refuse the empty value at boot, which is
+      # why that matcher is an expression.
       CLICKMONK_ADMIN_HOST: ${CLICKMONK_ADMIN_HOST:-}
     ports: ["80:80", "443:443"]
     volumes:
