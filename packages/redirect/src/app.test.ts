@@ -1319,6 +1319,149 @@ describe('a password-protected link', () => {
     expect(records.map((r) => r.status)).toEqual([200, 200, 200, 200])
   })
 
+  /**
+   * A refusal from one of the gates the GET applies: the form verified nothing,
+   * so no proof was minted, and the click is recorded as the step that refused
+   * it rather than as a password answer.
+   */
+  const expectNoProof = (
+    r: { headers: Record<string, unknown> },
+    records: ClickRecord[],
+    outcome: string,
+    step: string,
+  ) => {
+    const cookies = [(r.headers['set-cookie'] as string | string[] | undefined) ?? []].flat()
+    expect(cookies.some((c) => c.startsWith('cm_pw_'))).toBe(false)
+    expect(records.map((x) => [x.outcome, x.step])).toEqual([[outcome, step]])
+    expect(records.filter((x) => x.outcome === 'password')).toHaveLength(0)
+    expect(records.filter((x) => x.status === 302)).toHaveLength(0)
+  }
+
+  it('does not answer the password of an expired link', async () => {
+    const { app, records } = harness([
+      link({ passwordHash: hash, expiresAt: new Date(Date.now() - 1000), backupUrl: null }),
+    ])
+    const r = await post(app, `password=${PASSWORD}`)
+    expect(r.statusCode).toBe(410)
+    expectNoProof(r, records, 'expired', 'limits')
+  })
+
+  it('sends a right answer on an expired link where its GET would send it, and mints nothing', async () => {
+    // With a backup configured the GET answers 302 to it, so this does too:
+    // the visitor learns nothing here they would not learn by reloading, and
+    // the URL is the install's own, never anything from the request.
+    const { app, records } = harness([
+      link({ passwordHash: hash, expiresAt: new Date(Date.now() - 1000) }),
+    ])
+    const r = await post(app, `password=${PASSWORD}`)
+    expect(r.statusCode).toBe(302)
+    expect(r.headers.location).toBe('https://example.com/backup')
+    const cookies = [r.headers['set-cookie'] ?? []].flat()
+    expect(cookies.some((c) => c.startsWith('cm_pw_'))).toBe(false)
+    expect(records.map((x) => [x.outcome, x.step, x.status])).toEqual([['expired', 'limits', 302]])
+  })
+
+  it('does not answer the password of a link whose cap is used up', async () => {
+    const full = link({
+      id: '00000000-0000-4000-8000-0000000000c1',
+      slug: 'locked-full',
+      passwordHash: hash,
+      clickCap: 1,
+      backupUrl: null,
+    })
+    await pool.query(
+      "INSERT INTO domains (id, host, verified) VALUES ($1, 'go.example.test', true) ON CONFLICT DO NOTHING",
+      [domain.id],
+    )
+    await pool.query(
+      'INSERT INTO links (id, domain_id, slug, click_cap) VALUES ($1, $2, $3, 1) ON CONFLICT DO NOTHING',
+      [full.id, domain.id, full.slug],
+    )
+    await pool.query(
+      'INSERT INTO link_counters (link_id, clicks) VALUES ($1, 1) ON CONFLICT (link_id) DO UPDATE SET clicks = 1',
+      [full.id],
+    )
+    const { app, records } = harness([full])
+    const r = await post(app, `password=${PASSWORD}`, {}, '/locked-full')
+    expect(r.statusCode).toBe(410)
+    expectNoProof(r, records, 'capped', 'limits')
+    // Read, never consumed: a guesser cannot spend a link's cap by posting to it.
+    const c = await pool.query<{ clicks: string }>(
+      'SELECT clicks FROM link_counters WHERE link_id = $1',
+      [full.id],
+    )
+    expect(c.rows[0]?.clicks).toBe('1')
+  })
+
+  it('reads the cap without consuming it when the password is right', async () => {
+    const open = link({
+      id: '00000000-0000-4000-8000-0000000000c2',
+      slug: 'locked-open',
+      passwordHash: hash,
+      clickCap: 5,
+    })
+    await pool.query(
+      "INSERT INTO domains (id, host, verified) VALUES ($1, 'go.example.test', true) ON CONFLICT DO NOTHING",
+      [domain.id],
+    )
+    await pool.query(
+      'INSERT INTO links (id, domain_id, slug, click_cap) VALUES ($1, $2, $3, 5) ON CONFLICT DO NOTHING',
+      [open.id, domain.id, open.slug],
+    )
+    const { app } = harness([open])
+    const r = await post(app, `password=${PASSWORD}`, {}, '/locked-open')
+    expect(r.statusCode).toBe(302)
+    expect(String(r.headers['set-cookie'])).toContain(`cm_pw_${open.id}=`)
+    const c = await pool.query('SELECT 1 FROM link_counters WHERE link_id = $1', [open.id])
+    expect(c.rowCount).toBe(0)
+  })
+
+  it('does not answer the password of a disabled link', async () => {
+    const { app, records } = harness([link({ passwordHash: hash, enabled: false })])
+    const r = await post(app, `password=${PASSWORD}`)
+    expect(r.statusCode).toBe(404)
+    const cookies = [r.headers['set-cookie'] ?? []].flat()
+    expect(cookies.some((c) => c.startsWith('cm_pw_'))).toBe(false)
+    // As unanswerable as an unknown slug, and recorded as one is: not at all.
+    expect(records).toHaveLength(0)
+  })
+
+  it('does not answer the password of a link closed to this country', async () => {
+    // No IP data, so the country is unknown, which an allow-list refuses.
+    const { app, records } = harness([
+      link({ passwordHash: hash, countries: { mode: 'allow', list: ['DE'] }, backupUrl: null }),
+    ])
+    const r = await post(app, `password=${PASSWORD}`)
+    expect(r.statusCode).toBe(403)
+    expectNoProof(r, records, 'country_blocked', 'country')
+  })
+
+  it('classifies the answer, so a blocked class cannot answer and a flood is visible', async () => {
+    // The form used to touch neither the rate counter nor the classifier, so
+    // every answer was recorded as `unknown` and a flood of them was invisible
+    // to the abuser class.
+    const { app, records } = harness([locked], {
+      ipdata: IPDATA,
+      settings: {
+        ...DEFAULT_TRAFFIC_SETTINGS,
+        actions: { ...DEFAULT_TRAFFIC_SETTINGS.actions, abuser: 'block' },
+        abuserThreshold: 1,
+      },
+      rate: new RateCounter(),
+    })
+    const first = await post(app, `password=${PASSWORD}`)
+    expect(first.statusCode).toBe(302)
+    const second = await post(app, `password=${PASSWORD}`)
+    expect(second.statusCode).toBe(403)
+    const cookies = [second.headers['set-cookie'] ?? []].flat()
+    expect(cookies.some((c) => c.startsWith('cm_pw_'))).toBe(false)
+    expect(records.map((x) => [x.trafficClass, x.outcome, x.status])).toEqual([
+      ['human', 'password', 302],
+      ['abuser', 'blocked', 403],
+    ])
+    expect(records[1]?.signals).toEqual(['rate'])
+  })
+
   it('refuses a body larger than the bound', async () => {
     const { app, records } = harness([locked])
     const r = await post(app, `password=${'x'.repeat(2000)}`)

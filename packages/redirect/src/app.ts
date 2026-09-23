@@ -3,11 +3,17 @@ import {
   type ClickRecord,
   ConcurrencyGate,
   type Decision,
+  type Domain,
   type IpFacts,
+  type Link,
   MAX_PATH_LENGTH,
   MAX_REFERRER_LENGTH,
   MAX_UA_LENGTH,
   NO_IP_FACTS,
+  type Outcome,
+  type RequestFacts,
+  type Step,
+  type Traffic,
   ZERO_UUID,
   classifyDevice,
   classifyTraffic,
@@ -123,6 +129,79 @@ export function buildRedirectApp(
     },
   )
 
+  /**
+   * The decision both routes run, and the facts a click record takes from it.
+   * One function rather than a copy per route: answering a password must not be
+   * a way past the class's action, the expiry, the cap or a country rule, and
+   * a second copy of those five steps is exactly how that drifts apart — the
+   * form's first version applied none of them.
+   *
+   * `consumeCap` is the only difference between its callers. A GET that reaches
+   * a destination consumes one click of the cap; the password form only reads
+   * the counter, because posting a guess must not be a way to spend a link's
+   * cap.
+   */
+  async function resolveClick(o: {
+    snapshot: Snapshot
+    domain: Domain | null
+    link: Link | null
+    path: string
+    query: URLSearchParams
+    at: Date
+    clickId: string
+    ip: string
+    userAgent: string
+    head: boolean
+    /** Link ids from the visitor's own cookie. */
+    seen: string[]
+    passwordOk: boolean
+    consumeCap: boolean
+  }): Promise<{
+    decision: Decision
+    capUnchecked: boolean
+    traffic: Traffic
+    facts: RequestFacts
+    ipFacts: IpFacts
+  }> {
+    // In memory, synchronous and bounded: no lookup waits on the network.
+    const ipFacts = lookupIp(deps.ipdata, o.ip)
+    const traffic = classifyTraffic({
+      userAgent: o.userAgent,
+      head: o.head,
+      // A monotonic clock: a wall clock stepped back would restart every count.
+      clicksThisMinute: deps.rate.hit(o.ip, performance.now()),
+      abuserThreshold: o.snapshot.settings.abuserThreshold,
+      ip: ipFacts,
+    })
+    const facts: RequestFacts = {
+      path: o.path,
+      query: o.query,
+      now: o.at,
+      device: classifyDevice(o.userAgent),
+      country: ipFacts.country,
+      seenLink: o.link !== null && o.seen.includes(o.link.id),
+      clickId: o.clickId,
+      random: random(),
+      passwordOk: o.passwordOk,
+    }
+    const input = { facts, domain: o.domain, link: o.link, traffic, settings: o.snapshot.settings }
+    let decision: Decision = evaluate({ ...input, capExhausted: false })
+    let capUnchecked = false
+    // A used-up cap closes the link to every click that would reach a
+    // destination. A counted GET consumes one; a flagged click, a HEAD request
+    // and the password form only read the counter. Each call is bounded and
+    // fails open.
+    if (decision.reached && o.link?.clickCap) {
+      const cap =
+        decision.counted && o.consumeCap
+          ? await tryConsumeCap(deps.capPool, o.link.id, o.link.clickCap)
+          : await checkCap(deps.capPool, o.link.id, o.link.clickCap)
+      if (cap === 'exhausted') decision = evaluate({ ...input, capExhausted: true })
+      if (cap === 'unchecked') capUnchecked = true
+    }
+    return { decision, capUnchecked, traffic, facts, ipFacts }
+  }
+
   app.get('*', async (req, reply) => {
     const snapshot = deps.snapshot()
     if (!snapshot) {
@@ -160,26 +239,18 @@ export function buildRedirectApp(
     const clickId = uuidv7()
     const at = now()
 
-    // In memory, synchronous and bounded: no lookup waits on the network.
-    const ipFacts = lookupIp(deps.ipdata, ip)
-    const traffic = classifyTraffic({
-      userAgent,
-      head: req.method === 'HEAD',
-      // A monotonic clock: a wall clock stepped back would restart every count.
-      clicksThisMinute: deps.rate.hit(ip, performance.now()),
-      abuserThreshold: snapshot.settings.abuserThreshold,
-      ip: ipFacts,
-    })
-
-    const facts = {
+    const { decision, capUnchecked, traffic, facts, ipFacts } = await resolveClick({
+      snapshot,
+      domain,
+      link,
       path,
       query,
-      now: at,
-      device: classifyDevice(userAgent),
-      country: ipFacts.country,
-      seenLink: link !== null && visitor.seen.includes(link.id),
+      at,
       clickId,
-      random: random(),
+      ip,
+      userAgent,
+      head: req.method === 'HEAD',
+      seen: visitor.seen,
       // Read only for a link that has a password: a link without one costs
       // nothing for the gate existing.
       passwordOk:
@@ -192,20 +263,8 @@ export function buildRedirectApp(
               nowMs: at.getTime(),
               secret: deps.secret,
             }),
-    }
-    const input = { facts, domain, link, traffic, settings: snapshot.settings }
-    let decision: Decision = evaluate({ ...input, capExhausted: false })
-    let capUnchecked = false
-    // A used-up cap closes the link to every click that would reach a
-    // destination. A counted click consumes one; a flagged click or a HEAD
-    // request only reads the counter. Each call is bounded and fails open.
-    if (decision.reached && link?.clickCap) {
-      const cap = decision.counted
-        ? await tryConsumeCap(deps.capPool, link.id, link.clickCap)
-        : await checkCap(deps.capPool, link.id, link.clickCap)
-      if (cap === 'exhausted') decision = evaluate({ ...input, capExhausted: true })
-      if (cap === 'unchecked') capUnchecked = true
-    }
+      consumeCap: true,
+    })
 
     const record: ClickRecord = {
       v: 3,
@@ -297,36 +356,95 @@ export function buildRedirectApp(
     const at = now()
     const ip = canonicalIp(addressOnly(req.ip ?? '').slice(0, 45))
     const userAgent = (req.headers['user-agent'] ?? '').slice(0, MAX_UA_LENGTH)
-    const record = (status: number): void => {
+    const referrer = String(req.headers.referer ?? '').slice(0, MAX_REFERRER_LENGTH)
+    const visitor = readVisitor(req.headers.cookie, deps.secret)
+    const clickId = uuidv7()
+    // The same decision a GET runs, asked with the password already answered:
+    // would this visitor reach the destination if they had? Anything else and
+    // there is nothing here worth verifying — see the refusal below.
+    const resolved = await resolveClick({
+      snapshot,
+      domain,
+      link,
+      path,
+      query: new URLSearchParams(q === -1 ? '' : rawUrl.slice(q + 1)),
+      at,
+      clickId,
+      ip,
+      userAgent,
+      head: false,
+      seen: visitor.seen,
+      passwordOk: true,
+      consumeCap: false,
+    })
+
+    /** Exactly one record per request, whatever decided it. */
+    const record = (o: {
+      status: number
+      outcome: Outcome
+      step: Step
+      destination: string | null
+      targetId: string | null
+    }): void => {
       deps.spool.append({
         v: 3,
-        clickId: uuidv7(),
+        clickId,
         time: at.toISOString(),
         host,
         path,
         domainId: domain?.id ?? ZERO_UUID,
         linkId: link.id,
-        outcome: 'password',
-        step: 'password',
-        status,
-        destination: null,
-        targetId: null,
-        visitorId: readVisitor(req.headers.cookie, deps.secret).id,
-        returning: false,
-        device: classifyDevice(userAgent),
-        country: lookupIp(deps.ipdata, ip).country,
+        outcome: o.outcome,
+        step: o.step,
+        status: o.status,
+        destination: o.destination,
+        targetId: o.targetId,
+        visitorId: visitor.id,
+        returning: resolved.facts.seenLink,
+        device: resolved.facts.device,
+        country: resolved.facts.country,
         userAgent,
-        referrer: String(req.headers.referer ?? '').slice(0, MAX_REFERRER_LENGTH),
+        referrer,
         ip,
-        capUnchecked: false,
-        trafficClass: 'unknown',
-        signals: [],
-        action: null,
+        capUnchecked: resolved.capUnchecked,
+        trafficClass: resolved.traffic.class,
+        signals: resolved.traffic.signals,
+        action: resolved.decision.action,
         os: parseOs(userAgent),
         browser: parseBrowser(userAgent),
-        asn: lookupIp(deps.ipdata, ip).asn,
-        geoSource: lookupIp(deps.ipdata, ip).geoSource,
+        asn: resolved.ipFacts.asn,
+        geoSource: resolved.ipFacts.geoSource,
       })
+    }
+    /** The gate's own outcomes: the page, a wrong answer, a refusal, a pass. */
+    const recordPassword = (status: number): void =>
+      record({ status, outcome: 'password', step: 'password', destination: null, targetId: null })
+
+    // Every gate the GET applies is applied here first. A link closed by its
+    // class's action, its expiry, its cap or a country rule is closed to the
+    // form too: verifying a password for it would spend a scrypt pass on a link
+    // that is going nowhere, and minting a proof would hand out a credential
+    // that outlives the reason the link was shut. The answer is the GET's own,
+    // so a visitor learns nothing here they could not learn by reloading, and
+    // the only `Location` this route ever sends of its own is the link's own
+    // URL after a right answer.
+    if (!resolved.decision.reached) {
+      const d = resolved.decision
+      record({
+        status: d.status,
+        outcome: d.outcome,
+        step: d.step,
+        destination: d.location,
+        targetId: d.targetId,
+      })
+      reply.header('cache-control', NO_STORE)
+      if (d.status === 302 && d.location) {
+        return reply.code(302).header('location', d.location).send()
+      }
+      return reply
+        .code(d.status)
+        .type('text/plain; charset=utf-8')
+        .send(BODIES[d.status] ?? '')
     }
 
     const key = `${ip}|${link.id}`
@@ -342,7 +460,7 @@ export function buildRedirectApp(
      */
     const wrong = () => {
       passwordAttempts.fail(key, tick)
-      record(200)
+      recordPassword(200)
       return reply
         .code(200)
         .header('cache-control', NO_STORE)
@@ -352,7 +470,7 @@ export function buildRedirectApp(
 
     const attempt = passwordAttempts.check(key, tick)
     if (!attempt.allowed) {
-      record(429)
+      recordPassword(429)
       return reply
         .code(429)
         .header('cache-control', NO_STORE)
@@ -366,7 +484,7 @@ export function buildRedirectApp(
     // because nothing is going to be verified.
     if (password === null) return wrong()
     if (!passwordGate.tryEnter()) {
-      record(503)
+      recordPassword(503)
       return reply
         .code(503)
         .header('cache-control', NO_STORE)
@@ -386,7 +504,7 @@ export function buildRedirectApp(
     }
     if (!ok) return wrong()
     passwordAttempts.succeed(key)
-    record(302)
+    recordPassword(302)
     return (
       reply
         .code(302)
