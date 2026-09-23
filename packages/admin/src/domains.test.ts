@@ -93,27 +93,102 @@ const add = (payload: Record<string, unknown> = { host: 'go.example.test' }) =>
 // between a stranger and this API. One row per route, so removing one
 // handler's call fails that row alone.
 describe('every route needs a credential', () => {
-  it.each([
-    ['GET', '/api/domains', undefined],
-    ['POST', '/api/domains', { host: 'anon.example.test' }],
-    ['PATCH', '/api/domains/:id', { rootUrl: null }],
-    ['DELETE', '/api/domains/:id', undefined],
-    ['POST', '/api/domains/:id/check', undefined],
-    ['POST', '/api/domains/:id/unverify', undefined],
-    ['GET', '/api/alerts', undefined],
-  ])('refuses an anonymous %s %s', async (method, path, payload) => {
-    const created = (await add()).json()
+  const rowCount = async (sql: string, params: unknown[]) => (await pg.query(sql, params)).rowCount
+
+  /**
+   * One row per route: the refusal, and the state that route would have
+   * changed, read back afterwards. The status code alone is not the guard —
+   * a handler that acts and *then* refuses answers 401 having already
+   * deleted the domain — so each write row names what must still be true.
+   *
+   * The three reads change nothing, so what they must not do is answer with
+   * the data; that is pinned for every row by the body carrying the refusal
+   * and nothing else.
+   */
+  interface Anonymous {
+    name: string
+    method: 'GET' | 'POST' | 'PATCH' | 'DELETE'
+    path: string
+    payload?: Record<string, unknown>
+    unchanged?: (id: string) => Promise<void>
+  }
+
+  const anonymous: Anonymous[] = [
+    { name: 'GET /api/domains', method: 'GET', path: '/api/domains' },
+    {
+      name: 'POST /api/domains',
+      method: 'POST',
+      path: '/api/domains',
+      payload: { host: 'anon.example.test' },
+      unchanged: async () => {
+        expect(await rowCount('SELECT 1 FROM domains WHERE host = $1', ['anon.example.test'])).toBe(
+          0,
+        )
+      },
+    },
+    {
+      name: 'PATCH /api/domains/:id',
+      method: 'PATCH',
+      path: '/api/domains/:id',
+      payload: { rootUrl: null },
+      unchanged: async (id) => {
+        const r = await pg.query<{ root_url: string | null }>(
+          'SELECT root_url FROM domains WHERE id = $1',
+          [id],
+        )
+        expect(r.rows[0]?.root_url).toBe('https://example.com/')
+      },
+    },
+    {
+      name: 'DELETE /api/domains/:id',
+      method: 'DELETE',
+      path: '/api/domains/:id',
+      unchanged: async (id) => {
+        expect(await rowCount('SELECT 1 FROM domains WHERE id = $1', [id])).toBe(1)
+      },
+    },
+    {
+      name: 'POST /api/domains/:id/check',
+      method: 'POST',
+      path: '/api/domains/:id/check',
+      unchanged: async () => {
+        expect(resolver.asked).toBe(0)
+        expect(await rowCount('SELECT 1 FROM domain_dns_checks', [])).toBe(0)
+      },
+    },
+    {
+      name: 'POST /api/domains/:id/unverify',
+      method: 'POST',
+      path: '/api/domains/:id/unverify',
+      unchanged: async (id) => {
+        const r = await pg.query<{ verified: boolean }>(
+          'SELECT verified FROM domains WHERE id = $1',
+          [id],
+        )
+        expect(r.rows[0]?.verified).toBe(true)
+      },
+    },
+    { name: 'GET /api/alerts', method: 'GET', path: '/api/alerts' },
+  ]
+
+  it.each(anonymous)('refuses an anonymous $name, and changes nothing', async (row) => {
+    // Verified, and with a root URL, so that un-verifying and patching are
+    // changes this test could see if they happened.
+    const created = (await add({ host: 'go.example.test', rootUrl: 'https://example.com/' })).json()
+    await pg.query('UPDATE domains SET verified = true WHERE id = $1', [created.id])
     const r = await app.inject({
-      // The row's method, which `inject` types as its own narrow union.
-      method: method as 'GET',
-      url: path.replace(':id', created.id),
+      method: row.method,
+      url: row.path.replace(':id', created.id),
       // Everything a request can carry except a credential: the right host,
       // and an `Origin` the cross-site check accepts.
       headers: write(),
-      ...(payload ? { payload } : {}),
+      ...(row.payload ? { payload: row.payload } : {}),
     })
     expect(r.statusCode).toBe(401)
     expect(r.json().error).toBe('unauthenticated')
+    // The refusal and nothing else: no listing, no settings, no domain.
+    expect(Object.keys(r.json()).sort()).toEqual(['error', 'message'])
+    await row.unchanged?.(created.id)
   })
 })
 

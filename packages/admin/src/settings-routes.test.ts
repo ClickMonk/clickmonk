@@ -42,18 +42,31 @@ const ALL_FLAG = { bot: 'flag', abuser: 'flag', anonymous: 'flag', datacenter: '
 // credentials, and the hook that resolves one refuses nothing. One row per
 // route, so removing one handler's call fails that row alone.
 describe('every route needs a credential', () => {
+  // As on the domain routes, the status code is not the guard on its own: a
+  // handler that writes and then refuses answers 401 having already changed
+  // what the redirect serves every visitor.
   it.each([
-    ['GET', undefined],
-    ['PUT', { actions: ALL_FLAG, safeUrl: null, abuserThreshold: 60 }],
-  ])('refuses an anonymous %s /api/settings', async (method, payload) => {
+    { name: 'GET', method: 'GET' as const, payload: undefined },
+    {
+      name: 'PUT',
+      method: 'PUT' as const,
+      payload: { actions: ALL_FLAG, safeUrl: null, abuserThreshold: 99 },
+    },
+  ])('refuses an anonymous $name /api/settings, and changes nothing', async (row) => {
     const r = await app.inject({
-      method: method as 'GET',
+      method: row.method,
       url: '/api/settings',
       headers: write(),
-      ...(payload ? { payload } : {}),
+      ...(row.payload ? { payload: row.payload } : {}),
     })
     expect(r.statusCode).toBe(401)
     expect(r.json().error).toBe('unauthenticated')
+    // The refusal and nothing else: no settings in the body of a refused read.
+    expect(Object.keys(r.json()).sort()).toEqual(['error', 'message'])
+    const stored = await pg.query<{ abuser_threshold: number }>(
+      'SELECT abuser_threshold FROM settings',
+    )
+    expect(stored.rows[0]?.abuser_threshold).toBe(DEFAULT_TRAFFIC_SETTINGS.abuserThreshold)
   })
 })
 

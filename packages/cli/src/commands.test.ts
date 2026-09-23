@@ -62,6 +62,24 @@ describe('clickmonk cli', () => {
     )
   })
 
+  // The second add must not overwrite the first: the domain it would replace
+  // may already be verified and serving.
+  it('rejects a second domain with the same host, and leaves the first alone', async () => {
+    expect(await run('domain', 'add', 'twice.example.test')).toBe(0)
+    const first = await pg.query<{ id: string; verification_token: string }>(
+      'SELECT id, verification_token FROM domains WHERE host = $1',
+      ['twice.example.test'],
+    )
+    lines.length = 0
+    expect(await run('domain', 'add', 'twice.example.test')).toBe(2)
+    expect(lines).toEqual(['error: domain already exists: twice.example.test'])
+    const after = await pg.query<{ id: string; verification_token: string }>(
+      'SELECT id, verification_token FROM domains WHERE host = $1',
+      ['twice.example.test'],
+    )
+    expect(after.rows).toEqual(first.rows)
+  })
+
   it('rejects a bad host and a bad fallback URL', async () => {
     expect(await run('domain', 'add', 'not a host')).toBe(2)
     expect(await run('domain', 'add', 'x.example.test', '--root-url', 'javascript:alert(1)')).toBe(

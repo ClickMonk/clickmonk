@@ -266,6 +266,25 @@ describe('createDomain', () => {
     ])
   })
 
+  // The caller's own words decide this flag, and nothing else does. A plain
+  // property read walks the prototype chain, so a planted property would
+  // answer for every caller that said nothing.
+  it('is not verified by a property planted on Object.prototype', async () => {
+    Object.defineProperty(Object.prototype, 'verified', {
+      value: true,
+      configurable: true,
+      enumerable: false,
+    })
+    try {
+      const created = await createDomain(pool, { host: 'planted.example.test' })
+      expect(await verifiedOf(created?.id as string)).toBe(false)
+    } finally {
+      // Removed outright rather than set to undefined: a property left on
+      // Object.prototype is visible to every object in the process.
+      Reflect.deleteProperty(Object.prototype, 'verified')
+    }
+  })
+
   it('refuses a URL carrying a token, and a host name that is not one', async () => {
     await expect(
       createDomain(pool, { host: 'go.example.test', rootUrl: 'https://example.com/{click_id}' }),

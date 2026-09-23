@@ -195,6 +195,14 @@ export async function createDomain(
 ): Promise<CreatedDomain | null> {
   const host = normaliseHost(o.host)
   if (!host) throw new Error('a domain needs a valid host name')
+  // An own property, not an inherited one. `o` is an object literal a caller
+  // builds, and a plain `o.verified` walks the prototype chain: a property
+  // planted on `Object.prototype` would then decide the flag that lets a host
+  // name serve and be given a certificate, for every caller that says nothing
+  // about it. Nothing reaches that today — the API's schema refuses a body
+  // that carries the field at all — but a flag this one must be decided by
+  // what the caller actually wrote.
+  const verified = Object.hasOwn(o, 'verified') && o.verified === true
   for (const url of [o.rootUrl, o.notFoundUrl]) {
     // Sent to the visitor as written, so no token: a brace would reach them
     // literally.
@@ -206,7 +214,7 @@ export async function createDomain(
     `INSERT INTO domains (host, verified, root_url, not_found_url, verification_token)
      VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (host) DO NOTHING RETURNING id, verification_token`,
-    [host, o.verified === true, o.rootUrl ?? null, o.notFoundUrl ?? null, newVerificationToken()],
+    [host, verified, o.rootUrl ?? null, o.notFoundUrl ?? null, newVerificationToken()],
   )
   const row = r.rows[0]
   if (!row) return null
