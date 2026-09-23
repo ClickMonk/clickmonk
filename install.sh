@@ -76,8 +76,14 @@ if [ -f .env ]; then
   echo ".env already exists; leaving every value in it alone."
 else
   echo "Writing .env with fresh secrets..."
+  # Built beside .env and renamed over it, so .env is either absent or whole.
+  # A write that dies half way through would otherwise leave a .env that the
+  # next run keeps as it is, while telling the operator it left every value
+  # alone: an install missing a password nobody can recover.
+  tmp=".env.tmp.$$"
+  trap 'rm -f "$tmp"' EXIT INT TERM
   # umask before the redirect, not chmod after: chmod-after leaves a window in
-  # which .env exists world-readable and already holds the passwords.
+  # which the file exists world-readable and already holds the passwords.
   (
     umask 077
     {
@@ -86,8 +92,21 @@ else
       printf 'POSTGRES_PASSWORD=%s\n' "$(secret)"
       printf 'CLICKHOUSE_PASSWORD=%s\n' "$(secret)"
       printf 'CLICKMONK_SECRET=%s\n' "$(secret)"
-    } >.env
+    } >"$tmp"
   )
+  # Every value is checked before the file is put in place, and nothing here
+  # echoes what it read. A short or non-hex value means this host's random
+  # source, or one of the two commands that format it, did something
+  # unexpected; carrying on would install a password nobody can reproduce.
+  for key in POSTGRES_PASSWORD CLICKHOUSE_PASSWORD CLICKMONK_SECRET; do
+    if ! grep -Eq "^$key=[0-9a-f]{64}$" "$tmp"; then
+      echo "Could not generate $key: /dev/urandom, od or tr on this host did" >&2
+      echo "not give 32 bytes of hex. Nothing was written." >&2
+      exit 1
+    fi
+  done
+  mv "$tmp" .env
+  trap - EXIT INT TERM
 fi
 
 if [ "$START" = 0 ]; then

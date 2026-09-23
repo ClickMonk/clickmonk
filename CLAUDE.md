@@ -205,8 +205,9 @@ That rule is easy to satisfy badly, so:
 Anything that runs on an operator's host rather than in a container — an installer,
 backup or restore — targets **bash 3.2**, the version macOS still ships: no associative
 arrays, no `mapfile`. `install.sh` is the first. `shellcheck` is pinned as a Docker image
-and run by `pnpm lint:sh`, in CI and locally with the same command, so a failure there is
-reproducible here.
+and run by `pnpm lint:sh` over every `*.sh` in the repository, so a new script is linted
+without anything being added to the script, and by CI with the same command, so a failure
+there is reproducible here.
 
 ## Conventions
 
