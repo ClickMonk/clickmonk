@@ -92,6 +92,10 @@ else
       printf 'POSTGRES_PASSWORD=%s\n' "$(secret)"
       printf 'CLICKHOUSE_PASSWORD=%s\n' "$(secret)"
       printf 'CLICKMONK_SECRET=%s\n' "$(secret)"
+      # Optional, and empty by default: with no admin host the stack starts and
+      # serves links exactly as it did before there was an admin API. Written
+      # here so an operator finds it where the other settings are.
+      printf 'CLICKMONK_ADMIN_HOST=\n'
     } >"$tmp"
   )
   # Every value is checked before the file is put in place, and nothing here

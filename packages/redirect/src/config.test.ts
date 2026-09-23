@@ -54,3 +54,27 @@ describe('loadConfig', () => {
     )
   })
 })
+
+describe('the admin host', () => {
+  it('is null when it is not set, so ask approves verified link domains only', () => {
+    expect(loadConfig(base).adminHost).toBeNull()
+    expect(loadConfig({ ...base, CLICKMONK_ADMIN_HOST: '' }).adminHost).toBeNull()
+    expect(loadConfig({ ...base, CLICKMONK_ADMIN_HOST: ' admin.example.test ' }).adminHost).toBe(
+      'admin.example.test',
+    )
+  })
+
+  // A value with a scheme or a port would match no Host header and no `ask`
+  // query, so the install would look configured and quietly have no admin
+  // interface. It fails the configuration instead, naming the variable.
+  it.each([
+    'https://admin.example.test',
+    'admin.example.test:443',
+    'Admin.Example.Test',
+    'not a host',
+  ])('refuses %s', (value) => {
+    expect(() => loadConfig({ ...base, CLICKMONK_ADMIN_HOST: value })).toThrow(
+      /CLICKMONK_ADMIN_HOST/,
+    )
+  })
+})

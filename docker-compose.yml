@@ -23,6 +23,9 @@ services:
       CLICKMONK_POSTGRES_URL: postgres://clickmonk:${POSTGRES_PASSWORD:?set it in .env}@postgres:5432/clickmonk
       CLICKMONK_SECRET: ${CLICKMONK_SECRET:?set it in .env}
       CLICKMONK_TRUSTED_PROXIES: ${CLICKMONK_TRUSTED_PROXIES:-uniquelocal,loopback}
+      # The one name besides a verified link domain that `ask` approves a
+      # certificate for. Empty: no admin host, and no certificate for one.
+      CLICKMONK_ADMIN_HOST: ${CLICKMONK_ADMIN_HOST:-}
     volumes:
       - spool:/var/lib/clickmonk/spool
       - state:/var/lib/clickmonk/state
@@ -35,10 +38,36 @@ services:
       retries: 24
       start_period: 10s
 
+  # The admin API. Published nowhere: Caddy reaches it on the stack's own
+  # network, and only for the host name CLICKMONK_ADMIN_HOST names. Unset, it
+  # starts and answers 503 on every route rather than refusing to boot — an
+  # install that never sets it must still serve its links.
+  admin:
+    <<: *app
+    command: ["node", "packages/admin/dist/index.js"]
+    depends_on: [postgres]
+    environment:
+      CLICKMONK_POSTGRES_URL: postgres://clickmonk:${POSTGRES_PASSWORD:?set it in .env}@postgres:5432/clickmonk
+      CLICKMONK_ADMIN_HOST: ${CLICKMONK_ADMIN_HOST:-}
+      CLICKMONK_TRUSTED_PROXIES: ${CLICKMONK_TRUSTED_PROXIES:-uniquelocal,loopback}
+      CLICKMONK_DNS_SERVERS: ${CLICKMONK_DNS_SERVERS:-}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9100/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+
   caddy:
     image: caddy:2.11-alpine
     restart: unless-stopped
-    depends_on: [redirect]
+    depends_on: [redirect, admin]
+    environment:
+      # Read by the Caddyfile's @admin expression. Empty is expected and safe:
+      # the expression tests for it and the admin branch then matches nothing,
+      # so an install that never named a host serves exactly what it did
+      # before. This is why that matcher is not `host {$CLICKMONK_ADMIN_HOST}`.
+      CLICKMONK_ADMIN_HOST: ${CLICKMONK_ADMIN_HOST:-}
     ports: ["80:80", "443:443"]
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro

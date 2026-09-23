@@ -22,22 +22,58 @@
 	}
 }
 
-# Every host name. The redirect answers for the ones it knows and serves a
-# 404 page for the rest. Plain HTTP is proxied rather than redirected: a
-# domain that has not been verified has no certificate, and a local trial has
-# no domain at all.
+# Every host name. The admin API answers on the one host name the install is
+# configured with; every other name goes to the redirect, which answers for
+# the ones it knows and serves a 404 page for the rest.
+#
+# The site addresses are ports, not names, on purpose. A named site block would
+# make Caddy try to obtain a certificate for that name at boot, which fails
+# loudly on an install that has not set CLICKMONK_ADMIN_HOST yet.
+#
+# The admin matcher is a CEL expression rather than `host {$CLICKMONK_ADMIN_HOST}`
+# because Compose sets that variable either way, and Caddy refuses a `host`
+# matcher whose value is the empty string — "module value cannot be null" — at
+# boot as well as under `caddy validate`. Under `restart: unless-stopped` that
+# is a crash-loop, and Caddy is the only service with a published port, so it
+# would be the whole install. The expression reads the variable per request and
+# calls Caddy's own host matcher only when it is set, so with nothing set every
+# name goes to the redirect and there is no admin site at all. The match is
+# Caddy's own: case-insensitive, and a port in Host does not defeat it.
+#
+# Plain HTTP is proxied rather than redirected for a link: a domain that has
+# not been verified has no certificate, and a local trial has no domain at all.
+# The admin host is redirected to HTTPS instead, because its session cookie is
+# `Secure` and a browser drops that over plain HTTP — signing in would appear
+# to work and then not.
 :443 {
 	tls {
 		on_demand
 		import /etc/caddy/tls.d/*.caddy
 	}
-	reverse_proxy redirect:8080 {
-		import /etc/caddy/proxy.d/*.caddy
+	@admin expression {env.CLICKMONK_ADMIN_HOST} != "" && host({env.CLICKMONK_ADMIN_HOST})
+	handle @admin {
+		reverse_proxy admin:9100 {
+			import /etc/caddy/proxy.d/*.caddy
+		}
+	}
+	handle {
+		reverse_proxy redirect:8080 {
+			import /etc/caddy/proxy.d/*.caddy
+		}
 	}
 }
 
 :80 {
-	reverse_proxy redirect:8080 {
-		import /etc/caddy/proxy.d/*.caddy
+	@admin expression {env.CLICKMONK_ADMIN_HOST} != "" && host({env.CLICKMONK_ADMIN_HOST})
+	handle @admin {
+		# 308, not Caddy's `permanent` (301): a 301 lets a client turn a POST
+		# into a GET, so a sign-in sent to the plain-HTTP port would arrive as
+		# an empty GET rather than being retried as itself over HTTPS.
+		redir https://{host}{uri} 308
+	}
+	handle {
+		reverse_proxy redirect:8080 {
+			import /etc/caddy/proxy.d/*.caddy
+		}
 	}
 }

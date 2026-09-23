@@ -70,6 +70,7 @@ const internal = buildInternalApp({
   spool,
   ipdata: () => ipdata.status(),
   rate,
+  adminHost: config.adminHost,
 })
 
 await internal.listen({ host: '0.0.0.0', port: config.internalPort })

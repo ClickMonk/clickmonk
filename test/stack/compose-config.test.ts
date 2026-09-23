@@ -121,6 +121,26 @@ describe('what the stack publishes', () => {
     }
   })
 
+  // The admin surface must not be reachable from a link domain. Caddy routes
+  // by host name, and every service that has to agree on which name that is
+  // reads it from the same variable: the admin API refuses any other Host, the
+  // redirect approves a certificate for that name and no other, and Caddy
+  // sends that name to the admin service instead of to the redirect.
+  it('gives the same admin host name to caddy, the admin API and the redirect', () => {
+    const named = config('docker-compose.yml', 'CLICKMONK_ADMIN_HOST=admin.example.test\n')
+    for (const service of ['caddy', 'admin', 'redirect']) {
+      expect(serviceBlock(named, service), service).toContain(
+        'CLICKMONK_ADMIN_HOST: admin.example.test',
+      )
+    }
+  })
+
+  it('starts with no admin host at all, and says nothing about one', () => {
+    for (const service of ['caddy', 'admin', 'redirect']) {
+      expect(serviceBlock(cfg, service), service).toMatch(/CLICKMONK_ADMIN_HOST: ""?\n/)
+    }
+  })
+
   it('tells the redirect to believe a forwarded address only from the stack’s own network', () => {
     expect(cfg).toContain('CLICKMONK_TRUSTED_PROXIES: uniquelocal,loopback')
   })
@@ -251,7 +271,11 @@ describe('the shipped Caddy configuration', () => {
 
     const directives = [...caddyfile.matchAll(/^[ \t]*reverse_proxy\b/gm)]
     const blocks = [...caddyfile.matchAll(/reverse_proxy[^\n{]*\{([^}]*)\}/g)]
-    expect(directives.length, 'a reverse_proxy per site block, :443 and :80').toBe(2)
+    // Three: the admin API and the redirect on :443, and the redirect on :80.
+    expect(
+      directives.length,
+      'a reverse_proxy per handler: admin and redirect on :443, redirect on :80',
+    ).toBe(3)
     expect(blocks.length, 'a reverse_proxy that opens no block of its own').toBe(directives.length)
     for (const [i, block] of blocks.entries()) {
       expect(block[1], `reverse_proxy block ${i + 1} imports nothing`).toContain(
@@ -292,31 +316,74 @@ describe('the shipped Caddy configuration', () => {
   // over the text would notice. `--network none` because no test in this
   // suite reaches a network, and `--rm` because none leaves a container
   // behind.
-  it('is a configuration Caddy itself accepts', () => {
-    const r = spawnSync(
-      'docker',
-      [
-        'run',
-        '--rm',
-        '--network',
-        'none',
-        '-v',
-        `${join(ROOT, 'caddy')}:/etc/caddy:ro`,
-        caddyImage(),
-        'caddy',
-        'validate',
-        '--adapter',
-        'caddyfile',
-        '--config',
-        '/etc/caddy/Caddyfile',
-      ],
-      { encoding: 'utf8', stdio: 'pipe' },
-    )
-    // Docker's own failure to run is not a valid configuration. Without this
-    // a missing image reads as a passing check.
-    expect(r.error?.message, 'could not run caddy').toBeUndefined()
-    expect(r.status, `${r.stdout ?? ''}${r.stderr ?? ''}`).toBe(0)
-    expect(`${r.stdout ?? ''}${r.stderr ?? ''}`).toContain('Valid configuration')
+  //
+  // Three runs, and the middle one is the one that matters. Caddy's
+  // `{$VAR:default}` only falls back when the variable is UNSET; Compose sets
+  // CLICKMONK_ADMIN_HOST to the empty string for every install that did not
+  // name a host, and an empty `host` matcher value is fatal at boot as well as
+  // here. This is the guard on the default install starting at all.
+  it.each([
+    ['unset', undefined],
+    ['set to the empty string, as the default install leaves it', ''],
+    ['set to a host name', 'admin.example.test'],
+  ])(
+    'is a configuration Caddy itself accepts, with CLICKMONK_ADMIN_HOST %s',
+    (_label, value: string | undefined) => {
+      const r = spawnSync(
+        'docker',
+        [
+          'run',
+          '--rm',
+          '--network',
+          'none',
+          ...(value === undefined ? [] : ['-e', `CLICKMONK_ADMIN_HOST=${value}`]),
+          '-v',
+          `${join(ROOT, 'caddy')}:/etc/caddy:ro`,
+          caddyImage(),
+          'caddy',
+          'validate',
+          '--adapter',
+          'caddyfile',
+          '--config',
+          '/etc/caddy/Caddyfile',
+        ],
+        { encoding: 'utf8', stdio: 'pipe' },
+      )
+      // Docker's own failure to run is not a valid configuration. Without this
+      // a missing image reads as a passing check.
+      expect(r.error?.message, 'could not run caddy').toBeUndefined()
+      expect(r.status, `${r.stdout ?? ''}${r.stderr ?? ''}`).toBe(0)
+      expect(`${r.stdout ?? ''}${r.stderr ?? ''}`).toContain('Valid configuration')
+    },
+  )
+
+  // A named site block would make Caddy try to obtain a certificate for that
+  // name at boot; on an install with no admin host that is a certificate for
+  // nothing, and with an unset variable it is a parse error that crash-loops.
+  // Both site addresses are therefore ports, and the admin host is a matcher.
+  it('routes the admin API by host name, from a port-only site address', () => {
+    expect(caddyfile).toMatch(/^:443 \{$/m)
+    expect(caddyfile).toMatch(/^:80 \{$/m)
+    const matchers = [...caddyfile.matchAll(/^\s*@admin (\S+) (.*)$/gm)]
+    expect(matchers.length, 'an @admin matcher on each site block').toBe(2)
+    for (const m of matchers) {
+      // Never `host {$CLICKMONK_ADMIN_HOST…}`: Compose sets that variable to
+      // the empty string on a default install, and Caddy refuses an empty
+      // `host` value at boot. The expression form is empty-safe, which the
+      // validate rows above prove rather than assert.
+      expect(m[1], 'the admin matcher must not be a bare host matcher').toBe('expression')
+      expect(m[2]).toContain('{env.CLICKMONK_ADMIN_HOST} != ""')
+      expect(m[2]).toContain('host({env.CLICKMONK_ADMIN_HOST})')
+    }
+    expect(caddyfile).toContain('reverse_proxy admin:9100')
+  })
+
+  // The admin session cookie is Secure, so a browser drops it over plain
+  // HTTP: signing in would appear to work and then not.
+  it('sends the admin host to HTTPS on port 80 rather than proxying it', () => {
+    const plain = /\n:80 \{([\s\S]*?)\n\}/.exec(caddyfile)?.[1] ?? ''
+    expect(plain).toContain('redir https://{host}{uri} 308')
+    expect(plain).not.toContain('admin:9100')
   })
 
   // Anything but a commented-out example activates the directive in every
