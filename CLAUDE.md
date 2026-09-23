@@ -43,16 +43,17 @@ run it on their own infrastructure; their click data stays theirs.
 
 **Early, unreleased, not for production.** What exists: the redirect (in-memory snapshot,
 spool before response, click caps, traffic classification and actions, country rules
-from an in-memory IP lookup), the worker (spool to ClickHouse, migrations on boot, IP
-data updates), the CLI (`migrate`, `domain add`, `link add`, `settings show|set`,
-`ipdata status|update`), a Compose stack, and the restart durability suite.
+from an in-memory IP lookup), Caddy in front of it with on-demand TLS gated on a verified
+domain, the worker (spool to ClickHouse, migrations on boot, IP data updates, domain DNS
+verification), the CLI (`migrate`, `domain add|list|verify`, `link add`,
+`settings show|set`, `ipdata status|update`), `install.sh`, a Compose stack, and the
+restart durability and stack test suites.
 
 What does not exist yet, and must not be implied by any documentation:
 
-- **TLS.** The redirect serves plain HTTP on 8080. Visitor cookies are `Secure`, so
-  browsers drop them over HTTP and returning-visitor routing does not work until TLS.
-- **Admin API and UI.** Links and domains are added with the CLI. `domain add` marks a
-  domain verified without a DNS check.
+- **An admin hostname.** Caddy serves link domains only; there is no admin service to
+  route one to.
+- **Admin API and UI.** Links and domains are added with the CLI.
 - **Most link settings in the CLI.** `link add` takes `--target`, `--backup`, `--cap`,
   `--expires`, `--no-passthrough` and `--action` only, and no command changes a link
   after `link add`. `settings set` sets the install-wide traffic actions, the safe URL
@@ -96,7 +97,7 @@ packages/redirect/  the service that answers link domains: an in-memory snapshot
                     writer, the click-cap counter.
 packages/worker/    ships the spool into ClickHouse; runs migrations on boot;
                     updates the IP data.
-packages/cli/       `clickmonk migrate | domain add | link add | settings | ipdata`.
+packages/cli/       `clickmonk migrate | domain add|list|verify | link add | settings | ipdata`.
 ```
 
 Three properties of the product shape every change:
@@ -155,6 +156,22 @@ The CI stack binds **8080 and 8123**; the test databases bind **8123 and 5433**.
 test databases before running it, or you get "port is already allocated", which reads
 like a broken test. Bring them back before the next `pnpm test`. The suite runs
 `down -v` on its own project only (`clickmonk-ci`).
+
+### The stack suites
+
+```sh
+pnpm build
+pnpm vitest run --config vitest.stack.config.ts   # starts the stack; a few minutes
+```
+
+They bring the whole stack up with a certificate authority and a DNS server of their own,
+so nothing reaches the internet: a domain gets no certificate until it publishes its
+verification record, the address every visitor arrives from is the visitor's, and
+`install.sh` writes its secrets once. They bind **80 and 443**; the durability suite binds
+8080 and 8123 and the test databases 8123 and 5433. Run one at a time.
+
+The IPv6 half of the address suite is skipped on a host with no IPv6 address of its own,
+which is most CI runners. Run it by hand on a host that has one before a release.
 
 ## License and its consequences
 

@@ -19,6 +19,17 @@ on your own infrastructure, and your click data stays yours.
   down.
 - **The worker**, which ships spooled clicks into ClickHouse, runs the database
   migrations when it starts, and keeps the IP data up to date.
+- **TLS on every link domain.** Caddy sits in front and obtains a certificate the first
+  time someone asks for a domain over HTTPS, then renews it without anyone touching a
+  file. It asks ClickMonk first, and ClickMonk says yes only for a domain you added and
+  verified, so a host name somebody else points at your server never makes your install
+  ask a certificate authority for anything.
+- **Domain verification.** `clickmonk domain add` prints a TXT record to publish. The
+  worker looks for it every five minutes, and `clickmonk domain verify` looks now. Until
+  it is found, links on that domain answer 404 and it gets no certificate. A check that
+  fails later is recorded and shown, and never takes a verified domain back down.
+- **`./install.sh`**, which writes `.env` with fresh secrets the first time, builds the
+  image and starts the stack. Running it again changes nothing that is already set.
 - **Traffic classification.** Every click is classed as human, bot, abuser, anonymous
   (a Tor exit), datacenter, or unknown when the IP checks could not run, from its
   user-agent, the number of requests from its address in the current one-minute window,
@@ -29,7 +40,7 @@ on your own infrastructure, and your click data stays yours.
   as a bot unless another check gives it a class, and never uses up a click cap. Each
   click also records its country, network (ASN), operating system and browser.
 - **Country rules** use the country looked up from the visitor's address.
-- **The CLI**: `clickmonk migrate`, `clickmonk domain add`, `clickmonk link add`,
+- **The CLI**: `clickmonk migrate`, `clickmonk domain add|list|verify`, `clickmonk link add`,
   `clickmonk settings show|set` for the traffic actions, the safe URL and the abuser
   threshold, and `clickmonk ipdata status|update`.
 - **A Docker Compose stack** that runs all of it, and a test that restarts each service
@@ -38,11 +49,9 @@ on your own infrastructure, and your click data stays yours.
 
 What does not work yet:
 
-- **TLS.** The redirect serves plain HTTP on port 8080. Its visitor cookies are marked
-  `Secure`, so browsers drop them over plain HTTP, and sending returning visitors to a
-  different destination does not work until TLS does.
-- **An admin API or UI.** Domains and links are added with the CLI, and `domain add`
-  marks a domain verified without checking its DNS.
+- **An admin hostname.** Caddy serves link domains. There is nothing to serve on the
+  hostname you would run the admin interface on, because there is no admin interface.
+- **An admin API or UI.** Domains and links are added with the CLI.
 - **Most link settings.** `clickmonk link add` sets targets, a backup URL, a click cap,
   an expiry, passthrough and traffic action overrides only, and there is no command to
   change a link once it is added. The redirect supports per-device destinations, a
@@ -59,34 +68,97 @@ What does not work yet:
 - **Rejected clicks are not reported.** A batch of clicks ClickHouse refuses is set aside
   as a `.bad` file in the spool, and nothing tells you it is there.
 - **More than one redirect process per spool directory.**
-- **Real addresses for IPv6 visitors on the published port.** Docker relays IPv6
-  connections to the redirect's port through its own proxy, so they arrive from the
-  bridge gateway's address with no `X-Forwarded-For`. Until a TLS front end that passes
-  on the client's address exists, all IPv6 visitors are rated and located as one
-  address.
+- **The internal port is reachable from the whole compose network.** `redirect:9091`,
+  which serves the `ask` check, is published nowhere on the host, but any other
+  container on the stack's own Docker network can reach it, not only Caddy.
+- **IPv6 is proven only on a unique-local address.** The test suite exercises Caddy's
+  handling of an IPv6 client end to end, but the container running it has no globally
+  routable IPv6 address of its own, only a unique-local one — so a real internet-routable
+  IPv6 visitor is untested.
 
 If link tracking is a problem you have today, [open an issue](../../issues) describing
 it. That is the most useful contribution at this stage.
+
+## Installing
+
+You need a Linux host with Docker and Docker Compose v2, and ports 80 and 443 free.
+
+```sh
+git clone https://github.com/ClickMonk/clickmonk.git
+cd clickmonk
+./install.sh
+```
+
+It writes `.env` with fresh passwords — that file is the only copy of them, so back it
+up — builds the image from this checkout and starts the stack. Run it again any time:
+it never changes a value already in `.env`.
+
+`install.sh` waits for the services that declare a healthcheck; the worker does not
+declare one, so `install.sh` can return before its boot migration has finished. If a
+`domain add` run right after it fails oddly, give it a few seconds and try again.
+
+**Just trying it out?** A domain serves nothing until it is verified, so for a trial add
+one with `--verified`, which skips the DNS check and makes its links answer at once over
+plain HTTP on port 80:
+
+```sh
+docker compose exec worker node packages/cli/dist/index.js \
+  domain add links.example.com --verified
+```
+
+## Domains and TLS
+
+Add a domain, publish the two records it asks for, and wait:
+
+```sh
+docker compose exec worker node packages/cli/dist/index.js domain add links.example.com
+```
+
+It prints a TXT record at `_clickmonk.links.example.com`. Publish it, and point
+`links.example.com` at this server with an A record (and an AAAA record if you have
+IPv6). The worker checks every five minutes; `domain verify links.example.com` checks
+at once, and `domain list` shows where each domain stands.
+
+**Until the TXT record is found the domain serves nothing.** Links on it answer 404 and
+no certificate is requested for it. That is what stops somebody else's hostname, pointed
+at your server, from getting a certificate out of your install. `domain add --verified` is
+the way round it, for a trial or for a domain you proved some other way; it says on screen
+that no DNS check was made.
+
+ClickMonk does not know its own public address, so it records what a domain resolves to
+rather than judging it — a host behind NAT, a load balancer or a CDN is normal. A domain
+that stops publishing its record is reported, never un-verified: taking live links down
+because a resolver hiccuped would be worse than the problem.
+
+**Behind Cloudflare's proxy**, the challenge a certificate authority sends is answered by
+Cloudflare rather than by this server, so issuance fails. Either use a DNS-only (grey
+cloud) record, or turn the proxy on with Cloudflare set to Full (strict) and mount an
+Origin certificate — `caddy/tls.d/00-defaults.caddy` shows how. Flexible mode sends
+traffic to your server in clear and is not an option.
+
+Certificates live in the `caddy-data` volume. Back it up with the rest.
 
 ## IP data
 
 The worker downloads four lists to your server, and `clickmonk ipdata update` fetches
 them on demand. The redirect looks each visitor's address up in memory: no lookup
 leaves your server, and no request waits for a download. The lists take about 25 MB of
-the redirect's memory, and each has a fixed ceiling. The address looked up is the
-connection's, or the one `X-Forwarded-For` names when the connection comes from an
-address in `CLICKMONK_TRUSTED_PROXIES` (default `127.0.0.1`).
+the redirect's memory, and each has a fixed ceiling.
 
-Behind a reverse proxy, set `CLICKMONK_TRUSTED_PROXIES` in `.env` to the proxy's address
-as the redirect's container sees it: comma-separated addresses, ranges such as
-`172.17.0.0/16`, or `loopback`, `linklocal` and `uniquelocal`. For a proxy on the Docker
-host, that is the gateway of the stack's Docker network, such as `172.17.0.1` or
-`172.18.0.1` (`docker network inspect clickmonk_default` shows it), or that network's
-subnet, not `127.0.0.1`. A range ending in `/0` is refused, since it would let every visitor
-name its own address, and the redirect does not start with a value it cannot read. Left
-unset behind a proxy, every visitor arrives from the proxy's one address: they share
-one request count, so all of them are classed as abusers once it passes the threshold,
-and the country looked up is the proxy's rather than the visitor's.
+The address looked up is the one Caddy passes on, which is the visitor's: Caddy is the
+only service with a published port, nothing outside the stack can open a connection to the
+redirect, and Caddy replaces an `X-Forwarded-For` a client sent for itself. That is why
+`CLICKMONK_TRUSTED_PROXIES` defaults to `uniquelocal,loopback` — the private and loopback
+ranges Caddy sits in — rather than to one address.
+
+Change it only if you publish the redirect's port yourself, in which case narrow it to the
+proxy you actually run: comma-separated addresses, ranges such as `172.17.0.0/16`, or
+`loopback`, `linklocal` and `uniquelocal`. A range ending in `/0` is refused, since it
+would let every visitor name its own address, and the redirect does not start with a value
+it cannot read. **If a CDN sits in front of Caddy**, name its ranges in
+`caddy/proxy.d/` instead — see the comments in that file. Left unnamed, visitors arriving
+through it are all recorded as the CDN: they share one request count, so all of them are
+classed as abusers once it passes the threshold, and the country looked up is the CDN's.
 
 | Data | Source | Licence | Checked for updates |
 | --- | --- | --- | --- |
