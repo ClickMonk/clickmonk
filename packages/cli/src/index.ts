@@ -4,7 +4,7 @@ import { type ClickHouseClient, createChClient, createPgPool } from '@clickmonk/
 import { DEFAULT_IPDATA_DIR } from '@clickmonk/ipdata'
 import { isResolverAddress } from '@clickmonk/worker/domains'
 import { z } from 'zod'
-import { runCli } from './commands.js'
+import { readStdin, runCli } from './commands.js'
 
 // Every command but `ipdata` needs Postgres, and its URL is required up front
 // all the same: the CLI runs where the worker runs, which always has it, and
@@ -53,13 +53,14 @@ async function main(): Promise<number> {
       pg,
       ch,
       out: (s) => console.log(s),
-      // Read whole, never echoed. A password on the command line would be
-      // visible in `ps` and left in the shell's history.
-      stdin: async () => {
-        const chunks: Buffer[] = []
-        for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk))
-        return Buffer.concat(chunks).toString('utf8')
-      },
+      // Never echoed. A password on the command line would be visible in `ps`
+      // and left in the shell's history. The notice goes to standard error so
+      // that piping this command's output somewhere never carries it along.
+      stdin: () =>
+        readStdin(process.stdin, {
+          isTty: process.stdin.isTTY === true,
+          notify: (s) => console.error(s),
+        }),
       ipdata: { dir: process.env.CLICKMONK_IPDATA_DIR || DEFAULT_IPDATA_DIR },
       // Normalised rather than validated: the services parse this variable
       // strictly and refuse to boot on a value that is not a bare lower-case

@@ -138,7 +138,7 @@ cat <<'NEXT'
 
 ClickMonk is running. Add your first link domain:
 
-  docker compose exec worker node packages/cli/dist/index.js domain add links.example.com
+  docker compose exec -T worker node packages/cli/dist/index.js domain add links.example.com
 
 The worker runs the database migrations when it starts, and nothing here
 waited for them. If that command fails with a Postgres error about a missing
@@ -152,12 +152,12 @@ answering, and it gets a certificate on its first HTTPS request.
 Trying it out without a domain of your own? Add one with --verified, which
 skips the DNS check. Its links answer at once, over plain HTTP on port 80:
 
-  docker compose exec worker node packages/cli/dist/index.js \
+  docker compose exec -T worker node packages/cli/dist/index.js \
     domain add links.example.com --verified
 
 Then add a link:
 
-  docker compose exec worker node packages/cli/dist/index.js \
+  docker compose exec -T worker node packages/cli/dist/index.js \
     link add links.example.com spring --target https://example.com/offer
 
 There is no admin interface yet; the CLI above is the whole of it.

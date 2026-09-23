@@ -366,6 +366,59 @@ async function linkAdd(args: string[], d: CliDeps): Promise<void> {
 }
 
 /**
+ * Reads standard input whole, bounded, and says so first when there is nobody
+ * piping into it.
+ *
+ * Bounded as it reads rather than after: a command whose refusal is "that is
+ * longer than a password may be" cannot get there by buffering the whole of
+ * whatever was piped in first, and a file redirected in by mistake is exactly
+ * the case that refusal exists for. The cap is four bytes per allowed
+ * character, which is the most UTF-8 spends on one, so no password this build
+ * would accept is cut short by it; anything past the cap stops the read, and
+ * what was read is over the bound and refused by the caller.
+ *
+ * The notice goes to whoever is watching rather than to standard output: at a
+ * terminal, with nothing piped in, this waits for a password nobody has been
+ * asked for, and a command that looks hung is a command an operator kills.
+ */
+export async function readStdin(
+  stream: AsyncIterable<Uint8Array | string>,
+  o: { isTty: boolean; notify: (s: string) => void },
+): Promise<string> {
+  if (o.isTty) o.notify('Reading the password from standard input; type it and press Ctrl-D.')
+  const cap = (MAX_PASSWORD_LENGTH + 1) * 4
+  const chunks: Buffer[] = []
+  let bytes = 0
+  for await (const chunk of stream) {
+    const buf = Buffer.from(chunk as Uint8Array)
+    chunks.push(buf)
+    bytes += buf.length
+    if (bytes > cap) break
+  }
+  return Buffer.concat(chunks).toString('utf8')
+}
+
+/**
+ * Refuses, in the operator's own words, a command that needs the account
+ * before there is one.
+ *
+ * Without it the two commands below leave by throwing: `admin passwd` on the
+ * writer's own "no admin account yet", and `apikey create` on a foreign key
+ * violation from Postgres — a stack trace and exit 3 for what is simply the
+ * wrong order on a first run, and the right order is one line away. It is a
+ * message, not a lock: the write that follows still has the row, the
+ * constraint, or both behind it.
+ */
+async function requireAccount(d: CliDeps): Promise<void> {
+  const r = await d.pg.query('SELECT 1 FROM admin_account')
+  if ((r.rowCount ?? 0) === 0) {
+    throw new Rejected(
+      'this install has no admin account yet; run "clickmonk admin create <email>" first',
+    )
+  }
+}
+
+/**
  * The password on standard input, with one trailing newline removed so that
  * `printf 'pw\n' | clickmonk admin create …` and `printf 'pw'` mean the same
  * thing. Nothing here is printed or logged, ever — the refusal below says how
@@ -418,6 +471,7 @@ async function adminCreate(args: string[], d: CliDeps): Promise<void> {
 
 /** Changes the password, and signs every browser out: a session minted under the old one is exactly what an attacker would still hold. */
 async function adminPasswd(d: CliDeps): Promise<void> {
+  await requireAccount(d)
   const password = await readPassword(d)
   // The one writer, which clears the failure count and any standing lockout in
   // the same statement: this command is the way back in, and a lock over a
@@ -433,6 +487,10 @@ async function apikeyCreate(args: string[], d: CliDeps): Promise<void> {
     allowPositionals: true,
     options: { 'expires-days': { type: 'string' } },
   })
+  // Before the key is minted rather than after: a key references the account
+  // row, so without one this would be a constraint violation carrying the name
+  // of the constraint, which is neither an answer nor something to print.
+  await requireAccount(d)
   const name = positionals[0] ?? ''
   if (name.length === 0 || name.length > MAX_KEY_NAME_LENGTH)
     throw new Rejected(`a key needs a name of 1 to ${MAX_KEY_NAME_LENGTH} characters`)

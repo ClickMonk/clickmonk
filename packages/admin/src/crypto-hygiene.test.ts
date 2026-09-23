@@ -49,14 +49,6 @@ const ALLOWED: Exemption[] = [
       'anyone who connects to it',
   },
   {
-    file: 'config.ts',
-    fn: MODULE_LEVEL,
-    expression: 'normaliseHost(value) !== value',
-    because:
-      'configuration validation, refusing a host that is not already in its ' +
-      'normal form; it runs at boot on a value from the environment',
-  },
-  {
     file: 'session-routes.ts',
     fn: 'registerSessionRoutes',
     expression: 's.id === credential.id',

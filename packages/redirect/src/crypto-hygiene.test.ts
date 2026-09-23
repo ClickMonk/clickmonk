@@ -66,15 +66,6 @@ const ALLOWED: Exemption[] = [
       'install answers for is exactly what the check exists to tell the proxy',
   },
   {
-    file: 'config.ts',
-    fn: MODULE_LEVEL,
-    expression: 'normaliseHost(value) !== value',
-    because:
-      'configuration validation, refusing a host that is not already in its ' +
-      'normal form; it runs at boot on a value from the environment, and the ' +
-      'admin service carries the identical check with the identical reason',
-  },
-  {
     file: 'snapshot.ts',
     fn: IN_A_CLASS_METHOD,
     expression: 'gen === this.reloadGen',

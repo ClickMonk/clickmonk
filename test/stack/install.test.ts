@@ -233,6 +233,24 @@ describe('install.sh', () => {
     }
   })
 
+  // Every documented invocation of the CLI, in the script and in the README,
+  // has to be one an operator can pipe a password into: `admin create` and
+  // `admin passwd` read it from standard input and take it from nowhere else.
+  // Without `-T`, `docker compose exec` allocates a TTY and the pipe never
+  // reaches the command — so the one supported way of giving it a password
+  // would not work as documented.
+  it('invokes the CLI in a way a password can be piped into, everywhere it is documented', () => {
+    for (const file of ['install.sh', 'README.md']) {
+      const lines = readFileSync(join(ROOT, file), 'utf8')
+        .split('\n')
+        .filter((l) => l.includes('docker compose exec'))
+      // The loop would pass vacuously on a file where the invocation had been
+      // renamed or moved out, which is the case it is least likely to survive.
+      expect(lines.length, `${file}: documented CLI invocations`).toBeGreaterThan(0)
+      for (const line of lines) expect(line, `${file}: ${line.trim()}`).toContain('exec -T ')
+    }
+  })
+
   // macOS still ships bash 3.2, and an operator's first command is this one.
   it('uses nothing bash 3.2 does not have', () => {
     // Comments are stripped first: this script's own header names some of

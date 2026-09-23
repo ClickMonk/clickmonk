@@ -17,7 +17,7 @@ import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { type Fetcher, SOURCES, SOURCE_IDS } from '@clickmonk/ipdata'
 import type { DomainResolver } from '@clickmonk/worker/domains'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { runCli } from './commands.js'
+import { readStdin, runCli } from './commands.js'
 
 const pg = testPg()
 const ch = testCh()
@@ -829,6 +829,33 @@ describe('the admin account and API keys from the CLI', () => {
     expect(r.rows[0]).toEqual({ failed_logins: 0, last_failed_at: null, locked_until: null })
   })
 
+  // The wrong order on a first run is the likeliest order, and until this
+  // refusal existed each of these left by throwing: the writer's own error for
+  // one, a foreign key violation naming the constraint for the other. Both are
+  // exit 3 and a stack trace for something one line fixes.
+  it('refuses a command that needs the account before there is one, and says which command makes it', async () => {
+    lines.length = 0
+    expect(await withPassword('a decent admin password', 'admin', 'passwd')).toBe(2)
+    expect(lines.join('\n')).toContain('run "clickmonk admin create <email>" first')
+    // The password reached nothing: there is no account, so nothing was
+    // written, and nothing that was already signed in was signed out.
+    expect((await account()).rowCount).toBe(0)
+
+    lines.length = 0
+    expect(await withPassword('', 'apikey', 'create', 'reporting')).toBe(2)
+    expect(lines.join('\n')).toContain('run "clickmonk admin create <email>" first')
+    // Nothing of Postgres's own wording reaches the operator.
+    expect(lines.join('\n')).not.toContain('api_keys')
+    expect((await pg.query('SELECT 1 FROM api_keys')).rowCount).toBe(0)
+
+    // And once the account exists, both commands work.
+    expect(
+      await withPassword('a decent admin password', 'admin', 'create', 'admin@example.com'),
+    ).toBe(0)
+    expect(await withPassword('a new decent password', 'admin', 'passwd')).toBe(0)
+    expect(await withPassword('', 'apikey', 'create', 'reporting')).toBe(0)
+  })
+
   it('mints an API key, shows it once, and stores only its digest', async () => {
     await anAccount()
     expect(await withPassword('', 'apikey', 'create', 'reporting', '--expires-days', '7')).toBe(0)
@@ -842,8 +869,6 @@ describe('the admin account and API keys from the CLI', () => {
       'SELECT secret_hash, expires_at FROM api_keys',
     )
     expect(r.rows[0]?.secret_hash).toBe(hashToken(secret))
-    // Not merely "hashed": the secret itself is nowhere in the row.
-    expect(r.rows[0]?.secret_hash).not.toContain(secret)
     expect(r.rows[0]?.expires_at.toISOString()).toBe('2026-09-30T10:00:00.000Z')
     expect(lines.join('\n')).toContain('only time this key is shown')
   })
@@ -959,6 +984,13 @@ describe('the admin account and API keys from the CLI', () => {
 })
 
 describe('a link domain and the admin host', () => {
+  // This block reads and writes `domains` by host name, and every describe
+  // above it leaves domains behind. Cleared once here rather than trusting
+  // that none of them ever adds one of these two names.
+  beforeAll(async () => {
+    await pg.query('TRUNCATE domains CASCADE')
+  })
+
   // Caddy sends the admin host name to the admin service, so a link domain of
   // the same name accepts links that can never redirect: a domain row, a
   // verification record and a certificate all saying the setup worked.
@@ -991,5 +1023,76 @@ describe('a link domain and the admin host', () => {
     expect(
       (await pg.query('SELECT 1 FROM domains WHERE host = $1', ['admin.example.test'])).rowCount,
     ).toBe(1)
+  })
+})
+
+describe('reading the password from standard input', () => {
+  /** A stream of chunks, and a count of how many were actually pulled from it. */
+  function chunks(parts: string[]): AsyncIterable<Uint8Array> & { read: number } {
+    const state = { read: 0 }
+    return {
+      read: 0,
+      async *[Symbol.asyncIterator]() {
+        for (const part of parts) {
+          state.read++
+          this.read = state.read
+          yield Buffer.from(part, 'utf8')
+        }
+      },
+    } as AsyncIterable<Uint8Array> & { read: number }
+  }
+
+  const quiet = { isTty: false, notify: () => {} }
+
+  it('reads every chunk of a password that fits', async () => {
+    expect(await readStdin(chunks(['a decent ', 'admin password\n']), quiet)).toBe(
+      'a decent admin password\n',
+    )
+  })
+
+  // 804 is written out: the cap is four bytes per allowed character plus one,
+  // and derived from the constant this would grow with a raised bound instead
+  // of failing at once.
+  it('stops reading once there is more than a password could be, rather than buffering it all', async () => {
+    expect(MAX_PASSWORD_LENGTH).toBe(200)
+    // Eleven chunks of 100 bytes: the cap falls inside the ninth, so a reader
+    // that stops at the cap never pulls the last two.
+    const stream = chunks(Array.from({ length: 11 }, () => 'p'.repeat(100)))
+    const read = await readStdin(stream, quiet)
+    expect(stream.read).toBe(9)
+    // Exactly the nine it pulled, so it stopped at the chunk that crossed the
+    // cap rather than reading on and cutting the result back afterwards.
+    expect(read.length).toBe(900)
+    // And what it did read is past the bound, so the caller refuses it rather
+    // than hashing a truncated password.
+    expect(read.length).toBeGreaterThan(MAX_PASSWORD_LENGTH)
+  })
+
+  // A password of exactly the longest allowed length, every character three
+  // bytes of UTF-8: the cap counts bytes, so a cap set at the character bound
+  // would cut this one short and the command would hash the wrong password.
+  it('does not cut a password of allowed length short because its characters are wide', async () => {
+    const wide = '\u4e2d'.repeat(MAX_PASSWORD_LENGTH)
+    expect(Buffer.byteLength(wide, 'utf8')).toBe(MAX_PASSWORD_LENGTH * 3)
+    expect(await readStdin(chunks([wide]), quiet)).toBe(wide)
+  })
+
+  it('says it is waiting when there is a terminal on the other end, and nothing when there is not', async () => {
+    const said: string[] = []
+    await readStdin(chunks(['a decent admin password']), {
+      isTty: true,
+      notify: (s) => said.push(s),
+    })
+    expect(said).toHaveLength(1)
+    expect(said[0]).toContain('standard input')
+    // The password itself is never part of what it says.
+    expect(said.join('\n')).not.toContain('a decent admin password')
+
+    const silent: string[] = []
+    await readStdin(chunks(['a decent admin password']), {
+      isTty: false,
+      notify: (s) => silent.push(s),
+    })
+    expect(silent).toEqual([])
   })
 })

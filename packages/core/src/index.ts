@@ -4,6 +4,7 @@
  */
 export const SCHEMA_VERSION = 6
 
+export * from './admin-host.js'
 export * from './attempts.js'
 export * from './click-id.js'
 export * from './click-record.js'

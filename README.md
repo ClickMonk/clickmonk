@@ -117,9 +117,9 @@ marked `Secure`, so a browser drops it over plain HTTP, and returning-visitor ro
 needs a real HTTPS domain to do anything.
 
 ```sh
-docker compose exec worker node packages/cli/dist/index.js \
+docker compose exec -T worker node packages/cli/dist/index.js \
   domain add links.example.com --verified
-docker compose exec worker node packages/cli/dist/index.js \
+docker compose exec -T worker node packages/cli/dist/index.js \
   link add links.example.com promo --target https://example.com/landing
 ```
 
@@ -134,7 +134,7 @@ curl -H 'Host: links.example.com' http://localhost/promo
 Add a domain:
 
 ```sh
-docker compose exec worker node packages/cli/dist/index.js domain add links.example.com
+docker compose exec -T worker node packages/cli/dist/index.js domain add links.example.com
 ```
 
 It prints the TXT record to publish, at `_clickmonk.links.example.com`, and reminds you

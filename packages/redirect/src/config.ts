@@ -1,29 +1,11 @@
 import {
+  AdminHostSchema,
   DEFAULT_SPOOL_DIR,
   TrustedProxiesSchema,
   formatConfigError,
-  normaliseHost,
 } from '@clickmonk/core'
 import { DEFAULT_IPDATA_DIR } from '@clickmonk/ipdata'
 import { z } from 'zod'
-
-/**
- * The admin API's host name, as the `ask` check needs to know it: that name is
- * not a link domain, so it has no verified row, and without this the admin
- * interface could never get a certificate. Empty means there is none.
- */
-const AdminHost = z
-  .string()
-  .default('')
-  .transform((s) => s.trim())
-  .superRefine((value, ctx) => {
-    if (value !== '' && normaliseHost(value) !== value) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: `not a lower-case host name without a port or scheme: ${value}`,
-      })
-    }
-  })
 
 const Schema = z.object({
   CLICKMONK_POSTGRES_URL: z.string().url(),
@@ -35,7 +17,11 @@ const Schema = z.object({
   CLICKMONK_SNAPSHOT_PATH: z.string().min(1).default('/var/lib/clickmonk/state/snapshot.json'),
   CLICKMONK_TRUSTED_PROXIES: TrustedProxiesSchema,
   CLICKMONK_IPDATA_DIR: z.string().min(1).default(DEFAULT_IPDATA_DIR),
-  CLICKMONK_ADMIN_HOST: AdminHost,
+  // The shared schema, so this service and the admin API cannot come to read
+  // the same variable differently. The `ask` check needs this name because it
+  // is not a link domain: it has no verified row, and without it the admin
+  // interface could never be given a certificate.
+  CLICKMONK_ADMIN_HOST: AdminHostSchema,
 })
 
 export interface RedirectConfig {
