@@ -1,12 +1,17 @@
 /**
  * The credential primitives' crypto hygiene, and the shared checker's own tests.
  *
- * The two modules gated here hold this install's credential logic. The check
- * reads the *body* of the one function per file that decides whether a secret
- * matches — `digestsMatch` in secrets.ts, `verifyTotp` in totp.ts — because the
- * rest of both files legitimately compares lengths, prefixes and parameters that
- * are not secret. Elsewhere the same checker reads whole files; which it reads is
- * the package's own configuration.
+ * This package holds the credential logic every other one leans on, so the gate
+ * is the same shape as the admin service's and the redirect's: seeded from the
+ * entry point, it reaches every file, and it reads every file whole. It used to
+ * read the *body* of two named functions in two named files, which was narrower
+ * than it looked in two directions at once — a new file exporting a secret
+ * comparison was never read, and neither was a comparison planted in a function
+ * the list did not name inside a file it did. The price of reading everything is
+ * the exemptions below: seven comparisons of things that are not secret, each one
+ * named with its reason, which is a list that says something rather than a scope
+ * that hides what it skipped. Not one of them touches secret material, which is
+ * the answer to the question the narrow scope was never able to ask.
  *
  * The checker lives in `testing.ts` so that the admin service and the redirect
  * run the same parser over their own source. It was three copies until they
@@ -17,6 +22,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import {
+  type Exemption,
   type HygieneConfig,
   MODULE_LEVEL,
   callSites,
@@ -26,6 +32,7 @@ import {
   gatedFiles,
   missingComparers,
   readSource,
+  sourceFiles,
   staleExemptions,
   staleLengthExemptions,
   unexemptedComparisons,
@@ -35,27 +42,96 @@ import {
 import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+const ALLOWED: Exemption[] = [
+  {
+    file: 'admin-host.ts',
+    fn: MODULE_LEVEL,
+    expression: 'normaliseHost(value) !== value',
+    because:
+      'the configuration schema refuses a host name it would have had to ' +
+      'rewrite; the name the admin API answers on is visible to anyone who ' +
+      'connects to it, and the value being checked came from this install\u2019s ' +
+      'own environment',
+  },
+  {
+    file: 'domain-verification.ts',
+    fn: 'txtRecordsCarryToken',
+    expression: "chunks.join('').trim() === want",
+    because:
+      'a TXT record is published in public DNS and is read by anyone who asks ' +
+      'for it, so the token it carries is not secret by the time it is ' +
+      'compared, and nothing about how long the comparison took tells a caller ' +
+      'anything a DNS query would not',
+  },
+  {
+    file: 'link.ts',
+    fn: MODULE_LEVEL,
+    expression: "u.protocol !== 'https",
+    because:
+      'a destination URL must be http or https; a scheme is part of a value an ' +
+      'operator typed and is sent to the visitor in a Location header',
+  },
+  {
+    file: 'link.ts',
+    fn: MODULE_LEVEL,
+    expression: "u.protocol !== 'http",
+    because: 'the other half of the same scheme check, on the same URL',
+  },
+  {
+    file: 'secrets.ts',
+    fn: 'parseStoredHash',
+    expression: 'parts[0] !== SCRYPT_PREFIX',
+    because:
+      'the parser refuses a stored value whose first field is not this ' +
+      'install\u2019s hash label; the label is a constant in this file and is the ' +
+      'same for every account, so it is not material and no secret is read ' +
+      'before it matches',
+  },
+  {
+    file: 'settings.ts',
+    fn: MODULE_LEVEL,
+    expression: "s.actions[c] === 'safe'",
+    because:
+      'the settings schema checks whether a traffic class was given the safe ' +
+      'action, so that it can insist on a safe URL to send it to; an action ' +
+      'name is configuration an operator typed and is not secret',
+  },
+  {
+    file: 'traffic.ts',
+    fn: 'classifyTraffic',
+    expression: 'SIGNAL_CLASS[s] === c',
+    because:
+      'the classifier asks which class a signal belongs to, against a table in ' +
+      'this file; both sides are class names and neither depends on a request',
+  },
+]
+
 const CONFIG: HygieneConfig = {
   dir: dirname(fileURLToPath(import.meta.url)),
   /** Importing this from `node:crypto` is what makes a file a starting point. */
   primitives: ['timingSafeEqual'],
-  expectedGated: ['secrets.ts', 'totp.ts'],
+  /**
+   * The entry point, so the set is every file this package ships rather than the
+   * two that import the primitive. Seeded from the primitive alone it was 2 of
+   * 19, and a new file here exporting `if (presented === stored) return true`
+   * was invisible — in the package that owns password hashing, API key parsing
+   * and one-time codes.
+   */
+  alwaysSeed: ['index.ts'],
+  /**
+   * Empty because the floor is not a list any more: seeded from the entry point
+   * the walk reaches every file in the package, so the test asserts exactly that
+   * and there is no list to keep in step. A list would have had to be edited
+   * every time the package gained a file, which is a tripwire that teaches
+   * nothing — the assertion below already fails if a file stops being reachable.
+   */
+  expectedGated: [],
   expectedComparers: ['secrets.ts', 'totp.ts'],
   decider: 'timingSafeEqual',
   /** It throws on a length mismatch, so the two lengths come first. */
   lengthCheckedFirst: true,
-  /**
-   * Every function that touches secret material, not one per file. `digestsMatch`
-   * was the only one named in secrets.ts, so `verifyPassword` — the function the
-   * whole link password gate and every sign-in rest on — was read by nothing:
-   * `if (password === stored) return true` at its top left this gate green, and
-   * anyone holding a stored hash could present it as the password.
-   */
-  scope: {
-    kind: 'functions',
-    functions: { 'secrets.ts': ['digestsMatch', 'verifyPassword'], 'totp.ts': ['verifyTotp'] },
-  },
-  allowed: [],
+  scope: { kind: 'whole-file' },
+  allowed: ALLOWED,
   lengthExempt: [
     {
       file: 'secrets.ts',
@@ -74,18 +150,22 @@ const CONFIG: HygieneConfig = {
 describe('crypto hygiene in the credential primitives', () => {
   const gated = gatedFiles(CONFIG)
 
-  it('gates both modules that hold credential logic', () => {
-    expect(gated).toEqual(expect.arrayContaining(CONFIG.expectedGated))
+  it('gates every file in the package', () => {
+    // Every file, exactly. Seeded from the entry point the walk reaches all of
+    // them, so `arrayContaining` over a hand-kept list would pin less than this
+    // and rot faster: a file that left the set could only be one that stopped
+    // being reachable, and this says so directly.
+    expect(gated).toEqual(sourceFiles(CONFIG))
   })
 
   it('never seeds randomness with Math.random', () => {
-    for (const file of CONFIG.expectedGated) {
+    for (const file of sourceFiles(CONFIG)) {
       expect(readSource(CONFIG, file).includes('Math.random'), file).toBe(false)
     }
   })
 
-  it('decides a match, inside the gated function, only with timingSafeEqual', () => {
-    for (const file of CONFIG.expectedGated) {
+  it('decides a match, in every gated file, only with timingSafeEqual', () => {
+    for (const file of gated) {
       expect(unexemptedComparisons(CONFIG, file), file).toEqual([])
     }
   })
