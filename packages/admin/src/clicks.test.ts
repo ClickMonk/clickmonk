@@ -1,3 +1,4 @@
+import { request as httpRequest } from 'node:http'
 import { ClickHouseLogLevel } from '@clickhouse/client'
 import { ConcurrencyGate } from '@clickmonk/core'
 import { type ClickHouseClient, createChClient } from '@clickmonk/db'
@@ -867,6 +868,89 @@ describe('GET /api/clicks.csv', () => {
       await busy.close()
     }
   })
+})
+
+/**
+ * A gate that also counts the slots it handed out, so that a test about giving one
+ * back can say the export took one in the first place. A case that asserts an
+ * empty gate without that is a case an unserved request satisfies.
+ */
+class CountingGate extends ConcurrencyGate {
+  entered = 0
+  override tryEnter(): boolean {
+    const ok = super.tryEnter()
+    if (ok) this.entered++
+    return ok
+  }
+}
+
+/**
+ * A caller that hangs up, over a real socket.
+ *
+ * `inject` cannot ask this question: it has no socket to close, and the question
+ * is what the server does when the peer goes away. `node:http` rather than
+ * `fetch`, because the host guard reads the `Host` header and undici does not let
+ * a caller set it.
+ *
+ * The timings are the ones that mattered: a hangup in the first few milliseconds
+ * lands before the first row is pulled, which is the window where the generator's
+ * `finally` never runs because the generator never started — and where, with one
+ * export slot in the process, one request and an immediate close used to take the
+ * endpoint out until a restart.
+ */
+describe('GET /api/clicks.csv, a caller that hangs up', () => {
+  const settle = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+  /** Waits until the export holds the slot, so no case here is vacuous. */
+  const untilEntered = async (gate: CountingGate): Promise<void> => {
+    for (let waited = 0; waited < 2000; waited += 5) {
+      if (gate.entered > 0) return
+      await settle(5)
+    }
+    throw new Error('the export never took a slot, so this case would prove nothing')
+  }
+
+  it.each([0, 1, 2, 5, 10, 25])(
+    'gives the slot back when the caller hangs up %ims after the export took it',
+    async (ms) => {
+      const gate = new CountingGate(1)
+      const served = testApp(pool, clock, { ch, exportGate: gate })
+      try {
+        await served.listen({ host: '127.0.0.1', port: 0 })
+        const at = served.server.address()
+        const port = typeof at === 'object' && at !== null ? at.port : 0
+        const req = httpRequest({
+          host: '127.0.0.1',
+          port,
+          path: `/api/clicks.csv?${WINDOW}`,
+          headers: { host: ADMIN_HOST, cookie },
+        })
+        // The hangup is the arrangement, so the socket errors it causes are not a
+        // failure of anything.
+        req.on('error', () => {})
+        req.end()
+        await untilEntered(gate)
+        await settle(ms)
+        req.destroy()
+        // Long enough for the server to notice the closed socket and destroy the
+        // stream. A fixed wait rather than a poll: a loop that waited for the gate
+        // to empty would pass whatever the release took, including never.
+        await settle(250)
+        expect(gate.entered).toBe(1)
+        expect(gate.stats().inFlight).toBe(0)
+        // And the consequence an operator would see: with a single slot, one
+        // leaked slot answers every later export 429 until the process restarts.
+        const again = await served.inject({
+          method: 'GET',
+          url: `/api/clicks.csv?${WINDOW}`,
+          headers: read(cookie),
+        })
+        expect(again.statusCode).toBe(200)
+      } finally {
+        await served.close()
+      }
+    },
+  )
 })
 
 /**

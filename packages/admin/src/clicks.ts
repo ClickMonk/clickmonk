@@ -407,10 +407,10 @@ export function registerClickRoutes(app: FastifyInstance, ctx: AdminContext): vo
    * is handed to Fastify, while the body is still being written, so a slot
    * released in a `finally` around this handler — which is what `withSlot` does
    * — would be given back at the beginning of the export rather than at the end
-   * and would bound nothing. It is given back in the generator's own `finally`,
-   * which runs whether the stream ended, failed, or the client hung up. The gate
-   * is the export's own and not the report gate, so that a download an operator
-   * started does not lock their dashboard out.
+   * and would bound nothing. It is given back by `release` below, which every
+   * path calls and which runs once. The gate is the export's own and not the
+   * report gate, so that a download an operator started does not lock their
+   * dashboard out.
    *
    * **What bounds the slot.** `max_execution_time` on both statements, and
    * nothing else: Fastify's `requestTimeout` does not bound a handler — a
@@ -447,6 +447,39 @@ export function registerClickRoutes(app: FastifyInstance, ctx: AdminContext): vo
       })
     }
     let started = false
+    let released = false
+    /**
+     * The result set once there is one, as the one thing that has to be closed.
+     * Typed by the method called on it rather than by the client's own result
+     * type, which nothing else in this service names.
+     */
+    let result: { close: () => void } | null = null
+
+    /**
+     * Gives the slot back, once, from whichever path reaches it first.
+     *
+     * **Never conditioned on the body having been entered**, and this is the
+     * whole point of it. When a caller hangs up before the first row is pulled,
+     * Fastify destroys the stream and Node calls `return()` on a generator that
+     * has not run a line — which completes it *without* running its `finally`.
+     * A release that lived only there would therefore never happen, while
+     * `started` had already told the handler's own `finally` to skip; both paths
+     * skipped, and with one export slot in the process a single request and an
+     * immediate close took the endpoint out until a restart. So the stream's
+     * `close` and `error` release too, and this runs once because on an ordinary
+     * export all three of them fire.
+     *
+     * Closing the result set is insurance rather than a measured need: whether
+     * the store keeps working on a query nobody is reading was not established,
+     * and closing one whose rows are already exhausted costs nothing.
+     */
+    const release = (): void => {
+      if (released) return
+      released = true
+      result?.close()
+      ctx.exportGate.leave()
+    }
+
     try {
       const { where, params } = clickFilter(q, w, null)
       const [probe] = await chRows<{ n: string }>({
@@ -467,11 +500,26 @@ export function registerClickRoutes(app: FastifyInstance, ctx: AdminContext): vo
         format: 'JSONEachRow',
         clickhouse_settings: { max_execution_time: CH_MAX_EXECUTION_SECONDS },
       })
+      result = rows
+      /**
+       * The blocks, taken here rather than inside the generator, so that
+       * `release` always has a pipeline to close: closing a result set nobody has
+       * streamed destroys its response stream directly, and a destroyed stream
+       * with nothing listening for an error takes the process down instead of
+       * ending an export. Once this exists, the close is handled inside the
+       * client's own pipeline.
+       */
+      const blocks = rows.stream<ClickRow>()
+      // The error is handled where the rows are read, in the generator's `catch`.
+      // This listener is for the case where nobody is reading them — a result set
+      // closed after the caller hung up — which would otherwise be an uncaught
+      // exception rather than a download that stopped.
+      blocks.on('error', () => {})
 
       async function* body(): AsyncGenerator<string> {
         try {
           yield csvLine([...CSV_FIELDS])
-          for await (const block of rows.stream<ClickRow>()) {
+          for await (const block of blocks) {
             for (const row of block) {
               // The same mapper the page of JSON uses, so the file carries the
               // network and never the address it was truncated from.
@@ -496,7 +544,7 @@ export function registerClickRoutes(app: FastifyInstance, ctx: AdminContext): vo
           req.log.error({ err }, 'clickhouse failed while an export was streaming')
           throw err
         } finally {
-          ctx.exportGate.leave()
+          release()
         }
       }
 
@@ -508,13 +556,20 @@ export function registerClickRoutes(app: FastifyInstance, ctx: AdminContext): vo
       reply.header('x-clickmonk-row-cap', String(cap))
       // Before the body, which is the whole reason for the probe above.
       reply.header('x-clickmonk-truncated', truncated ? 'true' : 'false')
+      const file = Readable.from(body())
+      // Both events, and neither is spare: `close` is what a stream destroyed
+      // before it was ever read emits, and it is the only signal on that path;
+      // `error` is a stream that failed, which on a hangup can arrive first.
+      file.on('close', release)
+      file.on('error', release)
       started = true
-      return reply.send(Readable.from(body()))
+      return reply.send(file)
     } finally {
-      // Only when the generator never took ownership of the slot — the probe
-      // failed, say. Once the stream is handed over, its own `finally` is what
-      // gives it back.
-      if (!started) ctx.exportGate.leave()
+      // Only when nothing downstream can release it any more — the probe failed,
+      // say, and there is no stream. Once the stream exists, its own `close`
+      // gives the slot back, and releasing here would give it back at the
+      // beginning of the export.
+      if (!started) release()
     }
   })
 }
