@@ -953,22 +953,26 @@ describe('parseWindow', () => {
 
   /**
    * Raising `to` to the next hour is itself a way past the end, which is why the
-   * check runs after the alignment and not on what the caller sent. The last
-   * millisecond of 9999 aligns into year 10000, where `toISOString` stops
-   * producing a timestamp at all: unaligned this window would be refused for
-   * being past 2299 anyway, so what this pins is that an *aligned* end is what
-   * gets checked.
+   * check runs on the aligned window and not on what the caller sent.
+   *
+   * This window is legal unaligned — both ends are inside the range, and it is
+   * asserted here that they are — and illegal aligned, because the ceil to the
+   * next hour lands in 2300 where the store clamps. One input, two answers, and
+   * the only thing that decides is which side of the alignment the check sits on.
+   * A window in the year 9999 could not pin that: it is outside the range before
+   * the alignment as well, so a check in the wrong place refuses it too.
    */
-  it('refuses a window the alignment pushes past the end', () => {
+  it('refuses a window the alignment pushes past the end, and takes it unaligned', () => {
+    const q = { from: '2299-12-30T00:00:00.000Z', to: '2299-12-31T23:30:00.000Z' }
+    expect(parseWindow(q, { alignMs: null }).toMs).toBe(Date.parse('2299-12-31T23:30:00.000Z'))
     let thrown: unknown
     try {
-      parseWindow(
-        { from: '9999-12-31T22:00:00.000Z', to: '9999-12-31T23:59:59.999Z' },
-        { alignMs: HOUR_MS },
-      )
+      parseWindow(q, { alignMs: HOUR_MS })
     } catch (err) {
       thrown = err
     }
+    expect(thrown).toBeInstanceOf(HttpError)
+    expect((thrown as HttpError).status).toBe(400)
     expect((thrown as HttpError).code).toBe('invalid_query')
   })
 
