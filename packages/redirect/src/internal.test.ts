@@ -1,5 +1,6 @@
 import type { Domain } from '@clickmonk/core'
 import { describe, expect, it } from 'vitest'
+import { loadConfig } from './config.js'
 import { buildInternalApp } from './internal.js'
 import { Snapshot } from './snapshot.js'
 
@@ -153,6 +154,42 @@ describe('the ask check and the admin host', () => {
     } finally {
       await withHost.close()
       await without.close()
+    }
+  })
+})
+
+// The other half of the pair in config.test.ts: a value this service could not
+// parse leaves it in the state an install that never configured an admin host
+// runs in, rather than stopping it. What it costs is the admin interface's
+// certificate, which is what the logged line says; what it does not cost is a
+// single link.
+describe('an admin host this service could not read', () => {
+  const env = {
+    CLICKMONK_POSTGRES_URL: 'postgres://u:p@db:5432/clickmonk',
+    CLICKMONK_SECRET: 's'.repeat(32),
+    // The likeliest way to get here: a host name typed with capitals.
+    CLICKMONK_ADMIN_HOST: 'Admin.Example.Test',
+  }
+
+  it('approves a verified link domain and nothing else, as an unconfigured install does', async () => {
+    const config = loadConfig(env)
+    const app = buildInternalApp({
+      snapshot: () => snap,
+      spool,
+      adminHost: config.adminHost,
+    })
+    try {
+      // The link domain is served and may have a certificate, which is the part
+      // that must survive a mistyped variable.
+      expect((await app.inject('/ask?domain=go.example.test')).statusCode).toBe(200)
+      expect((await app.inject('/ready')).statusCode).toBe(200)
+      // Neither the value as written nor the name it was meant to be is
+      // approved: this install has no admin host as far as this check goes.
+      for (const host of ['Admin.Example.Test', 'admin.example.test']) {
+        expect((await app.inject(`/ask?domain=${host}`)).statusCode, host).toBe(404)
+      }
+    } finally {
+      await app.close()
     }
   })
 })

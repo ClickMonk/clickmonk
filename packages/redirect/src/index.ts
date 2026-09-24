@@ -3,7 +3,7 @@ import { dirname } from 'node:path'
 import { createPgPool } from '@clickmonk/db'
 import { IpDataStore } from '@clickmonk/ipdata'
 import { buildRedirectApp } from './app.js'
-import { loadConfig } from './config.js'
+import { ADMIN_HOST_IGNORED, loadConfig } from './config.js'
 import { buildInternalApp } from './internal.js'
 import { RateCounter } from './rate.js'
 import { SnapshotStore } from './snapshot.js'
@@ -75,6 +75,10 @@ const internal = buildInternalApp({
 
 await internal.listen({ host: '0.0.0.0', port: config.internalPort })
 await app.listen({ host: '0.0.0.0', port: config.port })
+// Once, at error level, because it is a configuration an operator has to fix
+// and nothing else will remind them: the links this process exists to serve are
+// unaffected, so there is no other symptom to notice.
+if (config.adminHostIgnored) app.log.error(ADMIN_HOST_IGNORED)
 
 let stopping = false
 async function shutdown(signal: string): Promise<void> {

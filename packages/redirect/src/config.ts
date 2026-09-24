@@ -17,12 +17,46 @@ const Schema = z.object({
   CLICKMONK_SNAPSHOT_PATH: z.string().min(1).default('/var/lib/clickmonk/state/snapshot.json'),
   CLICKMONK_TRUSTED_PROXIES: TrustedProxiesSchema,
   CLICKMONK_IPDATA_DIR: z.string().min(1).default(DEFAULT_IPDATA_DIR),
-  // The shared schema, so this service and the admin API cannot come to read
-  // the same variable differently. The `ask` check needs this name because it
-  // is not a link domain: it has no verified row, and without it the admin
-  // interface could never be given a certificate.
-  CLICKMONK_ADMIN_HOST: AdminHostSchema,
 })
+
+/**
+ * Said once at boot when the admin host could not be read, and the whole of
+ * what is said: the variable, what was ignored, and what still works.
+ *
+ * The value itself is never in it. An operator who has pasted the wrong line
+ * into their `.env` may have pasted a password, and a log a support request
+ * carries a copy of is the last place for one — naming the variable is enough
+ * to fix it, and the schema that refuses the value is the same one the admin
+ * service names on its own console.
+ */
+export const ADMIN_HOST_IGNORED =
+  'CLICKMONK_ADMIN_HOST is not a bare lower-case host name and has been ignored (the value is not logged). Links are being served as usual. The certificate check will approve verified link domains only, so the admin interface cannot be given a certificate until this is corrected.'
+
+/**
+ * The admin host, read the way this service alone reads it: a value it cannot
+ * parse is ignored rather than fatal.
+ *
+ * The admin service refuses to boot on the same value, and should: it cannot
+ * answer for a name it cannot parse, and it already has a documented state for
+ * having no name at all. This service is different, because it reads this
+ * variable for exactly one purpose — telling the proxy that one name may have a
+ * certificate — and a mistyped host name is not a reason to stop redirecting.
+ * Under a restart policy the alternative is every link on the install down for
+ * a capital letter, which inverts what this process is for. The proxy's own
+ * configuration already makes this trade, staying bootable on an empty value.
+ *
+ * `null` for both an unset variable and an unreadable one: the certificate
+ * check then approves verified link domains and nothing else, which is the same
+ * state an install that has never configured an admin host runs in.
+ */
+function readAdminHost(raw: string | undefined): {
+  adminHost: string | null
+  adminHostIgnored: boolean
+} {
+  const parsed = AdminHostSchema.safeParse(raw)
+  if (!parsed.success) return { adminHost: null, adminHostIgnored: true }
+  return { adminHost: parsed.data === '' ? null : parsed.data, adminHostIgnored: false }
+}
 
 export interface RedirectConfig {
   postgresUrl: string
@@ -34,8 +68,17 @@ export interface RedirectConfig {
   snapshotPath: string
   trustedProxies: string[]
   ipdataDir: string
-  /** Null when unset: `ask` then approves verified link domains only. */
+  /**
+   * Null when unset, and null when the value could not be read: `ask` then
+   * approves verified link domains only.
+   */
   adminHost: string | null
+  /**
+   * True when there was a value and it could not be read, so the caller logs
+   * `ADMIN_HOST_IGNORED` once at boot. False when the variable was unset, which
+   * is an ordinary configuration and not something to warn about.
+   */
+  adminHostIgnored: boolean
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv): RedirectConfig {
@@ -52,6 +95,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): RedirectConfig {
     snapshotPath: e.CLICKMONK_SNAPSHOT_PATH,
     trustedProxies: e.CLICKMONK_TRUSTED_PROXIES,
     ipdataDir: e.CLICKMONK_IPDATA_DIR,
-    adminHost: e.CLICKMONK_ADMIN_HOST === '' ? null : e.CLICKMONK_ADMIN_HOST,
+    // Read outside the schema above, so that a value this service cannot parse
+    // leaves it serving links instead of refusing to start.
+    ...readAdminHost(env.CLICKMONK_ADMIN_HOST),
   }
 }
