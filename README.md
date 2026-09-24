@@ -476,10 +476,13 @@ They are kept so that the rows add up to the number beside them. A breakdown ret
 rows unless you ask for more, at most 500, ordered by clicks, and sets `"truncated": true`
 when there were more.
 
-**Reports lag the clicks** by the time a spool segment takes to seal plus the shipper's next
-pass — a couple of seconds in normal operation. `newestHour`, on the summary and the chart,
-is the newest hour the rollups hold anywhere, not the newest hour in the window you asked
-for.
+**Reports lag the clicks**, and the mechanism is the whole of it: a click is countable once
+the spool segment holding it has been sealed and the shipper's next pass has taken it, which
+with the intervals as shipped is a small number of seconds. Nothing here reads the spool, so
+until both of those have happened the click is in no report and in no export.
+`newestHour`, on the summary and the chart, is the newest hour the rollups hold anywhere,
+not the newest hour in the window you asked for, and it is what says whether a run of zeroes
+at the end of a chart is "nobody clicked" or "not arrived yet".
 
 **Two reports or log pages at a time, and one export.** Past that the answer is `429` with
 `retry-after` rather than a queued query: a credential is not permission to scan the table

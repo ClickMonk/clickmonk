@@ -375,6 +375,23 @@ describe('clickmonk settings', () => {
     expect(lines).toContain('abuser threshold: 61 requests a minute from one client')
   })
 
+  // The same note with the other value of both periods, which is the case the
+  // test above cannot reach: "for ever" already carries its own preposition, so
+  // a sentence that writes one as well says "kept for for ever". A number needs
+  // the preposition and the word does not, which is why the formatter decides
+  // it rather than the sentence.
+  it('says a period of never without stuttering, in the note about a row it wrote', async () => {
+    await pg.query('DELETE FROM settings')
+    lines.length = 0
+    expect(
+      await run('settings', 'set', '--keep-clicks', 'never', '--keep-addresses', 'never'),
+    ).toBe(0)
+    expect(lines[0]).toBe(
+      'note: there was no settings row, so this command has written one; nothing was being deleted before, and clicks are now kept for ever and addresses for ever',
+    )
+    expect(await stored()).toEqual({ raw_retention_days: null, ip_retention_days: null })
+  })
+
   it('prints the retention periods, in days and as for ever', async () => {
     await setRetention(90, null)
     lines.length = 0

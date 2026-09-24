@@ -636,7 +636,18 @@ function printSettings(s: InstallSettings, d: CliDeps): void {
   if (note) d.out(`note: ${note}`)
 }
 
+/** A period where a label wants one: `90 days`, or `for ever` when there is none. */
 const days = (n: number | null): string => (n === null ? 'for ever' : `${n} days`)
+
+/**
+ * The same period where a sentence wants one, which needs the preposition a
+ * label does not: `for 90 days`, and `for ever` rather than "for for ever".
+ *
+ * A wrapper over `days` and not a second formatter. The number is still spelled
+ * in one place, so the two cannot come to disagree about what `90` reads as;
+ * what is decided here is only whether a `for` goes in front of it.
+ */
+const keptFor = (n: number | null): string => (n === null ? days(n) : `for ${days(n)}`)
 
 async function settingsShow(d: CliDeps): Promise<void> {
   const read = await readSettings(d.pg)
@@ -715,7 +726,10 @@ async function settingsSet(args: string[], d: CliDeps): Promise<void> {
   // The kept periods are named in full because there are two of them; the
   // traffic settings point at the lines printed below instead, because there
   // are five and they are about to be printed anyway.
-  const kept = `clicks are now kept for ${days(next.retention.rawRetentionDays)} and addresses for ${days(next.retention.ipRetentionDays)}`
+  // `keptFor`, not `days`: this is a sentence rather than a label, so the
+  // preposition comes from the formatter. With `days` and a `for` written here,
+  // `--keep-clicks never` printed "kept for for ever".
+  const kept = `clicks are now kept ${keptFor(next.retention.rawRetentionDays)} and addresses ${keptFor(next.retention.ipRetentionDays)}`
   for (const sub of substituted) {
     if (sub.what === 'row') {
       d.out(
