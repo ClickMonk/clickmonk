@@ -463,11 +463,12 @@ five of these.
 report answers at**: the hour for the summary and the breakdown, because that is the grain
 the rollups hold, and the bucket you asked for on the chart — so `bucket=day` counts whole
 days. The log and the export use the two instants exactly as they were sent. So the same
-window can answer differently through these surfaces and none of them is broken: one
-`from=2026-09-24T10:30:00Z&to=2026-09-24T10:50:00Z` gives two clicks from the summary, the
-hourly chart and the breakdown, three from a chart by day, and one from the log. Every one
-of these five answers repeats the window it actually counted, in its own `window` field.
-Read that before comparing two numbers.
+window can answer differently through these surfaces and none of them is broken: ask
+`from=2026-09-24T10:30:00Z&to=2026-09-24T10:50:00Z` and the summary, the hourly chart and the
+breakdown all count 10:00 to 11:00, a chart by day counts the whole of the 24th, and the log
+counts the twenty minutes you named — three different numbers from one request. Every one of
+these five answers repeats the window it actually counted, in its own `window` field. Read
+that before comparing two numbers.
 
 **What the numbers mean.** `clicks` counts distinct clicks and `visitors` distinct visitor
 cookies, and both are counted as sets rather than added up: a click the worker shipped twice
