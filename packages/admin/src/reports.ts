@@ -8,10 +8,10 @@
  *
  * **A credential is not a bound.** A caller who has one, or a key that has
  * leaked, can loop any of these, and each pass is a scan of a window they
- * chose. So a window is bounded, a page is bounded, and at most two of these
- * run in this process at once; past that the answer is a refusal with
- * `retry-after` rather than a queued query. The same argument as the
- * on-demand DNS check, for the same reason.
+ * chose. So a window is bounded — in length, and to the grain the rollups
+ * answer at — and at most two of these run in this process at once; past that
+ * the answer is a refusal with `retry-after` rather than a queued query. The
+ * same argument as the on-demand DNS check, for the same reason.
  *
  * **A report counts whole hours.** The rollups are hourly, so `from` is
  * floored to the hour and `to` is raised to the next one, and the response
@@ -41,10 +41,13 @@ export const HOUR_MS = 3_600_000
  * quietly ignored, which is what makes "no request field can widen what is
  * read" checkable on a surface that has nothing to widen to yet.
  */
+/** A link filter is a link id and nothing else. Checked here and in the parser. */
+const LinkId = z.string().uuid()
+
 export const WINDOW_FIELDS = {
   from: z.string().datetime({ offset: true }),
   to: z.string().datetime({ offset: true }),
-  link: z.string().uuid().optional(),
+  link: LinkId.optional(),
 }
 
 export interface ReportWindow {
@@ -92,6 +95,14 @@ export function parseWindow(
   }
   if (toMs - fromMs > MAX_REPORT_WINDOW_MS) {
     return fail(400, 'window_too_long', `a window may be at most ${MAX_REPORT_WINDOW_DAYS} days`)
+  }
+  // The shape of the link, here and not only in a route's schema, for the same
+  // reason the length is here: this value is bound into a query as a UUID, so a
+  // caller who reaches this function without that schema turns a bad request
+  // into a store error — a 503 that says reporting is unavailable when what is
+  // actually wrong is the one field the caller sent.
+  if (q.link !== undefined && !LinkId.safeParse(q.link).success) {
+    return fail(400, 'invalid_query', 'link: must be a link id')
   }
   return {
     fromMs,

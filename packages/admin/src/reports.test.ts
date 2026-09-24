@@ -279,6 +279,25 @@ describe('parseWindow', () => {
     expect((thrown as HttpError).status).toBe(400)
     expect((thrown as HttpError).code).toBe('invalid_query')
   })
+
+  // The link's shape belongs here for the same reason the length does. Bound
+  // into a query as a UUID, a link that is not one comes back from the store as
+  // a failure, so a caller reaching this function without the route's schema
+  // would be told reporting is unavailable when what is wrong is their field.
+  it('refuses a link that is not an id, whatever schema the caller came through', () => {
+    let thrown: unknown
+    try {
+      parseWindow(
+        { from: '2026-09-24T00:00:00.000Z', to: '2026-09-25T00:00:00.000Z', link: 'nope' },
+        { alignMs: HOUR_MS },
+      )
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(HttpError)
+    expect((thrown as HttpError).status).toBe(400)
+    expect((thrown as HttpError).code).toBe('invalid_query')
+  })
 })
 
 describe('the newest hour the install holds', () => {

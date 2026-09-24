@@ -34,9 +34,11 @@ export const DNS_CHECKS_IN_FLIGHT = 2
  * can loop a report endpoint, and each pass is a scan of a window they chose.
  * Past these the answer is a refusal with `retry-after`, never a queued query,
  * for the same reason the on-demand DNS check refuses rather than queues.
- * Exports get their own, smaller gate because an export is the one request
- * that holds a ClickHouse result open for as long as the client takes to read
- * it.
+ *
+ * The export gate is declared here and nothing takes it yet: the endpoint it
+ * bounds does not exist. It is separate from the report gate, and smaller,
+ * because an export holds a ClickHouse result open for as long as its client
+ * takes to read it, which is not a bound this process can set.
  */
 export const REPORT_QUERIES_IN_FLIGHT = 2
 export const EXPORTS_IN_FLIGHT = 1
