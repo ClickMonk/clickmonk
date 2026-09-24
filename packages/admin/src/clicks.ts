@@ -47,12 +47,15 @@ import { fail } from './http.js'
 import {
   CH_MAX_EXECUTION_SECONDS,
   MAX_STORE_MS,
+  MIN_STORE_MS,
   type ReportWindow,
   WINDOW_FIELDS,
   chRows,
   parseWindow,
   readQuery,
   requireCh,
+  windowClause,
+  windowParams,
   withSlot,
 } from './reports.js'
 
@@ -95,7 +98,7 @@ const ListQuery = z
  * A page boundary: the instant and the id of the last row of the page before.
  * Opaque to the caller, and parsed strictly — it reaches a comparison against a
  * `DateTime64` and a `UUID`, so the pattern refuses anything that is not those
- * two shapes and `MAX_STORE_MS` refuses an instant outside what the first of
+ * two shapes and the range below refuses an instant outside what the first of
  * them holds.
  *
  * That range is the window's, imported rather than written out again here: one
@@ -103,8 +106,15 @@ const ListQuery = z
  * it is how the two come to disagree. What the store does either side of it — a
  * clamp below year 10000 and a refused parameter above — is why the check
  * exists, and the constant's own comment says it.
+ *
+ * **The millisecond field is signed**, because `toUnixTimestamp64Milli` is: a
+ * window may reach back to 1900, so a page of clicks before 1970 hands out a
+ * cursor with a minus sign in it. With an unsigned pattern this service emitted a
+ * `nextCursor` its own parser refused, which is a listing that cannot be paged
+ * rather than a request that was wrong. What a caller can reach is not the whole
+ * of what has to be parsed here: this service is a caller of it too.
  */
-const CURSOR_RE = /^(\d{1,15})\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/
+const CURSOR_RE = /^(-?\d{1,15})\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/
 
 export function parseCursor(value: string): { atMs: number; clickId: string } {
   const m = CURSOR_RE.exec(value)
@@ -114,10 +124,11 @@ export function parseCursor(value: string): { atMs: number; clickId: string } {
   // pattern has two groups.
   if (!m) return fail(400, 'invalid_query', 'cursor: not a cursor from a previous page')
   const atMs = Number(m[1] as string)
-  // The pattern's digits are unsigned, so the oldest instant a cursor can name
-  // is the epoch, which is inside the type's range: only the newest end is
-  // reachable and only it is checked.
-  if (atMs > MAX_STORE_MS) {
+  // Both ends, and neither is unreachable: the newest by a caller inventing
+  // digits, the oldest by a minus sign in front of them. A window's bounds are
+  // pinned at both ends or at neither, and the cursor is the same rule on the
+  // same instants.
+  if (atMs < MIN_STORE_MS || atMs > MAX_STORE_MS) {
     return fail(400, 'invalid_query', 'cursor: names an instant no click can have')
   }
   return { atMs, clickId: m[2] as string }
@@ -243,12 +254,13 @@ export function clickFilter(
   w: ReportWindow,
   cursor: { atMs: number; clickId: string } | null,
 ): { where: string; params: Record<string, unknown> } {
-  const parts = [`time >= {from:DateTime64(3,'UTC')}`, `time < {to:DateTime64(3,'UTC')}`]
-  const params: Record<string, unknown> = { from: w.from, to: w.to }
-  if (w.linkId !== null) {
-    parts.push('link_id = {link:UUID}')
-    params.link = w.linkId
-  }
+  // The window and the link through `windowClause`, on the `time` column, which
+  // is what its second parameter is for. Written out here once, it was the same
+  // half-open rule in a second spelling — and a rule in two spellings is a rule
+  // that comes to disagree with itself. The parameter had no caller until this
+  // one, which is how the duplicate survived three rounds of pinning the bound.
+  const parts = [windowClause(w, 'time')]
+  const params: Record<string, unknown> = windowParams(w)
   if (q.class !== undefined) {
     parts.push('traffic_class = {class:String}')
     params.class = q.class

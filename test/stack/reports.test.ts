@@ -77,6 +77,12 @@ let clickHours: string[] = []
  * that row is counted and told apart from every click this suite really made.
  */
 const OLD_OUTCOME = 'expired'
+/**
+ * And the outcome on the row the blanking test writes for itself. Its own value,
+ * so the two retention tests cannot read each other's row: the first drops its
+ * row and the second must find exactly one.
+ */
+const BLANK_OUTCOME = 'capped'
 
 function api(
   method: string,
@@ -463,5 +469,51 @@ describe('the install', () => {
     const kept = `FROM clicks WHERE outcome = 'target'`
     expect(storeCount(`SELECT uniqExact(click_id) ${kept}`)).toBe(CLICKS)
     expect(storeCount(`SELECT uniqExact(click_id) ${kept} AND ip != ''`)).toBe(CLICKS)
+  })
+
+  /**
+   * The pass's other half, end to end: the address blanked in place, the click
+   * kept.
+   *
+   * It is the half that had unit cover and no cover here, in the one suite whose
+   * reason for existing is that the others cannot see a real chain — a real
+   * worker, reading a real settings row, issuing a real mutation against a real
+   * partition. The unit tests mock nothing either, but they call the pass; this
+   * one only restarts the worker and watches the store.
+   *
+   * **The periods are chosen so that the arithmetic does not depend on today's
+   * date.** A month goes only once every click it could hold is past the period,
+   * so which month is past a 30-day period depends on how far into the month the
+   * run happens to be. Four hundred days ago against `--keep-addresses 7` is past
+   * the address period by about a year whatever the date, and against
+   * `--keep-clicks 3650` is nowhere near the click period — so the row must be
+   * blanked and must not be dropped, and the difference between those two is what
+   * this test is for.
+   */
+  it('blanks the address on a month past the address period, and keeps the click', async () => {
+    cli('settings', 'set', '--keep-clicks', '3650', '--keep-addresses', '7')
+    const oldMs = Date.now() - 400 * 24 * HOUR_MS
+    const at = new Date(oldMs).toISOString().replace('T', ' ').replace('Z', '')
+    storeRun(
+      `INSERT INTO clicks (click_id, time, outcome, ip)
+         VALUES (generateUUIDv4(), toDateTime64('${at}', 3, 'UTC'), '${BLANK_OUTCOME}', '198.51.100.8')`,
+    )
+    const mine = `FROM clicks WHERE outcome = '${BLANK_OUTCOME}'`
+    // The premise, and it is a premise rather than a race: the pass that would
+    // touch this row is an hour away, and the restart below is what brings the
+    // next one forward.
+    expect(storeCount(`SELECT count() ${mine} AND ip != ''`)).toBe(1)
+
+    compose('restart', 'worker')
+    await until(
+      'the pass to blank the month past the address period',
+      60_000,
+      () => storeCount(`SELECT count() ${mine} AND ip = ''`) === 1,
+    )
+    // And the click itself is still there: a dropped partition would satisfy an
+    // assertion about no address being left, which is the wrong outcome reached by
+    // the same number. Blanking and dropping are the two halves of this pass and
+    // the whole point of the periods is that they are different.
+    expect(storeCount(`SELECT count() ${mine}`)).toBe(1)
   })
 })

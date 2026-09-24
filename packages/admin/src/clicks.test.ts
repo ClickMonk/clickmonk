@@ -521,6 +521,11 @@ describe('GET /api/clicks', () => {
     ['a cursor one millisecond past the last instant', `cursor=10413792000000.${CURSOR_ID}`],
     ['a cursor in year ten thousand', `cursor=253402300800000.${CURSOR_ID}`],
     ['a cursor of nothing but nines', `cursor=999999999999999.${CURSOR_ID}`],
+    // And the other end, which the pattern's minus sign makes reachable: one
+    // millisecond before 1900, where the store clamps rather than refusing in the
+    // same way it does above 2299.
+    ['a cursor one millisecond before the first instant', `cursor=-2208988800001.${CURSOR_ID}`],
+    ['a cursor of nothing but nines with a minus sign', `cursor=-999999999999999.${CURSOR_ID}`],
     ['a class nobody has', 'class=spider'],
     ['an outcome nobody has', 'outcome=maybe'],
     ['a lower-case country', 'country=de'],
@@ -563,6 +568,25 @@ describe('GET /api/clicks', () => {
     })
     expect(r.statusCode).toBe(200)
     expect(r.json().clicks).toHaveLength(3)
+  })
+
+  /**
+   * The other end of the same range, and a literal for the same reason.
+   *
+   * `-2208988800000` is 1900-01-01, the oldest instant a window may name, and it
+   * reaches the parser only because the pattern's millisecond field carries a
+   * sign. Every click in the fixture is newer than it, so the page is empty — the
+   * 200 is what says the instant was accepted rather than refused, and the empty
+   * page is what says it was used as the boundary rather than ignored.
+   */
+  it('takes the first instant a click can have', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/clicks?${WINDOW}&cursor=-2208988800000.${CURSOR_ID}`,
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.json().clicks).toEqual([])
   })
 
   // The ceiling from both sides. The 200 is what says it is not one row tighter
@@ -664,7 +688,11 @@ describe('GET /api/clicks.csv', () => {
   const HEADER =
     '"clickId","at","host","path","domainId","linkId","outcome","step","status","destination","targetId","visitorId","returning","country","region","city","geoSource","device","os","browser","asn","class","signals","action","referrer","userAgent","network","capUnchecked"'
 
-  it('exports the rows the log would have listed, newest first, as a file', async () => {
+  // Named for what it asserts: three literal ids in order, with two whole rows.
+  // It was called "the rows the log would have listed", and it reads no log —
+  // the two surfaces are held to each other by both pinning the same rows
+  // literally, not by this test comparing them.
+  it('writes every click in the window, newest first, with a header row', async () => {
     const r = await app.inject({
       method: 'GET',
       url: `/api/clicks.csv?${WINDOW}`,
@@ -1809,5 +1837,61 @@ describe('GET /api/clicks.csv, a caller that stops reading', () => {
     } finally {
       await served.close()
     }
+  })
+})
+
+/**
+ * A cursor this service hands out, handed straight back to it.
+ *
+ * Both sides of one seam, and each was reviewed alone: the parser's pattern
+ * reasoned about the instants a *caller* can name, and the emitter is a caller of
+ * it too. A window may reach back to 1900 and `toUnixTimestamp64Milli` is signed,
+ * so a page of clicks before 1970 hands out a cursor with a minus sign in it —
+ * which an unsigned pattern refused, making the second page of that listing
+ * unreachable through the cursor the first page gave.
+ *
+ * The rows are written straight into the store, which is where such a row comes
+ * from: the record schema refuses a click time outside what a rollup hour holds,
+ * so nothing this build ships can produce one — but an install that ran an earlier
+ * build, or a hand-written row, can already have one, and the log still has to
+ * page it.
+ *
+ * Its own window, decades from every other one in this file, so these two rows are
+ * invisible to every count above.
+ */
+describe('GET /api/clicks, a cursor from a page before 1970', () => {
+  const OLD_WINDOW = 'from=1950-01-01T00:00:00.000Z&to=1951-01-01T00:00:00.000Z'
+  const OLDER = '01920000-0000-7000-8000-0000000000e1'
+  const NEWER = '01920000-0000-7000-8000-0000000000e2'
+
+  beforeAll(async () => {
+    await insert([
+      click({ click_id: OLDER, time: '1950-06-15 10:00:00.000' }),
+      click({ click_id: NEWER, time: '1950-06-15 10:01:00.000' }),
+    ])
+  })
+
+  it('takes it back and gives the page after it', async () => {
+    const first = await app.inject({
+      method: 'GET',
+      url: `/api/clicks?${OLD_WINDOW}&limit=1`,
+      headers: read(cookie),
+    })
+    expect(first.statusCode).toBe(200)
+    expect(first.json().clicks.map((c: { clickId: string }) => c.clickId)).toEqual([NEWER])
+    const cursor = first.json().nextCursor as string
+    // The sign is the whole point, so it is asserted rather than assumed: a
+    // fixture that had drifted after 1970 would make the round trip below pass
+    // without ever exercising it.
+    expect(cursor).toMatch(/^-\d+\.[0-9a-f-]{36}$/)
+
+    const second = await app.inject({
+      method: 'GET',
+      url: `/api/clicks?${OLD_WINDOW}&limit=1&cursor=${encodeURIComponent(cursor)}`,
+      headers: read(cookie),
+    })
+    expect(second.statusCode).toBe(200)
+    expect(second.json().clicks.map((c: { clickId: string }) => c.clickId)).toEqual([OLDER])
+    expect(second.json().nextCursor).toBeNull()
   })
 })

@@ -268,7 +268,16 @@ export function newestHourOrNull(text: string | undefined): string | null {
   return `${text.replace(' ', 'T')}.000Z`
 }
 
-/** The window clause every report shares, with the link filter only when there is one. */
+/**
+ * The window clause every report shares, with the link filter only when there is
+ * one.
+ *
+ * `column` is what makes it shared rather than nearly shared: the rollups filter
+ * `hour` and the click log filters `time`, and those are the same half-open rule
+ * on two columns. It had no caller once, and the click log wrote the rule out
+ * again — which is how one rule comes to have two spellings and then two
+ * meanings.
+ */
 export function windowClause(w: ReportWindow, column = 'hour'): string {
   const parts = [`${column} >= {from:DateTime64(3,'UTC')}`, `${column} < {to:DateTime64(3,'UTC')}`]
   if (w.linkId !== null) parts.push('link_id = {link:UUID}')
