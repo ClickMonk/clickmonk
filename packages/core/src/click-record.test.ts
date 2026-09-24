@@ -183,6 +183,42 @@ describe('version 3: the password step', () => {
   })
 })
 
+/**
+ * The click time against the range the rollups' `hour` column holds, on every
+ * version, because `common` is where the field is written once.
+ *
+ * The instants are written out rather than computed from the constants: a bound
+ * derived from the value it is testing holds whatever that value becomes. A time
+ * outside this range is not refused by the store — the materialized views wrap it
+ * into an hour decades away, which is missing from every rollup-backed report and
+ * permanently wrong in the freshness field the reports answer with.
+ */
+describe('the click time against what a rollup hour holds', () => {
+  it('takes the instants that column holds, and nothing outside them', () => {
+    for (const time of ['1970-01-01T00:00:00.000Z', '2106-02-07T06:28:15.000Z']) {
+      expect(SpoolRecordSchema.safeParse(sampleRecord({ time })).success, time).toBe(true)
+    }
+    for (const time of [
+      '1969-12-31T23:59:59.999Z',
+      '1950-06-15T10:00:00.000Z',
+      '2106-02-07T06:28:16.000Z',
+      '2150-06-15T10:00:00.000Z',
+    ]) {
+      expect(SpoolRecordSchema.safeParse(sampleRecord({ time })).success, time).toBe(false)
+    }
+  })
+
+  // Refused on the time and not on something else the fixture happens to break,
+  // and on all three versions: the field is written once in `common`, so a bound
+  // added to one version only would leave the other two open.
+  it('refuses it on every record version, and refuses it for the time', () => {
+    const time = '1950-06-15T10:00:00.000Z'
+    expect(refusedFor(sampleRecord({ time }))).toEqual(['custom:time'])
+    expect(refusedFor(sampleV2({ time }))).toEqual(['custom:time'])
+    expect(refusedFor({ ...sampleV2(), v: 3, time })).toEqual(['custom:time'])
+  })
+})
+
 describe('spool segment names', () => {
   it('are what the reader matches, and sort by time as strings', () => {
     const name = segmentName(1_700_000_000_000, 42, 0)

@@ -67,9 +67,18 @@ export const WINDOW_FIELDS = {
 }
 
 /**
- * The instants the store can hold: the range `DateTime64(3, 'UTC')` represents,
- * which is the type every click time, every rollup hour and both ends of every
- * window are compared as.
+ * The instants a window may name: the range `DateTime64(3, 'UTC')` represents,
+ * which is the type both ends of every window are bound into and the type
+ * `clicks.time` is stored as.
+ *
+ * **It is not the rollups' range, and the two must not be confused.** The
+ * rollups' `hour` is `DateTime('UTC')` — 1970-01-01 to 2106-02-07 — so the
+ * instants a rollup row can sit at are a subset of the instants a window can
+ * name. What keeps that from mattering is a bound at the other end: a click time
+ * outside the narrower range is refused where the spool is read
+ * (`MIN_CLICK_TIME_MS`/`MAX_CLICK_TIME_MS`), so no rollup row exists outside it
+ * and a window that reaches past it is an empty answer rather than a wrong one. A
+ * window reaching past this range is the different problem below.
  *
  * **A bound on a window's length is not a bound on where it sits.** Four hundred
  * days in the year 9999 is inside every length and bucket ceiling here, and what

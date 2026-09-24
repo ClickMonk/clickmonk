@@ -9,10 +9,46 @@ export const MAX_PATH_LENGTH = 2048
 /** The referrer is recorded up to this many characters. */
 export const MAX_REFERRER_LENGTH = 2048
 
+/**
+ * The instants a click time may name: the range the **rollups' `hour` column**
+ * can hold, which is narrower than the one the click itself is stored in.
+ *
+ * Three columns and two ranges, and the gap between them is the whole reason
+ * this exists. `clicks.time` is `DateTime64(3, 'UTC')`, which reaches from 1900
+ * to 2299. `clicks_hourly.hour` and `clicks_hourly_dim.hour` are
+ * `DateTime('UTC')`: four bytes of seconds, 1970-01-01 to 2106-02-07 06:28:15.
+ * The materialized views write `toStartOfHour(time)` into that narrower column,
+ * and ClickHouse does not refuse a value outside it there — it **wraps**. A click
+ * at 1950 lands in a rollup hour in 2086, a click at 2150 in one in 2014, and
+ * both are then missing from every rollup-backed report while present in the log
+ * and the export. Worse, `max(hour)` is the only freshness field the reports
+ * have, nothing ever deletes a rollup row, and one such click makes it answer an
+ * hour sixty years out for the life of the install.
+ *
+ * So the bound is on the way in. `toStartOfHour` only ever moves an instant
+ * backwards, so a time inside this range has an hour inside it too, which is
+ * what makes one range enough.
+ *
+ * The same rule as the ASN below, and it is reachable the same way: the time is
+ * the redirect's own clock, so a container with a wrong year or a spool line
+ * written by hand is all it takes. No request can reach it.
+ */
+export const MIN_CLICK_TIME_MS = Date.parse('1970-01-01T00:00:00.000Z')
+export const MAX_CLICK_TIME_MS = Date.parse('2106-02-07T06:28:15.999Z')
+
 /** The fields every record version carries. */
 const common = {
   clickId: z.string().uuid(),
-  time: z.string().datetime({ offset: false }),
+  time: z
+    .string()
+    .datetime({ offset: false })
+    // On the parsed instant and not on the text: `.datetime()` has already said
+    // the text is an ISO timestamp, and every year a rollup hour cannot hold is
+    // a perfectly well-formed one.
+    .refine((s) => {
+      const ms = Date.parse(s)
+      return ms >= MIN_CLICK_TIME_MS && ms <= MAX_CLICK_TIME_MS
+    }, 'must name an instant the rollups can hold'),
   host: z.string().max(253),
   path: z.string().max(MAX_PATH_LENGTH),
   domainId: z.string().uuid(),
