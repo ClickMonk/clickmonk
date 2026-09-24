@@ -42,7 +42,7 @@ import {
   serverBusyPage,
   tooManyAttemptsPage,
 } from './password.js'
-import type { RateCounter } from './rate.js'
+import { type RateCounter, rateKey } from './rate.js'
 import type { Snapshot } from './snapshot.js'
 import type { SpoolWriter } from './spool.js'
 import { readVisitor, visitorCookies } from './visitor.js'
@@ -491,7 +491,11 @@ export function buildRedirectApp(
         .send(BODIES[d.status] ?? '')
     }
 
-    const key = `${ip}|${link.id}`
+    // Counted per /64 for IPv6, for the reason `rateKey` states: a client
+    // usually holds a whole /64, so a per-address count is no count at all —
+    // it buys unlimited guesses, and unlimited keys in a map that fails
+    // closed. An address the parser cannot read keys on itself.
+    const key = `${rateKey(ip) ?? ip}|${link.id}`
     // Monotonic, never `at.getTime()`: `at` is the wall clock the click is
     // recorded with, and a step backwards on it must not clear this counter.
     const tick = monotonic()

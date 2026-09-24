@@ -1215,6 +1215,27 @@ describe('a password-protected link', () => {
     expect(otherLink.statusCode).toBe(302)
   })
 
+  it('counts every address in one IPv6 /64 as one guesser', async () => {
+    // A client usually holds a whole /64 and can pick a new address from it
+    // for every request, so a per-address count buys unlimited guesses.
+    const { app } = harness([locked], { passwordAttempts: new AttemptCounter(1, 60_000) })
+    const guess = (ip: string) => post(app, 'password=wrong', { 'x-forwarded-for': ip })
+    expect((await guess('2001:db8::1')).statusCode).toBe(200)
+    expect((await guess('2001:db8::2')).statusCode).toBe(429)
+    // A different /64 is a different guesser.
+    expect((await guess('2001:db8:0:1::1')).statusCode).toBe(200)
+  })
+
+  it('does not let an IPv4 address and an IPv6 address share one counter', async () => {
+    const { app } = harness([locked], { passwordAttempts: new AttemptCounter(1, 60_000) })
+    const guess = (ip: string) => post(app, 'password=wrong', { 'x-forwarded-for': ip })
+    expect((await guess('192.0.2.7')).statusCode).toBe(200)
+    expect((await guess('2001:db8::1')).statusCode).toBe(200)
+    // Each family spent its own allowance, and only its own.
+    expect((await guess('192.0.2.7')).statusCode).toBe(429)
+    expect((await guess('2001:db8::2')).statusCode).toBe(429)
+  })
+
   it('answers "try again" rather than queueing when too many checks are in flight', async () => {
     const gate = new ConcurrencyGate(0)
     const { app, records } = harness([locked], { passwordGate: gate })
