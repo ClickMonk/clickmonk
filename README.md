@@ -211,8 +211,12 @@ CLICKMONK_ADMIN_HOST=admin.example.com
 
 The value is a bare lower-case host name: no scheme, no port, no wildcard. Anything else
 fails the configuration at boot with the variable named, rather than quietly routing names
-you did not mean. Then restart, so Compose hands the new value to the services that read
-it:
+you did not mean.
+
+Only `domain add`'s direction of the clash is caught. Set this to a name a link domain
+**already** holds and Caddy starts sending it to the admin API, that domain's links stop
+resolving, and nothing warns you, so check `clickmonk domain list` first. Restart when the
+value is right, so Compose hands it to the services that read it:
 
 ```sh
 docker compose up -d
