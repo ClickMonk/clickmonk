@@ -68,10 +68,34 @@ const ListQuery = z
   .strict()
 
 /**
+ * The newest instant a cursor may name: the last millisecond
+ * `DateTime64(3, 'UTC')` represents, which is the type every click time and both
+ * window bounds are stored and compared as.
+ *
+ * A caller's value is checked against the **range** of the type it is bound
+ * into, not only against its shape, and this is the third field on this surface
+ * to need saying so — after a fractional row limit and a link that was not a
+ * link. Both of the others reached the store and came back as
+ * `reporting_unavailable`, which tells an operator their install is broken when
+ * what is broken is one field of one request.
+ *
+ * Past this instant the store does neither of the two things a reader expects.
+ * It does not refuse the value: `2300-01-01` and `9999-12-31` are both silently
+ * clamped to 2299, so a caller would page from an instant they never named. And
+ * the text this module builds from a larger number is not a timestamp at all —
+ * `toISOString()` switches to its extended-year form at year 10000, so
+ * `253402300800000` becomes `+010000-01-01 00:00:00.000`, which ClickHouse
+ * refuses as a query parameter: a 503 and an error-level query-failure line,
+ * after a report slot was taken, for what is a bad request.
+ */
+export const MAX_CURSOR_MS = Date.parse('2299-12-31T23:59:59.999Z')
+
+/**
  * A page boundary: the instant and the id of the last row of the page before.
- * Opaque to the caller, and parsed strictly — it reaches a comparison against
- * a `DateTime64` and a `UUID`, so anything that is not exactly those two things
- * is refused here rather than by ClickHouse.
+ * Opaque to the caller, and parsed strictly — it reaches a comparison against a
+ * `DateTime64` and a `UUID`, so the pattern refuses anything that is not those
+ * two shapes and the bound above refuses an instant outside what the first of
+ * them holds.
  */
 const CURSOR_RE = /^(\d{1,15})\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/
 
@@ -82,7 +106,14 @@ export function parseCursor(value: string): { atMs: number; clickId: string } {
   // a match; the casts are for the index signature, which does not know the
   // pattern has two groups.
   if (!m) return fail(400, 'invalid_query', 'cursor: not a cursor from a previous page')
-  return { atMs: Number(m[1] as string), clickId: m[2] as string }
+  const atMs = Number(m[1] as string)
+  // The pattern's digits are unsigned, so the oldest instant a cursor can name
+  // is the epoch, which is inside the type's range: only the newest end is
+  // reachable and only it is checked.
+  if (atMs > MAX_CURSOR_MS) {
+    return fail(400, 'invalid_query', 'cursor: names an instant no click can have')
+  }
+  return { atMs, clickId: m[2] as string }
 }
 
 /**

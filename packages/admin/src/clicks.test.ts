@@ -15,6 +15,7 @@ let cookie = ''
 const LINK_A = '00000000-0000-4000-8000-0000000000a1'
 const LINK_B = '00000000-0000-4000-8000-0000000000a2'
 const DOMAIN = '00000000-0000-4000-8000-00000000000d'
+const DOMAIN_B = '00000000-0000-4000-8000-00000000000e'
 const TARGET = '00000000-0000-4000-8000-0000000000b1'
 
 const click = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
@@ -49,21 +50,79 @@ const click = (over: Record<string, unknown> = {}): Record<string, unknown> => (
   ...over,
 })
 
+/**
+ * `optimize_on_insert: 0`, so that a click written twice stays two rows.
+ *
+ * On by default, the engine collapses equal sort keys as it writes each part,
+ * which happens *before* any merge: a re-shipped click inside one INSERT would
+ * be one row by the time the first test ran, and `FINAL` would have nothing to
+ * deduplicate. With it off the pair is held in one part, with no merge to race
+ * and nothing set on the server that another suite on these shared databases
+ * could inherit.
+ */
 const insert = (values: Record<string, unknown>[]) =>
-  ch.insert({ table: 'clicks', values, format: 'JSONEachRow' })
+  ch.insert({
+    table: 'clicks',
+    values,
+    format: 'JSONEachRow',
+    clickhouse_settings: { optimize_on_insert: 0 },
+  })
+
+/**
+ * Six clicks on one day, in three instants: three of them share a millisecond,
+ * two share another, one is alone. Ids ascend with the order they are written
+ * in, so that the order a page must come back in is the reverse of this list.
+ *
+ * A fixture in which no two clicks share an instant cannot see the difference
+ * between a boundary on the pair the order is by and a boundary on the time
+ * alone — and the second of those silently drops every row of a tie after the
+ * first, which is the one thing a log must never do.
+ */
+const TIED_IDS = [
+  '01920000-0000-7000-8000-000000000011',
+  '01920000-0000-7000-8000-000000000012',
+  '01920000-0000-7000-8000-000000000013',
+  '01920000-0000-7000-8000-000000000014',
+  '01920000-0000-7000-8000-000000000015',
+  '01920000-0000-7000-8000-000000000016',
+]
+const TIED_TIMES = [
+  '2026-09-22 10:00:00.000',
+  '2026-09-22 10:00:00.000',
+  '2026-09-22 10:00:00.000',
+  '2026-09-22 10:01:00.000',
+  '2026-09-22 10:01:00.000',
+  '2026-09-22 10:02:00.000',
+]
+const tied = TIED_IDS.map((id, i) => click({ click_id: id, time: TIED_TIMES[i] }))
+
+/** A well-formed id for a cursor whose instant is the thing under test. */
+const CURSOR_ID = '01920000-0000-7000-8000-0000000000ff'
 
 const WINDOW = 'from=2026-09-24T00:00:00.000Z&to=2026-09-25T00:00:00.000Z'
 
-/** The day before, which nothing above reads: see the block at the end of the file. */
+/** Two days nothing above reads: see the two blocks at the end of the file. */
 const DAY_BEFORE = 'from=2026-09-23T00:00:00.000Z&to=2026-09-24T00:00:00.000Z'
+const TIED_DAY = 'from=2026-09-22T00:00:00.000Z&to=2026-09-23T00:00:00.000Z'
 
 beforeAll(async () => {
   await resetDatabases(pool, ch)
   await insert([
     click(),
+    // The same click again: one segment, shipped twice, and two rows because of
+    // the insert setting above.
+    click(),
+    // Every field this row overrides is a field the first row also has, and a
+    // second value is the only thing that can tell a response reading the column
+    // from a response carrying a constant. Six of them — the host, the domain,
+    // the device, the OS, the browser and the user agent — had one value across
+    // the whole fixture, and the user agent is the most identifying thing in a
+    // click after the visitor id.
     click({
       click_id: '01920000-0000-7000-8000-000000000002',
       time: '2026-09-24 10:01:00.000',
+      host: 'links.example.test',
+      domain_id: DOMAIN_B,
       link_id: LINK_B,
       path: '/b',
       country: 'US',
@@ -72,6 +131,10 @@ beforeAll(async () => {
       ip: '2001:db8:1234:5678:9abc:def0:1234:5678',
       referrer: '',
       asn: 0,
+      device: 'ios',
+      os: 'ios',
+      browser: 'safari',
+      user_agent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0) Safari/605',
     }),
     click({
       click_id: '01920000-0000-7000-8000-000000000003',
@@ -89,19 +152,21 @@ beforeAll(async () => {
       ip: '',
       cap_unchecked: 1,
     }),
-    // A day earlier, so outside every window above, and recorded through a
-    // proxy that spelled the address as a bracketed literal with a port. The
-    // redirect writes a canonical bare address, so this is a claim about what
-    // the column may hold — a plain String bounded only in length, written by
-    // whatever shipped the record — rather than about what the redirect writes
-    // today, and that is exactly why it earns a test. Its own window, because a
-    // fifth row inside the day would move every count and every page boundary
-    // the block above asserts.
+    // A day earlier, so outside every window above, and recorded through a proxy
+    // that spelled the address as a bracketed literal with a port. The redirect
+    // writes a canonical bare address, so this is a claim about what the column
+    // may hold — a plain String bounded only in length, written by whatever
+    // shipped the record — rather than about what the redirect writes today.
+    // Another row inside the day would move every count and every page boundary
+    // the first block asserts.
     click({
       click_id: '01920000-0000-7000-8000-000000000004',
       time: '2026-09-23 10:00:00.000',
       ip: '[2001:db8:1234:5678:9abc:def0:1234:5678]:443',
     }),
+    // Six clicks two days earlier, three of them in one millisecond and two in
+    // another: see the paging block at the end of the file.
+    ...tied,
   ])
 })
 
@@ -172,27 +237,20 @@ describe('GET /api/clicks', () => {
    * crash in between ships the same segment again: two rows identical to the
    * byte, until a merge collapses them.
    *
-   * The duplicate is written **here and in its own INSERT**, not with the
-   * fixture. One INSERT is one part and the engine collapses equal sort keys as
-   * it writes a part, so a duplicate inside the fixture's array is gone before
-   * any test runs — and `FINAL` then has nothing to do, which is how this test
-   * passed with `FINAL` dropped. A second INSERT is a second part, and the raw
-   * count asserted below is what says the duplicate was still there when the log
-   * was read: a background merge may collapse it at any moment, and that count
-   * failing is the right answer to a fixture this test can no longer see.
+   * The raw count is read first, and it is what says the pair was still two rows
+   * when the log was read — so that this test is about `FINAL` and not about a
+   * fixture that had already been deduplicated behind it. What holds it there is
+   * `optimize_on_insert: 0` on the fixture's INSERT, not luck.
    */
   it('shows a click that was shipped twice once', async () => {
-    await insert([click()])
-    const rs = await ch.query({ query: 'SELECT count() AS n FROM clicks', format: 'JSONEachRow' })
-    // Five rows: four from the fixture — three in this window and the day
-    // before's — plus the copy just written. The message is the whole point of
-    // asserting this before reading the log: four rows here means a background
-    // merge collapsed the pair between the INSERT and this count, which is a
-    // race in the fixture and not a regression in the query below.
+    const rs = await ch.query({
+      query: `SELECT count() AS n FROM clicks WHERE click_id = '01920000-0000-7000-8000-000000000001'`,
+      format: 'JSONEachRow',
+    })
     expect(
       await rs.json(),
-      'a background merge collapsed the re-shipped copy before the log was read, so this test could not see whether FINAL deduplicated anything. That is a race in the fixture, not a failure of the query. If it recurs, give this suite a ClickHouse database of its own; never SYSTEM STOP MERGES, which these shared test databases would hand to every other suite.',
-    ).toEqual([{ n: '5' }])
+      'the re-shipped copy is no longer a second row, so this test cannot see whether FINAL deduplicated anything and would pass either way. The fixture holds the pair with optimize_on_insert: 0 on its INSERT; if that has gone, or a merge rewrote the part, restore it there. Not SYSTEM STOP MERGES, which these shared test databases would hand to every other suite.',
+    ).toEqual([{ n: '2' }])
     const r = await app.inject({
       method: 'GET',
       url: `/api/clicks?${WINDOW}`,
@@ -279,6 +337,12 @@ describe('GET /api/clicks', () => {
    * where it holds its least interesting value can be replaced by a constant
    * with the rest of the suite green. So this one is asserted whole, at a value
    * nothing else in the file sends.
+   *
+   * It is also where six columns of the click itself are read at their second
+   * value — the host, the domain, the device, the OS, the browser and the user
+   * agent — which is what makes them columns rather than constants this mapper
+   * could have written in. The other whole click, in the test above, carries the
+   * first value of each.
    */
   it('echoes the link it was asked for, and nothing else, whole', async () => {
     const r = await app.inject({
@@ -294,9 +358,9 @@ describe('GET /api/clicks', () => {
         {
           clickId: '01920000-0000-7000-8000-000000000002',
           at: '2026-09-24T10:01:00.000Z',
-          host: 'go.example.test',
+          host: 'links.example.test',
           path: '/b',
-          domainId: DOMAIN,
+          domainId: DOMAIN_B,
           linkId: LINK_B,
           outcome: 'target',
           step: 'destination',
@@ -312,15 +376,15 @@ describe('GET /api/clicks', () => {
           region: null,
           city: null,
           geoSource: 'dbip',
-          device: 'desktop',
-          os: 'windows',
-          browser: 'chrome',
+          device: 'ios',
+          os: 'ios',
+          browser: 'safari',
           asn: null,
           class: 'human',
           signals: [],
           action: null,
           referrer: null,
-          userAgent: 'Mozilla/5.0 (Windows NT 10.0) Chrome/130',
+          userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0) Safari/605',
           network: '2001:db8:1234:5678::/64',
           capUnchecked: false,
         },
@@ -392,6 +456,17 @@ describe('GET /api/clicks', () => {
     ['a cursor that is not one', 'cursor=nonsense'],
     ['a cursor with no id', 'cursor=1758708000000.'],
     ['a cursor whose id is not an id', 'cursor=1758708000000.not-a-uuid-at-all-not-at-all-no-x'],
+    // Three instants no click can have, and all three used to reach the store.
+    // The first is one millisecond past what `DateTime64(3,'UTC')` represents,
+    // which ClickHouse does not refuse but silently clamps to 2299 — so the
+    // caller would be paged from an instant they never named. The second is the
+    // start of year 10000, where `toISOString` switches to its extended-year
+    // form and the text this module builds is not a timestamp at all: a 503 and
+    // an error-level query-failure line, after a report slot was taken, for a
+    // bad request. The third is the largest the pattern's digits allow.
+    ['a cursor one millisecond past the last instant', `cursor=10413792000000.${CURSOR_ID}`],
+    ['a cursor in year ten thousand', `cursor=253402300800000.${CURSOR_ID}`],
+    ['a cursor of nothing but nines', `cursor=999999999999999.${CURSOR_ID}`],
     ['a class nobody has', 'class=spider'],
     ['an outcome nobody has', 'outcome=maybe'],
     ['a lower-case country', 'country=de'],
@@ -413,6 +488,48 @@ describe('GET /api/clicks', () => {
     })
     expect(r.statusCode).toBe(400)
     expect(r.json().error).toBe('invalid_query')
+  })
+
+  /**
+   * The newest instant a cursor may name, one millisecond below the refusal
+   * above. Written out rather than read from `MAX_CURSOR_MS`, because a bound
+   * derived from the constant it is testing moves when the constant moves and
+   * goes on passing — and this end is the one that says the check is not a
+   * millisecond tighter than the type it protects.
+   *
+   * It reads every click in the window, since every click is older than it:
+   * the 200 is what says the store accepted the instant rather than refusing or
+   * clamping it.
+   */
+  it('takes the last instant a click can have', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/clicks?${WINDOW}&cursor=10413791999999.${CURSOR_ID}`,
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.json().clicks).toHaveLength(3)
+  })
+
+  // The ceiling from both sides. The 200 is what says it is not one row tighter
+  // than the number it promises — tightening it to 150 passed every other test
+  // in this file — and the 201 that it is there at all. Both literals, for the
+  // reason the cursor's last instant is a literal.
+  it('takes the largest page it will return, and refuses one more', async () => {
+    const at = await app.inject({
+      method: 'GET',
+      url: `/api/clicks?${WINDOW}&limit=200`,
+      headers: read(cookie),
+    })
+    expect(at.statusCode).toBe(200)
+    expect(at.json().nextCursor).toBeNull()
+    const over = await app.inject({
+      method: 'GET',
+      url: `/api/clicks?${WINDOW}&limit=201`,
+      headers: read(cookie),
+    })
+    expect(over.statusCode).toBe(400)
+    expect(over.json().error).toBe('invalid_query')
   })
 
   it('refuses a window longer than four hundred days', async () => {
@@ -473,6 +590,58 @@ describe('GET /api/clicks, an address with brackets and a port', () => {
         .json()
         .clicks.map((c: { clickId: string; network: string | null }) => [c.clickId, c.network]),
     ).toEqual([['01920000-0000-7000-8000-000000000004', '2001:db8:1234:5678::/64']])
+  })
+})
+
+/**
+ * Paging across a tie, one click at a time.
+ *
+ * The boundary is on `(time, click_id)` because the order is on `(time,
+ * click_id)`, and the pair is the whole point: with a boundary on the time
+ * alone, the next page starts after the *instant* the last row had, so every
+ * other row sharing that instant is skipped. Six clicks in three instants, three
+ * of them tied and two of them tied, walked at one row a page: the wrong
+ * boundary returns three of the six and every assertion about a page's length
+ * still passes, which is why this walks the whole window and compares ids.
+ *
+ * Its own window, because six more clicks in the window above would move every
+ * count and every page boundary asserted there.
+ */
+describe('GET /api/clicks, paging across a tie', () => {
+  const idsOf = (r: { json: () => { clicks: { clickId: string }[] } }): string[] =>
+    r.json().clicks.map((c) => c.clickId)
+
+  it('walks every click exactly once, newest first', async () => {
+    const seen: string[] = []
+    let url = `/api/clicks?${TIED_DAY}&limit=1`
+    // One request per click plus the one that ends it, and a hard stop well
+    // inside that: a loop whose bound is the thing it is testing would spin for
+    // ever on a cursor that does not advance.
+    for (let page = 0; page < 10; page++) {
+      const r = await app.inject({ method: 'GET', url, headers: read(cookie) })
+      expect(r.statusCode).toBe(200)
+      seen.push(...idsOf(r))
+      const next = r.json().nextCursor as string | null
+      if (next === null) break
+      url = `/api/clicks?${TIED_DAY}&limit=1&cursor=${encodeURIComponent(next)}`
+    }
+    // Newest first, and within one instant by descending id: the reverse of the
+    // order the fixture writes them in.
+    expect(seen).toEqual([...TIED_IDS].reverse())
+  })
+
+  // The same six in one page, which says two things at once: nothing is lost
+  // without a cursor, and the page size a caller who names none gets is at least
+  // six. The number itself — fifty — is not readable off a fixture of six, the
+  // way the ceiling is readable off a limit of 201.
+  it('returns them all when no page size is asked for', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/clicks?${TIED_DAY}`,
+      headers: read(cookie),
+    })
+    expect(idsOf(r)).toEqual([...TIED_IDS].reverse())
+    expect(r.json().nextCursor).toBeNull()
   })
 })
 
