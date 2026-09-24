@@ -1,0 +1,90 @@
+import { describe, expect, it } from 'vitest'
+import { loadConfig } from './config.js'
+
+const base = { CLICKMONK_POSTGRES_URL: 'postgres://u:p@db:5432/clickmonk' }
+
+describe('loadConfig', () => {
+  // The whole object, not a subset: a field this service starts with and
+  // nobody pinned is a field a later change can quietly drop.
+  it('applies the documented defaults', () => {
+    expect(loadConfig(base)).toEqual({
+      postgresUrl: 'postgres://u:p@db:5432/clickmonk',
+      adminHost: null,
+      port: 9100,
+      trustedProxies: ['127.0.0.1'],
+      dnsServers: [],
+    })
+  })
+
+  it('names every missing or bad variable at once', () => {
+    expect(() => loadConfig({ CLICKMONK_ADMIN_PORT: 'http' })).toThrow(
+      /CLICKMONK_POSTGRES_URL[\s\S]*CLICKMONK_ADMIN_PORT/,
+    )
+  })
+
+  it('takes a port, and refuses one outside the range', () => {
+    expect(loadConfig({ ...base, CLICKMONK_ADMIN_PORT: '9999' }).port).toBe(9999)
+    for (const value of ['0', '65536', '9100.5', 'nine']) {
+      expect(() => loadConfig({ ...base, CLICKMONK_ADMIN_PORT: value }), value).toThrow(
+        /CLICKMONK_ADMIN_PORT/,
+      )
+    }
+  })
+
+  it('splits trusted proxies, and refuses an entry that is not one', () => {
+    expect(
+      loadConfig({ ...base, CLICKMONK_TRUSTED_PROXIES: 'uniquelocal, 198.51.100.0/24' })
+        .trustedProxies,
+    ).toEqual(['uniquelocal', '198.51.100.0/24'])
+    expect(() => loadConfig({ ...base, CLICKMONK_TRUSTED_PROXIES: '0.0.0.0/0' })).toThrow(
+      /invalid configuration:\n {2}CLICKMONK_TRUSTED_PROXIES: /,
+    )
+  })
+
+  it('splits resolver addresses, and refuses one that is a host name', () => {
+    expect(
+      loadConfig({ ...base, CLICKMONK_DNS_SERVERS: '192.0.2.53, [2001:db8::53]:5353' }).dnsServers,
+    ).toEqual(['192.0.2.53', '[2001:db8::53]:5353'])
+    expect(() => loadConfig({ ...base, CLICKMONK_DNS_SERVERS: 'resolver.example.test' })).toThrow(
+      /invalid configuration:\n {2}CLICKMONK_DNS_SERVERS: /,
+    )
+  })
+})
+
+// This service and the redirect read this variable through one schema, held in
+// core: the redirect approves a certificate for exactly this name and this
+// service refuses every other Host, so they cannot be allowed to disagree about
+// what the name is. What is checked here is that this service's loader actually
+// applies that schema and maps its result — the rows are the redirect's rows,
+// so a change to the shared schema fails both files together.
+describe('the admin host', () => {
+  it('is null when it is not set, so every route answers 503 until it is', () => {
+    expect(loadConfig(base).adminHost).toBeNull()
+    expect(loadConfig({ ...base, CLICKMONK_ADMIN_HOST: '' }).adminHost).toBeNull()
+    expect(loadConfig({ ...base, CLICKMONK_ADMIN_HOST: '   ' }).adminHost).toBeNull()
+    expect(loadConfig({ ...base, CLICKMONK_ADMIN_HOST: ' admin.example.test ' }).adminHost).toBe(
+      'admin.example.test',
+    )
+  })
+
+  // A value with a scheme or a port would match no Host header and no `ask`
+  // query, so the install would look configured and quietly have no admin
+  // interface. It fails the configuration instead, naming the variable.
+  // The two wildcards are the ones worth stating: the reverse proxy's own host
+  // matcher would honour `*.example.test`, so an operator who wrote one here
+  // would be routing every link domain under it to the admin API. Both
+  // services parse this variable with this schema and refuse to boot instead,
+  // which is a crash-loop an operator sees rather than a mis-route nobody sees.
+  it.each([
+    'https://admin.example.test',
+    'admin.example.test:443',
+    'Admin.Example.Test',
+    'not a host',
+    '*',
+    '*.example.test',
+  ])('refuses %s', (value) => {
+    expect(() => loadConfig({ ...base, CLICKMONK_ADMIN_HOST: value })).toThrow(
+      /CLICKMONK_ADMIN_HOST/,
+    )
+  })
+})

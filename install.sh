@@ -92,6 +92,10 @@ else
       printf 'POSTGRES_PASSWORD=%s\n' "$(secret)"
       printf 'CLICKHOUSE_PASSWORD=%s\n' "$(secret)"
       printf 'CLICKMONK_SECRET=%s\n' "$(secret)"
+      # Optional, and empty by default: with no admin host the stack starts and
+      # serves links exactly as it did before there was an admin API. Written
+      # here so an operator finds it where the other settings are.
+      printf 'CLICKMONK_ADMIN_HOST=\n'
     } >"$tmp"
   )
   # Every value is checked before the file is put in place, and nothing here
@@ -134,11 +138,11 @@ cat <<'NEXT'
 
 ClickMonk is running. Add your first link domain:
 
-  docker compose exec worker node packages/cli/dist/index.js domain add links.example.com
+  docker compose exec -T worker node packages/cli/dist/index.js domain add links.example.com
 
 The worker runs the database migrations when it starts, and nothing here
-waited for them. If that command fails with a Postgres error about a missing
-relation, wait a few seconds and run it again.
+waited for them. If that command says the database has not been migrated yet,
+wait a few seconds and run it again.
 
 That prints a TXT record to publish. Point the domain at this server with an A
 or AAAA record as well. Once the TXT record is found — within a few minutes,
@@ -148,13 +152,28 @@ answering, and it gets a certificate on its first HTTPS request.
 Trying it out without a domain of your own? Add one with --verified, which
 skips the DNS check. Its links answer at once, over plain HTTP on port 80:
 
-  docker compose exec worker node packages/cli/dist/index.js \
+  docker compose exec -T worker node packages/cli/dist/index.js \
     domain add links.example.com --verified
 
 Then add a link:
 
-  docker compose exec worker node packages/cli/dist/index.js \
+  docker compose exec -T worker node packages/cli/dist/index.js \
     link add links.example.com spring --target https://example.com/offer
 
-There is no admin interface yet; the CLI above is the whole of it.
+There is no web interface yet, but there is an admin API. Create its one account
+first -- nothing can authenticate until it exists. The password is piped in and
+never typed as an argument. Keep the -T: without it, Compose asks for a terminal
+inside the container and then refuses to attach the pipe to one, and the command
+never runs.
+
+  printf '%s' 'your-admin-password' | docker compose exec -T worker \
+    node packages/cli/dist/index.js admin create you@example.com
+
+Then set CLICKMONK_ADMIN_HOST in .env to a host name that is not one of your link
+domains, point that name at this server, and run "docker compose up -d". Until
+you do, the admin service answers 503 to everything but its own healthcheck, and
+the CLI is the only way in. The admin API needs a real name over HTTPS; unlike a
+link domain, there is no way to try it over plain HTTP on this host.
+
+README.md, under "The admin API", has the rest.
 NEXT

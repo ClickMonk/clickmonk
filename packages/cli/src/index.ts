@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-import { formatConfigError } from '@clickmonk/core'
+import { formatConfigError, normaliseHost } from '@clickmonk/core'
 import { type ClickHouseClient, createChClient, createPgPool } from '@clickmonk/db'
 import { DEFAULT_IPDATA_DIR } from '@clickmonk/ipdata'
 import { isResolverAddress } from '@clickmonk/worker/domains'
 import { z } from 'zod'
-import { runCli } from './commands.js'
+import { readStdin, runCli } from './commands.js'
 
 // Every command but `ipdata` needs Postgres, and its URL is required up front
 // all the same: the CLI runs where the worker runs, which always has it, and
@@ -53,7 +53,19 @@ async function main(): Promise<number> {
       pg,
       ch,
       out: (s) => console.log(s),
+      // Never echoed, and never typed: a password on the command line would be
+      // visible in `ps` and left in the shell's history, and one typed at a
+      // terminal would be on screen. `isTTY` is undefined when there is no
+      // terminal on this end, which is what `docker compose exec -T` arranges.
+      stdin: () => readStdin(process.stdin, { isTty: process.stdin.isTTY === true }),
       ipdata: { dir: process.env.CLICKMONK_IPDATA_DIR || DEFAULT_IPDATA_DIR },
+      // Normalised rather than validated: the services parse this variable
+      // strictly and refuse to boot on a value that is not a bare lower-case
+      // host name, so the only job left here is to recognise the name a
+      // reverse proxy would match case-insensitively. A value too malformed to
+      // normalise leaves this null, and an install whose admin service will
+      // not boot has no admin host to collide with.
+      adminHost: normaliseHost(process.env.CLICKMONK_ADMIN_HOST ?? ''),
       dnsServers,
     })
   } finally {

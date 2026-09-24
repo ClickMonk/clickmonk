@@ -32,22 +32,43 @@ const COMPOSE_TIMEOUT = 600_000
 const UP_TIMEOUT = 270_000
 const CLIENT_TIMEOUT = 60_000
 
+/** The host name the admin API answers on in these suites. */
+export const ADMIN_HOST = 'admin.example.test'
+
 /** The stack's own passwords. Public, for a stack that binds nothing but 80 and 443. */
 export const ENV = {
   ...process.env,
   POSTGRES_PASSWORD: 'tlstest',
   CLICKHOUSE_PASSWORD: 'tlstest',
   CLICKMONK_SECRET: 'tls-suite-secret-tls-suite-secret-tls',
+  CLICKMONK_ADMIN_HOST: ADMIN_HOST,
 }
 
-export function compose(...args: string[]): string {
+/**
+ * `compose`, with environment variables changed for this one call — which is how
+ * a suite reaches an install configured differently from the one `ENV`
+ * describes, since a variable Compose interpolates cannot be changed on a
+ * container that is already running.
+ *
+ * **A value, always; never a variable taken away.** `Record<string, string>` is
+ * the point of this signature: Compose reads the repository's own `.env` for
+ * anything the environment does not set, so removing a variable here would hand
+ * the stack whatever that file happens to say and make the suite pass or fail on
+ * whose machine it ran. An empty string is set, and wins.
+ */
+export function composeWith(overrides: Record<string, string>, ...args: string[]): string {
+  const env: Record<string, string | undefined> = { ...ENV, ...overrides }
   return execFileSync('docker', ['compose', ...FILES, ...args], {
     cwd: ROOT,
     encoding: 'utf8',
     stdio: 'pipe',
-    env: ENV,
+    env,
     timeout: COMPOSE_TIMEOUT,
   })
+}
+
+export function compose(...args: string[]): string {
+  return composeWith({}, ...args)
 }
 
 /**
@@ -86,6 +107,28 @@ export function cli(...args: string[]): string {
   return compose('exec', '-T', 'worker', 'node', 'packages/cli/dist/index.js', ...args)
 }
 
+/**
+ * The CLI with something on standard input, which is how it takes a password —
+ * it refuses to read one from a terminal, so `-T` is part of the call and not a
+ * tidiness.
+ *
+ * The value goes in as an environment variable of the exec rather than as part
+ * of the command, so it is not in the container's process list. It is still in
+ * this suite's own argument list, which is what a test password is for.
+ */
+export function cliWithInput(input: string, ...args: string[]): string {
+  return compose(
+    'exec',
+    '-T',
+    '-e',
+    `CM_INPUT=${input}`,
+    'worker',
+    'sh',
+    '-c',
+    `printf '%s' "$CM_INPUT" | node packages/cli/dist/index.js ${args.join(' ')}`,
+  )
+}
+
 export interface CurlResult {
   /** The HTTP status, or 0 when the request never got one (a refused handshake, a timeout). */
   status: number
@@ -95,10 +138,19 @@ export interface CurlResult {
   ip: string
   /**
    * The response headers, when the call asked for them with `-D -`; empty
-   * otherwise. The body goes to /dev/null below, so `-D -` has stdout to
-   * itself and the write-out line is the last line of it.
+   * otherwise. The body goes to /dev/null below unless the call asked to keep
+   * it, so `-D -` has stdout to itself and the write-out line is the last line
+   * of it.
    */
   headers: string
+  /**
+   * The response body, for a call made with `{ body: true }`; empty otherwise.
+   * Worth the option: a refusal has to be pinned by how it was refused, and
+   * this API says that in the body — a status alone does not tell an admin
+   * service's 404 for a host it does not answer on from a router's 404 for a
+   * route that does not exist.
+   */
+  body: string
   stderr: string
 }
 
@@ -107,7 +159,11 @@ export interface CurlResult {
  * redirect records is a real client's rather than anything Docker rewrote on
  * the way through a published port.
  */
-export function curl(args: string[], docker: string[] = []): CurlResult {
+export function curl(
+  args: string[],
+  docker: string[] = [],
+  opts: { body?: boolean } = {},
+): CurlResult {
   const r = spawnSync(
     'docker',
     [
@@ -118,8 +174,7 @@ export function curl(args: string[], docker: string[] = []): CurlResult {
       ...docker,
       CURL_IMAGE,
       '-sS',
-      '-o',
-      '/dev/null',
+      ...(opts.body === true ? [] : ['-o', '/dev/null']),
       // On its own line, so a call that also asked for the headers with
       // `-D -` does not have them run into the two values parsed below.
       '-w',
@@ -141,11 +196,24 @@ export function curl(args: string[], docker: string[] = []): CurlResult {
     .slice(nl + 1)
     .trim()
     .split(' ')
+  // Everything curl wrote apart from the write-out line: the header block when
+  // the call asked for one, the body when it kept one, and both in that order
+  // when it asked for both — separated by the blank line that ends a header
+  // block, which is why the split below is on the *first* one.
+  const written = nl === -1 ? '' : out.slice(0, nl)
+  const askedForHeaders = args.includes('-D')
+  const blank = written.indexOf('\n\n')
+  const split = (): { headers: string; body: string } => {
+    if (opts.body !== true) return { headers: written, body: '' }
+    if (!askedForHeaders) return { headers: '', body: written }
+    if (blank === -1) return { headers: written, body: '' }
+    return { headers: written.slice(0, blank), body: written.slice(blank + 2) }
+  }
   return {
     status: Number(code),
     exit: r.status ?? -1,
     ip,
-    headers: nl === -1 ? '' : out.slice(0, nl),
+    ...split(),
     stderr: r.stderr ?? '',
   }
 }

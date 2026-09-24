@@ -1,12 +1,28 @@
 import { parseArgs } from 'node:util'
 import {
+  AccountExistsError,
+  createAccount,
+  disableTotp,
+  loadAccount,
+  setAccountPassword,
+  unusedRecoveryCodeCount,
+} from '@clickmonk/admin/account'
+import {
+  MAX_KEY_DAYS,
+  MAX_KEY_NAME_LENGTH,
+  createApiKey,
+  listApiKeys,
+  revokeApiKey,
+} from '@clickmonk/admin/keys'
+import {
   DEFAULT_TRAFFIC_SETTINGS,
+  MAX_PASSWORD_LENGTH,
+  MIN_ADMIN_PASSWORD_LENGTH,
   NON_HUMAN_CLASSES,
   type TrafficActions,
   type TrafficSettings,
   TrafficSettingsSchema,
   isDomainUrl,
-  newVerificationToken,
   normaliseHost,
   parseLinkInput,
   verificationRecordName,
@@ -22,12 +38,15 @@ import {
   runUpdate,
 } from '@clickmonk/ipdata'
 import {
+  AdminHostDomainError,
   type DomainResolver,
   checkDomain,
+  createDomain,
   createResolver,
   recordDomainCheck,
   runDomainChecks,
 } from '@clickmonk/worker/domains'
+import { createLink } from '@clickmonk/worker/links'
 import type { ZodError } from 'zod'
 
 export interface CliDeps {
@@ -50,6 +69,19 @@ export interface CliDeps {
   dnsServers?: string[]
   /** The clock a check is stamped with, so the worker and the CLI can be made to agree in a test. */
   now?: () => Date
+  /**
+   * The host name the admin API answers on, or null when this install has not
+   * named one. `domain add` refuses it: the reverse proxy sends that name to
+   * the admin service, so a link domain of the same name would accept links
+   * that then never resolve.
+   */
+  adminHost?: string | null
+  /**
+   * Reads a password from standard input. A password never comes from an
+   * argument: `argv` is visible to every process on the host through `ps`, and
+   * it lands in the shell's history. A test passes its own.
+   */
+  stdin?: () => Promise<string>
 }
 
 const USAGE = `usage:
@@ -64,7 +96,13 @@ const USAGE = `usage:
   clickmonk settings set [--action <class>=<action> ...] [--safe-url <url> | --no-safe-url]
                          [--abuser-threshold <n>]
   clickmonk ipdata update
-  clickmonk ipdata status`
+  clickmonk ipdata status
+  clickmonk admin create <email>      # the password is read from standard input
+  clickmonk admin passwd              # the new password is read from standard input
+  clickmonk admin totp disable        # the way back in when the authenticator is gone
+  clickmonk apikey create <name> [--expires-days <n>]
+  clickmonk apikey list
+  clickmonk apikey revoke <id>`
 
 class Rejected extends Error {}
 
@@ -101,26 +139,45 @@ async function domainAdd(args: string[], d: CliDeps): Promise<void> {
   const host = normaliseHost(positionals[0] ?? '')
   if (!host) throw new Rejected(`not a valid host name: ${positionals[0] ?? '(none)'}`)
   for (const u of [values['root-url'], values['not-found-url']]) {
-    // Sent as written, so no token: `{click_id}` would reach the visitor literally.
+    // Sent as written, so no token: `{click_id}` would reach the visitor
+    // literally. Checked here so the refusal names the value the operator
+    // typed; the writer checks it again for callers that have no argument
+    // parser in front of them.
     if (u !== undefined && !isDomainUrl(u))
       throw new Rejected(`not an http(s) URL in printable ASCII without tokens: ${u}`)
   }
-  const token = newVerificationToken()
   const verified = values.verified === true
-  const r = await d.pg.query<{ id: string; verification_token: string }>(
-    `INSERT INTO domains (host, verified, root_url, not_found_url, verification_token)
-     VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (host) DO NOTHING RETURNING id, verification_token`,
-    [host, verified, values['root-url'] ?? null, values['not-found-url'] ?? null, token],
-  )
-  const row = r.rows[0]
-  if (!row) throw new Rejected(`domain already exists: ${host}`)
-  d.out(`domain ${host} ${row.id}`)
+  // The one writer, shared with the API, so `verified` is decided in one
+  // statement and so is the refusal of the admin host. This is the only caller
+  // that may pass `verified` true, and it can because it is typed on the server
+  // by whoever installed this.
+  let created: Awaited<ReturnType<typeof createDomain>>
+  try {
+    created = await createDomain(d.pg, {
+      host,
+      adminHost: d.adminHost ?? null,
+      rootUrl: values['root-url'] ?? null,
+      notFoundUrl: values['not-found-url'] ?? null,
+      verified,
+    })
+  } catch (err) {
+    // The writer's rule, worded for an operator at a shell: it names the
+    // variable they would have to change, which is something only this surface
+    // knows to say.
+    if (err instanceof AdminHostDomainError) {
+      throw new Rejected(
+        `${err.host} is the host name the admin API answers on (CLICKMONK_ADMIN_HOST), so links on it would never resolve; use a different name for links`,
+      )
+    }
+    throw err
+  }
+  if (!created) throw new Rejected(`domain already exists: ${host}`)
+  d.out(`domain ${host} ${created.id}`)
   if (verified) {
     d.out('marked verified without a DNS check, so it can be given a certificate at once')
     return
   }
-  printVerificationRecords(host, row.verification_token, d)
+  printVerificationRecords(host, created.verificationToken, d)
 }
 
 /**
@@ -292,49 +349,21 @@ async function linkAdd(args: string[], d: CliDeps): Promise<void> {
     passthrough: !values['no-passthrough'],
   })
 
-  const client = await d.pg.connect()
-  try {
-    await client.query('BEGIN')
-    const dom = await client.query<{ id: string }>('SELECT id FROM domains WHERE host = $1', [host])
-    const domainId = dom.rows[0]?.id
-    if (!domainId)
-      throw new Rejected(`unknown domain: ${host} (add it with "clickmonk domain add")`)
-    const l = await client.query<{ id: string }>(
-      `INSERT INTO links (domain_id, slug, name, enabled, backup_url, device_urls, returning_url,
-                          countries, click_cap, expires_at, passthrough, traffic_actions)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-       ON CONFLICT (domain_id, slug) DO NOTHING RETURNING id`,
-      [
-        domainId,
-        input.slug,
-        input.name,
-        input.enabled,
-        input.backupUrl,
-        JSON.stringify(input.deviceUrls),
-        input.returningUrl,
-        JSON.stringify(input.countries),
-        input.clickCap,
-        input.expiresAt,
-        input.passthrough,
-        JSON.stringify(input.trafficActions),
-      ],
+  // One writer, shared with the API: a link decides where somebody's traffic
+  // goes, so the statement that writes one exists once. This command answers
+  // its own refusals, and it never asks for a generated slug — the slug is a
+  // positional argument here, so a collision is a refusal.
+  const created = await createLink(d.pg, { host, link: input })
+  if (!created.ok) {
+    throw new Rejected(
+      created.reason === 'unknown_domain'
+        ? `unknown domain: ${host} (add it with "clickmonk domain add")`
+        : created.reason === 'slug_taken'
+          ? `slug already exists on ${host}: ${created.slug}`
+          : 'could not find an unused slug; try again',
     )
-    const linkId = l.rows[0]?.id
-    if (!linkId) throw new Rejected(`slug already exists on ${host}: ${input.slug}`)
-    for (const [i, t] of input.targets.entries()) {
-      await client.query(
-        'INSERT INTO link_targets (link_id, url, weight, position) VALUES ($1, $2, $3, $4)',
-        [linkId, t.url, t.weight, i],
-      )
-    }
-    await client.query('COMMIT')
-    d.out(`link ${host}/${input.slug} ${linkId}`)
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {})
-    throw err
-  } finally {
-    client.release()
   }
+  d.out(`link ${host}/${created.link.slug} ${created.link.id}`)
 
   const safe = NON_HUMAN_CLASSES.filter((c) => input.trafficActions[c] === 'safe')
   if (safe.length > 0 && (await servedSettings(d)).settings.safeUrl === null) {
@@ -342,6 +371,243 @@ async function linkAdd(args: string[], d: CliDeps): Promise<void> {
       `note: ${safe.join(', ')} set to safe, but no safe URL is set, so those clicks are flagged until one is (clickmonk settings set --safe-url <url>)`,
     )
   }
+}
+
+/**
+ * The one way these commands take a password, spelled out, because it is what
+ * the refusal below has to leave the operator holding.
+ */
+const PIPE_IT_IN = `standard input is a terminal, and a password typed at one is echoed on screen and left in the shell's history. Pipe it in instead, with -T so that no terminal is allocated:
+  printf '%s' '<the password>' | docker compose exec -T worker node packages/cli/dist/index.js admin create <email>`
+
+/**
+ * Reads standard input whole and bounded, and refuses outright when standard
+ * input is a terminal.
+ *
+ * The refusal is the point. Left to read a terminal this would wait for a
+ * password nobody has been asked for — a command that looks hung — and the two
+ * ways out of that are both worse than refusing: a prompt saying "type it"
+ * puts the password on screen and into the scrollback, because a terminal
+ * echoes by default and nothing here turns that off; and the documented
+ * invocation passes `-T`, so there is no terminal on this end anyway and any
+ * prompt would be dead in the one path it was for. What is left is to say that
+ * the password has to be piped, and to show how.
+ *
+ * Bounded as it reads rather than after: a command whose refusal is "that is
+ * longer than a password may be" cannot get there by buffering the whole of
+ * whatever was piped in first, and a file redirected in by mistake is exactly
+ * the case that refusal exists for. The cap is four bytes per allowed
+ * character, which is the most UTF-8 spends on one, so no password this build
+ * would accept is cut short by it; anything past the cap stops the read, and
+ * what was read is over the bound and refused by the caller.
+ */
+export async function readStdin(
+  stream: AsyncIterable<Uint8Array | string>,
+  o: { isTty: boolean },
+): Promise<string> {
+  if (o.isTty) throw new Rejected(PIPE_IT_IN)
+  const cap = (MAX_PASSWORD_LENGTH + 1) * 4
+  const chunks: Buffer[] = []
+  let bytes = 0
+  for await (const chunk of stream) {
+    const buf = Buffer.from(chunk as Uint8Array)
+    chunks.push(buf)
+    bytes += buf.length
+    if (bytes > cap) break
+  }
+  return Buffer.concat(chunks).toString('utf8')
+}
+
+/**
+ * Refuses, in the operator's own words, a command that needs the account
+ * before there is one.
+ *
+ * Without it the two commands below leave by throwing: `admin passwd` on the
+ * writer's own "no admin account yet", and `apikey create` on a foreign key
+ * violation from Postgres — a stack trace and exit 3 for what is simply the
+ * wrong order on a first run, and the right order is one line away. It is a
+ * message, not a lock: the write that follows still has the row, the
+ * constraint, or both behind it.
+ */
+async function requireAccount(d: CliDeps): Promise<void> {
+  const r = await d.pg.query('SELECT 1 FROM admin_account')
+  if ((r.rowCount ?? 0) === 0) {
+    throw new Rejected(
+      'this install has no admin account yet; run "clickmonk admin create <email>" first',
+    )
+  }
+}
+
+/**
+ * The password on standard input, with one trailing newline removed so that
+ * `printf 'pw\n' | clickmonk admin create …` and `printf 'pw'` mean the same
+ * thing. Nothing here is printed or logged, ever — the refusal below says how
+ * long what it read was, and never what it was.
+ */
+async function readPassword(d: CliDeps): Promise<string> {
+  if (!d.stdin) throw new Rejected('no way to read the password: standard input is not available')
+  let raw: string
+  try {
+    raw = await d.stdin()
+  } catch (err) {
+    // Converted here because this is the only place that knows the failure came
+    // from reading a password, and it lands in the one classifying catch below
+    // rather than as a stack trace. A stream's error message says what went
+    // wrong with the stream and carries nothing that was read from it.
+    if (err instanceof Rejected) throw err
+    throw new Rejected(
+      `could not read the password from standard input: ${err instanceof Error ? err.message : 'unknown error'}`,
+    )
+  }
+  const password = raw.replace(/\r?\n$/, '')
+  if (password.length < MIN_ADMIN_PASSWORD_LENGTH) {
+    throw new Rejected(
+      `the password must be at least ${MIN_ADMIN_PASSWORD_LENGTH} characters (read ${password.length} from standard input)`,
+    )
+  }
+  // The ceiling as well as the floor, because what is on the far side of it is
+  // not a refusal: the hash function throws, which reaches the operator as an
+  // unexpected error and a stack trace rather than as something they can act
+  // on. A whole file piped in by mistake is exactly how that happens.
+  if (password.length > MAX_PASSWORD_LENGTH) {
+    throw new Rejected(
+      `the password must be at most ${MAX_PASSWORD_LENGTH} characters (read ${password.length} from standard input)`,
+    )
+  }
+  return password
+}
+
+/**
+ * Creates the one admin account. The API cannot do this — there is nothing to
+ * authenticate as yet — so it is typed on the server by whoever installed it.
+ */
+async function adminCreate(args: string[], d: CliDeps): Promise<void> {
+  const { positionals } = parseArgs({ args, allowPositionals: true, options: {} })
+  const email = (positionals[0] ?? '').trim().toLowerCase()
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 320) {
+    throw new Rejected(`not an email address: ${positionals[0] ?? '(none)'}`)
+  }
+  const password = await readPassword(d)
+  try {
+    await createAccount(d.pg, { email, password })
+  } catch (err) {
+    if (err instanceof AccountExistsError) throw new Rejected(err.message)
+    throw err
+  }
+  d.out(`admin ${email} created`)
+  d.out('')
+  d.out('Set CLICKMONK_ADMIN_HOST in .env to the host name the admin API answers on,')
+  d.out('point that name at this server, and restart the stack. Until it is set, the')
+  d.out('admin service answers 503 and links keep serving as usual.')
+}
+
+/** Changes the password, and signs every browser out: a session minted under the old one is exactly what an attacker would still hold. */
+async function adminPasswd(d: CliDeps): Promise<void> {
+  await requireAccount(d)
+  const password = await readPassword(d)
+  // Clearing the failure count and any standing lockout is this command's
+  // alone: it is the way back in, and a lock over a password that no longer
+  // exists would keep the only account out for nothing. The API route asks for
+  // the opposite, because it never has to show the second factor.
+  await setAccountPassword(d.pg, password, { clearLockout: true })
+  const r = await d.pg.query('DELETE FROM sessions')
+  d.out(`password changed; ${r.rowCount ?? 0} session(s) signed out`)
+}
+
+/**
+ * Removes the second factor from the server, which is the only way back in once
+ * the authenticator app and every recovery code are gone.
+ *
+ * The API cannot do this: removing the factor there requires the factor, for the
+ * good reason that disable-then-enrol would otherwise be the bypass. So the way
+ * back has to be somewhere a request cannot reach, and this is it — it runs as
+ * whoever can already open a shell in the container, which is the authority
+ * `admin create` and `admin passwd` already assume, so it adds no privilege that
+ * shell does not have. What it must not be is quiet: an install left with one
+ * factor and nobody aware of it is worse than the lockout it just fixed.
+ */
+async function adminTotpDisable(d: CliDeps): Promise<void> {
+  await requireAccount(d)
+  // Read before the write, because the write is what makes both unknowable.
+  const account = await loadAccount(d.pg)
+  const unused = await unusedRecoveryCodeCount(d.pg)
+  await disableTotp(d.pg, d.now?.() ?? new Date(), { clearLockout: true })
+  // Every session too: one minted while the factor was on was minted by
+  // something that proved a factor this account no longer has.
+  const sessions = await d.pg.query('DELETE FROM sessions')
+  d.out(
+    account?.totpSecret
+      ? 'two-factor authentication disabled'
+      : 'two-factor authentication was not enabled; nothing was removed',
+  )
+  d.out(
+    `${unused} unused recovery code(s) deleted; ${sessions.rowCount ?? 0} session(s) signed out; any lockout cleared`,
+  )
+  d.out('')
+  d.out('The password alone now signs this account in. Enrol an authenticator app again as')
+  d.out('soon as you can: until you do, that password is the only thing standing between')
+  d.out('this install and whoever learns it.')
+}
+
+async function apikeyCreate(args: string[], d: CliDeps): Promise<void> {
+  const { values, positionals } = parseArgs({
+    args,
+    allowPositionals: true,
+    options: { 'expires-days': { type: 'string' } },
+  })
+  // Before the key is minted rather than after: a key references the account
+  // row, so without one this would be a constraint violation carrying the name
+  // of the constraint, which is neither an answer nor something to print.
+  await requireAccount(d)
+  const name = positionals[0] ?? ''
+  if (name.length === 0 || name.length > MAX_KEY_NAME_LENGTH)
+    throw new Rejected(`a key needs a name of 1 to ${MAX_KEY_NAME_LENGTH} characters`)
+  let expiresAt: Date | null = null
+  const now = d.now?.() ?? new Date()
+  if (values['expires-days'] !== undefined) {
+    // `Number('')` is 0 and `Number(' 7 ')` is 7, so the floor below is what
+    // refuses an empty value rather than reading it as no expiry at all.
+    const days = Number(values['expires-days'])
+    if (!Number.isInteger(days) || days < 1 || days > MAX_KEY_DAYS) {
+      throw new Rejected(`--expires-days takes a whole number of days from 1 to ${MAX_KEY_DAYS}`)
+    }
+    expiresAt = new Date(now.getTime() + days * 24 * 60 * 60 * 1000)
+  }
+  const created = await createApiKey(d.pg, { name, expiresAt, now })
+  d.out(created.key)
+  d.out('')
+  d.out('That is the only time this key is shown. Store it somewhere safe; if it is lost,')
+  d.out(`revoke it with "clickmonk apikey revoke ${created.id}" and make another.`)
+}
+
+async function apikeyList(d: CliDeps): Promise<void> {
+  const { keys, truncated } = await listApiKeys(d.pg)
+  if (keys.length === 0) {
+    d.out('no API keys yet (make one with "clickmonk apikey create <name>")')
+    return
+  }
+  for (const k of keys) {
+    const state = k.revoked_at
+      ? `revoked ${k.revoked_at.toISOString()}`
+      : k.expires_at && k.expires_at.getTime() <= (d.now?.() ?? new Date()).getTime()
+        ? `expired ${k.expires_at.toISOString()}`
+        : 'active'
+    const used = k.last_used_at ? `last used ${k.last_used_at.toISOString()}` : 'never used'
+    d.out(`${k.id}  ${k.name}: ${state}; ${used}`)
+  }
+  // Said rather than left silent: a listing that stopped at the cap is a
+  // prefix, and an operator managing the wrong set would never find out.
+  if (truncated) d.out('(more keys than this list shows; revoke some)')
+}
+
+async function apikeyRevoke(args: string[], d: CliDeps): Promise<void> {
+  const { positionals } = parseArgs({ args, allowPositionals: true, options: {} })
+  const id = positionals[0] ?? ''
+  if (!/^[0-9a-f]{16}$/.test(id)) throw new Rejected(`not a key id: ${id || '(none)'}`)
+  if (!(await revokeApiKey(d.pg, id, d.now?.() ?? new Date()))) {
+    throw new Rejected(`no such key, or it was already revoked: ${id}`)
+  }
+  d.out(`key ${id} revoked`)
 }
 
 function printSettings(s: TrafficSettings, d: CliDeps): void {
@@ -530,6 +796,30 @@ export async function runCli(argv: string[], d: CliDeps): Promise<number> {
       ipdataStatus(d)
       return 0
     }
+    if (cmd === 'admin' && sub === 'create') {
+      await adminCreate(rest, d)
+      return 0
+    }
+    if (cmd === 'admin' && sub === 'passwd' && rest.length === 0) {
+      await adminPasswd(d)
+      return 0
+    }
+    if (cmd === 'admin' && sub === 'totp' && rest.length === 1 && rest[0] === 'disable') {
+      await adminTotpDisable(d)
+      return 0
+    }
+    if (cmd === 'apikey' && sub === 'create') {
+      await apikeyCreate(rest, d)
+      return 0
+    }
+    if (cmd === 'apikey' && sub === 'list' && rest.length === 0) {
+      await apikeyList(d)
+      return 0
+    }
+    if (cmd === 'apikey' && sub === 'revoke') {
+      await apikeyRevoke(rest, d)
+      return 0
+    }
     d.out(USAGE)
     return 1
   } catch (err) {
@@ -551,6 +841,24 @@ export async function runCli(argv: string[], d: CliDeps): Promise<number> {
     ) {
       d.out(`error: ${err.message}\n${USAGE}`)
       return 1
+    }
+    // A command run before the migrations. `42P01` is Postgres saying the table
+    // is not there, and the answer is always the same one command, so this is a
+    // refusal rather than an unexpected error. The database's own wording — the
+    // relation it could not find — is not repeated: it names an internal table
+    // to an operator who can do nothing with the name.
+    if (err instanceof Error && 'code' in err && err.code === '42P01') {
+      d.out('error: this database has not been migrated yet; run "clickmonk migrate" first')
+      return 2
+    }
+    // A bound inside a function shared with the admin API, which refuses by
+    // throwing the error that API answers with. By name, for the same reason the
+    // ZodError above is: the class belongs to a module this package does not
+    // import. Its message is written for a person and carries no secret — that
+    // is the rule the API answers by — so it is printed as it stands.
+    if (err instanceof Error && err.name === 'HttpError') {
+      d.out(`error: ${err.message}`)
+      return 2
     }
     throw err
   }

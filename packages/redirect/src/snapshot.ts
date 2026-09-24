@@ -15,6 +15,7 @@ import {
   type Link,
   type LinkTrafficActions,
   LinkTrafficActionsSchema,
+  MAX_PASSWORD_HASH_LENGTH,
   type TrafficSettings,
   TrafficSettingsSchema,
 } from '@clickmonk/core'
@@ -79,6 +80,7 @@ interface LinkRow {
   expires_at: Date | null
   passthrough: boolean
   traffic_actions: unknown
+  password_hash: string | null
   targets: { id: string; url: string; weight: number }[] | null
 }
 
@@ -131,6 +133,42 @@ export function linkActionsFromRow(raw: unknown): {
   return r.success ? { actions: r.data, problem: null } : { actions: {}, problem: issues(r.error) }
 }
 
+const unreadableHashes = (n: number): string =>
+  `password hashes of ${n} link(s) are unreadable; those links stay locked`
+
+/**
+ * What a link's password hash becomes when the file's value is not one: no
+ * verifier parses it, so the link stays locked and every answer to it is
+ * wrong. Falling back to null instead would open a protected link to
+ * everyone, which is the one outcome a corrupt or foreign file must not
+ * produce.
+ */
+export const UNREADABLE_PASSWORD_HASH = 'unreadable'
+
+/**
+ * A link's password hash out of a snapshot file. Postgres has a CHECK on the
+ * column, so only a file — one written by another release, or damaged — can
+ * carry something else there. Absent is no password. A string within the
+ * bound is taken as it is: whether it parses is the verifier's judgement, and
+ * the verifier already treats one it cannot parse as a wrong password.
+ * Anything else keeps the link locked rather than losing its password.
+ */
+export function linkPasswordHashFromFile(raw: unknown): {
+  passwordHash: string | null
+  problem: string | null
+} {
+  if (raw === undefined || raw === null) return { passwordHash: null, problem: null }
+  if (typeof raw === 'string' && raw.length <= MAX_PASSWORD_HASH_LENGTH) {
+    return { passwordHash: raw, problem: null }
+  }
+  // Never the value itself: whatever was written where a hash belongs is not
+  // something to put in a log line.
+  return {
+    passwordHash: UNREADABLE_PASSWORD_HASH,
+    problem: `not a string of at most ${MAX_PASSWORD_HASH_LENGTH} characters`,
+  }
+}
+
 /**
  * One REPEATABLE READ READ ONLY transaction on one connection, so the count,
  * the settings, the domains and the links are all a consistent view of the
@@ -172,6 +210,7 @@ export async function loadFromPostgres(
       const links = await client.query<LinkRow>(`
         SELECT l.id, l.domain_id, l.slug, l.enabled, l.backup_url, l.device_urls, l.returning_url,
                l.countries, l.click_cap, l.expires_at, l.passthrough, l.traffic_actions,
+               l.password_hash,
                json_agg(json_build_object('id', t.id, 'url', t.url, 'weight', t.weight)
                         ORDER BY t.position) FILTER (WHERE t.id IS NOT NULL) AS targets
           FROM links l
@@ -212,6 +251,10 @@ export async function loadFromPostgres(
             clickCap: r.click_cap === null ? null : Number(r.click_cap),
             expiresAt: r.expires_at,
             passthrough: r.passthrough,
+            // Carried so the gate can verify an answer without a query. It is
+            // a hash of a password, not a password, and it never leaves the
+            // process except into the snapshot file beside it.
+            passwordHash: r.password_hash,
             trafficActions: actionsOf(r),
           })),
         new Date(),
@@ -231,7 +274,7 @@ export async function loadFromPostgres(
 
 export function serializeSnapshot(s: Snapshot): string {
   return JSON.stringify({
-    v: 2,
+    v: 3,
     loadedAt: s.loadedAt.toISOString(),
     settings: s.settings,
     ...s.entries(),
@@ -239,11 +282,20 @@ export function serializeSnapshot(s: Snapshot): string {
 }
 
 /**
- * Reads version 2, and version 1 as written before traffic settings existed:
- * the defaults and no link overrides, which is what Postgres held then too.
- * A redirect upgraded while Postgres is down still serves its last snapshot.
- * A version 2 file's settings and overrides pass core's schemas as they do
- * from Postgres; refused, the defaults and no overrides apply, with a log.
+ * Reads version 3 and the two before it: version 2 as written before the file
+ * said it carried a link password hash, and version 1 as written before
+ * traffic settings existed — the defaults and no link overrides, which is what
+ * Postgres held then too. A redirect upgraded while Postgres is down still
+ * serves its last snapshot. A file's settings and overrides pass core's
+ * schemas as they do from Postgres; refused, the defaults and no overrides
+ * apply, with a log.
+ *
+ * Neither the settings nor the password hash is read on the version number.
+ * The settings are read from every file that has them, `v >= 2`, and the hash
+ * from whatever field a file holds, because the field arrived before the
+ * version said so: a build of this release writes `v: 2` files that carry a
+ * hash, and gating either read on `v === 3` would discard it and open every
+ * link those files protect.
  */
 export function deserializeSnapshot(text: string, log: Log = () => {}): Snapshot {
   const raw = JSON.parse(text) as {
@@ -251,29 +303,40 @@ export function deserializeSnapshot(text: string, log: Log = () => {}): Snapshot
     loadedAt: string
     settings?: unknown
     domains: Domain[]
-    links: (Omit<Link, 'expiresAt' | 'trafficActions'> & {
+    links: (Omit<Link, 'expiresAt' | 'trafficActions' | 'passwordHash'> & {
       expiresAt: string | null
       trafficActions?: unknown
+      passwordHash?: unknown
     })[]
   }
-  if (raw.v !== 1 && raw.v !== 2) throw new Error(`unknown snapshot version ${raw.v}`)
+  if (raw.v !== 1 && raw.v !== 2 && raw.v !== 3) {
+    throw new Error(`unknown snapshot version ${raw.v}`)
+  }
   let settings = DEFAULT_TRAFFIC_SETTINGS
-  if (raw.v === 2) {
+  if (raw.v >= 2) {
     const r = validSettings(raw.settings, 'the snapshot file settings')
     if (r.problem) log(`traffic settings: ${r.problem}; using the defaults`)
     settings = r.settings
   }
   let refused = 0
+  let unreadable = 0
   const links = raw.links.map((l) => {
     const a = linkActionsFromRow(l.trafficActions ?? {})
     if (a.problem) refused++
+    // A file written before links had passwords has no such field, and
+    // `undefined` is not `null`: every link read from one would otherwise look
+    // password-protected and the whole install would demand a password.
+    const h = linkPasswordHashFromFile(l.passwordHash)
+    if (h.problem) unreadable++
     return {
       ...l,
       expiresAt: l.expiresAt === null ? null : new Date(l.expiresAt),
+      passwordHash: h.passwordHash,
       trafficActions: a.actions,
     }
   })
   if (refused > 0) log(refusedOverrides(refused))
+  if (unreadable > 0) log(unreadableHashes(unreadable))
   return new Snapshot(raw.domains, links, new Date(raw.loadedAt), 'file', settings)
 }
 

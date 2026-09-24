@@ -25,6 +25,10 @@ services:
         aliases:
           - go.example.test
           - pending.example.test
+          # The admin API's host name, and a link domain the admin suite adds
+          # through the API rather than through the CLI.
+          - admin.example.test
+          - pw.example.test
 
   worker:
     environment:

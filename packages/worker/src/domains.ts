@@ -1,6 +1,12 @@
 import { Resolver } from 'node:dns/promises'
 import { isIP } from 'node:net'
-import { txtRecordsCarryToken, verificationRecordName } from '@clickmonk/core'
+import {
+  isDomainUrl,
+  newVerificationToken,
+  normaliseHost,
+  txtRecordsCarryToken,
+  verificationRecordName,
+} from '@clickmonk/core'
 import type { Pool } from '@clickmonk/db'
 
 /**
@@ -153,6 +159,104 @@ export interface DomainRow {
   verified: boolean
   /** The status this domain's last check recorded, or `null` if it has never been checked. */
   previous_status: DomainDnsStatus | null
+}
+
+export interface CreatedDomain {
+  id: string
+  host: string
+  /** Published as a TXT record by the admin; not a secret, and printed freely. */
+  verificationToken: string
+}
+
+/**
+ * Thrown when the host asked for is the one the admin API answers on.
+ *
+ * Its own class rather than a bare `Error` because, unlike the other two
+ * refusals here, this one is reachable from an operator's first attempt: a
+ * name that looks exactly right is the name they would try. Each caller catches
+ * it and words the refusal for its own surface, the way each already words the
+ * `null` that means the host is taken — a 500 or a stack trace for a typo would
+ * be the wrong answer on either of them.
+ */
+export class AdminHostDomainError extends Error {
+  constructor(readonly host: string) {
+    super(`${host} is the host name the admin API answers on`)
+    this.name = 'AdminHostDomainError'
+  }
+}
+
+/**
+ * Adds a domain, and is the only place that writes one. Shared by the API and
+ * by `clickmonk domain add`, for the same reason `recordDomainCheck` is: the
+ * flag this writes decides whether a host name's links answer and whether
+ * this install asks a certificate authority for a certificate in its name,
+ * and a second copy of the statement is a second place for that flag to be
+ * got wrong.
+ *
+ * `verified` is false unless a caller asks for it, and the only caller that
+ * may ask is one already running on the server — `domain add --verified`,
+ * typed by whoever installed it. Nothing reachable over the network passes
+ * it: the API's own body schema is strict, so a `verified` field is a 400,
+ * and its route never forwards one.
+ *
+ * The host and the URLs are checked here rather than only in the schema in
+ * front of an HTTP request, because this function has callers with no schema
+ * in front of them. Both existing callers reject the same values first, so
+ * nothing either of them answers changes; what this stops is the next caller.
+ * Returns `null` when the host is already taken, which each caller reports in
+ * its own words.
+ *
+ * `adminHost` is required, and null is how a caller says this install has not
+ * named one. Optional, a caller who knows the name and forgets to pass it loses
+ * the rule silently — and what it decides is whether a domain's links resolve
+ * at all, which is the same reason `verified` has to be asked for in so many
+ * words rather than defaulted from somewhere.
+ */
+export async function createDomain(
+  pg: Pool,
+  o: {
+    host: string
+    /** The host name the admin API answers on, or null when none is configured. */
+    adminHost: string | null
+    rootUrl?: string | null
+    notFoundUrl?: string | null
+    verified?: boolean
+  },
+): Promise<CreatedDomain | null> {
+  const host = normaliseHost(o.host)
+  if (!host) throw new Error('a domain needs a valid host name')
+  // One rule, here, because both callers would otherwise need their own copy
+  // of it. The reverse proxy sends the admin host name to the admin service, so
+  // a link domain of that name would take every one of its links with it: they
+  // would be stored, verified, given a certificate, and answer as the API does
+  // instead of redirecting. Normalised on both sides, since the proxy matches a
+  // host name without regard to case or a trailing dot.
+  const adminHost = o.adminHost === null ? null : normaliseHost(o.adminHost)
+  if (adminHost !== null && host === adminHost) throw new AdminHostDomainError(host)
+  // An own property, not an inherited one. `o` is an object literal a caller
+  // builds, and a plain `o.verified` walks the prototype chain: a property
+  // planted on `Object.prototype` would then decide the flag that lets a host
+  // name serve and be given a certificate, for every caller that says nothing
+  // about it. Nothing reaches that today — the API's schema refuses a body
+  // that carries the field at all — but a flag this one must be decided by
+  // what the caller actually wrote.
+  const verified = Object.hasOwn(o, 'verified') && o.verified === true
+  for (const url of [o.rootUrl, o.notFoundUrl]) {
+    // Sent to the visitor as written, so no token: a brace would reach them
+    // literally.
+    if (url !== null && url !== undefined && !isDomainUrl(url)) {
+      throw new Error("a domain's URL must be an absolute http(s) URL with no token")
+    }
+  }
+  const r = await pg.query<{ id: string; verification_token: string }>(
+    `INSERT INTO domains (host, verified, root_url, not_found_url, verification_token)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (host) DO NOTHING RETURNING id, verification_token`,
+    [host, verified, o.rootUrl ?? null, o.notFoundUrl ?? null, newVerificationToken()],
+  )
+  const row = r.rows[0]
+  if (!row) return null
+  return { id: row.id, host, verificationToken: row.verification_token }
 }
 
 export interface DomainCheckRun {

@@ -7,7 +7,11 @@ import {
   TrafficActionsSchema,
 } from './traffic.js'
 
-/** Clicks per minute from one address above which it is an abuser, unless the admin sets another. */
+/**
+ * Clicks per minute from one client above which it is an abuser, unless the admin
+ * sets another. A client is what `rateKey` counts: one IPv4 address, or one IPv6
+ * /64, because an IPv6 client usually holds a whole /64.
+ */
 export const DEFAULT_ABUSER_THRESHOLD = 60
 export const MAX_ABUSER_THRESHOLD = 100_000
 

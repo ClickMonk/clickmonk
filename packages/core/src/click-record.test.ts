@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import {
+  ClickRecordSchema,
   type ClickRecordV1,
   ClickRecordV1Schema,
   type ClickRecordV2,
   ClickRecordV2Schema,
+  MAX_RECORD_VERSION,
   SEALED_SEGMENT_RE,
   SpoolRecordSchema,
   ZERO_UUID,
@@ -43,7 +45,7 @@ describe('ClickRecordV1Schema', () => {
     ['an unknown outcome', { outcome: 'teleported' }],
     ['an over-long user-agent', { userAgent: 'x'.repeat(513) }],
     ['a non-ISO time', { time: 'yesterday' }],
-    ['another version', { v: 3 }],
+    ['another version', { v: 2 }],
   ])('rejects %s', (_label, over) => {
     expect(ClickRecordV1Schema.safeParse({ ...sampleRecord(), ...over }).success).toBe(false)
   })
@@ -117,6 +119,17 @@ describe('ClickRecordV2Schema', () => {
   })
 })
 
+/**
+ * Why a line was refused, not merely that it was: a fixture broken in some
+ * other way would make a refusal test pass without exercising the rule it
+ * names.
+ */
+const refusedFor = (value: unknown): string[] => {
+  const r = SpoolRecordSchema.safeParse(value)
+  expect(r.success).toBe(false)
+  return r.success ? [] : r.error.issues.map((i) => `${i.code}:${i.path.join('.')}`)
+}
+
 describe('SpoolRecordSchema', () => {
   it('reads version 1 and version 2, each by its own rules', () => {
     expect(SpoolRecordSchema.safeParse(sampleRecord()).success).toBe(true)
@@ -130,8 +143,43 @@ describe('SpoolRecordSchema', () => {
     expect(ClickRecordV1Schema.safeParse(sampleV2()).success).toBe(false)
   })
 
-  it('reads no other version', () => {
-    expect(SpoolRecordSchema.safeParse({ ...sampleV2(), v: 3 }).success).toBe(false)
+  it('reads no other version, and refuses it on the version rather than its fields', () => {
+    expect(refusedFor({ ...sampleV2(), v: 4 })).toEqual(['invalid_union_discriminator:v'])
+  })
+})
+
+describe('version 3: the password step', () => {
+  const sampleV3 = (over: Record<string, unknown> = {}) => ({ ...sampleV2(), v: 3, ...over })
+
+  it('is the version the redirect writes, and the newest the worker reads', () => {
+    expect(MAX_RECORD_VERSION).toBe(3)
+    expect(ClickRecordSchema.safeParse(sampleV3()).success).toBe(true)
+    expect(SpoolRecordSchema.safeParse(sampleV3()).success).toBe(true)
+  })
+
+  it('takes the password outcome and step', () => {
+    expect(
+      SpoolRecordSchema.safeParse(sampleV3({ outcome: 'password', step: 'password', status: 200 }))
+        .success,
+    ).toBe(true)
+  })
+
+  // The version is what tells an older worker to leave the segment alone. If
+  // version 2 took the new outcome, a worker that does not know it would read
+  // the line as malformed and drop the click instead.
+  it('is what carries them: version 2 does not', () => {
+    expect(refusedFor({ ...sampleV2(), outcome: 'password' })).toEqual([
+      'invalid_enum_value:outcome',
+    ])
+    expect(refusedFor({ ...sampleV2(), step: 'password' })).toEqual(['invalid_enum_value:step'])
+  })
+
+  it('still refuses everything version 2 refuses', () => {
+    expect(refusedFor(sampleV3({ outcome: 'teleported' }))).toEqual(['invalid_enum_value:outcome'])
+    expect(refusedFor(sampleV3({ trafficClass: 'robot' }))).toEqual([
+      'invalid_enum_value:trafficClass',
+    ])
+    expect(refusedFor(sampleV3({ extra: 1 }))).toEqual(['unrecognized_keys:'])
   })
 })
 

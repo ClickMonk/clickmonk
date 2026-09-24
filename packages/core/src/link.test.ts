@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import {
+  GENERATED_SLUG_LENGTH,
   LinkInputSchema,
+  SLUG_RE,
   isDestinationUrl,
   isDomainUrl,
+  newSlug,
   normaliseHost,
   parseLinkInput,
 } from './link.js'
@@ -140,5 +143,19 @@ describe('traffic action overrides', () => {
     })
     expect(() => parseLinkInput({ ...base, trafficActions: { human: 'block' } })).toThrow()
     expect(() => parseLinkInput({ ...base, trafficActions: { bot: 'drop' } })).toThrow()
+  })
+})
+
+describe('a generated slug', () => {
+  it('is seven characters a validator accepts, and different every time', () => {
+    const slug = newSlug()
+    expect(slug).toHaveLength(GENERATED_SLUG_LENGTH)
+    expect(SLUG_RE.test(slug)).toBe(true)
+    expect(slug).not.toBe(newSlug())
+  })
+
+  it('draws from an alphabet with no look-alike characters', () => {
+    const many = Array.from({ length: 200 }, () => newSlug()).join('')
+    expect(many).not.toMatch(/[0O1lI]/)
   })
 })

@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "${configDir}/dist/.tsbuildinfo-image"
+  },
+  "exclude": ["src/**/*.test.ts", "src/testing.ts"],
+  "references": [
+    {
+      "path": "../core/tsconfig.build.json"
+    },
+    {
+      "path": "../db/tsconfig.build.json"
+    },
+    {
+      "path": "../ipdata/tsconfig.build.json"
+    },
+    {
+      "path": "../worker/tsconfig.build.json"
+    }
+  ]
+}

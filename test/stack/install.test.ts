@@ -125,6 +125,11 @@ describe('install.sh', () => {
     const values = KEYS.map((k) => settingOf(env, k))
     for (const v of values) expect(v).toMatch(/^[0-9a-f]{64}$/)
     expect(new Set(values).size).toBe(3)
+    // The one setting the installer writes with no value, so an operator finds
+    // it where the others are rather than only in .env.example.
+    expect(env, 'the optional setting the installer writes empty').toMatch(
+      /^CLICKMONK_ADMIN_HOST=$/m,
+    )
   })
 
   // The run that generates the secrets is the run that could print one, and in
@@ -225,6 +230,49 @@ describe('install.sh', () => {
       expect(readFileSync(join(dir, '.env'), 'utf8'), host).toMatch(
         /^CLICKMONK_SECRET=[0-9a-f]{64}$/m,
       )
+    }
+  })
+
+  // Every documented invocation of the CLI, in the script and in the README,
+  // has to be one an operator can pipe a password into.
+  //
+  // What goes wrong without the flag, measured against `docker compose` rather
+  // than assumed: run from a terminal with a password piped in, Compose asks for
+  // a TTY, then refuses to attach the pipe to it — `cannot attach stdin to a
+  // TTY-enabled container because stdin is not a terminal`, exit 1, and the
+  // command never runs. Run with no terminal anywhere, as in a script, the same
+  // line works whether the flag is there or not. So the flag is never wrong and
+  // its absence is wrong exactly where an operator is typing, which is where
+  // every one of these lines is read.
+  //
+  // A line counts as an invocation by naming the CLI's entry point, not by the
+  // compose subcommand: `exec` and `run` both take a password and both take the
+  // flag, and an unrelated `exec -T postgres psql` is not one of these. Either
+  // spelling of the flag passes, because they are the same instruction.
+  //
+  // Continuations are joined before anything is selected. A documented command
+  // is wrapped for width, and `docker compose exec` and the entry point land on
+  // opposite sides of the break as often as not; selecting raw lines dropped
+  // every one of those, which included both of the piped examples — the only
+  // documented commands that read standard input at all, and so the only ones
+  // this test is really about. The piped-invocation floor below is what keeps
+  // that from happening again quietly: a filter that stops selecting them fails
+  // here rather than passing with less to check.
+  it('invokes the CLI in a way a password can be piped into, everywhere it is documented', () => {
+    for (const file of ['install.sh', 'README.md']) {
+      const invocations = readFileSync(join(ROOT, file), 'utf8')
+        .replace(/\\\n[ \t]*/g, ' ')
+        .split('\n')
+        .filter((l) => /docker compose\b.*\b(exec|run)\b/.test(l))
+        .filter((l) => l.includes('packages/cli/dist/index.js'))
+      expect(invocations.length, `${file}: documented CLI invocations`).toBeGreaterThan(0)
+      for (const line of invocations) {
+        expect(line, `${file}: ${line.trim()}`).toMatch(/\s(?:-T|--no-TTY)\s/)
+      }
+      expect(
+        invocations.filter((l) => /\|\s*docker compose/.test(l)).length,
+        `${file}: documented invocations that pipe a password in`,
+      ).toBeGreaterThan(0)
     }
   })
 

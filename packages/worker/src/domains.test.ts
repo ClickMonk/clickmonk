@@ -3,10 +3,12 @@ import type { Pool } from '@clickmonk/db'
 import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import {
+  AdminHostDomainError,
   type DomainResolver,
   MAX_ADDRESSES,
   MAX_DETAIL,
   checkDomain,
+  createDomain,
   isResolverAddress,
   recordDomainCheck,
   runDomainChecks,
@@ -230,6 +232,119 @@ const verifiedOf = (id: string) =>
   pool
     .query<{ verified: boolean }>('SELECT verified FROM domains WHERE id = $1', [id])
     .then((r) => r.rows[0]?.verified)
+
+// The single writer both the API and `domain add` go through. These call it
+// directly, with no schema and no argument parser in front of it, which is
+// the case its own checks exist for.
+describe('createDomain', () => {
+  afterEach(async () => {
+    await pool.query('TRUNCATE domains CASCADE')
+  })
+
+  it('writes an unverified domain with a token of its own', async () => {
+    const created = await createDomain(pool, { host: 'Go.Example.TEST.', adminHost: null })
+    expect(created?.host).toBe('go.example.test')
+    const row = await pool.query<{ host: string; verified: boolean; verification_token: string }>(
+      'SELECT host, verified, verification_token FROM domains',
+    )
+    expect(row.rows[0]?.host).toBe('go.example.test')
+    expect(row.rows[0]?.verified).toBe(false)
+    expect(row.rows[0]?.verification_token).toBe(created?.verificationToken)
+  })
+
+  // The flag that decides whether a host name serves and whether this install
+  // asks for a certificate in its name. A caller that says nothing about it
+  // gets `false`, so the only way to `true` is asking for it in so many words.
+  it('is verified only when the caller asks in so many words', async () => {
+    await createDomain(pool, { host: 'quiet.example.test', adminHost: null })
+    await createDomain(pool, { host: 'asked.example.test', adminHost: null, verified: true })
+    const rows = await pool.query<{ host: string; verified: boolean }>(
+      'SELECT host, verified FROM domains ORDER BY host',
+    )
+    expect(rows.rows.map((r) => `${r.host}:${r.verified}`)).toEqual([
+      'asked.example.test:true',
+      'quiet.example.test:false',
+    ])
+  })
+
+  // The caller's own words decide this flag, and nothing else does. A plain
+  // property read walks the prototype chain, so a planted property would
+  // answer for every caller that said nothing.
+  it('is not verified by a property planted on Object.prototype', async () => {
+    Object.defineProperty(Object.prototype, 'verified', {
+      value: true,
+      configurable: true,
+      enumerable: false,
+    })
+    try {
+      const created = await createDomain(pool, { host: 'planted.example.test', adminHost: null })
+      expect(await verifiedOf(created?.id as string)).toBe(false)
+    } finally {
+      // Removed outright rather than set to undefined: a property left on
+      // Object.prototype is visible to every object in the process.
+      Reflect.deleteProperty(Object.prototype, 'verified')
+    }
+  })
+
+  it('refuses a URL carrying a token, and a host name that is not one', async () => {
+    await expect(
+      createDomain(pool, {
+        host: 'go.example.test',
+        adminHost: null,
+        rootUrl: 'https://example.com/{click_id}',
+      }),
+    ).rejects.toThrow(/no token/)
+    await expect(
+      createDomain(pool, {
+        host: 'go.example.test',
+        adminHost: null,
+        notFoundUrl: 'https://example.com/{click_id}',
+      }),
+    ).rejects.toThrow(/no token/)
+    await expect(createDomain(pool, { host: 'not a host', adminHost: null })).rejects.toThrow(
+      /host name/,
+    )
+    expect((await pool.query('SELECT 1 FROM domains')).rowCount).toBe(0)
+  })
+
+  // The one rule about the admin host, in the one writer: the reverse proxy
+  // sends that name to the admin service, so links stored under it would be
+  // verified, given a certificate and then answered by the API rather than
+  // redirected — a domain that looks set up correctly and serves nothing.
+  it('refuses the host name the admin API answers on, and writes nothing', async () => {
+    await expect(
+      createDomain(pool, { host: 'admin.example.test', adminHost: 'admin.example.test' }),
+    ).rejects.toThrow(AdminHostDomainError)
+    // Both sides are normalised, because a host name is matched without regard
+    // to case or a trailing dot — the host as an operator typed it, and the
+    // configured name, which this function's callers are not all obliged to
+    // have normalised before they get here.
+    await expect(
+      createDomain(pool, { host: 'Admin.Example.TEST.', adminHost: 'admin.example.test' }),
+    ).rejects.toThrow(AdminHostDomainError)
+    await expect(
+      createDomain(pool, { host: 'admin.example.test', adminHost: 'Admin.Example.TEST.' }),
+    ).rejects.toThrow(AdminHostDomainError)
+    expect((await pool.query('SELECT 1 FROM domains')).rowCount).toBe(0)
+  })
+
+  it('writes any other host on an install that has an admin host, and every host on one that has none', async () => {
+    expect(
+      await createDomain(pool, { host: 'links.example.test', adminHost: 'admin.example.test' }),
+    ).not.toBeNull()
+    // No admin host configured: nothing routes that name away, so there is
+    // nothing to refuse and the name is an ordinary link domain.
+    expect(await createDomain(pool, { host: 'admin.example.test', adminHost: null })).not.toBeNull()
+    const rows = await pool.query<{ host: string }>('SELECT host FROM domains ORDER BY host')
+    expect(rows.rows.map((r) => r.host)).toEqual(['admin.example.test', 'links.example.test'])
+  })
+
+  it('answers null for a host this install already has', async () => {
+    expect(await createDomain(pool, { host: 'go.example.test', adminHost: null })).not.toBeNull()
+    expect(await createDomain(pool, { host: 'go.example.test', adminHost: null })).toBeNull()
+    expect((await pool.query('SELECT 1 FROM domains')).rowCount).toBe(1)
+  })
+})
 
 describe('recordDomainCheck', () => {
   afterEach(async () => {

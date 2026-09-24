@@ -32,7 +32,7 @@ vi.mock('node:fs', async (importOriginal) => {
 })
 
 const rec = (n: number): ClickRecord => ({
-  v: 2,
+  v: 3,
   clickId: `01920000-0000-7000-8000-${String(n).padStart(12, '0')}`,
   time: new Date().toISOString(),
   host: 'go.example.test',

@@ -11,6 +11,12 @@ export function buildInternalApp(deps: {
   /** Each IP data source loaded, with its version and age; empty while there is none. */
   ipdata?: () => SourceStatus[]
   rate?: Pick<RateCounter, 'stats'>
+  /**
+   * The host name the admin interface answers on, or null when this install
+   * has none. It is not a link domain, so it has no verified row of its own,
+   * and without it the admin interface could never obtain a certificate.
+   */
+  adminHost?: string | null
 }): FastifyInstance {
   const app = Fastify({ logger: false })
 
@@ -29,11 +35,20 @@ export function buildInternalApp(deps: {
     }
   })
 
-  // Caddy's on-demand TLS asks here before obtaining a certificate.
-  // Yes only for a domain the admin added and verified.
-  app.get<{ Querystring: { domain?: string } }>('/ask', async (req, reply) => {
-    const host = req.query.domain ? normaliseHost(req.query.domain) : null
+  // Caddy's on-demand TLS asks here before obtaining a certificate. Yes for a
+  // domain the admin added and verified, and for the admin host name this
+  // install is configured with. Nothing else, ever: a host name pointed at
+  // this server by somebody else gets no certificate and no ACME request.
+  app.get<{ Querystring: { domain?: string | string[] } }>('/ask', async (req, reply) => {
+    // A repeated `?domain=` arrives as an array, which is not a host name and
+    // is refused with the other malformed shapes. Typed and checked rather
+    // than assumed: this is an unauthenticated request on the port that
+    // decides certificate issuance, and calling a string method on the array
+    // made it a 500.
+    const asked = req.query.domain
+    const host = typeof asked === 'string' ? normaliseHost(asked) : null
     if (!host) return reply.code(400).send()
+    if (deps.adminHost && host === deps.adminHost) return reply.code(200).send()
     const d = deps.snapshot()?.domain(host)
     return d?.verified ? reply.code(200).send() : reply.code(404).send()
   })

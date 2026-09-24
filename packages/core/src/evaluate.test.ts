@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { type EvalInput, evaluate, slugFromPath } from './evaluate.js'
+import { type Decision, type EvalInput, evaluate, slugFromPath } from './evaluate.js'
 import type { CountryRule, Domain, Link } from './link.js'
 import { MAX_DESTINATION_LENGTH } from './passthrough.js'
 import { DEFAULT_TRAFFIC_SETTINGS, type TrafficSettings } from './settings.js'
@@ -29,6 +29,7 @@ function link(over: Partial<Link> = {}): Link {
     clickCap: null,
     expiresAt: null,
     passthrough: true,
+    passwordHash: null,
     trafficActions: {},
     ...over,
   }
@@ -68,6 +69,7 @@ function input(over: Partial<EvalInput> = {}, facts: Partial<EvalInput['facts']>
       seenLink: false,
       clickId: '01920000-0000-7000-8000-000000000001',
       random: 0.5,
+      passwordOk: false,
       ...facts,
     },
   }
@@ -504,6 +506,112 @@ describe('classify, in order', () => {
     expect(
       evaluate(input({ ...flagged, link: link({ countries: { mode: 'allow', list: ['FR'] } }) })),
     ).toMatchObject({ outcome: 'country_blocked', action: 'flag' })
+  })
+})
+
+describe('password', () => {
+  // The evaluator only asks whether there IS a hash, never what it is, so this
+  // is deliberately not hash-shaped: no hash literal is committed anywhere in
+  // the tree.
+  const locked = link({ passwordHash: 'no-verifier-accepts-this' })
+  /**
+   * Every field of a Decision, so every assertion below is over the whole
+   * decision: a step that fires in the wrong order changes the outcome, the
+   * step, the status, the destination and the action together, and a partial
+   * assertion would let some of that through.
+   */
+  const decision = (over: Partial<Decision> = {}): Decision => ({
+    status: 302,
+    location: null,
+    outcome: 'target',
+    step: 'destination',
+    targetId: null,
+    counted: false,
+    reached: false,
+    action: null,
+    ...over,
+  })
+  const PAGE = decision({ status: 200, outcome: 'password', step: 'password' })
+  const SENT = decision({
+    location: 'https://example.com/offer',
+    targetId: '00000000-0000-4000-8000-0000000000f1',
+    reached: true,
+    counted: true,
+  })
+
+  it('shows the page for a link with a password and no proof', () => {
+    expect(evaluate(input({ link: locked }, { passwordOk: false }))).toEqual(PAGE)
+  })
+
+  it('sends the visitor on once the proof is there', () => {
+    expect(evaluate(input({ link: locked }, { passwordOk: true }))).toEqual(SENT)
+  })
+
+  it('does not ask a link that has no password', () => {
+    expect(evaluate(input({}, { passwordOk: false }))).toEqual(SENT)
+  })
+
+  // The order that matters: classify, then limits, then password, then country.
+  it('is asked after classification, so a blocked click never sees the page', () => {
+    expect(
+      evaluate(
+        input(
+          { link: locked, traffic: traffic('bot'), settings: settings({ bot: 'block' }) },
+          { passwordOk: false },
+        ),
+      ),
+    ).toEqual(decision({ status: 403, outcome: 'blocked', step: 'classify', action: 'block' }))
+  })
+
+  it('is asked after the safe action, so flagged traffic is diverted rather than prompted', () => {
+    expect(
+      evaluate(
+        input(
+          {
+            link: locked,
+            traffic: traffic('datacenter'),
+            settings: settings({ datacenter: 'safe' }, 'https://example.com/safe'),
+          },
+          { passwordOk: false },
+        ),
+      ),
+    ).toEqual(
+      decision({
+        location: 'https://example.com/safe',
+        outcome: 'safe',
+        step: 'classify',
+        action: 'safe',
+      }),
+    )
+  })
+
+  it('is asked after expiry and the cap, so a dead link does not collect a password', () => {
+    const expired = link({
+      passwordHash: locked.passwordHash,
+      expiresAt: new Date(Date.now() - HOUR),
+      backupUrl: 'https://example.com/backup',
+    })
+    expect(evaluate(input({ link: expired }, { passwordOk: false }))).toEqual(
+      decision({ location: 'https://example.com/backup', outcome: 'expired', step: 'limits' }),
+    )
+    const capped = link({ passwordHash: locked.passwordHash, clickCap: 1 })
+    expect(evaluate(input({ link: capped, capExhausted: true }, { passwordOk: false }))).toEqual(
+      decision({ status: 410, outcome: 'capped', step: 'limits' }),
+    )
+  })
+
+  it('is asked before the country rule, so the page does not say who may follow the link', () => {
+    const geoLocked = link({
+      passwordHash: locked.passwordHash,
+      countries: { mode: 'allow', list: ['FR'] },
+    })
+    expect(evaluate(input({ link: geoLocked }, { passwordOk: false, country: 'DE' }))).toEqual(PAGE)
+  })
+
+  it('records the action of a flagged click that is prompted', () => {
+    expect(
+      evaluate(input({ link: locked, traffic: traffic('bot') }, { passwordOk: false })),
+    ).toEqual(decision({ status: 200, outcome: 'password', step: 'password', action: 'flag' }))
   })
 })
 

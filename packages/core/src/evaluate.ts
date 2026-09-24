@@ -17,8 +17,9 @@ export type Outcome =
   | 'country_blocked'
   | 'blocked'
   | 'safe'
+  | 'password'
 
-export type Step = 'resolve' | 'classify' | 'limits' | 'country' | 'destination'
+export type Step = 'resolve' | 'classify' | 'limits' | 'country' | 'destination' | 'password'
 
 export interface RequestFacts {
   /** Pathname only, starting with `/`. */
@@ -33,6 +34,12 @@ export interface RequestFacts {
   clickId: string
   /** In [0, 1); chooses the rotation target. */
   random: number
+  /**
+   * The visitor has already answered this link's password: a valid, unexpired
+   * proof cookie for this link and this password. Ignored for a link with no
+   * password.
+   */
+  passwordOk: boolean
 }
 
 export interface EvalInput {
@@ -46,7 +53,8 @@ export interface EvalInput {
 }
 
 export interface Decision {
-  status: 302 | 403 | 404 | 410
+  /** 200 is the password page: the only body this service sends a visitor that is not an error. */
+  status: 200 | 302 | 403 | 404 | 410
   location: string | null
   outcome: Outcome
   step: Step
@@ -186,7 +194,13 @@ export function evaluate(input: EvalInput): Decision {
   }
   if (input.capExhausted) return decided(toBackup(link, facts, 'capped', 410))
 
-  // 4. Password: not implemented yet.
+  // 4. Password. The page is shown on the link's own URL, so the proof cookie
+  // is first-party to the link domain and the visitor never leaves the host
+  // they clicked. Nothing about the password is in the answer: the same page
+  // is sent whether this is a first visit or a wrong answer.
+  if (link.passwordHash !== null && !facts.passwordOk) {
+    return decided(stop(200, null, 'password', 'password'))
+  }
 
   // 5. Country.
   if (!countryAllowed(link.countries, facts.country)) {

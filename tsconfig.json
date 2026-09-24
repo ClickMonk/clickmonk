@@ -1,6 +1,7 @@
 {
   "files": [],
   "references": [
+    { "path": "packages/admin" },
     { "path": "packages/cli" },
     { "path": "packages/core" },
     { "path": "packages/db" },

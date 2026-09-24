@@ -20,9 +20,12 @@ export const MAX_SEGMENT_BYTES = 64 * 1024 * 1024
 
 /**
  * A version 1 record predates classification: it is stored unclassified
- * (an empty class, no signals), never as human.
+ * (an empty class, no signals), never as human. Version 3 differs from
+ * version 2 only in the outcome and step it may name, and carries exactly
+ * the same fields, so one mapping reads both.
  */
 export function toClickhouseRow(r: SpoolRecord): Record<string, string | number | string[]> {
+  const classified = r.v === 1 ? null : r
   return {
     click_id: r.clickId,
     // DateTime64(3) accepts 'YYYY-MM-DD HH:MM:SS.mmm' in UTC.
@@ -41,18 +44,18 @@ export function toClickhouseRow(r: SpoolRecord): Record<string, string | number 
     country: r.country ?? '',
     region: '',
     city: '',
-    geo_source: r.v === 2 ? r.geoSource : '',
+    geo_source: classified?.geoSource ?? '',
     device: r.device,
     user_agent: r.userAgent,
     referrer: r.referrer,
     ip: r.ip,
     cap_unchecked: r.capUnchecked ? 1 : 0,
-    traffic_class: r.v === 2 ? r.trafficClass : '',
-    signals: r.v === 2 ? r.signals : [],
-    action: r.v === 2 ? (r.action ?? '') : '',
-    os: r.v === 2 ? r.os : '',
-    browser: r.v === 2 ? r.browser : '',
-    asn: r.v === 2 ? (r.asn ?? 0) : 0,
+    traffic_class: classified?.trafficClass ?? '',
+    signals: classified?.signals ?? [],
+    action: classified?.action ?? '',
+    os: classified?.os ?? '',
+    browser: classified?.browser ?? '',
+    asn: classified?.asn ?? 0,
   }
 }
 

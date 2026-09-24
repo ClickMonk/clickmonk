@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { addressOnly, canonicalIp, parseIp } from './ip.js'
+import { addressOnly, canonicalIp, parseIp, rateKey } from './ip.js'
 
 describe('parseIp', () => {
   it.each([
@@ -80,5 +80,32 @@ describe('canonicalIp', () => {
     ['', ''],
   ])('%s -> %s', (s, want) => {
     expect(canonicalIp(s)).toBe(want)
+  })
+})
+
+describe('rateKey', () => {
+  it('keys IPv4 by address, IPv4-mapped IPv6 as IPv4, and refuses what is not an address', () => {
+    expect(rateKey('192.0.2.1')).toBe(rateKey('::ffff:192.0.2.1'))
+    expect(rateKey('192.0.2.1')).not.toBe(rateKey('192.0.2.2'))
+    expect(rateKey('nope')).toBeNull()
+  })
+
+  it('keys every address in one IPv6 /64 the same, and a different /64 differently', () => {
+    // The whole point of the function: a client that holds a /64 cannot buy a
+    // second allowance by picking another address out of it.
+    expect(rateKey('2001:db8::1')).toBe(rateKey('2001:db8::2'))
+    expect(rateKey('2001:db8::1')).toBe(rateKey('2001:db8:0:0:ffff:ffff:ffff:ffff'))
+    expect(rateKey('2001:db8::1')).not.toBe(rateKey('2001:db8:0:1::1'))
+  })
+
+  it('tags the family, so no IPv4 key can ever be an IPv6 key', () => {
+    // A companion assertion, and one that cannot be pinned by a mutation on its
+    // own: building a colliding pair would need an IPv4 address whose 32-bit
+    // value equals an IPv6 address's first 32 bits, and no such pair exists
+    // inside the documentation ranges this repository may use. It is kept
+    // because the property matters and the tag is what makes it structural —
+    // an IPv4 key is one decimal number, an IPv6 key always carries a colon.
+    expect(rateKey('192.0.2.1')).toMatch(/^4:\d+$/)
+    expect(rateKey('2001:db8::1')).toMatch(/^6:\d+:\d+$/)
   })
 })

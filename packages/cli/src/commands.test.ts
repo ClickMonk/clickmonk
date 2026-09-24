@@ -2,11 +2,23 @@ import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gzipSync } from 'node:zlib'
+import { signIn } from '@clickmonk/admin/account'
+import { MAX_KEYS_LISTED, MAX_KEY_DAYS, MAX_KEY_NAME_LENGTH } from '@clickmonk/admin/keys'
+import {
+  ADMIN_SCRYPT,
+  LINK_SCRYPT,
+  MAX_PASSWORD_LENGTH,
+  SCRYPT_PREFIX,
+  hashPassword,
+  hashToken,
+  parseApiKey,
+  verifyPassword,
+} from '@clickmonk/core'
 import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { type Fetcher, SOURCES, SOURCE_IDS } from '@clickmonk/ipdata'
 import type { DomainResolver } from '@clickmonk/worker/domains'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { runCli } from './commands.js'
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { readStdin, runCli } from './commands.js'
 
 const pg = testPg()
 const ch = testCh()
@@ -60,6 +72,24 @@ describe('clickmonk cli', () => {
     expect(out).toContain(
       `_clickmonk.go.example.test  TXT  "clickmonk-verify=${r.rows[0]?.verification_token}"`,
     )
+  })
+
+  // The second add must not overwrite the first: the domain it would replace
+  // may already be verified and serving.
+  it('rejects a second domain with the same host, and leaves the first alone', async () => {
+    expect(await run('domain', 'add', 'twice.example.test')).toBe(0)
+    const first = await pg.query<{ id: string; verification_token: string }>(
+      'SELECT id, verification_token FROM domains WHERE host = $1',
+      ['twice.example.test'],
+    )
+    lines.length = 0
+    expect(await run('domain', 'add', 'twice.example.test')).toBe(2)
+    expect(lines).toEqual(['error: domain already exists: twice.example.test'])
+    const after = await pg.query<{ id: string; verification_token: string }>(
+      'SELECT id, verification_token FROM domains WHERE host = $1',
+      ['twice.example.test'],
+    )
+    expect(after.rows).toEqual(first.rows)
   })
 
   it('rejects a bad host and a bad fallback URL', async () => {
@@ -633,5 +663,622 @@ describe('clickmonk domain list and verify', () => {
     expect(out).toContain('nv.example.test: unverified')
     expect(out).toContain('_clickmonk.nv.example.test  TXT')
     expect(out).toContain('point nv.example.test at this server with an A or AAAA record')
+  })
+})
+
+describe('the admin account and API keys from the CLI', () => {
+  /** The moment the clock reads for every command below, so an expiry is exact. */
+  const NOW = new Date('2026-09-23T10:00:00.000Z')
+
+  /**
+   * How many times a command reached for standard input. A guard that has to
+   * refuse *before* the password is read — every one that answers "there is no
+   * account yet" — is only pinned by something that notices the read.
+   */
+  const stdin = { reads: 0 }
+
+  /** The CLI with a password on standard input, which is the only way it takes one. */
+  const withPassword = (password: string, ...argv: string[]) =>
+    runCli(argv, {
+      pg,
+      ch: () => ch,
+      out: (s) => lines.push(s),
+      ipdata: { dir: ipdataDir },
+      stdin: async () => {
+        stdin.reads++
+        return password
+      },
+      now: () => NOW,
+    })
+
+  /** The same, at a later moment: what an operator sees once a key has run out. */
+  const later = (days: number, ...argv: string[]) =>
+    runCli(argv, {
+      pg,
+      ch: () => ch,
+      out: (s) => lines.push(s),
+      ipdata: { dir: ipdataDir },
+      now: () => new Date(NOW.getTime() + days * 86_400_000),
+    })
+
+  const account = () =>
+    pg.query<{ email: string; password_hash: string }>(
+      'SELECT email, password_hash FROM admin_account',
+    )
+
+  /**
+   * A stored hash for the account the key tests need, derived here rather than
+   * written out, and at the link cost because nothing below verifies against
+   * it: this is the cheapest thing that satisfies the column's own check.
+   */
+  let storedHash = ''
+  beforeAll(async () => {
+    storedHash = await hashPassword('nothing below verifies against this', LINK_SCRYPT)
+  })
+
+  /**
+   * An API key references the account row, so a key cannot exist without one.
+   * Written straight in: `admin create` has its own tests, and going through it
+   * here would cost every key test a scrypt pass at the admin's cost.
+   */
+  const anAccount = () =>
+    pg.query('INSERT INTO admin_account (email, password_hash) VALUES ($1, $2)', [
+      'admin@example.com',
+      storedHash,
+    ])
+
+  beforeEach(async () => {
+    lines.length = 0
+    stdin.reads = 0
+    await pg.query('TRUNCATE admin_account, admin_recovery_codes, sessions, api_keys')
+  })
+
+  it('creates the one admin account, and says what to set next', async () => {
+    expect(
+      await withPassword('a decent admin password', 'admin', 'create', 'Admin@Example.com'),
+    ).toBe(0)
+    const r = await account()
+    expect(r.rows[0]?.email).toBe('admin@example.com')
+    // The frame and the admin's cost, built from the constants rather than
+    // written out: no `scrypt$…` literal is committed anywhere in this tree.
+    expect(r.rows[0]?.password_hash.startsWith(`${SCRYPT_PREFIX}$${ADMIN_SCRYPT.N}$`)).toBe(true)
+    const out = lines.join('\n')
+    expect(out).toContain('admin admin@example.com created')
+    expect(out).toContain('CLICKMONK_ADMIN_HOST')
+    // The password is never printed, whatever else is.
+    expect(out).not.toContain('a decent admin password')
+  })
+
+  // Ordered so that each refusal is the only thing that could have produced
+  // it: the floor and the address are tried while there is no account, because
+  // once one exists a second `admin create` is refused whatever the password
+  // or the address was, and a test run in that order passes with the floor
+  // taken out.
+  it('refuses a short password, an address that is not one, and a second account', async () => {
+    expect(await withPassword('short', 'admin', 'create', 'admin@example.com')).toBe(2)
+    expect(lines.join('\n')).toContain('at least 12 characters')
+    // Neither the password nor its length is echoed back.
+    expect(lines.join('\n')).not.toContain('short')
+    expect((await account()).rowCount).toBe(0)
+
+    lines.length = 0
+    expect(await withPassword('a decent admin password', 'admin', 'create', 'not-an-address')).toBe(
+      2,
+    )
+    expect(lines.join('\n')).toContain('not an email address')
+    expect((await account()).rowCount).toBe(0)
+
+    expect(
+      await withPassword('a decent admin password', 'admin', 'create', 'admin@example.com'),
+    ).toBe(0)
+    const first = await account()
+    lines.length = 0
+    expect(
+      await withPassword('another decent password', 'admin', 'create', 'other@example.com'),
+    ).toBe(2)
+    expect(lines.join('\n')).toContain('already has an admin account')
+    // The refusal is not enough on its own: the account it would have replaced
+    // may be the only way into this install, so the row is read back whole.
+    expect((await account()).rows).toEqual(first.rows)
+  })
+
+  // 201 is written out. Derived from the constant, this would move with a
+  // raised bound and pass against a command that had lost the check.
+  it('refuses a password longer than anything it can hash, rather than throwing', async () => {
+    expect(MAX_PASSWORD_LENGTH).toBe(200)
+    expect(await withPassword('p'.repeat(201), 'admin', 'create', 'admin@example.com')).toBe(2)
+    expect(lines.join('\n')).toContain('at most 200 characters')
+    expect((await account()).rowCount).toBe(0)
+    // The bound itself is a password this install accepts.
+    expect(await withPassword('p'.repeat(200), 'admin', 'create', 'admin@example.com')).toBe(0)
+  })
+
+  it('takes a password with a trailing newline, as a shell pipe sends one', async () => {
+    expect(
+      await withPassword('a decent admin password\n', 'admin', 'create', 'admin@example.com'),
+    ).toBe(0)
+    const r = await account()
+    expect(
+      await verifyPassword('a decent admin password', r.rows[0]?.password_hash as string),
+    ).toBe(true)
+    // And the newline is not part of it, so the two spellings are one password.
+    expect(
+      await verifyPassword('a decent admin password\n', r.rows[0]?.password_hash as string),
+    ).toBe(false)
+  })
+
+  it('changes the password and signs every browser out', async () => {
+    await withPassword('a decent admin password', 'admin', 'create', 'admin@example.com')
+    const before = (await account()).rows[0]?.password_hash as string
+    await pg.query(
+      "INSERT INTO sessions (token_hash, expires_at) VALUES ($1, now() + interval '1 day')",
+      ['a'.repeat(64)],
+    )
+    lines.length = 0
+    expect(await withPassword('a new decent password', 'admin', 'passwd')).toBe(0)
+    expect(lines.join('\n')).toContain('1 session(s) signed out')
+    expect((await pg.query('SELECT 1 FROM sessions')).rowCount).toBe(0)
+    const after = (await account()).rows[0]?.password_hash as string
+    expect(after).not.toBe(before)
+    expect(await verifyPassword('a new decent password', after)).toBe(true)
+  })
+
+  // The lockout is cleared with the password because this command is the way
+  // back in: an admin locked out at the form sets a new one and uses it at
+  // once, rather than waiting out a lock on a password that no longer exists.
+  it('clears a standing lockout, so the new password works at once', async () => {
+    await withPassword('a decent admin password', 'admin', 'create', 'admin@example.com')
+    await pg.query(
+      `UPDATE admin_account SET failed_logins = 9, last_failed_at = now(),
+                                locked_until = now() + interval '1 hour'`,
+    )
+    expect(await withPassword('a new decent password', 'admin', 'passwd')).toBe(0)
+    const r = await pg.query<{
+      failed_logins: number
+      last_failed_at: Date | null
+      locked_until: Date | null
+    }>('SELECT failed_logins, last_failed_at, locked_until FROM admin_account')
+    expect(r.rows[0]).toEqual({ failed_logins: 0, last_failed_at: null, locked_until: null })
+  })
+
+  // The wrong order on a first run is the likeliest order, and until this
+  // refusal existed each of these left by throwing: the writer's own error for
+  // one, a foreign key violation naming the constraint for the other. Both are
+  // exit 3 and a stack trace for something one line fixes.
+  it('refuses a command that needs the account before there is one, and says which command makes it', async () => {
+    lines.length = 0
+    expect(await withPassword('a decent admin password', 'admin', 'passwd')).toBe(2)
+    expect(lines.join('\n')).toContain('run "clickmonk admin create <email>" first')
+    // Refused before the password was asked for, not after: the operator is not
+    // made to hand one over to a command that was never going to use it.
+    expect(stdin.reads).toBe(0)
+    expect((await account()).rowCount).toBe(0)
+
+    lines.length = 0
+    expect(await withPassword('', 'apikey', 'create', 'reporting')).toBe(2)
+    expect(lines.join('\n')).toContain('run "clickmonk admin create <email>" first')
+    // Nothing of Postgres's own wording reaches the operator.
+    expect(lines.join('\n')).not.toContain('api_keys')
+    expect((await pg.query('SELECT 1 FROM api_keys')).rowCount).toBe(0)
+
+    // And once the account exists, both commands work.
+    expect(
+      await withPassword('a decent admin password', 'admin', 'create', 'admin@example.com'),
+    ).toBe(0)
+    expect(await withPassword('a new decent password', 'admin', 'passwd')).toBe(0)
+    expect(await withPassword('', 'apikey', 'create', 'reporting')).toBe(0)
+  })
+
+  // Lose the authenticator app and all ten recovery codes and there is no way
+  // back over the network: removing the factor through the API requires the
+  // factor, because disable-then-enrol would otherwise be the bypass. This
+  // command is the way back, and it runs where only whoever can already open a
+  // shell in the container can run it.
+  it('is the way back in when the authenticator and every recovery code are gone', async () => {
+    await withPassword('a decent admin password', 'admin', 'create', 'admin@example.com')
+    await pg.query(
+      `UPDATE admin_account SET totp_secret = $1, totp_last_step = 99,
+                                failed_logins = 7, last_failed_at = $2, locked_until = $3`,
+      ['A'.repeat(32), NOW, new Date(NOW.getTime() + 3_600_000)],
+    )
+    for (const code of ['one-unused-code', 'another-unused-code']) {
+      await pg.query('INSERT INTO admin_recovery_codes (code_hash, created_at) VALUES ($1, $2)', [
+        await hashPassword(code, LINK_SCRYPT),
+        NOW,
+      ])
+    }
+    await pg.query(
+      "INSERT INTO sessions (token_hash, expires_at) VALUES ($1, now() + interval '1 day')",
+      ['b'.repeat(64)],
+    )
+    const credentials = { email: 'admin@example.com', password: 'a decent admin password' }
+    // Before: the password alone gets nowhere, and the lockout the lost codes
+    // earned is standing.
+    expect(await signIn(pg, credentials, NOW)).toEqual({
+      ok: false,
+      reason: 'locked',
+      retryAfterSeconds: 3600,
+    })
+
+    lines.length = 0
+    // Reset after the setup above, which created the account and did read one.
+    stdin.reads = 0
+    expect(await withPassword('', 'admin', 'totp', 'disable')).toBe(0)
+    // It asks for no password: there is nothing here to authenticate, and a
+    // command that demanded one would be asking an operator who is locked out
+    // for the one credential they still have.
+    expect(stdin.reads).toBe(0)
+
+    // Read before the sign-in below, so that what cleared these is this command
+    // and not the successful sign-in that follows it.
+    const after = await pg.query<{ totp_secret: string | null; totp_last_step: string }>(
+      'SELECT totp_secret, totp_last_step FROM admin_account',
+    )
+    expect(after.rows[0]?.totp_secret).toBeNull()
+    expect(Number(after.rows[0]?.totp_last_step)).toBe(0)
+    expect((await pg.query('SELECT 1 FROM admin_recovery_codes')).rowCount).toBe(0)
+    expect((await pg.query('SELECT 1 FROM sessions')).rowCount).toBe(0)
+
+    // After: the password alone signs in. `ok` and not `totp_required` is what
+    // says the factor is gone; `ok` and not `locked` is what says the lockout
+    // went with it.
+    expect(await signIn(pg, credentials, NOW)).toEqual({ ok: true, email: 'admin@example.com' })
+
+    // Never quiet about it: an install left on one factor with nobody aware of
+    // it is worse than the lockout this just fixed.
+    const out = lines.join('\n')
+    expect(out).toContain('two-factor authentication disabled')
+    expect(out).toContain('2 unused recovery code(s) deleted')
+    expect(out).toContain('1 session(s) signed out')
+    expect(out).toContain('Enrol an authenticator app again')
+  })
+
+  it('says nothing was removed when the account was never enrolled', async () => {
+    await withPassword('a decent admin password', 'admin', 'create', 'admin@example.com')
+    lines.length = 0
+    expect(await withPassword('', 'admin', 'totp', 'disable')).toBe(0)
+    expect(lines.join('\n')).toContain('was not enabled')
+    // The reminder stands whatever it found, because the account is on one
+    // factor either way.
+    expect(lines.join('\n')).toContain('Enrol an authenticator app again')
+  })
+
+  it('refuses to disable the second factor before there is an account', async () => {
+    lines.length = 0
+    expect(await withPassword('', 'admin', 'totp', 'disable')).toBe(2)
+    expect(lines.join('\n')).toContain('run "clickmonk admin create <email>" first')
+  })
+
+  it('mints an API key, shows it once, and stores only its digest', async () => {
+    await anAccount()
+    expect(await withPassword('', 'apikey', 'create', 'reporting', '--expires-days', '7')).toBe(0)
+    const key = lines[0] as string
+    expect(key).toMatch(/^cmk_[0-9a-f]{16}_[A-Za-z0-9_-]{43}$/)
+    // Split by the parser the authentication path itself uses. A key's secret
+    // is base64url, so it may contain an underscore of its own, and taking the
+    // third `_`-separated field truncates roughly one key in three.
+    const secret = (parseApiKey(key) as { secret: string }).secret
+    const r = await pg.query<{ secret_hash: string; expires_at: Date }>(
+      'SELECT secret_hash, expires_at FROM api_keys',
+    )
+    expect(r.rows[0]?.secret_hash).toBe(hashToken(secret))
+    expect(r.rows[0]?.expires_at.toISOString()).toBe('2026-09-30T10:00:00.000Z')
+    expect(lines.join('\n')).toContain('only time this key is shown')
+  })
+
+  // 3651 and 0 are written out. Derived from the constant, these would move
+  // with a raised bound and pass against a command that had lost the check.
+  it('refuses a life that is not a whole number of days inside the bound', async () => {
+    await anAccount()
+    expect(MAX_KEY_DAYS).toBe(3650)
+    // No '-1' here: a leading dash is an option to the argument parser, which
+    // refuses it as a usage error before this bound is reached.
+    for (const days of ['3651', '0', '7.5', 'soon', '']) {
+      lines.length = 0
+      expect(await withPassword('', 'apikey', 'create', 'reporting', '--expires-days', days)).toBe(
+        2,
+      )
+      expect(lines.join('\n'), days).toContain('--expires-days takes a whole number of days')
+    }
+    expect((await pg.query('SELECT 1 FROM api_keys')).rowCount).toBe(0)
+    // The bound itself is a life a key may have.
+    expect(await withPassword('', 'apikey', 'create', 'reporting', '--expires-days', '3650')).toBe(
+      0,
+    )
+  })
+
+  it('refuses a key with no name, and one longer than the column takes', async () => {
+    await anAccount()
+    expect(MAX_KEY_NAME_LENGTH).toBe(100)
+    expect(await withPassword('', 'apikey', 'create')).toBe(2)
+    expect(await withPassword('', 'apikey', 'create', 'x'.repeat(101))).toBe(2)
+    expect((await pg.query('SELECT 1 FROM api_keys')).rowCount).toBe(0)
+    expect(await withPassword('', 'apikey', 'create', 'x'.repeat(100))).toBe(0)
+  })
+
+  it('lists keys without their secrets, and revokes one', async () => {
+    await anAccount()
+    expect(await withPassword('', 'apikey', 'create', 'reporting')).toBe(0)
+    const parsed = parseApiKey(lines[0] as string) as { id: string; secret: string }
+    const { id, secret } = parsed
+    lines.length = 0
+    expect(await withPassword('', 'apikey', 'list')).toBe(0)
+    // The whole line, so a secret could not hide at the end of it.
+    expect(lines).toEqual([`${id}  reporting: active; never used`])
+    expect(lines.join('\n')).not.toContain(secret)
+
+    lines.length = 0
+    expect(await withPassword('', 'apikey', 'revoke', id)).toBe(0)
+    const revoked = await pg.query<{ revoked_at: Date }>('SELECT revoked_at FROM api_keys')
+    expect(revoked.rows[0]?.revoked_at.toISOString()).toBe(NOW.toISOString())
+
+    lines.length = 0
+    expect(await withPassword('', 'apikey', 'revoke', id)).toBe(2)
+    expect(lines.join('\n')).toContain('already revoked')
+    // Revoking twice leaves the first time it happened, which is the record of
+    // when the key actually stopped working.
+    expect((await pg.query<{ revoked_at: Date }>('SELECT revoked_at FROM api_keys')).rows).toEqual(
+      revoked.rows,
+    )
+
+    lines.length = 0
+    expect(await withPassword('', 'apikey', 'revoke', 'nope')).toBe(2)
+    expect(lines.join('\n')).toContain('not a key id')
+
+    lines.length = 0
+    expect(await withPassword('', 'apikey', 'list')).toBe(0)
+    expect(lines).toEqual([`${id}  reporting: revoked ${NOW.toISOString()}; never used`])
+  })
+
+  // A key past its expiry is dead, and a listing that called it active would
+  // have an operator hunting for why a script stopped working.
+  it('says a key has run out rather than calling it active', async () => {
+    await anAccount()
+    expect(await withPassword('', 'apikey', 'create', 'reporting', '--expires-days', '7')).toBe(0)
+    const { id } = parseApiKey(lines[0] as string) as { id: string }
+    lines.length = 0
+    expect(await later(8, 'apikey', 'list')).toBe(0)
+    expect(lines).toEqual([`${id}  reporting: expired 2026-09-30T10:00:00.000Z; never used`])
+  })
+
+  it('says so when there are no keys', async () => {
+    expect(await withPassword('', 'apikey', 'list')).toBe(0)
+    expect(lines).toEqual(['no API keys yet (make one with "clickmonk apikey create <name>")'])
+  })
+
+  // A listing that stopped at the cap is a prefix, and an operator managing
+  // the wrong set would never find out. Rows go straight in: minting 201 keys
+  // would be 201 digests for nothing.
+  it('says when the listing was cut', async () => {
+    await anAccount()
+    expect(MAX_KEYS_LISTED).toBe(200)
+    await pg.query(
+      `INSERT INTO api_keys (id, name, secret_hash)
+       SELECT lpad(to_hex(n), 16, '0'), 'bulk-' || n, repeat('b', 64)
+         FROM generate_series(1, 200) AS n`,
+    )
+    expect(await withPassword('', 'apikey', 'list')).toBe(0)
+    expect(lines).toHaveLength(200)
+    expect(lines.at(-1)).not.toBe('(more keys than this list shows; revoke some)')
+    lines.length = 0
+    await pg.query(
+      "INSERT INTO api_keys (id, name, secret_hash) VALUES ('ffffffffffffffff', 'one more', repeat('b', 64))",
+    )
+    expect(await withPassword('', 'apikey', 'list')).toBe(0)
+    expect(lines).toHaveLength(201)
+    expect(lines.at(-1)).toBe('(more keys than this list shows; revoke some)')
+  })
+
+  it('names the new commands in its usage', async () => {
+    expect(await run('admin')).toBe(1)
+    expect(lines.join('\n')).toContain('clickmonk admin create <email>')
+    expect(lines.join('\n')).toContain('clickmonk admin totp disable')
+    expect(lines.join('\n')).toContain('clickmonk apikey create <name>')
+  })
+})
+
+describe('a link domain and the admin host', () => {
+  // This block reads and writes `domains` by host name, and every describe
+  // above it leaves domains behind. Cleared once here rather than trusting
+  // that none of them ever adds one of these two names.
+  beforeAll(async () => {
+    await pg.query('TRUNCATE domains CASCADE')
+  })
+
+  // Caddy sends the admin host name to the admin service, so a link domain of
+  // the same name accepts links that can never redirect: a domain row, a
+  // verification record and a certificate all saying the setup worked.
+  it('refuses a link domain with the same name as the admin host, and writes nothing', async () => {
+    const withAdminHost = (...argv: string[]) =>
+      runCli(argv, {
+        pg,
+        ch: () => ch,
+        out: (s) => lines.push(s),
+        ipdata: { dir: ipdataDir },
+        adminHost: 'admin.example.test',
+      })
+    lines.length = 0
+    // Written as the operator would type it: the name is normalised before the
+    // comparison, so a trailing dot and upper case do not slip past.
+    expect(await withAdminHost('domain', 'add', 'Admin.Example.TEST.')).toBe(2)
+    expect(lines.join('\n')).toContain('CLICKMONK_ADMIN_HOST')
+    expect(
+      (await pg.query('SELECT 1 FROM domains WHERE host = $1', ['admin.example.test'])).rowCount,
+    ).toBe(0)
+    // A different name on the same install is added as usual, so what was
+    // refused was the collision and not the command.
+    expect(await withAdminHost('domain', 'add', 'links.example.test')).toBe(0)
+    expect(
+      (await pg.query('SELECT 1 FROM domains WHERE host = $1', ['links.example.test'])).rowCount,
+    ).toBe(1)
+    // And with no admin host configured, that same name is an ordinary domain:
+    // nothing routes it away, so there is nothing to refuse.
+    expect(await run('domain', 'add', 'admin.example.test')).toBe(0)
+    expect(
+      (await pg.query('SELECT 1 FROM domains WHERE host = $1', ['admin.example.test'])).rowCount,
+    ).toBe(1)
+  })
+})
+
+describe('reading the password from standard input', () => {
+  /** A stream of chunks, and a count of how many were actually pulled from it. */
+  function chunks(parts: string[]): AsyncIterable<Uint8Array> & { read: number } {
+    const state = { read: 0 }
+    return {
+      read: 0,
+      async *[Symbol.asyncIterator]() {
+        for (const part of parts) {
+          state.read++
+          this.read = state.read
+          yield Buffer.from(part, 'utf8')
+        }
+      },
+    } as AsyncIterable<Uint8Array> & { read: number }
+  }
+
+  const piped = { isTty: false }
+
+  it('reads every chunk of a password that fits', async () => {
+    expect(await readStdin(chunks(['a decent ', 'admin password\n']), piped)).toBe(
+      'a decent admin password\n',
+    )
+  })
+
+  // 804 is written out: the cap is four bytes per allowed character plus one,
+  // and derived from the constant this would grow with a raised bound instead
+  // of failing at once.
+  it('stops reading once there is more than a password could be, rather than buffering it all', async () => {
+    expect(MAX_PASSWORD_LENGTH).toBe(200)
+    // Eleven chunks of 100 bytes: the cap falls inside the ninth, so a reader
+    // that stops at the cap never pulls the last two.
+    const stream = chunks(Array.from({ length: 11 }, () => 'p'.repeat(100)))
+    const read = await readStdin(stream, piped)
+    expect(stream.read).toBe(9)
+    // Exactly the nine it pulled, so it stopped at the chunk that crossed the
+    // cap rather than reading on and cutting the result back afterwards.
+    expect(read.length).toBe(900)
+    // And what it did read is past the bound, so the caller refuses it rather
+    // than hashing a truncated password.
+    expect(read.length).toBeGreaterThan(MAX_PASSWORD_LENGTH)
+  })
+
+  // A password of exactly the longest allowed length, every character three
+  // bytes of UTF-8: the cap counts bytes, so a cap set at the character bound
+  // would cut this one short and the command would hash the wrong password.
+  //
+  // One chunk per character, which is both what a terminal delivers and what
+  // makes this able to fail: the cap is checked after each chunk is taken, so
+  // the whole password arriving in one chunk is never cut whatever the cap is.
+  it('does not cut a password of allowed length short because its characters are wide', async () => {
+    const wide = Array.from({ length: MAX_PASSWORD_LENGTH }, () => '\u4e2d')
+    expect(Buffer.byteLength(wide.join(''), 'utf8')).toBe(MAX_PASSWORD_LENGTH * 3)
+    expect(await readStdin(chunks(wide), piped)).toBe(wide.join(''))
+  })
+
+  // A terminal echoes what is typed at it and nothing here turns that off, so
+  // there is no reading a password from one: it would be on screen and in the
+  // shell's history before this ever saw it. The documented invocation passes
+  // -T and has no terminal on this end at all, so nothing correct is refused.
+  it('refuses a terminal outright, and shows the piped form instead', async () => {
+    const stream = chunks(['a decent admin password'])
+    await expect(readStdin(stream, { isTty: true })).rejects.toThrow(/terminal/)
+    // Refused without reading: a password typed before the refusal arrived
+    // would already be on screen, and this must not be what consumes it.
+    expect(stream.read).toBe(0)
+    await expect(readStdin(stream, { isTty: true })).rejects.toThrow(/-T/)
+  })
+})
+
+// Three faults that used to leave `runCli` as an unexpected error — exit 3 and
+// a stack trace — where what an operator needs is one sentence saying what to
+// do. Each is provoked at the seam it comes through, because none of them is
+// reachable from a correct command: that is what made them exit 3 for so long.
+describe('a fault an operator can act on', () => {
+  // The last case reads `admin_account` back, and describes above this one
+  // leave accounts behind. Cleared once here rather than depending on which of
+  // them ran last.
+  beforeAll(async () => {
+    await pg.query('TRUNCATE admin_account, admin_recovery_codes, sessions, api_keys')
+  })
+
+  /**
+   * A pool whose every query throws. Cast because only `query` is reached here
+   * and a whole `Pool` is a large interface to stub for one method; anything
+   * else this touched would be a TypeError the test would show.
+   */
+  const throwingPg = (err: unknown) =>
+    ({
+      query: async () => {
+        throw err
+      },
+    }) as unknown as Parameters<typeof runCli>[1]['pg']
+
+  const withPg = (pgLike: Parameters<typeof runCli>[1]['pg'], ...argv: string[]) =>
+    runCli(argv, {
+      pg: pgLike,
+      ch: () => ch,
+      out: (s) => lines.push(s),
+      ipdata: { dir: ipdataDir },
+      stdin: async () => 'a decent admin password',
+    })
+
+  it('says to migrate when a command runs before the migrations have', async () => {
+    // What Postgres answers for a table that is not there. The code is what is
+    // classified; the message is what must not be repeated back.
+    const missing = Object.assign(new Error('relation "admin_account" does not exist'), {
+      code: '42P01',
+    })
+    lines.length = 0
+    expect(await withPg(throwingPg(missing), 'apikey', 'create', 'reporting')).toBe(2)
+    expect(lines.join('\n')).toContain('run "clickmonk migrate" first')
+    // The name of the table it could not find is no use to an operator and is
+    // not theirs to read.
+    expect(lines.join('\n')).not.toContain('admin_account')
+  })
+
+  // The bound lives inside a function shared with the admin API, which refuses
+  // by throwing what that API answers with. No command can reach it — the CLI's
+  // own bounds are strictly inside it — so what is pinned here is that such an
+  // error is a refusal rather than a crash if a later change ever lets one out.
+  it('answers a bound from the shared writer as a refusal, in its own words', async () => {
+    const bound = Object.assign(new Error('a key lives at most 3650 days'), { name: 'HttpError' })
+    lines.length = 0
+    expect(await withPg(throwingPg(bound), 'apikey', 'create', 'reporting')).toBe(2)
+    expect(lines).toEqual(['error: a key lives at most 3650 days'])
+  })
+
+  it('says so when standard input could not be read at all', async () => {
+    lines.length = 0
+    const code = await runCli(['admin', 'create', 'admin@example.com'], {
+      pg,
+      ch: () => ch,
+      out: (s) => lines.push(s),
+      ipdata: { dir: ipdataDir },
+      stdin: async () => {
+        throw Object.assign(new Error('read EIO'), { code: 'EIO' })
+      },
+    })
+    expect(code).toBe(2)
+    expect(lines.join('\n')).toContain('could not read the password from standard input')
+    expect(lines.join('\n')).toContain('read EIO')
+  })
+
+  // The refusal an operator at a terminal gets, through a real command rather
+  // than through the reader alone: exit 2, and the piped form to copy.
+  it('refuses a password typed at a terminal, and shows the command that works', async () => {
+    lines.length = 0
+    const code = await runCli(['admin', 'create', 'admin@example.com'], {
+      pg,
+      ch: () => ch,
+      out: (s) => lines.push(s),
+      ipdata: { dir: ipdataDir },
+      stdin: () => readStdin((async function* () {})(), { isTty: true }),
+    })
+    expect(code).toBe(2)
+    const out = lines.join('\n')
+    expect(out).toContain('standard input is a terminal')
+    expect(out).toContain("printf '%s'")
+    expect(out).toContain('docker compose exec -T worker')
+    expect((await pg.query('SELECT 1 FROM admin_account')).rowCount).toBe(0)
   })
 })
