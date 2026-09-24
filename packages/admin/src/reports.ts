@@ -180,6 +180,21 @@ export async function withSlot<T>(
 /** UInt64 comes back as a decimal string; every count here fits a double many times over. */
 const count = (v: string | number | undefined): number => Number(v ?? 0)
 
+/**
+ * The newest hour the rollup holds, as an instant — or null when it holds none.
+ *
+ * `max()` with no `GROUP BY` answers one row whatever the range, and over no
+ * rows that row is the zero of the column's type: `1970-01-01 00:00:00`, which
+ * is not an hour any install had. An empty install must say "nothing yet"
+ * rather than name the epoch, so the sentinel is read here. A separate function
+ * because the branch is otherwise reachable only from a suite that owns the
+ * whole table.
+ */
+export function newestHourOrNull(text: string | undefined): string | null {
+  if (!text || text.startsWith('1970')) return null
+  return `${text.replace(' ', 'T')}.000Z`
+}
+
 /** The window clause every report shares, with the link filter only when there is one. */
 export function windowClause(w: ReportWindow, column = 'hour'): string {
   const parts = [`${column} >= {from:DateTime64(3,'UTC')}`, `${column} < {to:DateTime64(3,'UTC')}`]
@@ -260,18 +275,17 @@ export function registerReportRoutes(app: FastifyInstance, ctx: AdminContext): v
         return {
           window: { from: new Date(w.fromMs).toISOString(), to: new Date(w.toMs).toISOString() },
           link: w.linkId,
+          // The `?.` on both of these is the type of an array index under
+          // `noUncheckedIndexedAccess`, not a guard against a missing row: an
+          // aggregate with no `GROUP BY` answers exactly one row even over an
+          // empty range, which the suite pins directly. The zeroes an empty
+          // window gives back are ClickHouse's, not a fallback of ours.
           clicks: count(totals?.clicks),
           visitors: count(totals?.visitors),
           byClass,
           byAction,
           byOutcome,
-          // Empty on an install with no clicks at all: ClickHouse answers the
-          // zero of the type for max() over nothing, which is not an hour
-          // anybody had.
-          newestHour:
-            !newest?.newest || newest.newest.startsWith('1970')
-              ? null
-              : `${newest.newest.replace(' ', 'T')}.000Z`,
+          newestHour: newestHourOrNull(newest?.newest),
         }
       },
     )

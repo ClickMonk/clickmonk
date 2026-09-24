@@ -28,9 +28,24 @@ describe('loadConfig', () => {
     })
   })
 
-  it('refuses to start without the store the reports read', () => {
-    const { CLICKMONK_CLICKHOUSE_URL: _omitted, ...rest } = base
-    expect(() => loadConfig(rest)).toThrow(/CLICKMONK_CLICKHOUSE_URL/)
+  // All four, one row each: the comment on them claims that an install with a
+  // typo fails at boot with the variable named, and three of the four were
+  // otherwise free to become optional with that claim still written down.
+  it.each([
+    'CLICKMONK_CLICKHOUSE_URL',
+    'CLICKMONK_CLICKHOUSE_USER',
+    'CLICKMONK_CLICKHOUSE_PASSWORD',
+    'CLICKMONK_CLICKHOUSE_DB',
+  ])('refuses to start without %s, which the reports read', (name) => {
+    const rest: Record<string, string> = { ...base }
+    delete rest[name]
+    expect(() => loadConfig(rest)).toThrow(new RegExp(name))
+  })
+
+  // The password is the one that needs saying: empty is a value an operator may
+  // have set, and it is not the same as the variable being absent above.
+  it('takes an empty ClickHouse password, which is not the same as none', () => {
+    expect(loadConfig({ ...base, CLICKMONK_CLICKHOUSE_PASSWORD: '' }).ch.password).toBe('')
   })
 
   it('names every missing or bad variable at once', () => {

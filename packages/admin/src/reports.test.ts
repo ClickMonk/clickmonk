@@ -5,7 +5,7 @@ import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import type { FastifyInstance } from 'fastify'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { HttpError } from './http.js'
-import { HOUR_MS, parseWindow } from './reports.js'
+import { HOUR_MS, newestHourOrNull, parseWindow } from './reports.js'
 import { ADMIN_HOST, clockFrom, read, signedIn, testApp } from './testing.js'
 
 const pool = testPg()
@@ -87,7 +87,22 @@ beforeAll(async () => {
       time: '2026-09-24 11:30:00.000',
       visitor_id: 'v3',
     }),
+    // In the hour that *starts* at the aligned end of the window below, which
+    // that window must not count: half-open is the only reason two adjacent
+    // reports do not both claim this click. Its own visitor, so an inclusive
+    // upper bound moves the visitor count as well as the clicks.
+    click({
+      click_id: '01920000-0000-7000-8000-00000000000f',
+      time: '2026-09-25 00:30:00.000',
+      visitor_id: 'v4',
+    }),
   ])
+  // The same segment again, byte for byte: the worker deletes a spool segment
+  // only after ClickHouse accepts it, so a crash in between ships it twice.
+  // Every number a report gives is a set over click ids, so the second copy
+  // must change none of them — the invariant the whole rollup design rests on,
+  // and one no fixture of distinct ids can see.
+  await insert([click()])
 })
 
 beforeEach(async () => {
@@ -117,8 +132,23 @@ describe('GET /api/reports/summary', () => {
       byClass: { human: 4, bot: 1 },
       byAction: { '': 4, block: 1 },
       byOutcome: { target: 4, blocked: 1 },
-      newestHour: '2026-09-24T11:00:00.000Z',
+      // The whole table, not this window: the click half an hour past the end
+      // of it is the newest hour the install has.
+      newestHour: '2026-09-25T00:00:00.000Z',
     })
+  })
+
+  // The other end of the same clause, and the end that goes unnoticed: an
+  // inclusive `to` makes two adjacent reports both count the click above, so a
+  // month read as twelve windows counts eleven hours twice.
+  it('ends the window before the hour it names', async () => {
+    const r = await summary(app, 'from=2026-09-24T23:00:00.000Z&to=2026-09-25T00:00:00.000Z')
+    expect(r.statusCode).toBe(200)
+    expect(r.json().clicks).toBe(0)
+    expect(r.json().visitors).toBe(0)
+    // And the hour it stops before does hold a click, so the zero above is the
+    // bound rather than an empty table.
+    expect(r.json().newestHour).toBe('2026-09-25T00:00:00.000Z')
   })
 
   // Three clicks by two visitors, one of whom also clicked the other link:
@@ -251,6 +281,31 @@ describe('parseWindow', () => {
   })
 })
 
+describe('the newest hour the install holds', () => {
+  it('is null rather than the epoch when the rollup holds nothing', () => {
+    expect(newestHourOrNull('1970-01-01 00:00:00')).toBeNull()
+    expect(newestHourOrNull('')).toBeNull()
+    expect(newestHourOrNull(undefined)).toBeNull()
+    expect(newestHourOrNull('2026-09-24 11:00:00')).toBe('2026-09-24T11:00:00.000Z')
+  })
+
+  // The claim that branch rests on, asked of the store rather than assumed: an
+  // aggregate with no GROUP BY answers exactly one row however empty the range,
+  // and max() over no rows is the zero of the column's type. It is also why the
+  // summary's totals need no fallback of their own.
+  it('is the epoch, in one row, when ClickHouse is asked over no rows at all', async () => {
+    const rs = await ch.query({
+      query: `SELECT toString(max(hour)) AS newest, count() AS seen
+                FROM clicks_hourly WHERE hour >= '2099-01-01 00:00:00'`,
+      format: 'JSONEachRow',
+    })
+    const rows = await rs.json<{ newest: string; seen: string }>()
+    expect(rows.length).toBe(1)
+    expect(rows[0]?.newest).toBe('1970-01-01 00:00:00')
+    expect(rows[0]?.seen).toBe('0')
+  })
+})
+
 describe('when ClickHouse is not there', () => {
   let dead: ClickHouseClient
   let deadApp: FastifyInstance
@@ -286,6 +341,37 @@ describe('when ClickHouse is not there', () => {
     // Nothing about the failure itself: a connection refused to a named host
     // and port is an address this service is not obliged to hand out.
     expect(r.json().message).not.toContain('127.0.0.1')
+  })
+
+  // A refusal has to be more than a status code: the window bound exists to
+  // stop a scan, so a bound checked after the query would be no bound at all.
+  // Against a store that cannot answer, anything that reaches it is a 503 — so
+  // a 400 here says the refusal came first, and the log says nothing was asked.
+  it('refuses a window too long to read without reading anything', async () => {
+    const lines: string[] = []
+    const logging = testApp(pool, clock, {
+      ch: dead,
+      log: {
+        level: 'error',
+        stream: {
+          write(line: string) {
+            lines.push(line)
+          },
+        },
+      },
+    })
+    try {
+      const r = await logging.inject({
+        method: 'GET',
+        url: '/api/reports/summary?from=2025-01-01T00:00:00.000Z&to=2026-09-25T00:00:00.000Z',
+        headers: read(cookie),
+      })
+      expect(r.statusCode).toBe(400)
+      expect(r.json().error).toBe('window_too_long')
+      expect(lines.filter((l) => l.includes('clickhouse query failed'))).toEqual([])
+    } finally {
+      await logging.close()
+    }
   })
 
   it('still answers everything that does not read it', async () => {

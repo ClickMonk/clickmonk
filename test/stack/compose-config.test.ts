@@ -145,6 +145,30 @@ describe('what the stack publishes', () => {
     }
   })
 
+  // The admin API reads ClickHouse directly, and its loader makes all four of
+  // these required, so a missing one is not a report that degrades: it is a
+  // container that exits at boot and an install with no admin interface. The
+  // values are the worker's, because the two services read one store, and the
+  // password is interpolated rather than written here — a literal would be a
+  // credential in this file and would also stop being the store's password the
+  // first time an operator changed theirs.
+  it('gives the admin API the four values its reports read ClickHouse with', () => {
+    const block = serviceBlock(cfg, 'admin')
+    for (const [name, value] of [
+      ['CLICKMONK_CLICKHOUSE_URL', 'http://clickhouse:8123'],
+      ['CLICKMONK_CLICKHOUSE_USER', 'clickmonk'],
+      ['CLICKMONK_CLICKHOUSE_PASSWORD', 'y'],
+      ['CLICKMONK_CLICKHOUSE_DB', 'clickmonk'],
+    ]) {
+      // Optionally quoted, as the admin-host rows above are: Compose quotes a
+      // value YAML would otherwise read as something other than a string, and
+      // the one-character password in this suite's env file is one of them.
+      const line = new RegExp(`\\n {6}${name}: "?${value}"?\\n`)
+      expect(block, name).toMatch(line)
+      expect(serviceBlock(cfg, 'worker'), `${name} on the worker`).toMatch(line)
+    }
+  })
+
   it('tells the redirect to believe a forwarded address only from the stack’s own network', () => {
     expect(cfg).toContain('CLICKMONK_TRUSTED_PROXIES: uniquelocal,loopback')
   })
