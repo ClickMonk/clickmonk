@@ -81,11 +81,14 @@ beforeAll(async () => {
       destination: '',
       target_id: '',
     }),
-    // An hour later, and outside the narrow window one test asks for.
+    // An hour later, and outside the narrow window one test asks for. The same
+    // visitor as the first, which is what makes a day's visitor count something
+    // other than the sum of its hours: two visitors at ten and one at eleven,
+    // and two for the day. With a third visitor here the two arithmetics agree
+    // and neither the chart nor the summary would notice being summed.
     click({
       click_id: '01920000-0000-7000-8000-00000000000e',
       time: '2026-09-24 11:30:00.000',
-      visitor_id: 'v3',
     }),
     // In the hour that *starts* at the aligned end of the window below, which
     // that window must not count: half-open is the only reason two adjacent
@@ -128,7 +131,9 @@ describe('GET /api/reports/summary', () => {
       window: { from: '2026-09-24T00:00:00.000Z', to: '2026-09-25T00:00:00.000Z' },
       link: null,
       clicks: 5,
-      visitors: 3,
+      // Two, not three: the click an hour later is the same visitor as the
+      // first, so the window's visitors are not its hours' visitors added up.
+      visitors: 2,
       byClass: { human: 4, bot: 1 },
       byAction: { '': 4, block: 1 },
       byOutcome: { target: 4, blocked: 1 },
@@ -286,10 +291,10 @@ describe('GET /api/reports/timeseries', () => {
       headers: read(cookie),
     })
     expect(r.json().buckets).toEqual([
-      // Five clicks by three visitors: v1 clicked in both hours and is one
-      // visitor for the day, which summing the two hourly numbers would not
-      // give.
-      { at: '2026-09-24T00:00:00.000Z', clicks: 5, visitors: 3 },
+      // Five clicks by two visitors. One of them clicked in both hours and is
+      // one visitor for the day, so the day's number is not the two hourly
+      // numbers added up: those are 2 and 1, and this is 2.
+      { at: '2026-09-24T00:00:00.000Z', clicks: 5, visitors: 2 },
     ])
   })
 
@@ -385,6 +390,21 @@ describe('GET /api/reports/timeseries', () => {
     })
     expect(r.statusCode).toBe(400)
     expect(r.json().error).toBe('invalid_query')
+  })
+
+  // The status alone does not pin the enum. With a plain string in its place an
+  // unknown bucket is still a 400, from the wrong guard: no bucket size is found
+  // for a name nobody has, the alignment becomes NaN, and the caller is told
+  // their `to` is not after their `from` — about a field they got right. So what
+  // pins the enum is the field the refusal names.
+  it('names the bucket when the bucket is one nobody has', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/reports/timeseries?from=2026-09-24T00:00:00.000Z&to=2026-09-25T00:00:00.000Z&bucket=week',
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(400)
+    expect(r.json().message).toContain('bucket')
   })
 
   it('refuses when every report slot is taken', async () => {
