@@ -384,21 +384,23 @@ describe('clickhouse schema 008: the key columns that keep rows apart', () => {
  * is the same before and after it.
  *
  * These clicks are in February rather than the September the rest of the file
- * accumulates in, because parts in different partitions never merge together:
- * the only rows the forced merge can collapse are the ones these tests wrote.
- * **That isolation is the monthly partition key**, so these tests depend on it
- * as much as on the sort key they are named for — which is why the first test
- * here pins the partition expression, rather than leaving a partition change to
- * surface as a sort-key test failing for a reason its name does not describe.
+ * accumulates in, so the forced merge cannot reach a row another test wrote.
+ * Two independent things keep them apart and either alone would do: a different
+ * monthly partition, because parts in different partitions never merge; and
+ * `hour` at the head of both sort keys. The partition is the one that reasoning
+ * names, so the first test below pins the expression on its own. A change to it
+ * then fails a test whose name is about partitioning, and the merge tests go on
+ * saying only what their own names say.
  */
 describe('clickhouse schema 008: the sort keys, across a merge', () => {
   const FEB = 'toYYYYMM(hour) = 202602'
 
   /**
-   * The expression, read from the engine, and not a row count that would follow
-   * from it: a count can come out right under a different partitioning, and
-   * whatever a rollup is partitioned by has to be derived from `hour` alone for
-   * a report's window to read whole months rather than every part in the table.
+   * The expression, read from the engine, rather than a row count that would
+   * follow from it: a count comes out right under any partitioning at all. What
+   * has to hold is that the expression is derived from `hour` and nothing else,
+   * because that is what lets a report bounding a window skip the partitions
+   * outside it instead of reading the table.
    */
   it('partitions both rollup tables by the month of the hour', async () => {
     const keys = await rows<{ name: string; partition_key: string }>(
