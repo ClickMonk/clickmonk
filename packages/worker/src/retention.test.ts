@@ -421,6 +421,34 @@ describe('startRetention', () => {
     expect(passes.length).toBe(after)
   })
 
+  // The loop has two ways to notice a stop — its own condition, and the check
+  // between the pass and the next timer — and for *terminating* either one is
+  // enough, so a test that only requires `stop()` to return cannot tell which
+  // of them is still there. This is the one that needs the condition: a loop
+  // woken out of its timer by `stop()` must not run one more pass on the way
+  // out. That pass is a round of DROP PARTITION issued after SIGTERM.
+  it('runs no pass after it has been told to stop', async () => {
+    const passes: string[] = []
+    const loop = startRetention({
+      pg: pool,
+      ch,
+      intervalMs: 3_600_000,
+      now: () => NOW,
+      log: (m) => passes.push(m),
+    })
+    for (let i = 0; i < 200 && passes.length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    // An hour-long interval is what makes the count below mean anything: the
+    // loop is asleep on a timer nothing but `stop()` can wake, so any pass
+    // logged after this line is one it ran on its way out.
+    const before = passes.length
+    expect(before).toBeGreaterThan(0)
+    await loop.stop()
+    expect(passes.length, 'a pass ran after the loop was told to stop').toBe(before)
+    await settleMutations()
+  })
+
   // `stop()` waits for the pass in flight, and the interval in production is an
   // hour. So a loop told to stop *during* a pass must not go on to set the next
   // hour's timer: nothing wakes a timer set after the stop, and `stop()` would
