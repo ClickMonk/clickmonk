@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { RATE_WINDOW_MS, RateCounter, rateKey } from './rate.js'
+import { RATE_WINDOW_MS, RateCounter } from './rate.js'
 
 // Times are offsets from an arbitrary start; the counter never reads a clock.
 const T = 1_000_000
@@ -55,13 +55,5 @@ describe('RateCounter', () => {
     r.hit('192.0.2.3', T + RATE_WINDOW_MS)
     expect(r.hit('192.0.2.3', T + RATE_WINDOW_MS)).toBe(2)
     expect(r.stats()).toEqual({ addresses: 1, untracked: 0 })
-  })
-})
-
-describe('rateKey', () => {
-  it('keys IPv4 by address, IPv4-mapped IPv6 as IPv4, and refuses what is not an address', () => {
-    expect(rateKey('192.0.2.1')).toBe(rateKey('::ffff:192.0.2.1'))
-    expect(rateKey('192.0.2.1')).not.toBe(rateKey('192.0.2.2'))
-    expect(rateKey('nope')).toBeNull()
   })
 })

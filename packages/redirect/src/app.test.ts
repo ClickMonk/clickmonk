@@ -1226,6 +1226,13 @@ describe('a password-protected link', () => {
     expect((await guess('2001:db8:0:1::1')).statusCode).toBe(200)
   })
 
+  // A companion to the row above rather than a guard of its own: it fails when
+  // the /64 key is reverted, but no mutation catches it alone, because a
+  // colliding pair would need an IPv4 address whose 32-bit value equals an IPv6
+  // address's first 32 bits and no such pair exists inside the documentation
+  // ranges this repository may use. The family tag on the key is what makes the
+  // property structural, and that is pinned where the key is built. This stays
+  // because the property matters at the gate that spends the scrypt passes.
   it('does not let an IPv4 address and an IPv6 address share one counter', async () => {
     const { app } = harness([locked], { passwordAttempts: new AttemptCounter(1, 60_000) })
     const guess = (ip: string) => post(app, 'password=wrong', { 'x-forwarded-for': ip })

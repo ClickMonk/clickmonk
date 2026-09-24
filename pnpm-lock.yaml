@@ -32,6 +32,9 @@ importers:
       '@clickmonk/db':
         specifier: workspace:*
         version: link:../db
+      '@clickmonk/ipdata':
+        specifier: workspace:*
+        version: link:../ipdata
       '@clickmonk/worker':
         specifier: workspace:*
         version: link:../worker

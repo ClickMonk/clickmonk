@@ -1,5 +1,6 @@
 import { AttemptCounter, ConcurrencyGate, newSlug, normaliseHost } from '@clickmonk/core'
 import type { Pool } from '@clickmonk/db'
+import { MAX_IP_LENGTH, addressOnly, rateKey } from '@clickmonk/ipdata'
 import type { DomainResolver } from '@clickmonk/worker/domains'
 import Fastify, {
   type FastifyInstance,
@@ -14,7 +15,7 @@ import { registerLinkRoutes } from './links.js'
 import { registerSessionRoutes } from './session-routes.js'
 import { registerSettingsRoutes } from './settings-routes.js'
 
-/** Failed sign-ins from one address before it is refused, and the window. */
+/** Failed sign-ins from one client before it is refused, and the window. */
 export const LOGIN_ATTEMPT_LIMIT = 10
 export const LOGIN_ATTEMPT_WINDOW_MS = 15 * 60 * 1000
 /** Password checks this process runs at once. */
@@ -92,9 +93,22 @@ declare module 'fastify' {
   }
 }
 
-/** The address a limiter counts by: the visitor's, through Caddy. */
+/**
+ * The key a limiter counts by: the caller's address, through Caddy, reduced to
+ * one key per client.
+ *
+ * `rateKey` rather than the address itself, and the same function the redirect's
+ * counters use, because an IPv6 client usually holds a whole /64 and can pick a
+ * new address from it for every request — so ten failures per address is no
+ * bound at all for one, at the form where the password being guessed owns the
+ * install. `addressOnly` first, because a forwarded address may arrive with a
+ * port or in brackets and `[2001:db8::5]:443` is the same client as
+ * `2001:db8::5`. An address the parser cannot read keys on itself rather than
+ * sharing one key with every other unreadable value.
+ */
 export function clientAddress(req: FastifyRequest): string {
-  return (req.ip ?? '').slice(0, 45)
+  const addr = addressOnly(req.ip ?? '').slice(0, MAX_IP_LENGTH)
+  return rateKey(addr) ?? addr
 }
 
 export function buildAdminApp(
@@ -152,7 +166,7 @@ export function buildAdminApp(
     // the same bargain: Caddy replaces that header rather than appending to
     // it, so a value reaching here came from Caddy, and the only way to forge
     // one is to already be a container inside the install. The limiter below
-    // still counts by `req.ip`.
+    // still counts by the address `req.ip` gives, through `clientAddress`.
     //
     // The port is stripped here rather than by Fastify, which is the one thing
     // `req.hostname` did for free: a browser sends `Host: name:443` and that is

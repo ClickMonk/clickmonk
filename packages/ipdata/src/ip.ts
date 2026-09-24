@@ -137,3 +137,22 @@ export function canonicalIp(s: string): string {
   if (p.v === 4) return [p.n >>> 24, (p.n >>> 16) & 0xff, (p.n >>> 8) & 0xff, p.n & 0xff].join('.')
   return formatV6(p.w)
 }
+
+/**
+ * The key a limiter counts an address under. An IPv6 client usually holds a
+ * whole /64 and can pick a new address from it for every request, so IPv6 is
+ * counted per /64 and IPv4 per address. Null for a string that is not an
+ * address, which leaves the caller to decide what an unreadable address costs.
+ *
+ * Here rather than in either service because both count by it and they have to
+ * agree: the redirect's click rate and link password attempts, and the admin
+ * sign-in limiter. It lives beside `parseIp` because that is the parser it is
+ * made of, and the family tag on the front is what keeps the two families in
+ * separate namespaces — an IPv4 key is one decimal number, an IPv6 key always
+ * carries a colon, so no address of one family can ever land on another's key.
+ */
+export function rateKey(ip: string): string | null {
+  const p = parseIp(ip)
+  if (!p) return null
+  return p.v === 4 ? `4:${p.n}` : `6:${p.w[0]}:${p.w[1]}`
+}

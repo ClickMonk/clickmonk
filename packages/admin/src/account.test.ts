@@ -8,6 +8,7 @@ import { SESSION_COOKIE, SESSION_IDLE_MS } from './auth.js'
 import {
   ADMIN_EMAIL,
   ADMIN_PASSWORD,
+  SHIPPED_TRUSTED_PROXIES,
   clockFrom,
   cookieFrom,
   read,
@@ -152,6 +153,80 @@ describe('signing in', () => {
       // And the window turning over gives the address its allowance back.
       clock.advance(LOGIN_ATTEMPT_WINDOW_MS + 1000)
       expect((await attempt(ADMIN_PASSWORD)).statusCode).toBe(200)
+    } finally {
+      await limited.close()
+    }
+  })
+
+  // An IPv6 client usually holds a whole /64 and can pick a new address from it
+  // for every request, so a limiter keyed on the full address is no limiter at
+  // all for one — and the password being guessed here is the one that owns the
+  // install. Built with the shipped trusted-proxy list, because the address
+  // being counted is the one Caddy forwards.
+  it('counts every address in one IPv6 /64 as one guesser at the sign-in form', async () => {
+    const attempts = new AttemptCounter(1, LOGIN_ATTEMPT_WINDOW_MS)
+    const limited = testApp(
+      pg,
+      clock,
+      { loginAttempts: attempts },
+      { trustProxy: SHIPPED_TRUSTED_PROXIES },
+    )
+    try {
+      await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+      const attempt = (password: string, ip: string) =>
+        limited.inject({
+          method: 'POST',
+          url: '/api/session',
+          headers: { ...write(), 'x-forwarded-for': ip },
+          payload: { email: ADMIN_EMAIL, password },
+        })
+      expect((await attempt('wrong', '2001:db8::1')).statusCode).toBe(401)
+      // A second address out of the same /64 is the same guesser, so the right
+      // password is refused by the limiter rather than checked.
+      const refused = await attempt(ADMIN_PASSWORD, '2001:db8::2')
+      expect(refused.statusCode).toBe(429)
+      expect(refused.json().error).toBe('too_many_attempts')
+      expect(refused.headers['set-cookie']).toBeUndefined()
+      // Three failures is below LOCKOUT_AFTER, so nothing here is the account's
+      // own lockout; this is the address limiter and nothing else.
+      const row = await pg.query<{ locked_until: Date | null }>(
+        'SELECT locked_until FROM admin_account',
+      )
+      expect(row.rows[0]?.locked_until).toBeNull()
+      // Another /64 still gets its own allowance, and so does an IPv4 address.
+      expect((await attempt('wrong', '2001:db8:0:1::1')).statusCode).toBe(401)
+      expect((await attempt('wrong', '192.0.2.7')).statusCode).toBe(401)
+    } finally {
+      await limited.close()
+    }
+  })
+
+  // The port and brackets a proxy may put around a forwarded address are the
+  // other way one client becomes several keys: `2001:db8::5` and
+  // `[2001:db8::5]:443` are one client, and a key the address parser cannot
+  // read falls back to the string itself.
+  it('counts one forwarded client once however its address was written', async () => {
+    const attempts = new AttemptCounter(1, LOGIN_ATTEMPT_WINDOW_MS)
+    const limited = testApp(
+      pg,
+      clock,
+      { loginAttempts: attempts },
+      { trustProxy: SHIPPED_TRUSTED_PROXIES },
+    )
+    try {
+      await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+      const attempt = (ip: string) =>
+        limited.inject({
+          method: 'POST',
+          url: '/api/session',
+          headers: { ...write(), 'x-forwarded-for': ip },
+          payload: { email: ADMIN_EMAIL, password: 'wrong' },
+        })
+      expect((await attempt('[2001:db8::5]:443')).statusCode).toBe(401)
+      expect((await attempt('2001:db8::5')).statusCode).toBe(429)
+      // And an IPv4-mapped spelling is the IPv4 address it carries.
+      expect((await attempt('192.0.2.7')).statusCode).toBe(401)
+      expect((await attempt('::ffff:192.0.2.7')).statusCode).toBe(429)
     } finally {
       await limited.close()
     }

@@ -1,24 +1,17 @@
-import { parseIp } from '@clickmonk/ipdata'
+import { rateKey } from '@clickmonk/ipdata'
 
 export const RATE_WINDOW_MS = 60_000
 /** At most this many addresses are counted per window: about 10 MB. */
 export const DEFAULT_MAX_ADDRESSES = 100_000
 
 /**
- * The key an address is counted under. An IPv6 client usually holds a whole
- * /64 and can pick a new address from it for every request, so IPv6 is
- * counted per /64. Null for a string that is not an address.
- */
-export function rateKey(ip: string): string | null {
-  const p = parseIp(ip)
-  if (!p) return null
-  return p.v === 4 ? `4:${p.n}` : `6:${p.w[0]}:${p.w[1]}`
-}
-
-/**
- * Requests per address in fixed one-minute windows, for the abuser class.
+ * Requests per client in fixed one-minute windows, for the abuser class.
  * Held in memory only: a restart starts a new window, which a per-minute
  * threshold can afford.
+ *
+ * A client is `rateKey`'s idea of one, which is a /64 for IPv6 and an address
+ * for IPv4; a string that is not an address is not counted at all, so this
+ * counter fails open rather than counting every unreadable value as one client.
  *
  * Bounded: at most `maxAddresses` addresses per window. Once the window is
  * full, an address not already in it is not counted (it reads as its first

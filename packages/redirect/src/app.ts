@@ -27,7 +27,7 @@ import {
   verifyPassword,
 } from '@clickmonk/core'
 import type { Pool } from '@clickmonk/db'
-import { type IpLookup, addressOnly, canonicalIp } from '@clickmonk/ipdata'
+import { type IpLookup, addressOnly, canonicalIp, rateKey } from '@clickmonk/ipdata'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { checkCap, tryConsumeCap } from './cap.js'
 import {
@@ -42,7 +42,7 @@ import {
   serverBusyPage,
   tooManyAttemptsPage,
 } from './password.js'
-import { type RateCounter, rateKey } from './rate.js'
+import type { RateCounter } from './rate.js'
 import type { Snapshot } from './snapshot.js'
 import type { SpoolWriter } from './spool.js'
 import { readVisitor, visitorCookies } from './visitor.js'
