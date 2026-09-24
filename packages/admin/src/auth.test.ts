@@ -61,7 +61,7 @@ describe('what the admin service answers at all', () => {
   // whether an admin account exists, which is the window in which the account
   // can still be claimed by whoever reaches the CLI first.
   it('answers liveness only, and says nothing about the install', async () => {
-    await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+    await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD, now: clock.now() })
     const configured = await app.inject({ method: 'GET', url: '/health' })
     expect(configured.statusCode).toBe(200)
     expect(configured.json()).toEqual({ status: 'ok' })
@@ -81,7 +81,7 @@ describe('what the admin service answers at all', () => {
 
   // Readiness is behind the guards, where a credential has already been shown.
   it('reports whether an account exists only to a credential', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const me = await app.inject({ method: 'GET', url: '/api/me', headers: read(cookie) })
     expect(me.statusCode).toBe(200)
     expect(me.json().email).toBe(ADMIN_EMAIL)
@@ -99,7 +99,7 @@ describe('what the admin service answers at all', () => {
   // by host name, and this is the second gate: any container on the Compose
   // network can open a connection to this port and send whatever Host it likes.
   it('answers 404 for every host name but its own', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     // No empty-Host case here: `inject` substitutes `localhost:80` for one, so
     // it would assert nothing the `localhost` row does not already assert.
     // An absent Host over a real socket is the stack suite's to show.
@@ -146,7 +146,7 @@ describe('what the admin service answers at all', () => {
 
     const trusting = testApp(pg, clock, {}, { trustProxy: SHIPPED_TRUSTED_PROXIES })
     try {
-      const cookie = await signedIn(trusting, pg, ADMIN_PASSWORD)
+      const cookie = await signedIn(trusting, pg, clock.now(), ADMIN_PASSWORD)
       const me = await trusting.inject({
         method: 'GET',
         url: '/api/me',
@@ -206,7 +206,7 @@ describe('what the admin service answers at all', () => {
   })
 
   it('answers its own host name with a port, as a browser sends it', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const r = await app.inject({
       method: 'GET',
       url: '/api/me',
@@ -243,7 +243,7 @@ describe('what the admin service answers at all', () => {
   })
 
   it('never answers a CORS header, so no other origin can read it', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const r = await app.inject({
       method: 'GET',
       url: '/api/me',
@@ -257,7 +257,7 @@ describe('what the admin service answers at all', () => {
 
 describe('the session cookie', () => {
   it('is HttpOnly, Secure, SameSite=Strict and host-only', async () => {
-    await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+    await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD, now: clock.now() })
     const r = await app.inject({
       method: 'POST',
       url: '/api/session',
@@ -283,7 +283,7 @@ describe('the session cookie', () => {
   // A stolen dump of `sessions` is not a way in: the row holds a digest, and
   // the cookie holds the token.
   it('stores only a digest of the token', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const token = cookie.slice(cookie.indexOf('=') + 1)
     const r = await pg.query<{ token_hash: string }>('SELECT token_hash FROM sessions')
     expect(r.rows[0]?.token_hash).toBe(hashToken(token))
@@ -291,7 +291,7 @@ describe('the session cookie', () => {
   })
 
   it('is refused once its row is gone, which is what signing out does', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     expect(
       (await app.inject({ method: 'GET', url: '/api/me', headers: read(cookie) })).statusCode,
     ).toBe(200)
@@ -303,7 +303,7 @@ describe('the session cookie', () => {
   })
 
   it('is refused after the idle bound, and the row is gone with it', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     clock.advance(SESSION_IDLE_MS + 1000)
     const r = await app.inject({ method: 'GET', url: '/api/me', headers: read(cookie) })
     expect(r.statusCode).toBe(401)
@@ -317,7 +317,7 @@ describe('the session cookie', () => {
   // refusal after enough time has passed would also come from the idle bound,
   // which is why this walks until the first refusal and pins where it landed.
   it('is refused after the absolute bound however busy it was', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const step = SESSION_IDLE_MS - 1000
     // Twice the absolute bound, so a session that is never ended is a loop
     // that finishes with nothing recorded rather than one that runs forever.
@@ -340,7 +340,7 @@ describe('the session cookie', () => {
   })
 
   it('refuses a token that was never issued, whatever shape it is', async () => {
-    await signedIn(app, pg)
+    await signedIn(app, pg, clock.now())
     for (const value of ['', 'x', 'a'.repeat(43), 'a'.repeat(4000)]) {
       const r = await app.inject({
         method: 'GET',
@@ -354,7 +354,7 @@ describe('the session cookie', () => {
 
 describe('the cross-site write guard', () => {
   it('refuses a write with no Origin', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const r = await app.inject({
       method: 'DELETE',
       url: '/api/session',
@@ -377,7 +377,7 @@ describe('the cross-site write guard', () => {
     ['a host the admin host is a prefix of', `https://${ADMIN_HOST}.evil.example.com`],
     ['null, as a sandboxed frame sends', 'null'],
   ])('refuses a write whose Origin is %s', async (_label, origin) => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const r = await app.inject({
       method: 'POST',
       url: '/api/password',
@@ -397,7 +397,7 @@ describe('the cross-site write guard', () => {
   })
 
   it('allows a read with no Origin, so a browser can load the API at all', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const r = await app.inject({
       method: 'GET',
       url: '/api/sessions',
@@ -412,7 +412,7 @@ describe('an API key', () => {
   // to exist before any key does. Every test here needs one, so it is made
   // once, here, and none of them calls `signedIn` — that would create a second.
   beforeEach(async () => {
-    await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+    await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD, now: clock.now() })
   })
 
   async function keyFor(pg_: typeof pg, name = 'scripting'): Promise<string> {
@@ -626,7 +626,7 @@ describe('what a body may say', () => {
     ['an owner', { ...change, owner: 'somebody' }],
     ['a password hash', { ...change, passwordHash: 'anything at all' }],
   ])('refuses a body carrying %s', async (_label, payload) => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const r = await app.inject({
       method: 'POST',
       url: '/api/password',
@@ -647,7 +647,7 @@ describe('what a body may say', () => {
   })
 
   it('answers a body that is not JSON with 400, not 500', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const r = await app.inject({
       method: 'POST',
       url: '/api/password',

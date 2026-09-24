@@ -12,6 +12,16 @@
 -- on exactly one of the tables that reload reads — and the last of them — so
 -- it can block a reload but can never be half of a deadlock.
 --
+-- The DEFAULTs backfill 90 and 30 onto the row that is already there, which is
+-- safe here for one reason only: **there is no released version to upgrade
+-- from.** Nothing is deployed, so no operator has ever chosen a period and no
+-- existing install can be given one it did not ask for. After a first release
+-- that reason is gone, and the rule that replaces it is the opposite: a
+-- migration may not start deleting data an operator never chose, so a later
+-- retention column arrives NULL — keep for ever — and an operator opts in.
+-- A default is a fine way to answer a question; it is not a way to answer one
+-- nobody was asked.
+--
 -- Deliberately NOT a check that the IP period is the shorter of the two. It
 -- usually is, and an IP period that outlives the clicks it belongs to simply
 -- never runs, but a constraint saying so would refuse an operator who is

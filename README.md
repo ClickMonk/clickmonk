@@ -323,8 +323,11 @@ The install-wide settings are `GET /api/settings` and `PUT /api/settings` — th
 things `clickmonk settings set` covers, in two halves: `traffic` and `retention`. The
 `PUT` takes the whole object rather than the fields you want to change, because the safe
 action and the safe URL depend on each other and a half-written pair is how a link ends up
-sent to nowhere. A stored retention period this build cannot read is reported as `null`
-rather than as the defaults, and nothing is deleted while it reads that way.
+sent to nowhere. `retention` comes back as `null` rather than as the defaults whenever
+this install's kept periods are not known — the settings row is missing, or its stored
+periods cannot be read — and nothing is deleted while it reads that way. A missing row is
+the likelier of the two: it is one `DELETE` away, and the defaults would answer it with a
+period nobody chose.
 
 For a script, mint an API key and send it as `Authorization: Bearer …`:
 

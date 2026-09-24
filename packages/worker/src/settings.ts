@@ -165,21 +165,35 @@ export async function writeSettings(pg: Pool, next: InstallSettings, now: Date):
 }
 
 /**
- * Told, before the write and inside the transaction, that a half of the stored
- * row could not be read and the defaults stood in for it. The argument is why.
+ * One place this function had to invent the value it started from, because the
+ * stored row did not supply one.
  *
- * **There are two of these, not one.** Either half of a row can be unreadable,
- * and in both cases this function writes the defaults over it while the
- * operator was changing something else — a threshold, a period — and says
- * nothing unless the surface in front of it does. Both are the same harm in
- * different units: a retention period nobody was told about is learned from
- * clicks that are gone, and a traffic action nobody was told about is learned
- * from traffic that was being blocked and is now only flagged. A caller with
- * nowhere to print a note passes no hook and is unchanged.
+ * **This is an invariant, not a list of special cases.** Three times now a
+ * surface has had to be taught about one more silent substitution — an
+ * unreadable retention half, an unreadable traffic half, and a row that was
+ * not there at all, where the reader answers "nothing is being deleted" before
+ * the command and "deleted after ninety days" after it. Each was the same
+ * thing: **the row that was written is not derived from the row that was
+ * read**, and the operator was changing something else at the time. So the
+ * rule is stated once, here, and every case reports through it. A fourth case
+ * needs no new callback, and a surface that handles this one handles it.
+ *
+ * `what` says which part was invented rather than read: one half, or the whole
+ * row. `why` is empty for a missing row — there is nothing to explain beyond
+ * its absence — and carries the schema's issues otherwise.
  */
+export type SettingsSubstitution =
+  | { what: 'row'; why: '' }
+  | { what: 'traffic'; why: string }
+  | { what: 'retention'; why: string }
+
 export interface UpdateSettingsHooks {
-  onRetentionReplaced?: (why: string) => void
-  onTrafficReplaced?: (why: string) => void
+  /**
+   * Called, before the write and inside the transaction, with every
+   * substitution this call made — and not called at all when it made none.
+   * A caller with nowhere to print them passes no hook and is unchanged.
+   */
+  onSubstituted?: (subs: SettingsSubstitution[]) => void
 }
 
 /**
@@ -203,15 +217,23 @@ export async function updateSettings(
   const client: PoolClient = await pg.connect()
   try {
     await client.query('BEGIN')
-    await client.query('INSERT INTO settings DEFAULT VALUES ON CONFLICT DO NOTHING')
+    // Whether this inserted tells us the row was not there, which is the third
+    // substitution and the one the earlier two callbacks could not express:
+    // before this statement the reader answered "nothing is being deleted",
+    // and after the write it answers a period. `ON CONFLICT DO NOTHING`
+    // reports 1 row when it inserted and 0 when the row already existed.
+    const ins = await client.query('INSERT INTO settings DEFAULT VALUES ON CONFLICT DO NOTHING')
     const r = await client.query<SettingsRow>(`SELECT ${COLUMNS} FROM settings FOR UPDATE`)
     const row = r.rows[0]
     if (!row) throw new Error('the settings row is missing after writing it')
     const { read, trafficIssues, retentionIssues } = parseRow(row)
-    if (trafficIssues !== null) hooks.onTrafficReplaced?.(trafficIssues)
+    const subs: SettingsSubstitution[] = []
+    if ((ins.rowCount ?? 0) > 0) subs.push({ what: 'row', why: '' })
+    if (trafficIssues !== null) subs.push({ what: 'traffic', why: trafficIssues })
     if (read.retention === null && retentionIssues !== null) {
-      hooks.onRetentionReplaced?.(retentionIssues)
+      subs.push({ what: 'retention', why: retentionIssues })
     }
+    if (subs.length > 0) hooks.onSubstituted?.(subs)
     const current: InstallSettings = {
       // The defaults, when the stored half could not be read — and the hook
       // above is what keeps that from being silent.

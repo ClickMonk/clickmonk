@@ -87,16 +87,23 @@ export class AccountExistsError extends Error {
 /**
  * Creates the account. One install, one admin: a second call throws rather
  * than replacing the first, so a script run twice cannot take an install over.
+ *
+ * `now` stamps both timestamps rather than letting the columns default to SQL
+ * `now()`. The row's later writes are stamped from the caller's clock, and a
+ * row created on one clock and updated on another is a row whose history reads
+ * as out of order — `updated_at` before `created_at` — wherever the two clocks
+ * differ, which is every test that freezes one.
  */
 export async function createAccount(
   pg: Pool,
-  o: { email: string; password: string },
+  o: { email: string; password: string; now: Date },
 ): Promise<void> {
   const hash = await hashPassword(o.password, ADMIN_SCRYPT)
   const r = await pg.query(
-    `INSERT INTO admin_account (email, password_hash) VALUES ($1, $2)
+    `INSERT INTO admin_account (email, password_hash, created_at, updated_at)
+     VALUES ($1, $2, $3, $3)
      ON CONFLICT (id) DO NOTHING`,
-    [normaliseEmail(o.email), hash],
+    [normaliseEmail(o.email), hash, o.now],
   )
   if ((r.rowCount ?? 0) === 0) throw new AccountExistsError()
 }
@@ -124,9 +131,10 @@ export async function setAccountPassword(
   o: { clearLockout: boolean; now: Date },
 ): Promise<string> {
   const hash = await hashPassword(password, ADMIN_SCRYPT)
-  // `updated_at` from the caller's clock, not SQL `now()`: every other write in
-  // this module is stamped from the injected one, and a row half on each is a
-  // row whose timestamps cannot be compared with each other.
+  // `updated_at` from the caller's clock, not SQL `now()`, which is what every
+  // write in this module does — `createAccount` included, since it stamps both
+  // columns rather than letting them default. A row with one timestamp on each
+  // clock is a row whose history reads as out of order.
   const r = await pg.query(
     `UPDATE admin_account SET password_hash = $1, updated_at = $2${
       o.clearLockout

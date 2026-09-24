@@ -46,16 +46,24 @@ const signInWith = (payload: Record<string, unknown>) =>
 
 describe('creating the one admin account', () => {
   it('refuses a second, rather than replacing the first', async () => {
-    await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+    await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD, now: clock.now() })
     await expect(
-      createAccount(pg, { email: 'other@example.com', password: 'another good password' }),
+      createAccount(pg, {
+        email: 'other@example.com',
+        password: 'another good password',
+        now: clock.now(),
+      }),
     ).rejects.toThrow(AccountExistsError)
     const r = await pg.query<{ email: string }>('SELECT email FROM admin_account')
     expect(r.rows[0]?.email).toBe(ADMIN_EMAIL)
   })
 
   it('stores the address lower-cased, and never the password', async () => {
-    await createAccount(pg, { email: '  Admin@Example.COM ', password: ADMIN_PASSWORD })
+    await createAccount(pg, {
+      email: '  Admin@Example.COM ',
+      password: ADMIN_PASSWORD,
+      now: clock.now(),
+    })
     const r = await pg.query<{ email: string; password_hash: string }>(
       'SELECT email, password_hash FROM admin_account',
     )
@@ -66,7 +74,7 @@ describe('creating the one admin account', () => {
 
 describe('signing in', () => {
   it('answers the same refusal for an unknown address and a wrong password', async () => {
-    await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+    await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD, now: clock.now() })
     const wrongEmail = await signInWith({ email: 'nobody@example.com', password: ADMIN_PASSWORD })
     const wrongPassword = await signInWith({ email: ADMIN_EMAIL, password: 'not the password' })
     expect(wrongEmail.statusCode).toBe(401)
@@ -86,14 +94,14 @@ describe('signing in', () => {
     expect(unclaimed.json().error).toBe('invalid_credentials')
     expect(unclaimed.body).not.toContain('no_admin')
 
-    await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+    await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD, now: clock.now() })
     const wrongPassword = await signInWith({ email: ADMIN_EMAIL, password: 'not the password' })
     expect(wrongPassword.statusCode).toBe(401)
     expect(unclaimed.json()).toEqual(wrongPassword.json())
   })
 
   it('locks the account after five failures, for longer each time', async () => {
-    await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+    await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD, now: clock.now() })
     for (let i = 0; i < 5; i++) {
       const r = await signInWith({ email: ADMIN_EMAIL, password: 'wrong' })
       expect(r.statusCode, `attempt ${i}`).toBe(401)
@@ -130,7 +138,7 @@ describe('signing in', () => {
     const attempts = new AttemptCounter(2, LOGIN_ATTEMPT_WINDOW_MS)
     const limited = testApp(pg, clock, { loginAttempts: attempts })
     try {
-      await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+      await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD, now: clock.now() })
       const attempt = (password: string) =>
         limited.inject({
           method: 'POST',
@@ -172,7 +180,7 @@ describe('signing in', () => {
       { trustProxy: SHIPPED_TRUSTED_PROXIES },
     )
     try {
-      await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+      await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD, now: clock.now() })
       const attempt = (password: string, ip: string) =>
         limited.inject({
           method: 'POST',
@@ -214,7 +222,7 @@ describe('signing in', () => {
       { trustProxy: SHIPPED_TRUSTED_PROXIES },
     )
     try {
-      await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+      await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD, now: clock.now() })
       const attempt = (ip: string) =>
         limited.inject({
           method: 'POST',
@@ -248,7 +256,7 @@ describe('signing in', () => {
     const attempts = new AttemptCounter(1, LOGIN_ATTEMPT_WINDOW_MS)
     const limited = testApp(pg, clock, { loginAttempts: attempts })
     try {
-      await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+      await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD, now: clock.now() })
       const attempt = (password: string) =>
         limited.inject({
           method: 'POST',
@@ -283,7 +291,7 @@ describe('signing in', () => {
   it('records the session with the device and address it came from', async () => {
     const trusting = testApp(pg, clock, {}, { trustProxy: SHIPPED_TRUSTED_PROXIES })
     try {
-      await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+      await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD, now: clock.now() })
       const signIn = (ip: string) =>
         trusting.inject({
           method: 'POST',
@@ -320,7 +328,7 @@ describe('signing in', () => {
   })
 
   it('removes sessions that have run out, when someone signs in', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     // Named by the constant, and carrying a token: a substring check against
     // the name written out passes on a cookie the helper failed to read, since
     // the name is still there in front of an empty value.
@@ -346,7 +354,7 @@ describe('signing in', () => {
   // rows to be listed as live with an expiry weeks away — which is the exact
   // opposite of what the admin is reading that list to find out.
   it('treats a session idle past its bound as gone, in the sweep and in the list', async () => {
-    const mine = await signedIn(app, pg)
+    const mine = await signedIn(app, pg, clock.now())
     const theirs = cookieFrom(
       (await signInWith({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD })).headers['set-cookie'],
     )
@@ -412,7 +420,7 @@ describe('two-factor authentication', () => {
   }
 
   it('is off until a code proves the app holds the secret', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const start = await app.inject({
       method: 'POST',
       url: '/api/totp',
@@ -444,7 +452,7 @@ describe('two-factor authentication', () => {
   // client cannot enrol a secret it chose — and confirming without having
   // started is refused rather than treated as an enrolment of something.
   it('enrols only the secret it minted, and never one a body names', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const chosen = newTotpSecret()
     const smuggled = await app.inject({
       method: 'POST',
@@ -481,7 +489,7 @@ describe('two-factor authentication', () => {
   // replace it or remove it — otherwise a stolen session plus the password is
   // a full bypass by way of disable-then-enrol.
   it('needs the current factor to re-enrol or to turn off, and takes a recovery code for it', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const { secret, recoveryCodes } = await enrol(cookie)
 
     for (const [method, url] of [
@@ -541,7 +549,7 @@ describe('two-factor authentication', () => {
   // The password comes first on every one of these, before the second factor
   // is even looked at, so a wrong password never says whether a factor exists.
   it('needs the password again to enrol, to disable, or to replace the codes', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     for (const [method, url] of [
       ['POST', '/api/totp'],
       ['DELETE', '/api/totp'],
@@ -559,13 +567,15 @@ describe('two-factor authentication', () => {
   })
 
   // Every timestamp on this row comes from the clock the service was built
-  // with. One written by SQL `now()` instead cannot be compared with the
-  // others, and is a row whose history reads as out of order on any install
-  // where the two clocks differ.
-  it('stamps the change from the service clock, not the database one', async () => {
-    const cookie = await signedIn(app, pg)
+  // with — `created_at` at the insert as well as `updated_at` at every write
+  // after it. One written by SQL `now()` instead cannot be compared with the
+  // others: on any install where the two clocks differ it reads as history out
+  // of order, and here it would put the change *before* the account existed.
+  it('stamps the row from the service clock at creation and at every change', async () => {
+    const made = clock.now()
+    const cookie = await signedIn(app, pg, made)
     clock.advance(90 * 60 * 1000)
-    const at = clock.now()
+    const changed = clock.now()
     const r = await app.inject({
       method: 'POST',
       url: '/api/password',
@@ -573,15 +583,22 @@ describe('two-factor authentication', () => {
       payload: { currentPassword: ADMIN_PASSWORD, newPassword: 'a new decent password' },
     })
     expect(r.statusCode).toBe(200)
-    const row = await pg.query<{ updated_at: Date }>('SELECT updated_at FROM admin_account')
-    expect(row.rows[0]?.updated_at.toISOString()).toBe(at.toISOString())
+    const row = await pg.query<{ created_at: Date; updated_at: Date }>(
+      'SELECT created_at, updated_at FROM admin_account',
+    )
+    expect(row.rows[0]?.created_at.toISOString()).toBe(made.toISOString())
+    expect(row.rows[0]?.updated_at.toISOString()).toBe(changed.toISOString())
+    // And in that order, which is what a stamp from the wrong clock breaks.
+    expect(row.rows[0]?.created_at.getTime()).toBeLessThan(
+      row.rows[0]?.updated_at.getTime() as number,
+    )
   })
 
   // A session cookie is not a bound. A wrong password here costs the account
   // exactly what a wrong password at the sign-in form costs, so a cookie taken
   // off a shared machine is not an oracle.
   it('counts a wrong password behind a session, and locks the account on it', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     for (let i = 0; i < 5; i++) {
       const r = await app.inject({
         method: 'POST',
@@ -631,7 +648,7 @@ describe('two-factor authentication', () => {
   // failures inside the window is what the lockout is for; a scatter of them
   // across a year is not.
   it('forgets failures older than the decay window, and locks on ones inside it', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const mistype = () =>
       app.inject({
         method: 'POST',
@@ -677,7 +694,7 @@ describe('two-factor authentication', () => {
   // The count and the lock are invisible everywhere else, which is half of why
   // the trap above went unnoticed until it sprang.
   it('reports the failure count and any lockout on the account', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const me = () => app.inject({ method: 'GET', url: '/api/me', headers: read(cookie) })
     expect((await me()).json().failedLogins).toBe(0)
     expect((await me()).json().lockedUntil).toBeNull()
@@ -719,7 +736,7 @@ describe('two-factor authentication', () => {
     const attempts = new AttemptCounter(1, LOGIN_ATTEMPT_WINDOW_MS)
     const limited = testApp(pg, clock, { loginAttempts: attempts })
     try {
-      const cookie = await signedIn(limited, pg)
+      const cookie = await signedIn(limited, pg, clock.now())
       const ask = (currentPassword: string) =>
         limited.inject({
           method: 'POST',
@@ -748,7 +765,7 @@ describe('two-factor authentication', () => {
   // guesses. A wrong code behind a session costs what a wrong password behind a
   // session costs.
   it('counts a wrong second factor behind a session, and locks the account on it', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const { secret } = await enrol(cookie)
     for (let i = 0; i < 5; i++) {
       const r = await app.inject({
@@ -791,7 +808,7 @@ describe('two-factor authentication', () => {
   // and spend one of them as "the current factor" on the next request, which
   // is the second factor removed by someone who never held it.
   it('needs the current factor to replace the recovery codes', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const { secret } = await enrol(cookie)
     const withoutFactor = await app.inject({
       method: 'POST',
@@ -820,7 +837,7 @@ describe('two-factor authentication', () => {
   })
 
   it('then asks for a code at every sign-in', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const { secret } = await enrol(cookie)
     const withoutCode = await signInWith({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
     expect(withoutCode.statusCode).toBe(401)
@@ -848,7 +865,7 @@ describe('two-factor authentication', () => {
 
   // A code seen over a shoulder, or read out of a proxy log, is already spent.
   it('accepts a code once, and refuses every step at or below it', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const { secret } = await enrol(cookie)
     clock.advance(60_000)
     const code = totpCode(secret, totpStep(clock.now().getTime())) as string
@@ -871,7 +888,7 @@ describe('two-factor authentication', () => {
   })
 
   it('takes each recovery code once', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const { recoveryCodes } = await enrol(cookie)
     expect(recoveryCodes).toHaveLength(10)
     const code = recoveryCodes[0] as string
@@ -899,7 +916,7 @@ describe('two-factor authentication', () => {
   })
 
   it('refuses a recovery code this install never issued, and one from an old set', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const { secret, recoveryCodes } = await enrol(cookie)
     const stranger = await signInWith({
       email: ADMIN_EMAIL,
@@ -938,7 +955,7 @@ describe('two-factor authentication', () => {
   // codes outright and enrolling a new secret are two different writes, so a
   // test of one says nothing about the other.
   it('takes the previous set of recovery codes with a fresh enrolment', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const { secret, recoveryCodes } = await enrol(cookie)
 
     // Replacing the app: the current factor authorises it...
@@ -986,7 +1003,7 @@ describe('two-factor authentication', () => {
   })
 
   it('refuses a code and a recovery code in one request', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const { secret, recoveryCodes } = await enrol(cookie)
     const r = await signInWith({
       email: ADMIN_EMAIL,
@@ -998,7 +1015,7 @@ describe('two-factor authentication', () => {
   })
 
   it('takes the codes with it when it is turned off', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const { secret } = await enrol(cookie)
     clock.advance(60_000)
     const off = await app.inject({
@@ -1022,7 +1039,7 @@ describe('two-factor authentication', () => {
 
 describe('changing the password', () => {
   it('needs the current one, and signs every other session out', async () => {
-    const first = await signedIn(app, pg)
+    const first = await signedIn(app, pg, clock.now())
     const secondLogin = await signInWith({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
     const second = cookieFrom(secondLogin.headers['set-cookie'])
 
@@ -1065,7 +1082,7 @@ describe('changing the password', () => {
   // lockout would never arrive. Clearing belongs to the command line, where a
   // shell is already the operator's way back in.
   it('does not clear the failure count when the password is changed through the API', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const wrong = () =>
       app.inject({
         method: 'POST',
@@ -1104,7 +1121,7 @@ describe('changing the password', () => {
   })
 
   it('refuses a new password shorter than the floor', async () => {
-    const cookie = await signedIn(app, pg)
+    const cookie = await signedIn(app, pg, clock.now())
     const r = await app.inject({
       method: 'POST',
       url: '/api/password',

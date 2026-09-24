@@ -335,6 +335,21 @@ describe('clickmonk settings', () => {
     })
   })
 
+  // The third substitution, and the one that is easiest to miss because the
+  // command looks like it worked: before it, nothing was being deleted at all;
+  // after it, clicks go at ninety days. The operator asked about a threshold.
+  it('says so when it wrote a settings row that was not there', async () => {
+    await pg.query('DELETE FROM settings')
+    lines.length = 0
+    expect(await run('settings', 'set', '--abuser-threshold', '61')).toBe(0)
+    expect(lines[0]).toBe(
+      'note: there was no settings row, so this command has written one; nothing was being deleted before, and clicks are now kept for 90 days and addresses for 30 days',
+    )
+    expect(await stored()).toEqual({ raw_retention_days: 90, ip_retention_days: 30 })
+    // And the change the operator actually asked for landed.
+    expect(lines).toContain('abuser threshold: 61 requests a minute from one client')
+  })
+
   it('prints the retention periods, in days and as for ever', async () => {
     await setRetention(90, null)
     lines.length = 0

@@ -124,12 +124,21 @@ export async function signInAs(app: FastifyInstance, password = ADMIN_PASSWORD):
   return cookieFrom(r.headers['set-cookie'])
 }
 
-/** Creates the account and signs in; returns the cookie header a browser would hold. */
+/**
+ * Creates the account and signs in; returns the cookie header a browser would
+ * hold.
+ *
+ * `now` is not optional, and it is the clock the app under test was built
+ * with. A fixture that stamped the account from real time while the app stamps
+ * every later write from a frozen clock would write a row whose history reads
+ * as out of order, which is the shape this suite exists to catch elsewhere.
+ */
 export async function signedIn(
   app: FastifyInstance,
   pg: Pool,
+  now: Date,
   password = ADMIN_PASSWORD,
 ): Promise<string> {
-  await createAccount(pg, { email: ADMIN_EMAIL, password })
+  await createAccount(pg, { email: ADMIN_EMAIL, password, now })
   return signInAs(app, password)
 }

@@ -2,7 +2,12 @@ import { DEFAULT_INSTALL_SETTINGS, DEFAULT_TRAFFIC_SETTINGS } from '@clickmonk/c
 import { type Pool, createPgPool } from '@clickmonk/db'
 import { TEST_PG_URL, resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { readSettings, updateSettings, writeSettings } from './settings.js'
+import {
+  type SettingsSubstitution,
+  readSettings,
+  updateSettings,
+  writeSettings,
+} from './settings.js'
 
 /**
  * Every connection this file's pool opens reports this name to Postgres, so
@@ -262,5 +267,43 @@ describe('updateSettings', () => {
       traffic: DEFAULT_INSTALL_SETTINGS.traffic,
       retention: { rawRetentionDays: 5, ipRetentionDays: 30 },
     })
+  })
+
+  /**
+   * The third substitution, and the one two separate callbacks could not
+   * express. Before this call the reader answers `retention: null` and a pass
+   * deletes nothing; after it the row says ninety days and the pass deletes by
+   * it. Nothing in the command asked for that, so it is reported.
+   */
+  it('reports writing a row that was not there', async () => {
+    await pool.query('TRUNCATE settings')
+    const subs: SettingsSubstitution[][] = []
+    await updateSettings(
+      pool,
+      NOW,
+      (current) => ({
+        ...current,
+        traffic: { ...current.traffic, abuserThreshold: 61 },
+      }),
+      { onSubstituted: (s) => subs.push(s) },
+    )
+    expect(subs).toEqual([[{ what: 'row', why: '' }]])
+  })
+
+  // The report is of a substitution, not of a write: a command that started
+  // from the row it found substituted nothing, and a hook called every time
+  // would be a banner rather than a warning.
+  it('reports nothing when it started from the row it read', async () => {
+    const subs: SettingsSubstitution[][] = []
+    await updateSettings(
+      pool,
+      NOW,
+      (current) => ({
+        ...current,
+        traffic: { ...current.traffic, abuserThreshold: 61 },
+      }),
+      { onSubstituted: (s) => subs.push(s) },
+    )
+    expect(subs).toEqual([])
   })
 })

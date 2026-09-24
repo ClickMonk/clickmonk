@@ -21,7 +21,7 @@ beforeEach(async () => {
   await pg.query('TRUNCATE admin_account, admin_recovery_codes, sessions, api_keys')
   await pg.query('TRUNCATE domains CASCADE')
   app = testApp(pg, clock)
-  cookie = await signedIn(app, pg)
+  cookie = await signedIn(app, pg, clock.now())
   await app.inject({
     method: 'POST',
     url: '/api/domains',

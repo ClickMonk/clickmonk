@@ -46,7 +46,7 @@ import {
   runDomainChecks,
 } from '@clickmonk/worker/domains'
 import { createLink } from '@clickmonk/worker/links'
-import { readSettings, updateSettings } from '@clickmonk/worker/settings'
+import { type SettingsSubstitution, readSettings, updateSettings } from '@clickmonk/worker/settings'
 import type { ZodError } from 'zod'
 
 export interface CliDeps {
@@ -490,7 +490,7 @@ async function adminCreate(args: string[], d: CliDeps): Promise<void> {
   }
   const password = await readPassword(d)
   try {
-    await createAccount(d.pg, { email, password })
+    await createAccount(d.pg, { email, password, now: d.now?.() ?? new Date() })
   } catch (err) {
     if (err instanceof AccountExistsError) throw new Rejected(err.message)
     throw err
@@ -681,8 +681,7 @@ async function settingsSet(args: string[], d: CliDeps): Promise<void> {
   // Arrays rather than nullable locals: the hooks run inside the call below,
   // and a `let` assigned only from a callback is narrowed to its initialiser
   // by the compiler.
-  const replaced: string[] = []
-  const replacedTraffic: string[] = []
+  const substituted: SettingsSubstitution[] = []
   const next = await updateSettings(
     d.pg,
     d.now?.() ?? new Date(),
@@ -700,28 +699,32 @@ async function settingsSet(args: string[], d: CliDeps): Promise<void> {
         ipRetentionDays: period(values['keep-addresses'], current.retention.ipRetentionDays),
       },
     }),
-    {
-      onRetentionReplaced: (why) => replaced.push(why),
-      onTrafficReplaced: (why) => replacedTraffic.push(why),
-    },
+    { onSubstituted: (subs) => substituted.push(...subs) },
   )
-  // Both rewrites are said, not done quietly. This command may have been about
-  // one field and have overwritten the other half of the row on its way past,
-  // and neither is a change an operator should first learn about from clicks
+  // Every substitution is said, not done quietly, and they all arrive through
+  // the one report rather than as a note per case. This command may have been
+  // about one field and have written the rest of the row on its way past, and
+  // none of that is a change an operator should first learn about from clicks
   // that are gone or from traffic that stopped being blocked.
   //
-  // The traffic note points at the lines below rather than naming the values,
-  // because there are five of them and they are already about to be printed;
-  // the retention note names its two, because they are two.
-  for (const why of replacedTraffic) {
-    d.out(
-      `note: the stored traffic settings could not be read (${why}), so this command has rewritten them; what is stored now is below`,
-    )
-  }
-  for (const why of replaced) {
-    d.out(
-      `note: the stored retention could not be read (${why}), so this command has rewritten it as keep clicks ${days(next.retention.rawRetentionDays)}, keep addresses ${days(next.retention.ipRetentionDays)}`,
-    )
+  // The kept periods are named in full because there are two of them; the
+  // traffic settings point at the lines printed below instead, because there
+  // are five and they are about to be printed anyway.
+  const kept = `clicks are now kept for ${days(next.retention.rawRetentionDays)} and addresses for ${days(next.retention.ipRetentionDays)}`
+  for (const sub of substituted) {
+    if (sub.what === 'row') {
+      d.out(
+        `note: there was no settings row, so this command has written one; nothing was being deleted before, and ${kept}`,
+      )
+    } else if (sub.what === 'traffic') {
+      d.out(
+        `note: the stored traffic settings could not be read (${sub.why}), so this command has rewritten them; what is stored now is below`,
+      )
+    } else {
+      d.out(
+        `note: the stored retention could not be read (${sub.why}), so this command has rewritten it as keep clicks ${days(next.retention.rawRetentionDays)}, keep addresses ${days(next.retention.ipRetentionDays)}`,
+      )
+    }
   }
   printSettings(next, d)
 }
