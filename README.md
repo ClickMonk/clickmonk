@@ -18,7 +18,8 @@ on your own infrastructure, and your click data stays yours.
   local disk before it answers, and keeps redirecting while Postgres or ClickHouse is
   down.
 - **The worker**, which ships spooled clicks into ClickHouse, runs the database
-  migrations when it starts, and keeps the IP data up to date.
+  migrations when it starts, keeps the IP data up to date, and deletes what this install
+  has stopped keeping.
 - **TLS on every link domain.** Caddy sits in front and obtains a certificate the first
   time someone asks for a domain over HTTPS, then renews it without anyone touching a
   file. It asks ClickMonk first, and ClickMonk says yes only for a domain you added and
@@ -32,8 +33,9 @@ on your own infrastructure, and your click data stays yours.
   image and starts the stack. Running it again changes nothing that is already set.
 - **An admin API.** One admin account, created on the server with `clickmonk admin
   create`, a session cookie for a browser and API keys for a script, two-factor
-  authentication with recovery codes, and endpoints for domains, links and the
-  install-wide settings. It answers on one host name of its own — set
+  authentication with recovery codes, and endpoints for domains, links, the
+  install-wide settings and everything under "Reading the clicks back out"
+  below. It answers on one host name of its own — set
   `CLICKMONK_ADMIN_HOST` — and Caddy gets it a certificate the first time you visit it.
 - **Password-protected links.** Set a password on a link and visitors are asked for it on
   a ClickMonk page on your own domain before they are sent on. Attempts are counted per
@@ -50,6 +52,31 @@ on your own infrastructure, and your click data stays yours.
   as a bot unless another check gives it a class, and never uses up a click cap. Each
   click also records its country, network (ASN), operating system and browser.
 - **Country rules** use the country looked up from the visitor's address.
+- **Reports over the admin API.** Clicks come back out: a summary of a window, a chart by
+  hour or by day, and a breakdown by country, device, operating system, browser, referring
+  host, the target rotation chose, the traffic class, the action taken or the outcome. They
+  read hourly rollups written as the clicks arrive rather than the clicks themselves, so a
+  window of a year is read as hours and not as every click inside it, and every number
+  counts a click once even if the worker shipped its spool segment twice. **A report counts
+  whole hours** and says in its answer which hours it counted: ask for
+  `from=2026-09-24T10:30:00Z` and you are told you were given 10:00 onwards.
+- **The click log, and a CSV of it.** `GET /api/clicks` lists the clicks themselves, newest
+  first, filterable by link, traffic class, outcome, country and time, and exact to the
+  millisecond. `GET /api/clicks.csv` is the same rows as a file: it streams, so the window
+  can be as wide as you like, and when it reaches its row cap it says so in a header rather
+  than handing you a prefix that looks complete. The file identifies visitors, which
+  "Reading the clicks back out" spells out before you send one to anybody.
+- **Addresses are shown as networks, always.** The log and the export show
+  `198.51.100.0/24` and `2001:db8:1234:5678::/64`, never the address itself — enough to see
+  a pattern or a bot, and not a file of addresses. The whole address stays in the database
+  until the address retention period blanks it, because the traffic classification and the
+  per-client counters need it, and no response reads it back out.
+- **Retention.** Raw clicks are kept for 90 days on a new install and the address on them
+  for 30, both changeable with `clickmonk settings set --keep-clicks` and
+  `--keep-addresses`, and either can be `never`. The rollups are never deleted, so a chart
+  or a breakdown still answers for a window whose raw clicks are gone. **Both periods are
+  floors, not deadlines**: clicks are stored a month at a time and dropped the same way, so
+  90 days keeps 90 to 121 days of clicks and 30 days of addresses keeps them 30 to 61.
 - **The CLI**: `clickmonk migrate`, `clickmonk domain add|list|verify`, `clickmonk link add`,
   `clickmonk settings show|set`, `clickmonk ipdata status|update`, `clickmonk admin create`,
   `clickmonk admin passwd`, `clickmonk admin totp disable`, `clickmonk apikey create|list|revoke`.
@@ -74,8 +101,28 @@ What does not work yet:
   every browser out. An API key is the only credential you can hand over and revoke on its
   own, and a key is not a person — it cannot sign in, and nothing it does is attributed to
   anyone. The admin API also cannot be tried without a real domain name: see that section.
-- **Reports and the click log over the API.** The API covers domains, links and settings.
-  Clicks reach ClickHouse and nothing reads them back out yet.
+- **Anything drawn.** The reports are JSON; nothing plots them. There is no dashboard, so
+  how fresh the numbers are is a field in the answer — `newestHour`, on the summary and the
+  chart — rather than something on a screen.
+- **A CSV of a report.** The export is the click log. A summary or a breakdown is already one
+  small answer, and turning it into a file is a job for the web interface rather than
+  something this API streams.
+- **A time zone.** Every window, bucket and retention period is UTC. A preset like
+  "yesterday" is for whoever is asking to work out.
+- **A breakdown by two things at once.** One dimension per request: clicks by country, or
+  clicks by browser, never clicks by country by browser.
+- **A report of a window older than this install's rollups.** They are written as the clicks
+  arrive and there is nothing to backfill them from, so a window from before this install
+  had them reads as zeroes rather than as a refusal.
+- **A report is only as fresh as the shipper.** Nothing reads the spool: a click that has
+  not been shipped is in no report, and the shipper stops while ClickHouse is unreachable.
+  The redirect keeps answering and keeps spooling throughout, so nothing is lost — it has
+  simply not arrived yet.
+- **Reports answer nothing while ClickHouse is down.** `GET /api/reports/…`,
+  `GET /api/clicks` and `GET /api/clicks.csv` answer 503; domains, links and settings keep
+  working.
+- **An export that fails part way through ends the connection** rather than finishing the
+  file, because a file that looks complete and is not is worse than a download that broke.
 - **Any notification.** Nothing is emailed, posted or pushed anywhere: there is no mail
   configuration and no secret for one. `GET /api/alerts` lists every domain whose last DNS
   check did not find its token, and every domain no check has reached, which is what an
@@ -92,7 +139,8 @@ What does not work yet:
   used.
 - **Cloud providers' published address ranges.** Datacenter traffic is recognised by its
   network (ASN) only. The providers' range files state no licence, so they are not used.
-- **Region and city.** A click records its country only.
+- **Region and city.** A click records its country only. The two columns exist and are
+  always empty, and a breakdown by either would need a rollup of its own.
 - **Backup and restore.**
 - **Rejected clicks are not reported.** A batch of clicks ClickHouse refuses is set aside
   as a `.bad` file in the spool, and nothing tells you it is there.
@@ -329,15 +377,14 @@ periods cannot be read — and nothing is deleted while it reads that way. A mis
 the likelier of the two: it is one `DELETE` away, and the defaults would answer it with a
 period nobody chose.
 
-The worker enforces both periods once an hour, and **each one is a floor rather than a
-deadline.** Clicks are stored a month at a time and deleted the same way, so a month of
-them goes only once its newest possible click is past the period: 90 days keeps between 90
-and 121 days, and 30 days of addresses keeps them between 30 and 61. Lowering a period
-takes effect on the next pass and never rewrites anything already deleted. What is deleted
-is the raw clicks and the addresses on them; the hourly totals every report but the click
-log reads are kept, which is why a chart still answers for a window older than the clicks
-behind it. A blanked address leaves an empty network in an export, the same as an address
-that could never be looked up.
+The worker enforces both periods, and **each one is a floor rather than a deadline** —
+[How long ClickMonk keeps things](#how-long-clickmonk-keeps-things) below has the numbers
+and what a missing row does. What is deleted is the raw clicks and the addresses on them;
+the hourly rollups — which every report but the click log and its export reads — are kept,
+which is why a chart still answers for a window whose raw clicks are gone. A blanked
+address reads as no `network` at all, `null` in the log and an empty cell in the export,
+the same as an address this build's parser does not recognise: the answer does not tell
+those two apart, because the row does not either.
 
 For a script, mint an API key and send it as `Authorization: Bearer …`:
 
@@ -345,11 +392,12 @@ For a script, mint an API key and send it as `Authorization: Bearer …`:
 docker compose exec -T worker node packages/cli/dist/index.js apikey create reporting
 ```
 
-A key can read and write domains, links and settings, and it can read the account's
-identity at `GET /api/me`: the email address, whether two-factor authentication is on, and
-how many recovery codes are unspent. It can change no credential at all. Every route that
-touches one wants a session instead: listing or ending sessions, changing the password,
-anything to do with two-factor authentication, and minting or revoking a key. So a key
+A key can read and write domains, links and settings, read the reports, the click log and
+the CSV export, and read the account's identity at `GET /api/me`: the email address,
+whether two-factor authentication is on, and how many recovery codes are unspent. It can
+change no credential at all. Every route that touches one wants a session instead: listing
+or ending sessions, changing the password, anything to do with two-factor authentication,
+and minting or revoking a key. So a key
 that leaks cannot lock you out of your own install, and cannot make itself a second key.
 `GET /api/me` also reports the failed sign-in count and any standing lockout, and those two
 it reports only to a session: they say whether someone is attacking the account right now,
@@ -369,6 +417,116 @@ install query DNS in a loop.
 **If you never set `CLICKMONK_ADMIN_HOST`,** nothing above exists and nothing breaks: the
 stack starts, Caddy routes every name to the redirect exactly as it did before, the admin
 service answers `503` on every route but `/health`, and the CLI is the only way in.
+
+## Reading the clicks back out
+
+Every one of these is a read, so an API key reaches all of them and no `Origin` header is
+needed. Windows are UTC, `from` is included and `to` is not, and a window may be at most
+400 days.
+
+```sh
+# Everything, for a day
+curl -H "authorization: Bearer $KEY" \
+  "https://admin.example.com/api/reports/summary?from=2026-09-23T00:00:00Z&to=2026-09-24T00:00:00Z"
+
+# A chart: bucket=hour or bucket=day, at most 2000 buckets in one answer
+curl -H "authorization: Bearer $KEY" \
+  "https://admin.example.com/api/reports/timeseries?from=2026-09-01T00:00:00Z&to=2026-09-24T00:00:00Z&bucket=day"
+
+# One dimension: country, device, os, browser, referrer, target, class, action, outcome
+curl -H "authorization: Bearer $KEY" \
+  "https://admin.example.com/api/reports/breakdown?from=2026-09-23T00:00:00Z&to=2026-09-24T00:00:00Z&dimension=country&limit=20"
+
+# The log itself, newest first, paged with the cursor the previous answer gave
+curl -H "authorization: Bearer $KEY" \
+  "https://admin.example.com/api/clicks?from=2026-09-23T00:00:00Z&to=2026-09-24T00:00:00Z&class=bot&limit=100"
+
+# And as a file
+curl -H "authorization: Bearer $KEY" -OJ \
+  "https://admin.example.com/api/clicks.csv?from=2026-09-01T00:00:00Z&to=2026-09-24T00:00:00Z"
+```
+
+Add `&link=<id>` to any of them for one link instead of all of them. **Nothing looks the
+link up**, so an id that belongs to no link is an empty answer rather than an error, on all
+five of these.
+
+**A report counts whole hours; the log counts milliseconds.** Before a report is counted,
+`from` is floored to the hour and `to` raised to the next one, because that is the grain the
+rollups hold; the log and the export use the two instants exactly as they were sent. So the
+same window can answer differently through the two surfaces and neither is broken — a window
+starting one millisecond after the newest click was measured giving three clicks from the
+summary and none from the log, because the summary counted the whole hour that click is in.
+Every one of these five answers repeats the window it actually counted, in its own `window`
+field. Read that before comparing two numbers.
+
+**What the numbers mean.** `clicks` counts distinct clicks and `visitors` distinct visitor
+cookies, and both are counted as sets rather than added up: a click the worker shipped twice
+is one click, and a visitor who clicked two links is one visitor for the install and one for
+each link. The per-link visitor numbers therefore do not add up to the install-wide one, on
+purpose. And `visitors` counts only what a cookie can see. A client that keeps no cookie is
+a new visitor on every click, so for bot traffic `visitors` comes out close to `clicks`, and
+that is the truth rather than a fault. The cookie is also `Secure` and set for one host
+name: over a plain-HTTP trial every click is a new visitor, and one person using two of your
+link domains is two visitors.
+
+**An empty value is a row, not a gap.** A breakdown by country, by referrer or by target has
+a row whose `value` is `""`, and it means something different in each: an address that could
+not be looked up, a visitor who arrived with no referrer, and a click that reached no target.
+They are kept so that the rows add up to the number beside them. A breakdown returns 100
+rows unless you ask for more, at most 500, ordered by clicks, and sets `"truncated": true`
+when there were more.
+
+**Reports lag the clicks** by the time a spool segment takes to seal plus the shipper's next
+pass — a couple of seconds in normal operation. `newestHour`, on the summary and the chart,
+is the newest hour the rollups hold anywhere, not the newest hour in the window you asked
+for.
+
+**Two reports or log pages at a time, and one export.** Past that the answer is `429` with
+`retry-after` rather than a queued query: a credential is not permission to scan the table
+in a loop. The export's slot is its own, so a download does not lock a dashboard out.
+
+### The export
+
+`GET /api/clicks.csv` answers `content-disposition: attachment` with a filename built from
+the window — `clicks-20260901T000000Z-20260924T000000Z.csv` — and a chunked body with no
+`content-length`, because the rows are read from the store and written out as they arrive
+rather than built in memory first. The filename drops milliseconds, so two windows a
+millisecond apart produce the same name; what distinguishes them is the request, not the
+file.
+
+**One export writes at most 1,000,000 rows**, which is just under what a spreadsheet will
+open. Every export carries `x-clickmonk-row-cap` with that number and
+`x-clickmonk-truncated`, `true` or `false`, and both are sent before the first byte of the
+body — which is why a probe query runs in front of the export rather than a trailer being
+appended, since the clients an operator actually uses do not show trailers. Narrow the
+window and ask again; nothing is lost. The cap can be built as high as 10,000,000, and
+there is no environment variable for it yet.
+
+**A cell that would otherwise look like a formula is prefixed with an apostrophe.** A
+spreadsheet runs a cell beginning `=`, `+`, `-` or `@`, or with whitespace in front of one,
+whether the cell is quoted or not. The two columns a visitor's own browser chooses the
+contents of — `referrer` and `userAgent` — are where that turns up, so those are the ones
+that can come back with an apostrophe in front of them.
+
+**The file identifies people, and the truncated network is the least of it.** Every row
+carries `visitorId`, the 128-bit value from a cookie that lives a year and does not change
+between sessions, so one visitor's rows reconstruct everything that person did through this
+install's links on that domain. Every row also carries the whole `userAgent` and the whole
+`referrer`, query string included, which is whatever the referring site chose to put there.
+Decide who receives the file with that in mind: it is not an anonymous export with one
+field redacted. `GET /api/clicks` hands over the same three fields, and the reports hand
+over none of them.
+
+**A slow reader holds the export's slot**, because the slot is given back when the last row
+has been written rather than when the request was accepted. A second export started while
+one is still being read is refused.
+
+**A store failure after the first byte is a short file and nothing else.** The 200 and every
+header have already gone, so there is no status left to change and nothing honest to append:
+the download stops mid-file, inside a chunked body that never gets its last chunk, which is
+a transfer error the client can see rather than a file that looks whole. The only record on
+the server is one error line in the admin service's log, and **a download cannot be
+retracted** — so check that a file you are about to pass on ends where you expect it to.
 
 ## Password-protected links
 
@@ -412,6 +570,40 @@ password page, and answering it correctly gets the visitor no further than the 4
 backup URL. That ordering is deliberate: the page a protected link shows says nothing
 about the link's state, and posting a guess at one must not say anything either. Use it to
 keep a link out of casual hands, not to protect something that matters if it gets out.
+
+## How long ClickMonk keeps things
+
+```sh
+docker compose exec -T worker node packages/cli/dist/index.js settings show
+docker compose exec -T worker node packages/cli/dist/index.js settings set \
+  --keep-clicks 180 --keep-addresses 7
+```
+
+- **Raw clicks**: 90 days on a new install. `--keep-clicks never` keeps them for ever.
+- **The address on a click**: 30 days, after which that one column is blanked and the click
+  keeps everything else. `--keep-addresses never` keeps them for ever.
+- **The hourly rollups**: for ever. They are small, and they are what answers a question
+  about a window whose raw clicks are gone.
+
+Clicks are stored a month at a time and dropped a month at a time, and a month goes only
+once every click it could hold is past the period — so 90 days means 90 to 121 days of
+clicks, and 30 days means 30 to 61 days of addresses: the period, plus the longest month.
+That is the trade for dropping a month in one statement instead of rewriting the table
+continuously. The worker checks once an hour, or as often as
+`CLICKMONK_RETENTION_INTERVAL_MS` says. Lowering a period applies on the next check; raising
+one brings nothing back.
+
+**Nothing is deleted while this install cannot say what it asked for.** If the settings row
+is missing, or the two periods on it cannot be read, the pass does nothing at all and says
+why in the worker's log, `settings show` prints `keep clicks: unknown, so nothing is being
+deleted`, and `GET /api/settings` answers `"retention": null` with a `problem`. That is
+deliberate rather than a gap: applying the defaults there would delete clicks for an
+operator who never chose a period, including one who had chosen to keep them for ever and
+whose row was since deleted. `settings set` writes the row back, and says that it did.
+
+Setting the address period longer than the click period does nothing: the address goes when
+the click does. `settings show` and `GET /api/settings` say so in a note rather than letting
+you find out.
 
 ## IP data
 
