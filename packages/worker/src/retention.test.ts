@@ -409,4 +409,19 @@ describe('startRetention', () => {
     await new Promise((resolve) => setTimeout(resolve, 150))
     expect(passes.length).toBe(after)
   })
+
+  // `stop()` waits for the pass in flight, and the interval in production is an
+  // hour. So a loop told to stop *during* a pass must not go on to set the next
+  // hour's timer: nothing wakes a timer set after the stop, and `stop()` would
+  // then be a shutdown that hangs until the interval runs out — which SIGTERM
+  // does not wait for, so the container is killed instead of stopping.
+  it('stops without waiting out the interval when it is told to during a pass', async () => {
+    const loop = startRetention({ pg: pool, ch, intervalMs: 3_600_000, now: () => NOW })
+    // The next statement after starting it, so the first pass — several round
+    // trips to two stores — is certainly still running.
+    const began = Date.now()
+    await loop.stop()
+    expect(Date.now() - began).toBeLessThan(10_000)
+    await settleMutations()
+  })
 })
