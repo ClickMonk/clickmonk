@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { loadConfig } from './config.js'
 
-const base = { CLICKMONK_POSTGRES_URL: 'postgres://u:p@db:5432/clickmonk' }
+const base = {
+  CLICKMONK_POSTGRES_URL: 'postgres://u:p@db:5432/clickmonk',
+  CLICKMONK_CLICKHOUSE_URL: 'http://clickhouse:8123',
+  CLICKMONK_CLICKHOUSE_USER: 'clickmonk',
+  CLICKMONK_CLICKHOUSE_PASSWORD: 'a clickhouse password',
+  CLICKMONK_CLICKHOUSE_DB: 'clickmonk',
+}
 
 describe('loadConfig', () => {
   // The whole object, not a subset: a field this service starts with and
@@ -9,11 +15,22 @@ describe('loadConfig', () => {
   it('applies the documented defaults', () => {
     expect(loadConfig(base)).toEqual({
       postgresUrl: 'postgres://u:p@db:5432/clickmonk',
+      ch: {
+        url: 'http://clickhouse:8123',
+        username: 'clickmonk',
+        password: 'a clickhouse password',
+        database: 'clickmonk',
+      },
       adminHost: null,
       port: 9100,
       trustedProxies: ['127.0.0.1'],
       dnsServers: [],
     })
+  })
+
+  it('refuses to start without the store the reports read', () => {
+    const { CLICKMONK_CLICKHOUSE_URL: _omitted, ...rest } = base
+    expect(() => loadConfig(rest)).toThrow(/CLICKMONK_CLICKHOUSE_URL/)
   })
 
   it('names every missing or bad variable at once', () => {

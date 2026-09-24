@@ -12,6 +12,8 @@ export interface ChConfig {
   database: string
   /** Passed straight through to the client's own logger, e.g. ClickHouseLogLevel.OFF to silence it. */
   logLevel?: ClickHouseLogLevel
+  /** Client-side bound on one query, in milliseconds. */
+  requestTimeoutMs?: number
 }
 
 export interface PgPoolOptions {
@@ -50,5 +52,6 @@ export function createChClient(cfg: ChConfig): ClickHouseClient {
     password: cfg.password,
     database: cfg.database,
     ...(cfg.logLevel !== undefined ? { log: { level: cfg.logLevel } } : {}),
+    ...(cfg.requestTimeoutMs !== undefined ? { request_timeout: cfg.requestTimeoutMs } : {}),
   })
 }

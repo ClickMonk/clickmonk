@@ -1,5 +1,5 @@
 import { AttemptCounter, ConcurrencyGate, newSlug, normaliseHost } from '@clickmonk/core'
-import type { Pool } from '@clickmonk/db'
+import type { ClickHouseClient, Pool } from '@clickmonk/db'
 import { MAX_IP_LENGTH, addressOnly, canonicalIp } from '@clickmonk/ipdata'
 import type { DomainResolver } from '@clickmonk/worker/domains'
 import Fastify, {
@@ -12,6 +12,7 @@ import { registerDomainRoutes } from './domains.js'
 import { HttpError, MAX_BODY_BYTES, securityHeaders } from './http.js'
 import { registerKeyRoutes } from './keys.js'
 import { registerLinkRoutes } from './links.js'
+import { registerReportRoutes } from './reports.js'
 import { registerSessionRoutes } from './session-routes.js'
 import { registerSettingsRoutes } from './settings-routes.js'
 
@@ -26,6 +27,19 @@ export const PASSWORD_CHECKS_IN_FLIGHT = 2
  * bound must not have to reach back into this file for the number.
  */
 export const DNS_CHECKS_IN_FLIGHT = 2
+/**
+ * Report queries this process runs at once, and exports.
+ *
+ * A credential is not a bound: an authenticated caller — or a leaked API key —
+ * can loop a report endpoint, and each pass is a scan of a window they chose.
+ * Past these the answer is a refusal with `retry-after`, never a queued query,
+ * for the same reason the on-demand DNS check refuses rather than queues.
+ * Exports get their own, smaller gate because an export is the one request
+ * that holds a ClickHouse result open for as long as the client takes to read
+ * it.
+ */
+export const REPORT_QUERIES_IN_FLIGHT = 2
+export const EXPORTS_IN_FLIGHT = 1
 
 export interface AdminDeps {
   pg: Pool
@@ -63,6 +77,16 @@ export interface AdminDeps {
   passwordGate?: ConcurrencyGate
   checkGate?: ConcurrencyGate
   /**
+   * Where the reports read from. Optional here and required in `loadConfig`:
+   * required in configuration so an install with a typo fails at boot with the
+   * variable named rather than answering 503 for ever, and optional here so
+   * that the 503 path is reachable from a test, and so that a suite about
+   * links does not have to build a ClickHouse client to test a link.
+   */
+  ch?: ClickHouseClient
+  reportGate?: ConcurrencyGate
+  exportGate?: ConcurrencyGate
+  /**
    * Where a link with no slug of its own gets one. `newSlug` unless a caller
    * says otherwise, and nothing in the product says otherwise: it is here so
    * that a test can hand out a slug that is already taken, which is the only
@@ -84,6 +108,8 @@ export interface AdminContext extends AdminDeps {
   passwordGate: ConcurrencyGate
   /** How many on-demand DNS checks this process runs at once. */
   checkGate: ConcurrencyGate
+  reportGate: ConcurrencyGate
+  exportGate: ConcurrencyGate
   slugSource: () => string
 }
 
@@ -129,6 +155,8 @@ export function buildAdminApp(
       deps.loginAttempts ?? new AttemptCounter(LOGIN_ATTEMPT_LIMIT, LOGIN_ATTEMPT_WINDOW_MS),
     passwordGate: deps.passwordGate ?? new ConcurrencyGate(PASSWORD_CHECKS_IN_FLIGHT),
     checkGate: deps.checkGate ?? new ConcurrencyGate(DNS_CHECKS_IN_FLIGHT),
+    reportGate: deps.reportGate ?? new ConcurrencyGate(REPORT_QUERIES_IN_FLIGHT),
+    exportGate: deps.exportGate ?? new ConcurrencyGate(EXPORTS_IN_FLIGHT),
     slugSource: deps.slugSource ?? newSlug,
   }
 
@@ -243,6 +271,7 @@ export function buildAdminApp(
   registerDomainRoutes(app, ctx)
   registerLinkRoutes(app, ctx)
   registerSettingsRoutes(app, ctx)
+  registerReportRoutes(app, ctx)
 
   return app
 }

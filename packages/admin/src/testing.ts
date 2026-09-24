@@ -60,6 +60,11 @@ export const SHIPPED_TRUSTED_PROXIES = ['uniquelocal', 'loopback']
  * `trustProxy: false` by default, because most suites are not about forwarded
  * headers and a false here keeps them reading what they were sent. A suite
  * that is about them passes `SHIPPED_TRUSTED_PROXIES`.
+ *
+ * A suite that reads a report passes `{ ch }` in `extra`; one that does not,
+ * does not, and the report routes then answer 503 — which is a real answer
+ * this service gives and has a test of its own. Nothing ClickHouse is
+ * re-exported from here: each suite builds its own client with `testCh()`.
  */
 export function testApp(
   pg: Pool,
