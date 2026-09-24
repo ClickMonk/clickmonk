@@ -918,25 +918,52 @@ describe('GET /api/clicks.csv, a caller that hangs up', () => {
   const settle = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
   /**
-   * The ordinary export, for the count rather than the file.
+   * An export read to the end over a real socket, for the count rather than the
+   * file.
    *
    * Three paths call the release — the generator's `finally` and the stream's
-   * `close` and `error` — and on an export that simply finishes, two of them do.
-   * The gate cannot notice the second: `leave()` on an empty gate does nothing.
-   * So what is asserted is the number of calls, because a release that runs twice
-   * is a slot handed back that was never taken, and with two exports allowed at
-   * once that is one of them freeing the other's.
+   * `close` and `error` — and an export that simply finishes takes two of them.
+   * The gate cannot notice the second: `leave()` on an empty gate does nothing,
+   * so a release that ran twice is invisible in `inFlight` until two exports run
+   * at once and one of them hands back the other's slot. What is asserted is
+   * therefore the number of calls.
+   *
+   * Over a socket and not through `inject`, which was measured calling it once:
+   * `inject` has no connection to close, so the stream's `close` never reaches
+   * this. An idempotence this file pinned through `inject` would be an assertion
+   * about light-my-request.
    */
-  it('gives the slot back exactly once when the export finishes', async () => {
+  it('gives the slot back exactly once when the export is read to the end', async () => {
     const gate = new CountingGate(1)
     const one = testApp(pool, clock, { ch, exportGate: gate })
     try {
-      const r = await one.inject({
-        method: 'GET',
-        url: `/api/clicks.csv?${WINDOW}`,
-        headers: read(cookie),
+      await one.listen({ host: '127.0.0.1', port: 0 })
+      const at = one.server.address()
+      const port = typeof at === 'object' && at !== null ? at.port : 0
+      const body = await new Promise<string>((resolve, reject) => {
+        const req = httpRequest(
+          {
+            host: '127.0.0.1',
+            port,
+            path: `/api/clicks.csv?${WINDOW}`,
+            headers: { host: ADMIN_HOST, cookie },
+          },
+          (res) => {
+            let text = ''
+            res.setEncoding('utf8')
+            res.on('data', (chunk: string) => {
+              text += chunk
+            })
+            res.on('end', () => resolve(text))
+          },
+        )
+        req.on('error', reject)
+        req.end()
       })
-      expect(r.statusCode).toBe(200)
+      // The whole file came down the socket, which nothing else here checks:
+      // every other export in this suite is read through `inject`.
+      expect(body.split('\r\n').filter((l) => l.length > 0)).toHaveLength(4)
+      await settle(100)
       expect(gate.entered).toBe(1)
       expect(gate.left).toBe(1)
       expect(gate.stats().inFlight).toBe(0)
