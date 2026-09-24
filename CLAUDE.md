@@ -127,7 +127,7 @@ packages/ipdata/    IP data: the compact range-table format, the source parsers
                     and their licences, the manifest the redirect loads, and the
                     updater the worker runs.
 packages/redirect/  the service that answers link domains: an in-memory snapshot,
-                    the IP data and the per-address rate counter, the spool
+                    the IP data and the per-client rate counter, the spool
                     writer, the click-cap counter, the password gate and its
                     proof cookie.
 packages/worker/    ships the spool into ClickHouse; runs migrations on boot;

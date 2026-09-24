@@ -37,8 +37,9 @@ on your own infrastructure, and your click data stays yours.
   `CLICKMONK_ADMIN_HOST` — and Caddy gets it a certificate the first time you visit it.
 - **Password-protected links.** Set a password on a link and visitors are asked for it on
   a ClickMonk page on your own domain before they are sent on. Attempts are counted per
-  address per link, and the proof a visitor holds stops working the moment you change the
-  password.
+  client per link — an IPv4 address, or a whole IPv6 /64, since one client usually holds
+  an entire /64 and can pick a new address out of it for every request — and the proof a
+  visitor holds stops working the moment you change the password.
 - **Traffic classification.** Every click is classed as human, bot, abuser, anonymous
   (a Tor exit), datacenter, or unknown when the IP checks could not run, from its
   user-agent, the number of requests from its address in the current one-minute window,
@@ -283,9 +284,11 @@ password.
 **Locked out, or the authenticator is gone.** Five wrong passwords lock the account for
 five minutes, six for ten, and so on to an hour; the count is forgotten an hour after the
 last failure, and a sign-in that succeeds clears it. `GET /api/me` shows the count and any
-standing lock to a signed-in browser, before the lock bites. Separately, each address gets
+standing lock to a signed-in browser, before the lock bites. Separately, each client gets
 ten failed sign-ins per fifteen minutes, counted in the process rather than in the
-database. Two commands on the server are the way back, and both work while the account is
+database — a client being one IPv4 address or one IPv6 /64, because an IPv6 client usually
+holds a whole /64 and counting each address on its own would be no bound at all for one.
+The session list still shows the full address each of your browsers signed in from. Two commands on the server are the way back, and both work while the account is
 locked, because both run where a request cannot reach:
 
 ```sh
@@ -364,8 +367,9 @@ curl -X POST https://admin.example.com/api/links \
 A visitor gets a page on your own domain with one field. A correct password sets a signed
 cookie for that link, good for twelve hours, and they are sent on; the cookie is `Secure`,
 so this needs HTTPS — over a plain-HTTP trial the visitor is asked every time. Wrong
-answers are counted per address per link and refused after five in a minute. Changing the
-password invalidates every cookie issued under the old one.
+answers are counted per client per link and refused after five in a minute, a client here
+being one IPv4 address or one IPv6 /64 for the reason above. Changing the password
+invalidates every cookie issued under the old one.
 
 The limit counts wrong answers only — a correct one clears the count — so it is not a bound
 on how often somebody who knows the password can make the server hash it. What bounds that
