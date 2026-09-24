@@ -271,8 +271,40 @@ export function clickFilter(
   return { where: parts.join(' AND '), params }
 }
 
-/** Rows one export writes at most. */
+/**
+ * Rows one export writes at most, and the largest an install may set it to.
+ *
+ * The default sits just under the 1,048,576 rows a spreadsheet will open, which
+ * is the ceiling that matters to the person the file is for. The other one is a
+ * file's rather than the store's: ten million rows of click log is tens of
+ * gigabytes, and an install asking for more has stopped asking for a spreadsheet.
+ */
 export const EXPORT_ROW_CAP = 1_000_000
+export const MAX_EXPORT_ROW_CAP = 10_000_000
+
+/**
+ * The cap, checked against the range it is bound into and not only its type.
+ *
+ * It reaches the query text as a `LIMIT`, and the probe's as `LIMIT cap + 1`, so
+ * it is a caller value with a longer path: it comes from whoever built this
+ * service, which on an install is configuration, which is a file an operator
+ * edits. A fractional one is `LIMIT 3.5` and a negative one is a syntax error —
+ * each one a store error that every export from then on would answer with, and
+ * that the caller would be told is an install outage rather than a number
+ * somebody typed. So it is refused here, at boot, naming the thing that is
+ * wrong, which is the bargain `loadConfig` already makes for a bad port.
+ *
+ * The default goes through it too: a range nothing is checked against is a range
+ * that can quietly stop containing the value it was written for.
+ */
+export function checkExportRowCap(cap: number): number {
+  if (!Number.isInteger(cap) || cap < 1 || cap > MAX_EXPORT_ROW_CAP) {
+    throw new Error(
+      `exportRowCap: must be a whole number of rows from 1 to ${MAX_EXPORT_ROW_CAP}, not ${cap}`,
+    )
+  }
+  return cap
+}
 
 /**
  * The CSV's columns, in order, by the same names the JSON uses: one vocabulary
@@ -448,10 +480,19 @@ export function registerClickRoutes(app: FastifyInstance, ctx: AdminContext): vo
             }
           }
         } catch (err) {
-          // The status and the headers are long gone. Ending the connection
-          // without a well-formed last line is the only honest thing left: a
-          // 200 that ends in a complete-looking file with half the rows missing
-          // is exactly what this endpoint exists not to do.
+          // **A download cannot be retracted.** The 200 and every header went
+          // out before the first row, so there is no status left to change and
+          // nothing honest to append: what the caller gets is a truncated file
+          // and a connection that ended mid-line, and what they see is a broken
+          // download. Appending a well-formed last line would be worse — a file
+          // that looks complete with half the rows missing is the one thing this
+          // endpoint exists not to produce.
+          //
+          // So this line is the only record that the file is short, which is why
+          // it is at error level: an operator who reads it counts the rows, and
+          // one who never sees it trusts a file that ends early. A failure
+          // *before* the first byte is a different case — the probe's is a 503,
+          // and the stream query's own is the error handler's 500.
           req.log.error({ err }, 'clickhouse failed while an export was streaming')
           throw err
         } finally {

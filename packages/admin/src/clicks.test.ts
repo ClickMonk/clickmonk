@@ -115,6 +115,23 @@ const PAGE_IDS = Array.from(
 )
 const manyInOneInstant = PAGE_IDS.map((id) => click({ click_id: id, time: PAGE_INSTANT }))
 
+/**
+ * One click whose user agent opens the way a formula does, in a month of its own.
+ *
+ * A spreadsheet runs what the file hands it, not what the writer's helper
+ * returned, so the defusing is read back off a streamed body and not only off
+ * `csvCell`. A user agent is a string a stranger chose, which is what makes this
+ * the field to do it with. Its own month, older than every other click in this
+ * file, so no count and no page boundary above moves.
+ */
+const FORMULA_ID = '01920000-0000-7000-8000-000000000031'
+const FORMULA_UA = '=HYPERLINK("https://example.com","click")'
+const formulaClick = click({
+  click_id: FORMULA_ID,
+  time: '2026-07-10 10:00:00.000',
+  user_agent: FORMULA_UA,
+})
+
 /** A well-formed id for a cursor whose instant is the thing under test. */
 const CURSOR_ID = '01920000-0000-7000-8000-0000000000ff'
 
@@ -124,6 +141,7 @@ const WINDOW = 'from=2026-09-24T00:00:00.000Z&to=2026-09-25T00:00:00.000Z'
 const DAY_BEFORE = 'from=2026-09-23T00:00:00.000Z&to=2026-09-24T00:00:00.000Z'
 const TIED_DAY = 'from=2026-09-22T00:00:00.000Z&to=2026-09-23T00:00:00.000Z'
 const PAGE_DAY = 'from=2026-08-15T00:00:00.000Z&to=2026-08-16T00:00:00.000Z'
+const FORMULA_DAY = 'from=2026-07-10T00:00:00.000Z&to=2026-07-11T00:00:00.000Z'
 
 beforeAll(async () => {
   await resetDatabases(pool, ch)
@@ -196,6 +214,9 @@ beforeAll(async () => {
     ...tied,
     // Fifty-one in another month: see the default-page block at the end.
     ...manyInOneInstant,
+    // One in a month of its own, whose user agent a spreadsheet would run: see
+    // the export's formula block at the end.
+    formulaClick,
   ])
 })
 
@@ -844,6 +865,93 @@ describe('GET /api/clicks.csv', () => {
       expect(r.statusCode).toBe(200)
     } finally {
       await busy.close()
+    }
+  })
+})
+
+/**
+ * A value a spreadsheet would run, read back off the file.
+ *
+ * The unit tests for `csvCell` say the helper defuses one; this says the row the
+ * export wrote did. They are different claims, and only the second one is about
+ * the file an operator double-clicks. Its own window, so the fixture click is the
+ * only row in it and the whole line can be asserted.
+ */
+describe('GET /api/clicks.csv, a value a spreadsheet would run', () => {
+  it('defuses the cell and leaves the value readable in it', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/clicks.csv?${FORMULA_DAY}`,
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(200)
+    const out = r.body.split('\r\n').filter((l) => l.length > 0)
+    expect(out).toHaveLength(2)
+    // The whole row, written out: the apostrophe in front of the user agent, the
+    // quotes inside it doubled, and every other cell where it belongs.
+    expect(out[1]).toBe(
+      `"${FORMULA_ID}","2026-07-10T10:00:00.000Z","go.example.test","/a","${DOMAIN}","${LINK_A}","target","destination","302","https://example.com/?c=01920000-0000-7000-8000-000000000001","${TARGET}","v1","false","DE","","","dbip","desktop","windows","chrome","64500","human","","","https://blog.example.com/post","'=HYPERLINK(""https://example.com"",""click"")","198.51.100.0/24","false"`,
+    )
+    // And said directly: no cell in the file opens with the formula. Asserted
+    // after the line above, so an empty body could not satisfy it.
+    expect(r.body).not.toContain('"=HYPERLINK')
+  })
+})
+
+/**
+ * The cap, where it is set.
+ *
+ * It reaches the query text as a `LIMIT`, so it is refused against the range it is
+ * bound into and not only against its type — and refused when the app is built,
+ * which is where a value from configuration arrives. Both ends, with literals,
+ * for the reason every bound in this file is a literal: one derived from the
+ * constant it is testing moves when the constant moves and goes on passing.
+ */
+describe('the export row cap, where it is set', () => {
+  it.each([
+    ['nothing to export', 0],
+    ['a negative number of rows', -1],
+    ['a fraction of a row', 2.5],
+    ['more rows than a file holds', 10_000_001],
+    ['not a number at all', Number.NaN],
+  ])('refuses %s, when the app is built', (_label, cap) => {
+    expect(() => testApp(pool, clock, { ch, exportRowCap: cap })).toThrow(/exportRowCap/)
+  })
+
+  it('takes the smallest cap there is, and exports one row', async () => {
+    const small = testApp(pool, clock, { ch, exportRowCap: 1 })
+    try {
+      const r = await small.inject({
+        method: 'GET',
+        url: `/api/clicks.csv?${WINDOW}`,
+        headers: read(cookie),
+      })
+      expect(r.statusCode).toBe(200)
+      expect(r.headers['x-clickmonk-row-cap']).toBe('1')
+      expect(r.headers['x-clickmonk-truncated']).toBe('true')
+      expect(r.body.split('\r\n').filter((l) => l.length > 0)).toHaveLength(2)
+    } finally {
+      await small.close()
+    }
+  })
+
+  // The other end, and a request through it: the 200 is what says the store took
+  // `LIMIT 10000000` rather than answering an error the caller would be told was
+  // an install outage.
+  it('takes the largest cap there is, and the store takes the query it makes', async () => {
+    const large = testApp(pool, clock, { ch, exportRowCap: 10_000_000 })
+    try {
+      const r = await large.inject({
+        method: 'GET',
+        url: `/api/clicks.csv?${WINDOW}`,
+        headers: read(cookie),
+      })
+      expect(r.statusCode).toBe(200)
+      expect(r.headers['x-clickmonk-row-cap']).toBe('10000000')
+      expect(r.headers['x-clickmonk-truncated']).toBe('false')
+      expect(r.body.split('\r\n').filter((l) => l.length > 0)).toHaveLength(4)
+    } finally {
+      await large.close()
     }
   })
 })

@@ -8,7 +8,7 @@ import Fastify, {
   type FastifyServerOptions,
 } from 'fastify'
 import { type Credential, authenticate, checkCsrf, hasBearer } from './auth.js'
-import { EXPORT_ROW_CAP, registerClickRoutes } from './clicks.js'
+import { EXPORT_ROW_CAP, checkExportRowCap, registerClickRoutes } from './clicks.js'
 import { registerDomainRoutes } from './domains.js'
 import { HttpError, MAX_BODY_BYTES, securityHeaders } from './http.js'
 import { registerKeyRoutes } from './keys.js'
@@ -90,9 +90,10 @@ export interface AdminDeps {
   reportGate?: ConcurrencyGate
   exportGate?: ConcurrencyGate
   /**
-   * Rows one export writes at most. Injectable only so that a test can reach
-   * the cap with three rows instead of a million; nothing in the product sets
-   * it.
+   * Rows one export writes at most. Injectable so that a test can reach the cap
+   * with three rows instead of a million; nothing in the product sets it today,
+   * and whatever does will be configuration an operator wrote, which is why it
+   * is refused at boot rather than trusted — see `checkExportRowCap`.
    */
   exportRowCap?: number
   /**
@@ -167,7 +168,10 @@ export function buildAdminApp(
     checkGate: deps.checkGate ?? new ConcurrencyGate(DNS_CHECKS_IN_FLIGHT),
     reportGate: deps.reportGate ?? new ConcurrencyGate(REPORT_QUERIES_IN_FLIGHT),
     exportGate: deps.exportGate ?? new ConcurrencyGate(EXPORTS_IN_FLIGHT),
-    exportRowCap: deps.exportRowCap ?? EXPORT_ROW_CAP,
+    // Checked here rather than where it is interpolated: a bad one is a fault in
+    // how this service was built, so it belongs at boot with the name of the
+    // thing that is wrong, not in the 503 every export would answer with.
+    exportRowCap: checkExportRowCap(deps.exportRowCap ?? EXPORT_ROW_CAP),
     slugSource: deps.slugSource ?? newSlug,
   }
 
