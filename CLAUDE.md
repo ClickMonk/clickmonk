@@ -50,12 +50,26 @@ API (one account, sessions, TOTP with recovery codes, API keys, domain/link/sett
 CRUD, answering on `CLICKMONK_ADMIN_HOST` alone — unset, every route but `/health` is a
 503 and links serve exactly as before), the CLI (`migrate`,
 `domain add|list|verify`, `link add`, `settings show|set`, `ipdata status|update`,
-`admin create|passwd`, `apikey create|list|revoke`), `install.sh`, a Compose stack, and
-the restart durability and stack test suites.
+`admin create|passwd`, `admin totp disable`, `apikey create|list|revoke`), `install.sh`, a
+Compose stack, and the restart durability and stack test suites.
+
+**The two services read `CLICKMONK_ADMIN_HOST` differently on purpose.** The admin service
+refuses to boot on a value it cannot parse; the redirect logs `ADMIN_HOST_IGNORED` once and
+serves links with the certificate check approving verified link domains only. The redirect
+reads it for one thing — telling the proxy which name may have a certificate — and a
+mistyped host name is not a reason to take every link on the install down.
 
 What does not exist yet, and must not be implied by any documentation:
 
-- **A web UI.** There is an admin API; nothing draws it yet.
+- **A web UI.** There is an admin API; nothing draws it yet, and it cannot be reached over
+  plain HTTP at all — the admin host answers 308, and the session cookie is `Secure` with
+  the `__Host-` prefix — so unlike a link domain it cannot be tried on a laptop.
+- **More than one admin account.** One account is the whole of the access control: no
+  roles, no second person, no attribution of who did what. An API key is the only
+  credential that can be handed out and revoked on its own, and it is not a person.
+- **A way back in over the API when both factors are lost.** Removing the second factor
+  there requires the second factor. `clickmonk admin totp disable` is the answer, and it is
+  a command on the server for that reason.
 - **Reports and exports, over the API or anywhere else.** Clicks reach ClickHouse and
   nothing reads them back out. The API covers domains, links and settings only.
 - **Notifications of any kind.** No mail configuration exists; `GET /api/alerts` is what
@@ -120,6 +134,10 @@ packages/worker/    ships the spool into ClickHouse; runs migrations on boot;
                     updates the IP data; checks domain DNS verification on a schedule.
 packages/admin/     the admin API: sessions, API keys, TOTP, domain/link/settings CRUD.
 packages/cli/       `clickmonk migrate | domain | link add | settings | ipdata | admin | apikey`.
+                    Two commands here are deliberately not API routes: `admin create`,
+                    because nothing can authenticate before the account exists, and
+                    `admin totp disable`, because it is the way back in when the second
+                    factor is gone and so must not be reachable by a request.
 caddy/              the Caddyfile, and the tls.d/ and proxy.d/ drop-in directories an
                     operator edits: where certificates come from, and a proxy in
                     front of Caddy. The Caddyfile routes CLICKMONK_ADMIN_HOST to the

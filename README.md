@@ -50,10 +50,11 @@ on your own infrastructure, and your click data stays yours.
   click also records its country, network (ASN), operating system and browser.
 - **Country rules** use the country looked up from the visitor's address.
 - **The CLI**: `clickmonk migrate`, `clickmonk domain add|list|verify`, `clickmonk link add`,
-  `clickmonk settings show|set`, `clickmonk ipdata status|update`, `clickmonk admin create|passwd`,
-  `clickmonk apikey create|list|revoke`. `settings set` covers the traffic actions, the
-  safe URL and the abuser threshold; the two `admin` commands read the password from
-  standard input and from nowhere else.
+  `clickmonk settings show|set`, `clickmonk ipdata status|update`, `clickmonk admin create`,
+  `clickmonk admin passwd`, `clickmonk admin totp disable`, `clickmonk apikey create|list|revoke`.
+  `settings set` covers the traffic actions, the safe URL and the abuser threshold.
+  `admin create` and `admin passwd` read the password from standard input and from nowhere
+  else; `admin totp disable` reads none, and is the way back in when both factors are lost.
 - **A Docker Compose stack** that runs all of it, and a test that restarts each service
   under continuous traffic and requires every redirect the client received to arrive in
   ClickHouse as a click.
@@ -64,6 +65,12 @@ What does not work yet:
   in, and there is nothing to click. Driving it means `curl` or the CLI for now. Enrolling
   an authenticator app hands you the secret and an `otpauth:` URI to paste into it, because
   nothing here draws a QR code.
+- **More than one admin account.** There is exactly one, and it is the whole of the access
+  control: no second person, no roles, no record of which of you did something, and no way
+  to let someone in and then out again except by changing the one password, which signs
+  every browser out. An API key is the only credential you can hand over and revoke on its
+  own, and a key is not a person — it cannot sign in, and nothing it does is attributed to
+  anyone. The admin API also cannot be tried without a real domain name: see that section.
 - **Reports and the click log over the API.** The API covers domains, links and settings.
   Clicks reach ClickHouse and nothing reads them back out yet.
 - **Any notification.** Nothing is emailed, posted or pushed anywhere: there is no mail
@@ -200,18 +207,44 @@ Certificates live in the `caddy-data` volume. Back it up with the rest.
 
 ## The admin API
 
-Pick a host name for it that is **not** a link domain — link slugs and admin routes would
-otherwise share one namespace, and `domain add` refuses a link domain under this name for
-that reason — point it at this server, and put it in `.env`:
+**This one needs a real domain name.** A link domain can be tried over plain HTTP on a
+laptop with `--verified`; the admin API cannot be tried at all that way. Plain HTTP on the
+admin host answers `308` to HTTPS, and the session cookie is `Secure` with the `__Host-`
+prefix, so a browser will not store it over HTTP even if it could reach the form. Set this
+up on a host with a name pointed at it, not on your own machine.
+
+Create the one admin account first — it needs nothing but the database, and nothing can
+authenticate until it exists. The password is read from standard input, never from an
+argument, because arguments are visible in `ps` and left in your shell history. It is
+between 12 and 200 characters.
+
+```sh
+printf '%s' 'your-admin-password' | docker compose exec -T worker \
+  node packages/cli/dist/index.js admin create you@example.com
+```
+
+**Keep the `-T`.** Run that line from a terminal without it and Compose asks for a terminal
+inside the container, then refuses to attach the pipe to one — `cannot attach stdin to a
+TTY-enabled container because stdin is not a terminal`, and the command never runs. (From a
+script, where nothing is a terminal, it works either way. The flag is never wrong, so it is
+in every line here.) Leave out the pipe as well and the command does run, and refuses: a
+password typed at a terminal is echoed on screen and kept in your shell history.
+
+Then pick the host name the API answers on. It must **not** be a link domain — link slugs
+and admin routes would otherwise share one namespace, and `domain add` refuses a link
+domain under this name for that reason — point it at this server, and put it in `.env`:
 
 ```sh
 # in .env
 CLICKMONK_ADMIN_HOST=admin.example.com
 ```
 
-The value is a bare lower-case host name: no scheme, no port, no wildcard. Anything else
-fails the configuration at boot with the variable named, rather than quietly routing names
-you did not mean.
+The value is a bare lower-case host name: no scheme, no port, no wildcard. The admin
+service refuses to start on anything else and names the variable. **Your links are not
+affected by a mistyped one:** the redirect reads the same variable only to tell Caddy which
+name may have a certificate, so it logs that it ignored the value and carries on serving,
+and the certificate check then approves verified link domains and nothing else — which
+means the admin interface gets no certificate until the value is fixed.
 
 Only `domain add`'s direction of the clash is caught. Set this to a name a link domain
 **already** holds and Caddy starts sending it to the admin API, that domain's links stop
@@ -220,17 +253,6 @@ value is right, so Compose hands it to the services that read it:
 
 ```sh
 docker compose up -d
-```
-
-Then create the one admin account. The password is read from standard input, never from an
-argument, because arguments are visible in `ps` and left in your shell history. It is at
-least 12 characters. **The `-T` is not optional:** without it Compose allocates a
-terminal, nothing arrives on standard input, and the command refuses rather than reading a
-password off the screen.
-
-```sh
-printf '%s' 'your-admin-password' | docker compose exec -T worker \
-  node packages/cli/dist/index.js admin create you@example.com
 ```
 
 Visiting `https://admin.example.com/api/me` is what makes Caddy obtain a certificate for
@@ -251,10 +273,36 @@ change your links. An API key is exempt, which is why a script is better off wit
 Turn on two-factor authentication with `POST /api/totp`, which takes the password and
 hands back a secret to put in your authenticator app, then `POST /api/totp/confirm`, which
 takes the password and a code from the app and prints ten recovery codes once. The secret
-is the one the server minted, so `confirm` takes those two fields and nothing else. From
-then on the sign-in body carries a `code` as well, or a `recoveryCode` instead of one; and
-replacing or removing the authenticator needs a code from the app you already have, or one
-of those recovery codes, not just the password.
+is the one the server minted, so `confirm` takes those two fields and nothing else — and it
+does not wait: an enrolment you do not confirm within fifteen minutes is gone, and `confirm`
+then tells you to start again. From then on the sign-in body carries a `code` as well, or a
+`recoveryCode` instead of one; and replacing or removing the authenticator over the API
+needs a code from the app you already have, or one of those recovery codes, not just the
+password.
+
+**Locked out, or the authenticator is gone.** Five wrong passwords lock the account for
+five minutes, six for ten, and so on to an hour; the count is forgotten an hour after the
+last failure, and a sign-in that succeeds clears it. `GET /api/me` shows the count and any
+standing lock to a signed-in browser, before the lock bites. Separately, each address gets
+ten failed sign-ins per fifteen minutes, counted in the process rather than in the
+database. Two commands on the server are the way back, and both work while the account is
+locked, because both run where a request cannot reach:
+
+```sh
+printf '%s' 'a-new-admin-password' | docker compose exec -T worker \
+  node packages/cli/dist/index.js admin passwd
+docker compose exec -T worker node packages/cli/dist/index.js admin totp disable
+```
+
+`admin passwd` sets the password, clears the lock and signs every browser out.
+`admin totp disable` is for the case the API deliberately has no answer to: the
+authenticator app **and** every recovery code are gone. It removes the second factor,
+deletes the recovery codes — telling you how many were still unused, in case that number
+is a surprise — clears any lock, signs every session out, and says to enrol again, because
+until you do the password alone is the whole of the account. It reads no password and asks
+nothing. **That it needs a shell on this host is the whole reason it is allowed to do
+this:** over the API, removing the factor requires the factor, because otherwise
+disable-then-enrol would be the way around having one at all.
 
 `GET /health` on that host answers `{"status":"ok"}` to anyone, because Caddy has to be
 able to route it and Compose has to be able to probe it. It tells a stranger nothing else —
@@ -265,6 +313,11 @@ not whether the install is configured, and not whether the account exists. That 
 setting `"truncated": true` when there were more. `clickmonk domain list` has no such cap;
 `clickmonk apikey list` has the same one and says when it hit it. `GET /api/links` pages
 properly, with `limit` and `cursor`.
+
+The install-wide traffic settings are `GET /api/settings` and `PUT /api/settings` — the
+same three things `clickmonk settings set` covers. The `PUT` takes the whole object rather
+than the fields you want to change, because the safe action and the safe URL depend on each
+other and a half-written pair is how a link ends up sent to nowhere.
 
 For a script, mint an API key and send it as `Authorization: Bearer …`:
 
@@ -310,9 +363,16 @@ so this needs HTTPS — over a plain-HTTP trial the visitor is asked every time.
 answers are counted per address per link and refused after five in a minute. Changing the
 password invalidates every cookie issued under the old one.
 
+The limit counts wrong answers only — a correct one clears the count — so it is not a bound
+on how often somebody who knows the password can make the server hash it. What bounds that
+is the two-checks-at-once gate, which answers 503 and a `Retry-After` rather than queueing.
+
 The password is stored as a slow salted hash and is never in a response, a log or a click
 record. What is recorded is that the page was shown: every prompt, wrong answer, refusal
-and correct answer is a click event with the step that decided it.
+and correct answer is a click event with the step that decided it. **A wrong answer and a
+first visit are the same event in that log** — both are the password step with a 200 — which
+is what stops the log from being a list of near misses to an attacker who reaches it, and
+also means you cannot count how many visitors got the password wrong.
 
 **What a link password is not.** It gates the redirect, not the destination. The URL a
 visitor is sent to is whatever you set, and anyone who already has that URL reaches it
@@ -400,16 +460,22 @@ bad-asn-list's licence:
 
 ## Upgrading
 
-Two things change when you pull this release, and four more if you are coming from before
-TLS was added.
+Each release that needs anything of you has its own heading here. Read the one you are
+coming from, and every one after it.
 
-**`docker compose up -d --build` adds one container.** The `admin` service starts beside
-the others, and Caddy is recreated because it reads the new setting too. **There is
-nothing to run by hand:** the worker applies the schema change when it starts, as it does
-for every release, and `up -d --wait` waits for the new container, which becomes healthy
-whether or not you have configured it. Nothing else about the stack moves — Caddy still
-binds 80 and 443 and is still the only service with a published port. Clicks are written
-at record version 3 from here on, which the last paragraph of this section covers.
+### Upgrading to the admin API
+
+**`docker compose up -d --build` adds one container and restarts most of the others.** The
+new `admin` service starts beside them. The redirect and the worker are rebuilt from the
+same image, so they are recreated too, and Caddy is recreated because it reads the new
+setting — which makes this a brief outage for your links, as any rebuild is. Postgres and
+ClickHouse are left alone. Caddy still binds 80 and 443 and is still the only service with
+a published port.
+
+**There is nothing to run by hand:** the worker applies the schema change when it starts,
+as it does for every release, and `up -d --wait` waits for the new container, which becomes
+healthy whether or not you have configured it. Clicks are written at record version 3 from
+here on, which "Every release: upgrade the worker before the redirect" below covers.
 
 **The admin API is off until you name a host for it, and your existing `.env` names
 none.** `CLICKMONK_ADMIN_HOST` is optional and defaults to empty, so an `.env` written by
@@ -422,7 +488,10 @@ certificate in it. ["The admin API"](#the-admin-api) above is how to set it up, 
 [Password-protected links](#password-protected-links) is the other half of what this
 release adds.
 
-The four below are for an install that was running before TLS was added.
+### Upgrading from before TLS
+
+Four things change, and two of them destroy something. **Nothing in this heading applies to
+an install that was already serving HTTPS.**
 
 **Ports 80 and 443 on the host have to be free, and the redirect publishes nothing.**
 Caddy binds both, so the stack does not start while something else holds either one —
@@ -466,11 +535,13 @@ and it is the same setting the "Domains and TLS" section above asks for — or, 
 cannot, delete the `networks:` block at the end of `docker-compose.yml` and accept that
 every IPv6 visitor is recorded as your Docker bridge's address rather than their own.
 
-Upgrade the worker before the redirect. Each release's redirect writes clicks in the
-record version it knows, and a worker older than the redirect does not read a newer
-version: it leaves those spool segments where they are, and they count toward the
-spool's size bound until a worker that reads them is running. The Compose stack builds
-both from one image, so `docker compose up -d --build` upgrades them together.
+### Every release: upgrade the worker before the redirect
+
+Each release's redirect writes clicks in the record version it knows, and a worker older
+than the redirect does not read a newer version: it leaves those spool segments where they
+are, and they count toward the spool's size bound until a worker that reads them is
+running. The Compose stack builds both from one image, so `docker compose up -d --build`
+upgrades them together and this takes care of itself.
 
 ## License
 

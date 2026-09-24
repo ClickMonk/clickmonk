@@ -160,17 +160,20 @@ Then add a link:
   docker compose exec -T worker node packages/cli/dist/index.js \
     link add links.example.com spring --target https://example.com/offer
 
-There is no web interface yet, but there is an admin API. To turn it on, set
-CLICKMONK_ADMIN_HOST in .env to a host name that is not one of your link
-domains, point that name at this server, and run "docker compose up -d".
-Until you do, the admin service answers 503 to everything but its own
-healthcheck, and the CLI is the only way in.
-
-Then create the one admin account. The password is piped in, never typed as an
-argument, and -T is what lets it through:
+There is no web interface yet, but there is an admin API. Create its one account
+first -- nothing can authenticate until it exists. The password is piped in and
+never typed as an argument. Keep the -T: without it, Compose asks for a terminal
+inside the container and then refuses to attach the pipe to one, and the command
+never runs.
 
   printf '%s' 'your-admin-password' | docker compose exec -T worker \
     node packages/cli/dist/index.js admin create you@example.com
+
+Then set CLICKMONK_ADMIN_HOST in .env to a host name that is not one of your link
+domains, point that name at this server, and run "docker compose up -d". Until
+you do, the admin service answers 503 to everything but its own healthcheck, and
+the CLI is the only way in. The admin API needs a real name over HTTPS; unlike a
+link domain, there is no way to try it over plain HTTP on this host.
 
 README.md, under "The admin API", has the rest.
 NEXT
