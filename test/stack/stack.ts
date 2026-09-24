@@ -45,21 +45,19 @@ export const ENV = {
 }
 
 /**
- * `compose`, with environment variables changed for this one call. A variable
- * given as `undefined` is removed, which is the only way to reach the install
- * that was never told an admin host name: Compose substitutes
- * `${CLICKMONK_ADMIN_HOST:-}` either way, so a suite that wants that install
- * has to run the whole stack without the variable rather than assert about it.
+ * `compose`, with environment variables changed for this one call — which is how
+ * a suite reaches an install configured differently from the one `ENV`
+ * describes, since a variable Compose interpolates cannot be changed on a
+ * container that is already running.
+ *
+ * **A value, always; never a variable taken away.** `Record<string, string>` is
+ * the point of this signature: Compose reads the repository's own `.env` for
+ * anything the environment does not set, so removing a variable here would hand
+ * the stack whatever that file happens to say and make the suite pass or fail on
+ * whose machine it ran. An empty string is set, and wins.
  */
-export function composeWith(
-  overrides: Record<string, string | undefined>,
-  ...args: string[]
-): string {
-  const env: Record<string, string | undefined> = { ...ENV }
-  for (const [name, value] of Object.entries(overrides)) {
-    if (value === undefined) delete env[name]
-    else env[name] = value
-  }
+export function composeWith(overrides: Record<string, string>, ...args: string[]): string {
+  const env: Record<string, string | undefined> = { ...ENV, ...overrides }
   return execFileSync('docker', ['compose', ...FILES, ...args], {
     cwd: ROOT,
     encoding: 'utf8',

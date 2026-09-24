@@ -2,9 +2,5 @@
   "extends": "../tsconfig.base.json",
   "compilerOptions": { "noEmit": true },
   "include": ["*.ts", "stack/*.ts"],
-  "references": [
-    { "path": "../packages/admin" },
-    { "path": "../packages/db" },
-    { "path": "../packages/redirect" }
-  ]
+  "references": [{ "path": "../packages/db" }]
 }

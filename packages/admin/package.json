@@ -7,7 +7,6 @@
   "exports": {
     ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
     "./account": { "types": "./dist/account.d.ts", "default": "./dist/account.js" },
-    "./auth": { "types": "./dist/auth.d.ts", "default": "./dist/auth.js" },
     "./keys": { "types": "./dist/keys.d.ts", "default": "./dist/keys.js" }
   },
   "engines": { "node": ">=22 <23" },

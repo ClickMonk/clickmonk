@@ -1,5 +1,3 @@
-import { SESSION_COOKIE } from '@clickmonk/admin/auth'
-import { passwordCookieName, passwordPage, tooManyAttemptsPage } from '@clickmonk/redirect/password'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import {
   ADMIN_HOST,
@@ -50,7 +48,19 @@ const REDIRECT_404 = 'Not found.\n'
 const ADMIN_ONLY_HEADER = /^content-security-policy: default-src 'none'/im
 
 let root = ''
+/**
+ * The session the sign-in below gets, as a `Cookie` header: the pair the response
+ * set, carried on afterwards the way a browser carries it. No cookie name is
+ * written anywhere in this suite — every one of them is read back out of the
+ * response that set it, so what is tested is what a browser would actually send.
+ */
 let cookie = ''
+/**
+ * The page a wrong password is answered with, kept from the one over HTTPS so
+ * that the guessing loop can compare against a page this service really sent
+ * rather than against a sentence written out here.
+ */
+let wrongPage = ''
 let setUp = false
 let failures = 0
 /**
@@ -61,6 +71,13 @@ let failures = 0
  * brings the configured one up over it.
  */
 let unconfigured: CurlResult | null = null
+/**
+ * What the admin service itself said in that same stack, asked on its own port.
+ * With no host name configured it answers every route `not_configured`, which is
+ * how this suite checks that the install it measured really was the unconfigured
+ * one rather than one a stray environment file had configured differently.
+ */
+let unconfiguredService: RawResponse | null = null
 
 /** A request to the admin API over HTTPS, trusting the local authority only. */
 function api(
@@ -87,31 +104,38 @@ function api(
   return curl(args, CA_MOUNT, { body: true })
 }
 
-/** Every `Set-Cookie` of a response, without the header name. */
-function setCookies(headers: string): string[] {
-  return headers
-    .split('\n')
-    .filter((l) => /^set-cookie:/i.test(l))
-    .map((l) => l.slice(l.indexOf(':') + 1).trim())
+interface SetCookie {
+  name: string
+  value: string
+  attributes: string[]
+  /** The pair a browser would send back, which is what `header()` puts in a request. */
+  pair: string
 }
 
 /**
- * One named cookie a response set, with its attributes, or null when it set no
- * cookie of that name. The name is never written out here: both cookie names
- * come from the modules that mint them, so a rename reaches this suite instead
- * of leaving a regex that quietly matches nothing.
+ * Every cookie a response set, parsed. Names are read out rather than looked up:
+ * a test that knows the name in advance can only check that the name it expected
+ * is the name it got, and this suite would then hold the two ends of the same
+ * string. What matters about each of these cookies is its attributes and, for a
+ * link's proof, which link it is named after.
  */
-function cookieNamed(
-  headers: string,
-  name: string,
-): { value: string; attributes: string[] } | null {
-  for (const c of setCookies(headers)) {
-    const [pair = '', ...attributes] = c.split(';')
-    const eq = pair.indexOf('=')
-    if (eq === -1 || pair.slice(0, eq).trim() !== name) continue
-    return { value: pair.slice(eq + 1).trim(), attributes: attributes.map((a) => a.trim()) }
-  }
-  return null
+function setCookies(headers: string): SetCookie[] {
+  return headers
+    .split('\n')
+    .filter((l) => /^set-cookie:/i.test(l))
+    .map((l) => {
+      const [pair = '', ...attributes] = l
+        .slice(l.indexOf(':') + 1)
+        .trim()
+        .split(';')
+      const eq = pair.indexOf('=')
+      return {
+        name: eq === -1 ? pair.trim() : pair.slice(0, eq).trim(),
+        value: eq === -1 ? '' : pair.slice(eq + 1).trim(),
+        attributes: attributes.map((a) => a.trim()),
+        pair: pair.trim(),
+      }
+    })
 }
 
 /**
@@ -203,13 +227,25 @@ beforeAll(async () => {
   compose('down', '-v')
   writeAcmeRoot()
   publishZone()
-  // First the install that was never told an admin host name: Compose resolves
-  // the variable to the empty string either way, so the only way to see what
-  // that install does with the admin name is to run it.
-  composeWith({ CLICKMONK_ADMIN_HOST: undefined }, 'up', '-d', '--build', '--wait', ...WAIT_TIMEOUT)
+  // First the install that was never told an admin host name, which is the only
+  // way to see what that install does with the admin name.
+  //
+  // The empty string, never a variable removed from the environment: with it
+  // gone, Compose falls back to whatever the repository's own `.env` says, and on
+  // a machine whose `.env` names some other host the stack would come up *with*
+  // an admin host configured. `admin.example.test` would then merely fail to
+  // match it, the answer would be the redirect's 404 all the same, and this test
+  // would pass with its premise false — on the one property this group exists
+  // for.
+  composeWith({ CLICKMONK_ADMIN_HOST: '' }, 'up', '-d', '--build', '--wait', ...WAIT_TIMEOUT)
   unconfigured = curl(['--max-time', '30', '-D', '-', `http://${ADMIN_HOST}/api/me`], [], {
     body: true,
   })
+  unconfiguredService = rawToAdmin(
+    'GET /api/me HTTP/1.1',
+    `Host: ${ADMIN_HOST}`,
+    'Connection: close',
+  )
   // Then the same stack with the name set, which recreates every service that
   // reads it and leaves the authority and the databases alone.
   compose('up', '-d', '--wait', ...WAIT_TIMEOUT)
@@ -242,6 +278,19 @@ describe('an install that was never given an admin host name', () => {
     expect(r.status).toBe(404)
     expect(r.body).toBe(REDIRECT_404)
     expect(r.headers).not.toMatch(ADMIN_ONLY_HEADER)
+  })
+
+  // The premise of the test above, asserted rather than assumed. The redirect's
+  // 404 is also what an install configured with *some other* name answers for
+  // this one, so without this the group would pass unchanged on a machine whose
+  // environment file named a different admin host — a green with a false premise,
+  // on the one property this group exists for. The admin service says which
+  // install it is in: with no name configured it answers every route
+  // `not_configured`, and with one configured it refuses by host instead.
+  it('has no admin host configured, which is what the answer above means', () => {
+    const r = unconfiguredService as RawResponse
+    expect(r.status, r.raw).toBe(503)
+    expect(errorCode(r)).toBe('not_configured')
   })
 })
 
@@ -296,19 +345,27 @@ describe('the admin host', () => {
       origin: `https://${ADMIN_HOST}`,
     })
     expect(r.status).toBe(200)
-    const set = cookieNamed(r.headers, SESSION_COOKIE)
-    expect(set, `no session cookie in ${r.headers}`).not.toBeNull()
-    const session = set as NonNullable<typeof set>
+    // One cookie, so there is no question which one the attributes below belong
+    // to, and no name has to be known to find it.
+    const cookies = setCookies(r.headers)
+    expect(cookies.length, `expected one cookie, got ${r.headers}`).toBe(1)
+    const session = cookies[0] as SetCookie
     expect(session.value).not.toBe('')
-    // `__Host-` is a browser rule, and this is the only place the real thing is
-    // seen over a real certificate: the attributes it demands — Secure, Path=/,
-    // no Domain — are what the service actually sends, read off this cookie
-    // rather than searched for anywhere in the response.
+    // `__Host-` is the browser's own token rather than a name of this product's:
+    // it is what stops a sibling host under the same registrable domain from
+    // setting a cookie of this name, and the browser only honours it on a cookie
+    // that is Secure, `Path=/` and has no `Domain` — which is what the rest of
+    // this checks, read off this cookie rather than searched for anywhere in the
+    // response. This is the only place the real thing is seen over a real
+    // certificate.
+    expect(session.name.startsWith('__Host-'), session.name).toBe(true)
     expect(session.attributes).toContain('Secure')
     expect(session.attributes).toContain('HttpOnly')
     expect(session.attributes).toContain('Path=/')
     expect(session.attributes.filter((a) => /^Domain=/i.test(a))).toEqual([])
-    cookie = `${SESSION_COOKIE}=${session.value}`
+    // Carried on exactly as the response set it, which is what a browser sends
+    // back and the only thing this suite knows about the name.
+    cookie = session.pair
     const me = api('GET', '/api/me', { cookie })
     expect(me.status).toBe(200)
     expect(JSON.parse(me.body).email).toBe(EMAIL)
@@ -374,11 +431,13 @@ describe('the admin service on its own port, over a real connection', () => {
     expect(r.body).toContain('no such host on this service')
   })
 
-  // Refused by Node's own parser, which requires a host name on an HTTP/1.1
-  // request, so the guard never sees it — recorded here because that is the
-  // reason the guard is allowed to treat an absent `Host` as unremarkable, and
-  // until now nothing said which layer refused it.
-  it('refuses a connection with no host name at all', () => {
+  // Named for the runtime because the runtime is what refuses it: Node's parser
+  // requires a host name on an HTTP/1.1 request, so the guard never sees this
+  // connection — disabling the guard's refusal leaves this test green, which is
+  // the proof of whose refusal it is. Kept because the guard's own comment leans
+  // on this being refused and nothing else observed it: if a future runtime stops
+  // refusing, the hole arrives as a red.
+  it('is refused by the runtime when a connection carries no host name', () => {
     const r = rawToAdmin('GET /api/me HTTP/1.1', 'Connection: close')
     expect(r.status, r.raw).toBe(400)
     // Node's refusal comes with no body of this API's, which is the evidence
@@ -419,6 +478,15 @@ describe('the admin service on its own port, over a real connection', () => {
 describe('a link with a password, end to end', () => {
   let token = ''
   let linkId = ''
+
+  // Every test here spends the session the group above signed in with. Refused up
+  // front, because otherwise a failed sign-in is not one red: it is three waits
+  // of two minutes each, spent on a domain that was never created and a
+  // certificate that was never asked for, and a forty-second suite becomes a
+  // seven-minute one on the way to the same answer.
+  beforeAll(() => {
+    if (cookie === '') throw new Error('no session cookie: the sign-in above did not succeed')
+  })
 
   it('is created through the API, unverified, with a token to publish', () => {
     const created = api('POST', '/api/domains', {
@@ -470,35 +538,46 @@ describe('a link with a password, end to end', () => {
   })
 
   it('asks the visitor for the password, over HTTPS, and sends them on when it is right', async () => {
+    // Without a link id there is nothing for a proof cookie to be named after,
+    // and `endsWith('')` below would hold for every cookie in the response.
+    expect(linkId, 'the link was not created').not.toBe('')
     await until('a certificate for the new link domain', 120_000, () => {
       const r = visitTls('/secret')
       return r.exit === 0 && r.status === 200
     })
+    /** Cookies this link's proof could be: the ones named after its id. */
+    const proofs = (headers: string) => setCookies(headers).filter((c) => c.name.endsWith(linkId))
+
     const page = visitTls('/secret')
     expect(page.status).toBe(200)
     expect(page.headers).toMatch(/^content-type: text\/html/im)
-    // No proof cookie yet: nothing is granted by asking.
-    expect(cookieNamed(page.headers, passwordCookieName(linkId))).toBeNull()
+    // No proof yet: nothing is granted by asking. The response does set the
+    // visitor's own cookies, so this is "none for this link", not "none at all".
+    expect(proofs(page.headers)).toEqual([])
 
     const wrong = visitTls('/secret', ['--data-urlencode', 'password=not-it'])
     expect(wrong.status).toBe(200)
-    expect(cookieNamed(wrong.headers, passwordCookieName(linkId))).toBeNull()
+    expect(proofs(wrong.headers)).toEqual([])
+    wrongPage = wrong.body
+    expect(wrongPage).not.toBe('')
+    // A wrong answer is not the first visit's page: it says so, and the guessing
+    // loop below compares against this one.
+    expect(wrongPage).not.toBe(page.body)
 
     const right = visitTls('/secret', ['--data-urlencode', `password=${LINK_PASSWORD}`])
     expect(right.status).toBe(302)
-    // Named for this link, so a proof is a proof of one link and not of any.
-    const proof = cookieNamed(right.headers, passwordCookieName(linkId))
-    expect(proof, `no proof cookie in ${right.headers}`).not.toBeNull()
-    const set = proof as NonNullable<typeof proof>
+    // Named after this link's id, which is the binding: a cookie is a proof for
+    // one link and cannot be renamed into another's, and this suite reads the
+    // name off the response rather than knowing it in advance.
+    const proof = proofs(right.headers)
+    expect(proof.length, `no proof cookie in ${right.headers}`).toBe(1)
+    const set = proof[0] as SetCookie
     // Secure, which is why this can only be tested here: over plain HTTP the
     // browser drops the proof and the visitor is asked again forever.
     expect(set.attributes).toContain('Secure')
     expect(set.attributes).toContain('HttpOnly')
 
-    const followed = visitTls('/secret', [
-      '-H',
-      `cookie: ${passwordCookieName(linkId)}=${set.value}`,
-    ])
+    const followed = visitTls('/secret', ['-H', `cookie: ${set.pair}`])
     expect(followed.status).toBe(302)
     expect(followed.headers).toMatch(new RegExp(`^location: ${TARGET}$`, 'im'))
   })
@@ -523,6 +602,11 @@ describe('a link with a password, end to end', () => {
       const r = visit('/open')
       return r.exit === 0 && r.status === 302
     })
+    // The page the test above got for a wrong password over HTTPS, which is what
+    // the first guesses here must be answered with. Taken from a real answer of
+    // this service rather than written out, and asserted to exist so that a
+    // comparison against an empty string cannot pass for agreement.
+    expect(wrongPage, 'the test above did not record a wrong-answer page').not.toBe('')
     // Each guess prints one line of JSON, so a page full of newlines is still one
     // line per guess and the answer is read as a whole rather than as a status.
     const r = compose(
@@ -532,23 +616,35 @@ describe('a link with a password, end to end', () => {
       'sh',
       '-c',
       `for i in 1 2 3 4 5 6 7 8; do
-         node -e "fetch('http://${LINK_HOST}/secret',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'password=still-not-it',redirect:'manual'}).then(async r=>console.log(JSON.stringify({status:r.status,body:await r.text()}))).catch(e=>console.log(JSON.stringify({status:0,body:String(e)})))"
+         node -e "fetch('http://${LINK_HOST}/secret',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'password=still-not-it',redirect:'manual'}).then(async r=>console.log(JSON.stringify({status:r.status,retryAfter:r.headers.get('retry-after'),body:await r.text()}))).catch(e=>console.log(JSON.stringify({status:0,retryAfter:null,body:String(e)})))"
        done`,
     )
     const answers = r
       .split('\n')
       .filter((l) => l.trim().startsWith('{'))
-      .map((l) => JSON.parse(l) as { status: number; body: string })
-    // Five wrong answers get the page that says so, and every guess after them is
-    // refused with the page that says *that* — the pages themselves, built here by
-    // the same functions the service renders, because a 429 from somewhere else in
-    // the stack would satisfy a status on its own. Eight and five are written out
-    // rather than counted from the limit, so a limit that moved is a red here
-    // instead of a test that quietly follows it.
-    expect(answers, r).toEqual([
-      ...Array(5).fill({ status: 200, body: passwordPage({ wrong: true }) }),
-      ...Array(3).fill({ status: 429, body: tooManyAttemptsPage() }),
-    ])
+      .map((l) => JSON.parse(l) as { status: number; retryAfter: string | null; body: string })
+    expect(answers.length, r).toBe(8)
+    // Eight and five are written out rather than counted from the limit, so a
+    // limit that moved is a red here instead of a test that quietly follows it.
+    expect(
+      answers.map((a) => a.status),
+      r,
+    ).toEqual([200, 200, 200, 200, 200, 429, 429, 429])
+    const [asked, refused] = [answers.slice(0, 5), answers.slice(5)]
+    // The first five get the page a wrong answer gets, whole — the same page the
+    // same service sent over HTTPS a moment ago — and no `Retry-After`, because
+    // nothing was refused.
+    expect(asked.map((a) => a.body)).toEqual(Array(5).fill(wrongPage))
+    expect(asked.map((a) => a.retryAfter)).toEqual(Array(5).fill(null))
+    // The refusals are one page of their own, not the page above and not empty,
+    // and each says when to come back. A status alone would be satisfied by a 429
+    // from anywhere else in the stack.
+    for (const a of refused) {
+      expect(a.body).not.toBe(wrongPage)
+      expect(a.body).not.toBe('')
+      expect(Number(a.retryAfter), `retry-after: ${a.retryAfter}`).toBeGreaterThan(0)
+    }
+    expect(new Set(refused.map((a) => a.body)).size, 'the refusals differ from each other').toBe(1)
   })
 })
 
@@ -577,10 +673,9 @@ describe('what Caddy tells the redirect about the visitor', () => {
       client: ['-4'],
     })
     expect(signIn.status).toBe(200)
-    const set = cookieNamed(signIn.headers, SESSION_COOKIE)
-    expect(set, `no session cookie in ${signIn.headers}`).not.toBeNull()
-    const value = (set as NonNullable<typeof set>).value
-    const listed = api('GET', '/api/sessions', { cookie: `${SESSION_COOKIE}=${value}` })
+    const cookies = setCookies(signIn.headers)
+    expect(cookies.length, `expected one cookie, got ${signIn.headers}`).toBe(1)
+    const listed = api('GET', '/api/sessions', { cookie: (cookies[0] as SetCookie).pair })
     expect(listed.status).toBe(200)
     const sessions = JSON.parse(listed.body).sessions as { ip: string; current: boolean }[]
     const current = sessions.find((s) => s.current)
@@ -650,9 +745,9 @@ describe('the admin service in the stack', () => {
       '-e',
       "fetch('http://admin:9100/health').then(r=>r.json()).then(j=>console.log(JSON.stringify(j)))",
     )
-    // That it answers, on this port, with this status — what it must *not* also
-    // say is the test above's subject, and saying it twice would leave two tests
-    // to change for one decision.
-    expect(r).toContain('"status":"ok"')
+    // The whole body, as the test above reads it over the certificate: a field
+    // that grew here would reach Compose's probe as well, and this is the answer
+    // the probe is judging.
+    expect(r.trim()).toBe('{"status":"ok"}')
   })
 })
