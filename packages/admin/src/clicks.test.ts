@@ -1540,3 +1540,131 @@ describe('GET /api/clicks.csv, a store that fails mid-file', () => {
     }
   })
 })
+
+/**
+ * A caller reading while the store is still producing.
+ *
+ * **The property this endpoint was built for, and the one nothing here could
+ * see.** The cap is a million rows, so an export that reads its answer to the end
+ * before sending any of it holds a file's worth of memory in the process — which
+ * is the whole reason the rows are streamed. Measured before this existed: an
+ * implementation that concatenated every chunk and handed the result over as a
+ * single-chunk stream passed all 398 tests of this service and the stack suite's
+ * `content-length` assertion too, because a one-chunk stream is still chunked and
+ * still carries no length. A length is a weaker question than this one.
+ *
+ * So the question asked here is the ordering: **were bytes given to the caller
+ * while the store still had blocks to hand over?** No implementation that buffers
+ * can answer yes, however it is written, and none that streams can answer no.
+ *
+ * A stub store, because a healthy ClickHouse hands over a small result set faster
+ * than a socket can be read and the two events would not be ordered at all; and a
+ * real socket, because `inject` resolves once with a whole body and has no
+ * earlier moment to observe. The stub is what makes the ordering deterministic
+ * rather than a race: it hands over one block and then **waits to be told the
+ * caller has bytes**. A streaming server tells it within milliseconds. A
+ * buffering one cannot, because it is itself waiting for the block, so the wait
+ * expires, the file is produced whole, and the first bytes reach the caller with
+ * every block already pulled.
+ */
+describe('GET /api/clicks.csv, a caller reading while the store produces', () => {
+  /** Blocks the stub hands over. More than one, so "the last block" means something. */
+  const BLOCKS = 8
+  /**
+   * How long the stub waits to hear that the caller has bytes before giving up and
+   * producing the rest. Only ever paid by an implementation that cannot answer, so
+   * it is the cost of a failure and not of a pass.
+   */
+  const WAIT_MS = 2000
+
+  const settle = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+  interface Producing {
+    ch: ClickHouseClient
+    /** How many blocks the store has been asked for so far. */
+    pulled: () => number
+    /** Told by the test the moment the caller is given its first bytes. */
+    gotBytes: () => void
+  }
+
+  function producingCh(): Producing {
+    let pulled = 0
+    let tell = (): void => {}
+    const bytesReached = new Promise<void>((resolve) => {
+      tell = resolve
+    })
+    async function* blocks(): AsyncGenerator<{ json: () => ClickRow }[]> {
+      for (let i = 0; i < BLOCKS; i++) {
+        pulled++
+        const row = {
+          ...click(),
+          click_id: `01920000-0000-7000-8000-0000000000${String(i).padStart(2, '0')}`,
+          at_ms: '1758708000000',
+        } as unknown as ClickRow
+        yield [{ json: () => row }]
+        // The whole arrangement, in one line: after the first block the store will
+        // not produce another until the caller has been given something.
+        if (i === 0) await Promise.race([bytesReached, settle(WAIT_MS)])
+      }
+    }
+    return {
+      pulled: () => pulled,
+      gotBytes: () => tell(),
+      ch: {
+        query: async ({ query }: { query: string }) =>
+          query.includes('count()')
+            ? { json: async () => [{ n: String(BLOCKS) }] }
+            : { close: () => {}, stream: () => Readable.from(blocks(), { objectMode: true }) },
+      } as unknown as ClickHouseClient,
+    }
+  }
+
+  it('gives the caller bytes before the store has produced the last block', async () => {
+    const store = producingCh()
+    const served = testApp(pool, clock, { ch: store.ch })
+    try {
+      await served.listen({ host: '127.0.0.1', port: 0 })
+      const at = served.server.address()
+      const port = typeof at === 'object' && at !== null ? at.port : 0
+      /** What the store had produced when the caller was first given bytes. */
+      let pulledAtFirstBytes = -1
+      let status = 0
+      const body = await new Promise<string>((resolve, reject) => {
+        const req = httpRequest(
+          {
+            host: '127.0.0.1',
+            port,
+            path: `/api/clicks.csv?${WINDOW}`,
+            headers: { host: ADMIN_HOST, cookie },
+          },
+          (res) => {
+            status = res.statusCode ?? 0
+            let text = ''
+            res.setEncoding('utf8')
+            res.on('data', (chunk: string) => {
+              if (pulledAtFirstBytes === -1) {
+                pulledAtFirstBytes = store.pulled()
+                store.gotBytes()
+              }
+              text += chunk
+            })
+            res.on('end', () => resolve(text))
+          },
+        )
+        req.on('error', reject)
+        req.end()
+      })
+      // The whole file arrived, so none of this is about a request that failed
+      // early: a refusal has no rows and would make the ordering below vacuous.
+      expect(status).toBe(200)
+      expect(body.split('\r\n').filter((l) => l.length > 0)).toHaveLength(BLOCKS + 1)
+      // And the ordering. Not `-1`: that is "no chunk ever arrived", which the
+      // length above already rules out and which would otherwise satisfy the
+      // comparison that follows it.
+      expect(pulledAtFirstBytes).not.toBe(-1)
+      expect(pulledAtFirstBytes).toBeLessThan(BLOCKS)
+    } finally {
+      await served.close()
+    }
+  })
+})
