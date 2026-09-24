@@ -156,13 +156,28 @@ describe('GET /api/reports/summary', () => {
     expect(r.json().newestHour).toBe('2026-09-25T00:00:00.000Z')
   })
 
-  // Three clicks by two visitors, one of whom also clicked the other link:
-  // the per-link visitor count is not a share of the install-wide one.
+  // One click by a visitor who also clicked the other link, so the per-link
+  // visitor count is not a share of the install-wide one.
+  //
+  // Asserted whole, and this is the response to assert whole: the one above
+  // carries `link: null`, which an echo replaced by a constant would still
+  // answer. A filter the response does not really carry is the worst of the
+  // three answers — the numbers are for one link and the body says so about
+  // nothing in particular.
   it('counts one link when asked for one', async () => {
     const r = await summary(app, `${WINDOW}&link=${LINK_B}`)
-    expect(r.json().clicks).toBe(1)
-    expect(r.json().visitors).toBe(1)
-    expect(r.json().link).toBe(LINK_B)
+    expect(r.statusCode).toBe(200)
+    expect(r.json()).toEqual({
+      window: { from: '2026-09-24T00:00:00.000Z', to: '2026-09-25T00:00:00.000Z' },
+      link: LINK_B,
+      clicks: 1,
+      visitors: 1,
+      byClass: { human: 1 },
+      byAction: { '': 1 },
+      byOutcome: { target: 1 },
+      // The whole install's freshness, which a link filter does not narrow.
+      newestHour: '2026-09-25T00:00:00.000Z',
+    })
   })
 
   it('counts whole hours and says which hours it counted', async () => {
@@ -290,12 +305,21 @@ describe('GET /api/reports/timeseries', () => {
       url: '/api/reports/timeseries?from=2026-09-24T00:00:00.000Z&to=2026-09-25T00:00:00.000Z&bucket=day',
       headers: read(cookie),
     })
-    expect(r.json().buckets).toEqual([
-      // Five clicks by two visitors. One of them clicked in both hours and is
-      // one visitor for the day, so the day's number is not the two hourly
-      // numbers added up: those are 2 and 1, and this is 2.
-      { at: '2026-09-24T00:00:00.000Z', clicks: 5, visitors: 2 },
-    ])
+    expect(r.statusCode).toBe(200)
+    // Whole, because this is the response where `bucket` is off the value the
+    // hourly test above asserts: an echo replaced by the constant `'hour'`
+    // answers that one correctly and this one wrongly.
+    expect(r.json()).toEqual({
+      window: { from: '2026-09-24T00:00:00.000Z', to: '2026-09-25T00:00:00.000Z' },
+      link: null,
+      bucket: 'day',
+      buckets: [
+        // Five clicks by two visitors. One of them clicked in both hours and is
+        // one visitor for the day, so the day's number is not the two hourly
+        // numbers added up: those are 2 and 1, and this is 2.
+        { at: '2026-09-24T00:00:00.000Z', clicks: 5, visitors: 2 },
+      ],
+    })
   })
 
   // The bucket the window's end names is the one it stops before, the same way
@@ -334,13 +358,21 @@ describe('GET /api/reports/timeseries', () => {
     expect(r.json().buckets).toHaveLength(1)
   })
 
+  // Whole for the same reason the summary's link test is whole: the only other
+  // body this block asserts entirely carries `link: null`.
   it('counts one link when asked for one', async () => {
     const r = await app.inject({
       method: 'GET',
       url: `/api/reports/timeseries?from=2026-09-24T10:00:00.000Z&to=2026-09-24T11:00:00.000Z&bucket=hour&link=${LINK_B}`,
       headers: read(cookie),
     })
-    expect(r.json().buckets).toEqual([{ at: '2026-09-24T10:00:00.000Z', clicks: 1, visitors: 1 }])
+    expect(r.statusCode).toBe(200)
+    expect(r.json()).toEqual({
+      window: { from: '2026-09-24T10:00:00.000Z', to: '2026-09-24T11:00:00.000Z' },
+      link: LINK_B,
+      bucket: 'hour',
+      buckets: [{ at: '2026-09-24T10:00:00.000Z', clicks: 1, visitors: 1 }],
+    })
   })
 
   it('refuses more buckets than one response carries, and says to ask for days', async () => {
@@ -353,6 +385,32 @@ describe('GET /api/reports/timeseries', () => {
     expect(r.statusCode).toBe(400)
     expect(r.json().error).toBe('too_many_buckets')
     expect(r.json().message).toContain('bucket=day')
+  })
+
+  // The ceiling itself, at the two points either side of it. The tests around
+  // this one reach 2,400 and 100, so the comparison could be written `>=` — one
+  // bucket tighter than the number the message promises — and nothing would
+  // notice. Both windows are written out rather than computed from
+  // MAX_REPORT_BUCKETS: a bound derived from the constant it is testing moves
+  // when the constant does and goes on passing.
+  it('takes the most buckets it will return, and refuses one more', async () => {
+    // 2026-07-02 16:00 to 2026-09-24 00:00 is 2,000 hours: 704 left in July,
+    // 744 in August, 552 in September.
+    const at = await app.inject({
+      method: 'GET',
+      url: '/api/reports/timeseries?from=2026-07-02T16:00:00.000Z&to=2026-09-24T00:00:00.000Z&bucket=hour',
+      headers: read(cookie),
+    })
+    expect(at.statusCode).toBe(200)
+    expect(at.json().buckets).toHaveLength(2000)
+    // One hour earlier is 2,001.
+    const over = await app.inject({
+      method: 'GET',
+      url: '/api/reports/timeseries?from=2026-07-02T15:00:00.000Z&to=2026-09-24T00:00:00.000Z&bucket=hour',
+      headers: read(cookie),
+    })
+    expect(over.statusCode).toBe(400)
+    expect(over.json().error).toBe('too_many_buckets')
   })
 
   it('takes a hundred days of days, which is inside the ceiling', async () => {
@@ -532,6 +590,38 @@ describe('when ClickHouse is not there', () => {
     await dead.close()
   })
 
+  /**
+   * An app on the unreachable client, with its error log captured.
+   *
+   * Every refusal that has to come *before* a query is asked of this app.
+   * Against a store that cannot answer, anything reaching it is a 503, so a
+   * refusal's own status is what says nothing was asked — and the log line the
+   * query failure would have written is asserted absent as well, because a
+   * guard moved after the query would otherwise leave only the status to tell
+   * the two apart.
+   */
+  const onDeadWithLog = async (
+    fn: (on: FastifyInstance, lines: string[]) => Promise<void>,
+  ): Promise<void> => {
+    const lines: string[] = []
+    const on = testApp(pool, clock, {
+      ch: dead,
+      log: {
+        level: 'error',
+        stream: {
+          write(line: string) {
+            lines.push(line)
+          },
+        },
+      },
+    })
+    try {
+      await fn(on, lines)
+    } finally {
+      await on.close()
+    }
+  }
+
   it('answers a report 503 and names the store, not an internal error', async () => {
     const r = await summary(deadApp)
     expect(r.statusCode).toBe(503)
@@ -546,20 +636,8 @@ describe('when ClickHouse is not there', () => {
   // Against a store that cannot answer, anything that reaches it is a 503 — so
   // a 400 here says the refusal came first, and the log says nothing was asked.
   it('refuses a window too long to read without reading anything', async () => {
-    const lines: string[] = []
-    const logging = testApp(pool, clock, {
-      ch: dead,
-      log: {
-        level: 'error',
-        stream: {
-          write(line: string) {
-            lines.push(line)
-          },
-        },
-      },
-    })
-    try {
-      const r = await logging.inject({
+    await onDeadWithLog(async (on, lines) => {
+      const r = await on.inject({
         method: 'GET',
         url: '/api/reports/summary?from=2025-01-01T00:00:00.000Z&to=2026-09-25T00:00:00.000Z',
         headers: read(cookie),
@@ -567,9 +645,25 @@ describe('when ClickHouse is not there', () => {
       expect(r.statusCode).toBe(400)
       expect(r.json().error).toBe('window_too_long')
       expect(lines.filter((l) => l.includes('clickhouse query failed'))).toEqual([])
-    } finally {
-      await logging.close()
-    }
+    })
+  })
+
+  // The credential is asked for route by route, with no hook over all of them,
+  // and the 401 tests pin that each route asks — not where it asks. Moved below
+  // the query, an unauthenticated request takes a report slot and scans the
+  // window it chose before being told it was never allowed to ask, which is the
+  // scan the credential is there to stop. Both routes, because each one asks
+  // for its own and a rule one route knows is not inherited by its neighbour.
+  it.each([
+    ['the summary', `/api/reports/summary?${WINDOW}`],
+    ['the chart', `/api/reports/timeseries?${WINDOW}&bucket=hour`],
+  ])('refuses %s without a credential before reading anything', async (_label, url) => {
+    await onDeadWithLog(async (on, lines) => {
+      const r = await on.inject({ method: 'GET', url, headers: { host: ADMIN_HOST } })
+      expect(r.statusCode).toBe(401)
+      expect(r.json().error).toBe('unauthenticated')
+      expect(lines.filter((l) => l.includes('clickhouse query failed'))).toEqual([])
+    })
   })
 
   // The same claim for the chart's own ceiling, and it needs making separately:
@@ -580,20 +674,8 @@ describe('when ClickHouse is not there', () => {
   // answer, anything that reaches it is a 503, so the 400 is what says the
   // count came first.
   it('refuses too many buckets without reading anything', async () => {
-    const lines: string[] = []
-    const logging = testApp(pool, clock, {
-      ch: dead,
-      log: {
-        level: 'error',
-        stream: {
-          write(line: string) {
-            lines.push(line)
-          },
-        },
-      },
-    })
-    try {
-      const r = await logging.inject({
+    await onDeadWithLog(async (on, lines) => {
+      const r = await on.inject({
         method: 'GET',
         url: '/api/reports/timeseries?from=2026-06-16T00:00:00.000Z&to=2026-09-24T00:00:00.000Z&bucket=hour',
         headers: read(cookie),
@@ -601,9 +683,7 @@ describe('when ClickHouse is not there', () => {
       expect(r.statusCode).toBe(400)
       expect(r.json().error).toBe('too_many_buckets')
       expect(lines.filter((l) => l.includes('clickhouse query failed'))).toEqual([])
-    } finally {
-      await logging.close()
-    }
+    })
   })
 
   it('still answers everything that does not read it', async () => {
