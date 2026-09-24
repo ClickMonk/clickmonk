@@ -8,6 +8,7 @@ import Fastify, {
   type FastifyServerOptions,
 } from 'fastify'
 import { type Credential, authenticate, checkCsrf, hasBearer } from './auth.js'
+import { registerClickRoutes } from './clicks.js'
 import { registerDomainRoutes } from './domains.js'
 import { HttpError, MAX_BODY_BYTES, securityHeaders } from './http.js'
 import { registerKeyRoutes } from './keys.js'
@@ -274,6 +275,7 @@ export function buildAdminApp(
   registerLinkRoutes(app, ctx)
   registerSettingsRoutes(app, ctx)
   registerReportRoutes(app, ctx)
+  registerClickRoutes(app, ctx)
 
   return app
 }

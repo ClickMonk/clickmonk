@@ -47,6 +47,16 @@ const V1_OUTCOMES = [
 const V1_STEPS = ['resolve', 'limits', 'country', 'destination'] as const
 
 /**
+ * Every outcome and step a click record may name, which is version 3's lists.
+ * Exported because the click log lets a caller filter by one, and a filter
+ * validated against a list written out a second time is a filter that silently
+ * stops matching when a version adds a value. The type equalities at the
+ * bottom of this file are what hold these to the evaluator's own unions.
+ */
+export const OUTCOMES = [...V1_OUTCOMES, 'blocked', 'safe', 'password'] as const
+export const STEPS = [...V1_STEPS, 'classify', 'password'] as const
+
+/**
  * One line of the spool as the redirect wrote it before traffic
  * classification. The worker still reads it: a spool written before an
  * upgrade is shipped after it.
@@ -100,8 +110,8 @@ export const ClickRecordV2Schema = z
  */
 export const ClickRecordV3Schema = ClickRecordV2Schema.extend({
   v: z.literal(3),
-  outcome: z.enum([...V1_OUTCOMES, 'blocked', 'safe', 'password'] as const),
-  step: z.enum([...V1_STEPS, 'classify', 'password'] as const),
+  outcome: z.enum(OUTCOMES),
+  step: z.enum(STEPS),
 })
 
 /** Every record version the worker ships. */
