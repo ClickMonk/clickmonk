@@ -296,6 +296,9 @@ describe('GET /api/reports/timeseries', () => {
         { at: '2026-09-24T11:00:00.000Z', clicks: 1, visitors: 1 },
         { at: '2026-09-24T12:00:00.000Z', clicks: 0, visitors: 0 },
       ],
+      // The whole install's newest hour, past the end of this window: the two
+      // zero buckets above are quiet hours, and this is what says so.
+      newestHour: '2026-09-25T00:00:00.000Z',
     })
   })
 
@@ -319,13 +322,22 @@ describe('GET /api/reports/timeseries', () => {
         // numbers added up: those are 2 and 1, and this is 2.
         { at: '2026-09-24T00:00:00.000Z', clicks: 5, visitors: 2 },
       ],
+      newestHour: '2026-09-25T00:00:00.000Z',
     })
   })
 
-  // The bucket the window's end names is the one it stops before, the same way
-  // the summary's is: with `<= to` this day chart would carry a second bucket
-  // holding the click at 2026-09-25 00:30, and two adjacent charts drawn a day
-  // apart would each show it.
+  // The chart's own half-open end is the fill loop's, not the clause's. With
+  // `at <= w.toMs` the loop draws a bucket for the instant the window ends at —
+  // an empty one, because the clause returned no row for it — and two charts
+  // drawn a day apart each show a bar for the same day.
+  //
+  // The clause's upper bound is a separate guard and this block does not cover
+  // it: `< to` written as `<= to` leaves every chart test green, because the
+  // extra group comes back and the fill loop never asks for it, and only the
+  // summary catches it. The clause's lower bound the chart does cover — `>=
+  // from` as `> from` fails this test and the per-link one. So an endpoint
+  // added later that reuses `windowClause` inherits its upper bound from the
+  // summary's tests and from nothing here.
   it('stops before the bucket its end names', async () => {
     const r = await app.inject({
       method: 'GET',
@@ -372,6 +384,8 @@ describe('GET /api/reports/timeseries', () => {
       link: LINK_B,
       bucket: 'hour',
       buckets: [{ at: '2026-09-24T10:00:00.000Z', clicks: 1, visitors: 1 }],
+      // Not narrowed by the link filter, any more than the summary's is.
+      newestHour: '2026-09-25T00:00:00.000Z',
     })
   })
 
@@ -424,10 +438,15 @@ describe('GET /api/reports/timeseries', () => {
     expect(buckets).toHaveLength(100)
     expect(buckets[0]?.at).toBe('2026-06-16T00:00:00.000Z')
     expect(buckets[99]?.at).toBe('2026-09-23T00:00:00.000Z')
-    // Every fixture click is on the 24th, which is the instant this window
-    // ends at, so every one of the hundred buckets is a real zero rather than
-    // a row that was not returned.
+    // The window ends where the fixtures start: the earliest click is at 10:15
+    // on the 24th and this stops at midnight that morning. So all hundred
+    // buckets are zeroes the fill put there rather than rows the query left
+    // out — which is exactly what a hundred quiet days look like too.
     expect(buckets.reduce((n, b) => n + b.clicks, 0)).toBe(0)
+    // Which is what the freshness is for: the newest hour the install holds is
+    // past the end of this window, so these hundred days are quiet and not
+    // days nothing has been shipped for yet. The whole table, not the window.
+    expect(r.json().newestHour).toBe('2026-09-25T00:00:00.000Z')
   })
 
   it.each([

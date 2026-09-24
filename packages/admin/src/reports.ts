@@ -40,7 +40,11 @@ import { fail } from './http.js'
 /** The server-side bound on one report query. Shorter than the client's own. */
 export const CH_MAX_EXECUTION_SECONDS = 25
 
-/** Exported because the chart aligns to its own bucket and the log aligns to nothing. */
+/**
+ * The grain the rollups answer at, and so the alignment the summary counts in.
+ * The chart aligns to its own bucket size instead. Exported for the suite,
+ * which calls `parseWindow` directly and has to pass what a route would pass.
+ */
 export const HOUR_MS = 3_600_000
 
 /**
@@ -326,11 +330,18 @@ export function registerReportRoutes(app: FastifyInstance, ctx: AdminContext): v
   /**
    * The chart: one row per bucket, with the empty ones filled in.
    *
-   * Filled here rather than by ClickHouse's `WITH FILL`, because the loop that
-   * fills is then the same loop whose count decided whether this window was
-   * allowed at all — a response cannot come back longer than the ceiling that
-   * let it through. The other way round, the ceiling is in this file and the
-   * filling is in a query, and nothing holds them to each other.
+   * Filled in this process rather than by ClickHouse's `WITH FILL`. It is not
+   * one loop doing both jobs: the count is `bucketCount` in the shared
+   * vocabulary and the fill is the loop below, two expressions that can be
+   * changed apart. What holds them to each other is that both walk the same
+   * half-open `[fromMs, toMs)` a `step` at a time from the same aligned bounds,
+   * and what notices when they stop agreeing is the test at exactly the
+   * ceiling: it asks for a window that counts 2,000 buckets and asserts 2,000
+   * came back. `WITH FILL` would put the filling in a query and leave the
+   * ceiling here, where no test can hold the two together at all.
+   *
+   * Two queries under one slot, and a slot is held for their sum: the buckets,
+   * and the freshness of the whole install, which is not about this window.
    *
    * The bucket count is checked here and not by `parseWindow`, because the two
    * bounds do not compose: four hundred days is inside the window bound and
@@ -375,10 +386,24 @@ export function registerReportRoutes(app: FastifyInstance, ctx: AdminContext): v
                    GROUP BY at ORDER BY at`,
           params: windowParams(w),
         })
-        // Keyed by the same text ClickHouse returned, so nothing has to agree
-        // about how to format an instant twice. `toString` of a DateTime gives
-        // nineteen characters and `chTime` gives milliseconds too, so the key
-        // is the sliced form of ours.
+        // The same freshness the summary answers with, and a chart needs it
+        // more than a number does. Every bucket the rollup has no row for is
+        // drawn as a zero, so a window running past the newest hour the install
+        // holds is a run of real-looking zeroes with nothing in the response to
+        // tell "nothing shipped yet" from "nobody clicked" — and a picture that
+        // cannot say how fresh it is gets read as current. The whole table, not
+        // this window, which is the question it answers.
+        const [newest] = await chRows<{ newest: string }>({
+          ch,
+          req,
+          query: 'SELECT toString(max(hour)) AS newest FROM clicks_hourly',
+          params: {},
+        })
+        // Two formatters produce this key and the slice is what makes them
+        // agree: ClickHouse's `toString` of a DateTime is nineteen characters,
+        // `chTime` adds milliseconds. Checked against a running store rather
+        // than assumed, because a key that never matched would draw every
+        // bucket as a zero and every assertion about the length would pass.
         const found = new Map(rows.map((row) => [row.at, row]))
         const out: { at: string; clicks: number; visitors: number }[] = []
         // `at < w.toMs`, matching the half-open clause the query ran with: the
@@ -397,6 +422,7 @@ export function registerReportRoutes(app: FastifyInstance, ctx: AdminContext): v
           link: w.linkId,
           bucket: q.bucket,
           buckets: out,
+          newestHour: newestHourOrNull(newest?.newest),
         }
       },
     )
