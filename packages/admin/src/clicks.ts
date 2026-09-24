@@ -14,11 +14,21 @@
  *
  * **The address is a network and the field says so.** A field called `ip`
  * holding `198.51.100.0/24` invites its next reader to treat it as an address;
- * `network` cannot be misread, and it means no response this service sends has
- * a field called `ip` at all — which a test can check across the whole surface
- * rather than one route at a time. The truncation itself is `truncateIp`, the
- * same function the export calls, and it is never done in SQL: two copies of a
- * rule about what an operator may see is one too many.
+ * `network` cannot be misread. The rule it makes checkable is about click data:
+ * no response built from a click carries a whole address, or a field called
+ * `ip`, on any route — which is a property of the surface rather than of this
+ * module, and what the check exists to catch is a route added later that selects
+ * a click's `ip` and forgets to truncate it.
+ *
+ * It is **not** a claim that no response names a whole address. `GET
+ * /api/sessions` hands the operator the addresses their own sessions were opened
+ * from, whole and deliberately, because that is how they recognise their own
+ * devices. The difference is whose address it is: a visitor never consented to
+ * being in an operator's log, and the operator is looking at themselves.
+ *
+ * The truncation itself is `truncateIp`, and it is never done in SQL: a rule
+ * about what an operator may see is stated once, in one place, so that a second
+ * reader of these rows cannot come to state it differently.
  */
 import { OUTCOMES, TRAFFIC_CLASSES } from '@clickmonk/core'
 import { addressOnly, truncateIp } from '@clickmonk/ipdata'
@@ -43,7 +53,11 @@ export const MAX_CLICK_PAGE = 200
 
 /**
  * The filters the product promises: link, class, outcome, country and time.
- * Shared with the export, which filters the same rows it would have listed.
+ *
+ * Exported, with the column list and the row mapper below, so that a second
+ * reader of these rows — a download of the same log is the one this product
+ * wants next — filters and maps them with this module's rules rather than with
+ * its own. This route is the only caller today.
  */
 export const CLICK_FILTER_FIELDS = {
   ...WINDOW_FIELDS,
@@ -154,7 +168,7 @@ export interface ClickRow {
 }
 
 /**
- * The columns both readers select, in the order the CSV writes them.
+ * The columns the log selects, exported for the reason the filter fields are.
  *
  * `toUnixTimestamp64Milli` rather than the column itself: an instant that
  * travels as a number needs no agreement about how either end formats a
@@ -171,15 +185,21 @@ const none = (s: string): string | null => (s === '' ? null : s)
  * The network a click came from, or nothing.
  *
  * `addressOnly` first, always. `truncateIp` answers null for anything that is
- * not bare address text — a port or a bracketed literal included — and the
- * stored column is a plain `String` that the record schema bounds only in
- * length, so a click recorded through a proxy that spelled the address
- * `[2001:db8::5]:443` would otherwise read as "no network" rather than as the
- * /64 it came from. Returning null is the right answer for a value the parser
- * genuinely does not recognise and the wrong one for a value it would
- * recognise a character later.
+ * not bare address text, and the stored column is a plain `String` that the
+ * record schema bounds only in length, so a click recorded through a proxy that
+ * spelled the address `[2001:db8::5]:443` would otherwise read as "no network"
+ * rather than as the /64 it came from.
+ *
+ * What is left after that reads as nothing, and there is no better answer to
+ * give. A zone-suffixed address or a dotted quad with leading zeros is not
+ * something this parser will take, and the only other value to hand over is the
+ * stored one, which is the whole address. So a null here means one of two things
+ * and the response does not tell them apart, because the row does not either:
+ * the column was blanked by the retention pass, or whatever wrote the row was
+ * not this redirect. The empty string a blanked column holds is among the values
+ * `truncateIp` already refuses, so it needs no branch of its own.
  */
-const networkOf = (ip: string): string | null => (ip === '' ? null : truncateIp(addressOnly(ip)))
+const networkOf = (ip: string): string | null => truncateIp(addressOnly(ip))
 
 /** One click over the API. The address is a network; nothing here is an address. */
 export function asClick(r: ClickRow): Record<string, unknown> {
@@ -214,8 +234,8 @@ export function asClick(r: ClickRow): Record<string, unknown> {
     action: none(r.action),
     referrer: none(r.referrer),
     userAgent: none(r.user_agent),
-    // Null for a click whose address was blanked by the retention pass, and
-    // null for anything the parser does not recognise: never the stored value.
+    // Null for a click whose address was blanked by the retention pass, and null
+    // for anything the parser does not recognise. Never the stored value.
     network: networkOf(r.ip),
     capUnchecked: r.cap_unchecked === 1,
   }

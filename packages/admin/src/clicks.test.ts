@@ -152,17 +152,24 @@ beforeAll(async () => {
       ip: '',
       cap_unchecked: 1,
     }),
-    // A day earlier, so outside every window above, and recorded through a proxy
-    // that spelled the address as a bracketed literal with a port. The redirect
-    // writes a canonical bare address, so this is a claim about what the column
-    // may hold — a plain String bounded only in length, written by whatever
-    // shipped the record — rather than about what the redirect writes today.
-    // Another row inside the day would move every count and every page boundary
-    // the first block asserts.
+    // Two addresses the parser reads differently, a day earlier so that they are
+    // outside every window above: another row inside the day would move every
+    // count and every page boundary the first block asserts.
+    //
+    // The redirect writes a canonical bare address and refuses nothing, so what
+    // this column may hold is whatever shipped the record — a plain String
+    // bounded only in length. The bracketed form with a port is a network once
+    // the port is taken off; the zone-suffixed form is not an address at all and
+    // can be stored today, since nothing on the write path would reject it.
     click({
       click_id: '01920000-0000-7000-8000-000000000004',
       time: '2026-09-23 10:00:00.000',
       ip: '[2001:db8:1234:5678:9abc:def0:1234:5678]:443',
+    }),
+    click({
+      click_id: '01920000-0000-7000-8000-000000000005',
+      time: '2026-09-23 10:01:00.000',
+      ip: '2001:db8:1234:5678:9abc:def0:1234:5678%eth0',
     }),
     // Six clicks two days earlier, three of them in one millisecond and two in
     // another: see the paging block at the end of the file.
@@ -568,17 +575,23 @@ describe('GET /api/clicks', () => {
 })
 
 /**
- * An address the way a proxy may have spelled it, in a window of its own.
+ * Two addresses the parser reads differently, in a window of their own.
  *
- * `truncateIp` answers null for anything that is not bare address text, a port
- * and a bracketed literal included, and the stored column is a plain String the
- * record schema bounds only in length. So the address is run through
- * `addressOnly` first; without that, a click recorded this way reads as "no
- * network" — the same answer as a click whose address the retention pass
- * blanked, which is the one thing the two must not share.
+ * `truncateIp` answers null for anything that is not bare address text, so the
+ * stored value goes through `addressOnly` first: without that, a bracketed
+ * address with a port reads as "no network" — the answer a click whose address
+ * the retention pass blanked gets, which is the one thing the two must not
+ * share.
+ *
+ * The zone-suffixed form is the other half, and it stays null on purpose. There
+ * is no parse this module could do that would turn `%eth0` into a network, so
+ * what the operator is told is the truth: this click has no network. What a null
+ * therefore means is one of two things — the column was blanked, or whatever
+ * wrote the row was not this redirect — and nothing in the response distinguishes
+ * them, because nothing in the row does either.
  */
-describe('GET /api/clicks, an address with brackets and a port', () => {
-  it('shows it as the network it came from', async () => {
+describe('GET /api/clicks, addresses a proxy may have spelled oddly', () => {
+  it('shows the bracketed one as a network and the zone-suffixed one as nothing', async () => {
     const r = await app.inject({
       method: 'GET',
       url: `/api/clicks?${DAY_BEFORE}`,
@@ -589,7 +602,10 @@ describe('GET /api/clicks, an address with brackets and a port', () => {
       r
         .json()
         .clicks.map((c: { clickId: string; network: string | null }) => [c.clickId, c.network]),
-    ).toEqual([['01920000-0000-7000-8000-000000000004', '2001:db8:1234:5678::/64']])
+    ).toEqual([
+      ['01920000-0000-7000-8000-000000000005', null],
+      ['01920000-0000-7000-8000-000000000004', '2001:db8:1234:5678::/64'],
+    ])
   })
 })
 

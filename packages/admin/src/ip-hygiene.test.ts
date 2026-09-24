@@ -4,13 +4,22 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { clockFrom, read, signedIn, testApp } from './testing.js'
 
 /**
- * No response this service sends carries a whole address, and no response has
- * a field called `ip`.
+ * No response carries a **visitor's** whole address, and no click in a response
+ * has a field called `ip`.
  *
  * It is one file rather than an assertion inside each route's suite because the
- * rule is about the surface: a route added later that selects `ip` and forgets
- * to truncate it is caught here, by a test nobody has to remember to extend,
- * as long as its URL is in the list below.
+ * rule is about the surface: a route added later that selects a click's `ip` and
+ * forgets to truncate it is caught here, by a test nobody has to remember to
+ * extend, as long as its URL is in the list below.
+ *
+ * What it does not say is that no response anywhere names an address. `GET
+ * /api/sessions` is in the list and hands the operator the addresses their own
+ * sessions were opened from, whole and on purpose; it passes because the
+ * addresses in these fixtures are visitors' addresses, in ClickHouse, which the
+ * session list has no way to reach. So the two addresses below are the subject of
+ * the check, not merely two strings that happen not to appear: a route that reads
+ * a click and prints its address whole fails, and the operator's own session
+ * addresses go on being shown.
  */
 const pool = testPg()
 const ch = testCh()
@@ -23,9 +32,10 @@ const HOST_ADDRESS = '198.51.100.77'
 const V6_ADDRESS = '2001:db8:1234:5678:9abc:def0:1234:5678'
 const WINDOW = 'from=2026-09-24T00:00:00.000Z&to=2026-09-25T00:00:00.000Z'
 
-// Every GET this service answers, so that the check is about the surface and
-// not about the routes somebody thought of. The CSV export is added to this
-// list by the task that adds the export.
+// Every GET behind the credential, so that the check is about the surface and
+// not about the routes somebody thought of. `/health` is the one GET left out:
+// it is in front of the credential and answers a fixed status with no data of
+// its own. A read added later belongs here.
 const READS = [
   `/api/clicks?${WINDOW}`,
   `/api/reports/summary?${WINDOW}`,
