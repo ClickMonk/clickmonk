@@ -323,6 +323,40 @@ describe('runRetention', () => {
     }
   })
 
+  // The other end of holding that lock: a pass that throws while it holds it
+  // must end its transaction before the client goes back to the pool. A client
+  // released inside an open transaction takes the row lock with it, and the
+  // next `settings set` an operator runs waits for a connection that is never
+  // coming back — one failed pass, and the install cannot change its settings
+  // until the worker restarts.
+  it('holds no lock after a pass that threw', async () => {
+    const idleInTransaction = async (): Promise<number> => {
+      const r = await pool.query<{ n: string }>(
+        `SELECT count(*) AS n FROM pg_stat_activity
+          WHERE datname = current_database() AND state LIKE 'idle in transaction%'`,
+      )
+      return Number(r.rows[0]?.n ?? 0)
+    }
+    await expect(
+      runRetention({
+        pg: pool,
+        ch,
+        now: NOW,
+        partitionSource: async () => {
+          throw new Error('the partition list is unreadable')
+        },
+      }),
+    ).rejects.toThrow('the partition list is unreadable')
+    // Bounded rather than immediate: a backend's reported state settles a
+    // moment after the statement that changed it.
+    let open = await idleInTransaction()
+    for (let i = 0; i < 40 && open > 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      open = await idleInTransaction()
+    }
+    expect(open, 'a connection went back to the pool inside a transaction').toBe(0)
+  })
+
   it('considers at most as many partitions as it is given, oldest first', async () => {
     const r = await runRetention({ pg: pool, ch, now: NOW, maxPartitions: 1 })
     await settleMutations()
