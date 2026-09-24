@@ -54,11 +54,11 @@ export interface RedirectDeps {
   secret: string
   /** The loaded IP data, or null while there is none. Omitted: none. */
   ipdata?: () => IpLookup | null
-  /** Requests per address, for the abuser class; the one `/health` reports. */
+  /** Requests per client, for the abuser class; the one `/health` reports. */
   rate: RateCounter
   now?: () => Date
   random?: () => number
-  /** Wrong password answers per address and link. Omitted: this file's bounds. */
+  /** Wrong password answers per client and link. Omitted: this file's bounds. */
   passwordAttempts?: AttemptCounter
   /** Password checks in flight in this process. Omitted: this file's bound. */
   passwordGate?: ConcurrencyGate

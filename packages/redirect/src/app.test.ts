@@ -921,7 +921,7 @@ describe('traffic classification', () => {
     expect(records[2]?.country).toBe('DE')
   })
 
-  it('counts an address the same with or without brackets and a port', async () => {
+  it('counts one client the same with or without brackets and a port', async () => {
     const { app, records } = harness([link()], {
       ipdata: IPDATA,
       settings: { ...DEFAULT_TRAFFIC_SETTINGS, abuserThreshold: 1 },
@@ -1168,7 +1168,7 @@ describe('a password-protected link', () => {
     expectPasswordRecord(records[0], 200, locked.id)
   })
 
-  it('refuses an address that keeps guessing, and lets it try again in the next window', async () => {
+  it('refuses a client that keeps guessing, and lets it try again in the next window', async () => {
     const attempts = new AttemptCounter(2, 60_000)
     // A monotonic clock the test moves, so "the next window" is something this
     // test can actually reach rather than a phrase in its name.
@@ -1195,7 +1195,7 @@ describe('a password-protected link', () => {
     expectPasswordRecord(records[2], 429, locked.id)
   })
 
-  it('counts guesses per link and address, not per link alone or per address alone', async () => {
+  it('counts guesses per link and client, not per link alone or per client alone', async () => {
     const attempts = new AttemptCounter(1, 60_000)
     const other = link({
       id: '00000000-0000-4000-8000-0000000000a9',
@@ -1261,7 +1261,7 @@ describe('a password-protected link', () => {
     expectPasswordRecord(records[0], 200, locked.id)
   })
 
-  it('counts a body with no password against the address that sent it', async () => {
+  it('counts a body with no password against the client that sent it', async () => {
     // The cheapest way to ask this endpoint for work, so it is paid for at the
     // same rate as a guess.
     const { app } = harness([locked], { passwordAttempts: new AttemptCounter(1, 60_000) })

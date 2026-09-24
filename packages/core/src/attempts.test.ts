@@ -25,8 +25,8 @@ describe('counting failed attempts', () => {
     const c = new AttemptCounter(1, 60_000)
     c.fail('k', 0)
     // A second key with its own failure: a link password page's counter is
-    // shared across addresses and links, so one address getting a password
-    // right must not clear anyone else's lockout.
+    // shared across clients and links, so one client getting a password right
+    // must not clear anyone else's lockout.
     c.fail('other', 0)
     expect(c.check('k', 0).allowed).toBe(false)
     c.succeed('k')

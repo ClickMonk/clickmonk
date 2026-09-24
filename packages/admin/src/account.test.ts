@@ -121,12 +121,12 @@ describe('signing in', () => {
     expect(lockoutMs(100)).toBe(60 * 60 * 1000)
   })
 
-  // The per-address bound, shown on its own. With the shipped numbers the
+  // The per-client bound, shown on its own. With the shipped numbers the
   // account locks at five and answers 429 `locked` for every attempt after
   // that, so a test that just made ten attempts would pass whether this
   // limiter ran or not. Two failures against a counter of two reaches it while
   // the account is still unlocked, and the assertion is the exact code.
-  it('refuses one address after too many attempts, before the password is even checked', async () => {
+  it('refuses one client after too many attempts, before the password is even checked', async () => {
     const attempts = new AttemptCounter(2, LOGIN_ATTEMPT_WINDOW_MS)
     const limited = testApp(pg, clock, { loginAttempts: attempts })
     try {
@@ -145,12 +145,12 @@ describe('signing in', () => {
       expect(refused.json().error).toBe('too_many_attempts')
       expect(Number(refused.headers['retry-after'])).toBeGreaterThan(0)
       // Two failures is below LOCKOUT_AFTER, so the account itself is not
-      // locked: this refusal is the address limiter's and nothing else's.
+      // locked: this refusal is the client limiter's and nothing else's.
       const row = await pg.query<{ locked_until: Date | null }>(
         'SELECT locked_until FROM admin_account',
       )
       expect(row.rows[0]?.locked_until).toBeNull()
-      // And the window turning over gives the address its allowance back.
+      // And the window turning over gives the client its allowance back.
       clock.advance(LOGIN_ATTEMPT_WINDOW_MS + 1000)
       expect((await attempt(ADMIN_PASSWORD)).statusCode).toBe(200)
     } finally {
@@ -188,7 +188,7 @@ describe('signing in', () => {
       expect(refused.json().error).toBe('too_many_attempts')
       expect(refused.headers['set-cookie']).toBeUndefined()
       // Three failures is below LOCKOUT_AFTER, so nothing here is the account's
-      // own lockout; this is the address limiter and nothing else.
+      // own lockout; this is the client limiter and nothing else.
       const row = await pg.query<{ locked_until: Date | null }>(
         'SELECT locked_until FROM admin_account',
       )
@@ -234,7 +234,7 @@ describe('signing in', () => {
 
   // LOGIN_ATTEMPT_LIMIT is the shipped number; this pins that it is what the
   // app is built with, which the test above deliberately does not use.
-  it('is built with the documented per-address limit', () => {
+  it('is built with the documented per-client limit', () => {
     expect(LOGIN_ATTEMPT_LIMIT).toBe(10)
     expect(LOGIN_ATTEMPT_WINDOW_MS).toBe(15 * 60 * 1000)
   })

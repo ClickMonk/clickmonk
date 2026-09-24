@@ -5,7 +5,7 @@ import { RATE_WINDOW_MS, RateCounter } from './rate.js'
 const T = 1_000_000
 
 describe('RateCounter', () => {
-  it('counts each address on its own, this request included', () => {
+  it('counts each client on its own, this request included', () => {
     const r = new RateCounter()
     expect(r.hit('192.0.2.1', T)).toBe(1)
     expect(r.hit('192.0.2.1', T + 1)).toBe(2)

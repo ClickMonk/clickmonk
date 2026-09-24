@@ -14,7 +14,7 @@
  * concurrency, a one-time code cannot be spent twice by two requests that read
  * the same `totp_last_step`, and a recovery code cannot be used twice. The
  * cost — attempts queue behind each other — is the behaviour wanted from a
- * guessing gate, and the per-address limiter and the concurrency gate in front
+ * guessing gate, and the per-client limiter and the concurrency gate in front
  * of it are what stop that queue from growing.
  */
 import { randomBytes } from 'node:crypto'
@@ -386,7 +386,7 @@ export async function signIn(pg: Pool, input: SignInInput, now: Date): Promise<S
       } else {
         // The password was right and a code is needed. Not counted against
         // the account: it is an incomplete attempt, not a wrong credential.
-        // The per-address limiter still counts it.
+        // The per-client limiter still counts it.
         await client.query('COMMIT')
         return { ok: false, reason: 'totp_required' }
       }

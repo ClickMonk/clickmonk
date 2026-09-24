@@ -5,7 +5,7 @@ import { z } from 'zod'
  * Which addresses an `X-Forwarded-For` header is believed from. One
  * definition, used by every service that sits behind Caddy: the redirect,
  * whose rate counter and click record take the visitor's address, and the
- * admin API, whose sign-in limiter counts failures per address. Two copies of
+ * admin API, whose sign-in limiter counts failures per client. Two copies of
  * this would eventually disagree, and the way it fails — every request
  * arriving as the proxy — looks like one shared client rather than a
  * configuration fault.

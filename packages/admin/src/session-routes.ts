@@ -164,7 +164,7 @@ async function confirmSecondFactor(
 
 export function registerSessionRoutes(app: FastifyInstance, ctx: AdminContext): void {
   /**
-   * Signing in. Three gates in front of the password check: the per-address
+   * Signing in. Three gates in front of the password check: the per-client
    * limiter, the account's own lockout, and the bound on password checks in
    * flight. Every refusal but a lockout answers 401 with the same body, so
    * nothing here says whether the address exists or the password was right.

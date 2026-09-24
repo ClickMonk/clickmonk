@@ -109,7 +109,7 @@ export function isNonHuman(c: TrafficClass): c is NonHumanClass {
   return c !== 'human' && c !== 'unknown'
 }
 
-/** Pure: the address's request count and IP facts are looked up by the caller. */
+/** Pure: the client's request count and IP facts are looked up by the caller. */
 export function classifyTraffic(f: TrafficFacts): Traffic {
   const signals: Signal[] = []
   if (f.userAgent.length === 0) signals.push('ua_missing')

@@ -1,10 +1,12 @@
 /**
  * Counting failed attempts against a secret, in fixed windows, in memory.
  *
- * Used twice: for the admin login, keyed by the address the attempt came
- * from, and for a link's password page, keyed by address and link together.
- * Both are gates in front of a deliberately slow hash, so the count is what
- * stops one address from spending the process's CPU on guesses.
+ * Used twice: for the admin login, keyed by the client the attempt came from,
+ * and for a link's password page, keyed by client and link together. A client
+ * is what `rateKey` counts — one IPv4 address, or one IPv6 /64, because an IPv6
+ * client usually holds a whole /64 and could otherwise buy a fresh allowance
+ * per request. Both are gates in front of a deliberately slow hash, so the
+ * count is what stops one client from spending the process's CPU on guesses.
  *
  * **This counter fails closed**, which is the opposite of the abuser counter
  * on the redirect path. When the map is full and the window has not turned

@@ -286,7 +286,7 @@ describe('the page', () => {
 
   it('never says how many guesses are left', () => {
     // The limiter's own page says to wait; neither password page may hint at
-    // where an address stands, or the count is readable off it.
+    // where a client stands, or the count is readable off it.
     for (const page of [passwordPage(), passwordPage({ wrong: true })]) {
       expect(page.toLowerCase()).not.toContain('attempt')
       expect(page.toLowerCase()).not.toContain('again')

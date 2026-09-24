@@ -13,8 +13,9 @@
  *   never echoes what was typed. A slug with no password behaves exactly as an
  *   unknown slug does today.
  * - **A way to spend the process.** Verifying a password costs 16 MiB and tens
- *   of milliseconds by design, so attempts are counted per address and link and
+ *   of milliseconds by design, so attempts are counted per client and link and
  *   refused past a small number, and only a couple of checks ever run at once.
+ *   A client is one IPv4 address or one IPv6 /64: see `rateKey`.
  * - **A proof that outlives the password.** The cookie is signed over the link
  *   id *and* a fingerprint of the stored hash, so changing the password stops
  *   every proof issued under the old one. The link id is in the signed payload
@@ -29,7 +30,7 @@ import { MAX_PASSWORD_LENGTH } from '@clickmonk/core'
 export const PASSWORD_COOKIE_PREFIX = 'cm_pw_'
 /** How long a visitor is not asked again. */
 export const PASSWORD_PROOF_MS = 12 * 60 * 60 * 1000
-/** Wrong answers from one address for one link, per minute. */
+/** Wrong answers from one client for one link, per minute. */
 export const PASSWORD_ATTEMPT_LIMIT = 5
 export const PASSWORD_ATTEMPT_WINDOW_MS = 60_000
 /** Password checks in flight in the redirect process. */
@@ -177,7 +178,7 @@ export function plainPage(title: string, message: string): string {
 `
 }
 
-/** The page shown when an address has answered wrongly too many times. */
+/** The page shown when a client has answered wrongly too many times. */
 export function tooManyAttemptsPage(): string {
   return plainPage('Too many attempts', 'Too many attempts. Wait a minute and try again.')
 }
