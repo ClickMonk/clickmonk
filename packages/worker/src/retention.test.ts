@@ -444,11 +444,50 @@ describe('runRetention', () => {
     }
   })
 
-  it('considers at most as many partitions as it is given, oldest first', async () => {
+  it('acts on at most as many partitions as it is given, oldest first', async () => {
     const r = await runRetention({ pg: pool, ch, now: NOW, maxPartitions: 1 })
     await settleMutations()
+    // The drop spends the whole budget, so the two months past the address
+    // period are left for the next pass rather than blanked in this one.
     expect(r.dropped).toEqual(['202605'])
     expect(r.blanked).toEqual([])
+  })
+
+  // **The bound is on work, not on position.** With no raw period nothing is
+  // ever dropped, so the list of partitions never shrinks — and a pass that took
+  // the oldest few of them would consider the same few every hour and never
+  // reach the months behind them. Measured on the code before this: the first
+  // pass blanked its budget's worth and every pass after it blanked nothing,
+  // leaving every further month holding whole addresses for the life of the
+  // install while the pass logged a success line each hour.
+  //
+  // So this runs more passes than one and asserts the outcome the periods
+  // promise — no address left past the cutoff — rather than which partitions
+  // either pass named. Two passes and a budget of two against three months of
+  // work: the budget has to be spent twice for the third month to be reached.
+  it('keeps making progress across passes when nothing is ever dropped', async () => {
+    await pool.query('UPDATE settings SET raw_retention_days = NULL, ip_retention_days = 30')
+    const first = await runRetention({ pg: pool, ch, now: NOW, maxPartitions: 2 })
+    await settleMutations()
+    // The premise: the first pass filled its budget and stopped, so there is
+    // still work left for the second. Without this the assertion below would
+    // pass against a build that did everything in one pass and against one whose
+    // budget was never reached.
+    expect(first.blanked).toEqual(['202605', '202606'])
+    const second = await runRetention({ pg: pool, ch, now: NOW, maxPartitions: 2 })
+    await settleMutations()
+    expect(second.blanked).toEqual(['202607'])
+    // The address cutoff is 2026-08-25, so 202605, 202606 and 202607 are all
+    // past it and 202608 and 202609 are not. Nothing was dropped: five months
+    // are still here, and the two inside the period still hold what they came
+    // with.
+    expect(await addresses()).toEqual([
+      { partition_id: '202605', ip: '' },
+      { partition_id: '202606', ip: '' },
+      { partition_id: '202607', ip: '' },
+      { partition_id: '202608', ip: '198.51.100.8' },
+      { partition_id: '202609', ip: '198.51.100.9' },
+    ])
   })
 
   it('logs and skips a partition id that is not a month rather than putting it in a statement', async () => {
