@@ -31,6 +31,17 @@ const SLUG = 'r1'
 const TARGET = 'https://example.com/report'
 /** Clicks to make. Three, so a count of one or of every request is visibly wrong. */
 const CLICKS = 3
+const HOUR_MS = 3_600_000
+/**
+ * An address per click, so that "no response carries the address a click came
+ * from" is a claim about every row rather than about whichever row happens to
+ * carry the newest client's. Docker hands a container the next free address in
+ * the pool, which gave all three of these the same one when the suite let it
+ * choose — and an older row leaking its address then passed, because the address
+ * it leaked was the newest one. High in the range the compose file declares, so
+ * they are clear of the addresses the stack's own containers are allocated.
+ */
+const CLIENT_IPS = ['172.30.0.201', '172.30.0.202', '172.30.0.203']
 
 /**
  * What the redirect answers a name it does not serve, in plain text, and the
@@ -47,15 +58,25 @@ let root = ''
 let cookie = ''
 let setUp = false
 let failures = 0
-/** The address the client container used, read from the client rather than written here. */
-let clientIp = ''
 /**
- * How many retention passes had logged a result by the time the clicks were
- * countable. The pass the retention test reads has to be one that ran with the
- * clicks already in the store, and this is the only way to say that without
- * sleeping: it waits for the count to grow.
+ * The addresses the client containers reported for themselves, one per click.
+ * Read back out of each client rather than trusted to be the ones asked for
+ * above, and asserted to be three different addresses before anything is
+ * concluded from them.
  */
-let passesWithClicks = 0
+const clientIps: string[] = []
+/**
+ * The hours the clicks could have landed in: the hour the first went out and the
+ * hour the last did. One hour in every run so far — three requests take under a
+ * second — and two if a run crosses a boundary between them, which is why it is
+ * a list.
+ */
+let clickHours: string[] = []
+/**
+ * The outcome on the one row the retention test writes for itself, which is how
+ * that row is counted and told apart from every click this suite really made.
+ */
+const OLD_OUTCOME = 'expired'
 
 function api(
   method: string,
@@ -72,13 +93,27 @@ function api(
   return curl(args, CA_MOUNT, { body: true })
 }
 
-/** The window every request below asks for: a day either side of now, in UTC. */
+/** Hours either side of the hour this run is in that the window below covers. */
+const WINDOW_HOURS_EITHER_SIDE = 24
+
+/**
+ * The window every request below asks for, in UTC, with both ends **on the
+ * hour**.
+ *
+ * Aligned rather than "now, give or take a day", because a report raises an
+ * unaligned `to` to the next hour and the chart then holds 48 buckets or 49
+ * depending on what minute the run started. Aligned, the count is one number and
+ * the chart test can assert it.
+ */
 function window(): string {
-  const now = Date.now()
-  const from = new Date(now - 86_400_000).toISOString()
-  const to = new Date(now + 86_400_000).toISOString()
+  const hour = Math.floor(Date.now() / HOUR_MS) * HOUR_MS
+  const from = new Date(hour - WINDOW_HOURS_EITHER_SIDE * HOUR_MS).toISOString()
+  const to = new Date(hour + WINDOW_HOURS_EITHER_SIDE * HOUR_MS).toISOString()
   return `from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`
 }
+
+/** The hour an instant falls in, spelled the way a chart bucket spells it. */
+const hourOf = (ms: number): string => new Date(Math.floor(ms / HOUR_MS) * HOUR_MS).toISOString()
 
 const cookieFrom = (headers: string): string => {
   const line = headers.split('\n').find((l) => /^set-cookie:/i.test(l)) ?? ''
@@ -86,15 +121,48 @@ const cookieFrom = (headers: string): string => {
 }
 
 /**
- * The result line every retention pass writes, one per pass. The line the worker
- * writes at start says the pass was *started*; this one says a pass *ran*, and
- * what it decided, which is the difference between the two things the retention
- * tests below want to know.
+ * One statement against ClickHouse, run from the worker container and therefore
+ * through the four variables the install gives it: the store is reached with the
+ * install's own configuration, and no password is written here.
+ *
+ * It exists because no report can answer what the retention test asks. Every
+ * report reads a rollup; the pass drops partitions of `clicks` and blanks
+ * addresses in `clicks`, and never touches a rollup. A pass that had deleted
+ * every raw click would leave the summary, the chart and the breakdown answering
+ * exactly what they answered before.
+ *
+ * POST with the statement as the body rather than a query parameter, because the
+ * HTTP interface treats a GET as read-only and the retention test writes a row.
  */
-const PASS_LINE = /retention: dropped (\d+), blanked (\d+), skipped \d+/g
+const RUN_IN_STORE = `
+const u = new URL(process.env.CLICKMONK_CLICKHOUSE_URL)
+u.searchParams.set('database', process.env.CLICKMONK_CLICKHOUSE_DB)
+fetch(u, {
+  method: 'POST',
+  body: process.env.CM_SQL,
+  headers: {
+    'x-clickhouse-user': process.env.CLICKMONK_CLICKHOUSE_USER,
+    'x-clickhouse-key': process.env.CLICKMONK_CLICKHOUSE_PASSWORD,
+  },
+}).then(async (r) => {
+  const text = await r.text()
+  if (!r.ok) throw new Error(r.status + ' ' + text)
+  process.stdout.write(text)
+})
+`
 
-const passes = (): string[] =>
-  [...compose('logs', '--no-color', 'worker').matchAll(PASS_LINE)].map((m) => m[0] as string)
+const storeRun = (sql: string): string =>
+  compose('exec', '-T', '-e', `CM_SQL=${sql}`, 'worker', 'node', '-e', RUN_IN_STORE)
+
+function storeCount(sql: string): number {
+  const out = storeRun(sql).trim()
+  const n = Number(out)
+  // Never a silent NaN or a silent zero: an unreachable store answers nothing and
+  // `Number('')` is 0, which would reach an assertion looking like a count of
+  // none.
+  if (out === '' || !Number.isInteger(n)) throw new Error(`the store answered "${out}"`)
+  return n
+}
 
 afterEach((ctx) => {
   if (ctx.task.result?.state === 'fail') failures++
@@ -131,13 +199,21 @@ beforeAll(async () => {
   // the sign-in above both happen in between. A 404 here is therefore a link
   // that was never created rather than one that has not arrived yet, which is
   // what the message says.
+  //
+  // One address per client, and `-4` so that the address the client reports for
+  // itself is the one that was asked for: a container on this network also gets
+  // an IPv6 address, which `--ip` does not set, and curl would prefer it.
+  const startedMs = Date.now()
   for (let i = 0; i < CLICKS; i++) {
-    const r = curl(['--max-time', '30', '-D', '-', `http://${LINK_HOST}/${SLUG}`], [], {
-      body: true,
-    })
+    const r = curl(
+      ['-4', '--max-time', '30', '-D', '-', `http://${LINK_HOST}/${SLUG}`],
+      ['--ip', CLIENT_IPS[i] as string],
+      { body: true },
+    )
     if (r.status !== 302) throw new Error(`click ${i} answered ${r.status}: ${r.body}`)
-    clientIp = r.ip
+    clientIps.push(r.ip)
   }
+  clickHours = [...new Set([hourOf(startedMs), hourOf(Date.now())])]
 
   // A segment seals after two seconds or 8 MB, and the shipper takes a pass a
   // second: a few seconds in normal operation, waited for rather than slept
@@ -147,7 +223,6 @@ beforeAll(async () => {
     if (r.status !== 200) return false
     return (JSON.parse(r.body) as { clicks: number }).clicks >= CLICKS
   })
-  passesWithClicks = passes().length
   setUp = true
 }, 900_000)
 
@@ -182,10 +257,18 @@ describe('a report of real clicks', () => {
   it('puts them in the chart, in the hour they happened', () => {
     const r = api('GET', `/api/reports/timeseries?${window()}&bucket=hour`, { cookie })
     expect(r.status, r.body).toBe(200)
-    const buckets = (JSON.parse(r.body) as { buckets: { clicks: number }[] }).buckets
-    expect(buckets.reduce((n, b) => n + b.clicks, 0)).toBe(CLICKS)
-    // Two days of hours, all present, because a chart fills its gaps.
-    expect(buckets.length).toBeGreaterThan(24)
+    const buckets = (JSON.parse(r.body) as { buckets: { at: string; clicks: number }[] }).buckets
+    // Two days of hours, every one of them there because a chart fills its gaps.
+    // The number and not a floor: "more than 24" is satisfied by 25, and the
+    // window is aligned at both ends precisely so this can be one number.
+    expect(buckets.length).toBe(48)
+    // Which bucket carries them, not only that some bucket does. Shifting the
+    // fill's lookup key by an hour leaves the length and the total untouched and
+    // draws the clicks in the wrong hour, which is the whole of what a chart
+    // says.
+    const carrying = buckets.filter((b) => b.clicks > 0)
+    expect(carrying.reduce((n, b) => n + b.clicks, 0)).toBe(CLICKS)
+    for (const b of carrying) expect(clickHours).toContain(b.at)
   })
 
   it('breaks them down by the target rotation chose', () => {
@@ -204,22 +287,32 @@ describe('a report of real clicks', () => {
     const clicks = (JSON.parse(r.body) as { clicks: { network: string; destination: string }[] })
       .clicks
     expect(clicks).toHaveLength(CLICKS)
-    expect(clicks[0]?.destination).toBe(TARGET)
-    expect(clicks[0]?.network).toMatch(/\/(24|64)$/)
-    // The whole address the client really used, which is read from the client
-    // and never written down here: no response may contain it.
-    expect(clientIp.length).toBeGreaterThan(0)
-    expect(r.body).not.toContain(clientIp)
+    for (const c of clicks) {
+      expect(c.destination).toBe(TARGET)
+      expect(c.network).toMatch(/\/(24|64)$/)
+    }
+    // Three different addresses, asserted before anything is concluded from them:
+    // the check below is only about every row while the rows carry addresses that
+    // differ, and letting Docker choose gave all three clients the same one.
+    expect(new Set(clientIps).size).toBe(CLICKS)
+    for (const ip of clientIps) expect(r.body).not.toContain(ip)
   })
 
-  // One assertion here goes through Caddy rather than through `inject`, and a
-  // reverse proxy is allowed to buffer a small chunked body and add a length of
-  // its own. If `content-length` turns up on this response, read the whole
-  // header block and Caddy's configuration before touching the assertion: the
-  // property that matters is that this service did not buffer the file, which
-  // the unit test pins directly. A length added by the proxy is a different
-  // fact, and it belongs in the README's limits rather than in a relaxed
-  // assertion here.
+  // **What the absent length does and does not prove.** It proves no length was
+  // decided before the first row, which is what a handler that hands back the
+  // whole file as a string does: measured, that shape fails here and fails
+  // exactly one unit test, `holds nothing: no content-length, and a chunked
+  // body`. It does not prove the file was never held in memory — a body read to
+  // the end and handed over as a single-chunk stream is still chunked and still
+  // carries no length, and measured, it passes here and passes all 398 of the
+  // admin service's unit tests. Nothing catches that shape today. Do not read
+  // this assertion as more than the header it reads.
+  //
+  // This one answer travels through Caddy rather than through `inject`, and a
+  // reverse proxy may buffer a small chunked body and add a length of its own.
+  // Measured on this stack, Caddy adds none. If one turns up, read the whole
+  // header block and Caddy's configuration before touching the assertion: a
+  // length added by the proxy is a different fact from a length added here.
   it('exports them as a file, streamed, and says it was not cut', () => {
     const r = api('GET', `/api/clicks.csv?${window()}`, { cookie })
     expect(r.status, r.body).toBe(200)
@@ -231,12 +324,13 @@ describe('a report of real clicks', () => {
     // Split on the newline alone, not on the CRLF this file is really written
     // with: the client helper normalises every CRLF in what curl wrote so that
     // a header block can be told from a body at all, so the line ending cannot
-    // be read back out here. It is not unpinned — the unit test compares a
+    // be read back out here. It is not unpinned — `csv.test.ts` compares a
     // written line byte for byte. What this counts is the rows.
     const lines = r.body.split('\n').filter((l) => l.length > 0)
     expect(lines).toHaveLength(CLICKS + 1)
     expect(lines[0]).toContain('"network"')
-    expect(r.body).not.toContain(clientIp)
+    expect(new Set(clientIps).size).toBe(CLICKS)
+    for (const ip of clientIps) expect(r.body).not.toContain(ip)
   })
 
   it('answers a script holding a key, not only a browser holding a cookie', () => {
@@ -291,44 +385,67 @@ describe('the install', () => {
   })
 
   it('takes a shorter period and reports it back', () => {
+    // Through the API before the change as well as after. With only the second
+    // read, two constants in the settings response satisfy this test: nothing
+    // would have seen this surface answer anything else.
+    const before = api('GET', '/api/settings', { cookie })
+    expect(before.status, before.body).toBe(200)
+    expect((JSON.parse(before.body) as { retention: unknown }).retention).toEqual({
+      rawRetentionDays: 90,
+      ipRetentionDays: 30,
+    })
     cli('settings', 'set', '--keep-clicks', '30', '--keep-addresses', '7')
-    const r = api('GET', '/api/settings', { cookie })
-    expect(r.status, r.body).toBe(200)
-    expect((JSON.parse(r.body) as { retention: unknown }).retention).toEqual({
+    const after = api('GET', '/api/settings', { cookie })
+    expect(after.status, after.body).toBe(200)
+    expect((JSON.parse(after.body) as { retention: unknown }).retention).toEqual({
       rawRetentionDays: 30,
       ipRetentionDays: 7,
     })
   })
 
-  it('is running the retention pass, and has deleted nothing', async () => {
-    // A period is a floor and the partition is this month, so the right
-    // behaviour here is that a pass ran and dropped nothing. Two passes past the
-    // count taken once the clicks were countable, so at least one of them began
-    // after they were in the store: a pass logs its result at the end, so the
-    // first one past that count could have read the partition before them.
-    // Half the file's test timeout, so a worker that never runs a pass fails
-    // with the sentence naming what was missing rather than with vitest's own
-    // "test timed out", which says nothing about retention. Measured: with the
-    // pass not started at all, the two deadlines landed on the same millisecond
-    // and the timeout won.
-    await until(
-      'a retention pass over a partition holding the clicks',
-      60_000,
-      () => passes().length >= passesWithClicks + 2,
+  it('drops a month past the period it was just given, and keeps the month it is in', async () => {
+    // **A pass needs something to delete before a test can watch it delete.**
+    // Nothing that can be clicked is past a period on a fresh install: a period is
+    // a floor, partitions go whole, and the month this run is in has not ended. So
+    // a pass here has no work, and a test that only watched for one — a log line,
+    // a count of passes — is satisfied by a pass that prints that it ran and
+    // returns. This row is the work: a click in a month that ended long before the
+    // thirty days set above, written straight into the store because no click can
+    // be made 120 days ago.
+    //
+    // Its own outcome, so that it is counted apart from every real click, and an
+    // address from the documentation range, so that the row the pass considers is
+    // shaped like the rows beside it.
+    const oldMs = Date.now() - 120 * 24 * HOUR_MS
+    const at = new Date(oldMs).toISOString().replace('T', ' ').replace('Z', '')
+    storeRun(
+      `INSERT INTO clicks (click_id, time, outcome, ip)
+         VALUES (generateUUIDv4(), toDateTime64('${at}', 3, 'UTC'), '${OLD_OUTCOME}', '198.51.100.7')`,
     )
-    // The line the worker writes at start, which says the pass was started at
-    // all, and then every pass's own result. Each pass decided about a partition
-    // whose month has not ended, and every one of them left it alone.
-    expect(compose('logs', '--no-color', 'worker')).toContain('retention periods')
-    for (const line of passes()) expect(line).toMatch(/dropped 0, blanked 0,/)
-    // What would have changed if any of them had been wrong. The clicks that
-    // reached a target, not the total: the 404 above is a click too, so the total
-    // here is four, and a number that counts something a test did on its way past
-    // is a number that changes when the tests are reordered. A dropped partition
-    // takes every outcome with it, so this sees it either way.
-    const r = api('GET', `/api/reports/summary?${window()}`, { cookie })
-    expect(r.status, r.body).toBe(200)
-    const body = JSON.parse(r.body) as { byOutcome: Record<string, number> }
-    expect(body.byOutcome.target).toBe(CLICKS)
+    const old = `SELECT count() FROM clicks WHERE outcome = '${OLD_OUTCOME}'`
+    expect(storeCount(old)).toBe(1)
+
+    // The pass, watched for by its effect rather than by anything it printed.
+    // Sixty seconds against a five-second interval, and half the file's test
+    // timeout so that a worker which never runs a pass fails with the sentence
+    // naming what was missing: measured, with the pass not started at all the two
+    // deadlines landed on the same millisecond and vitest's own "test timed out"
+    // won, which says nothing about retention.
+    await until('the pass to drop the month past the period', 60_000, () => storeCount(old) === 0)
+
+    // And the month this run is in, which the same pass considered and had to
+    // leave alone: every raw click still there, and every one of them still
+    // holding the address it came from. Read out of `clicks` and not out of a
+    // report, because the pass deletes from `clicks` and no report reads it — a
+    // pass that dropped every raw click would leave every report answering exactly
+    // what it answered before, which is how a test that read one of them passed
+    // with every raw click gone.
+    //
+    // Counted by outcome rather than as a total, because the 404 further up is a
+    // click too: a number that counts what another test did on its way past
+    // changes when the tests are reordered.
+    const kept = `FROM clicks WHERE outcome = 'target'`
+    expect(storeCount(`SELECT uniqExact(click_id) ${kept}`)).toBe(CLICKS)
+    expect(storeCount(`SELECT uniqExact(click_id) ${kept} AND ip != ''`)).toBe(CLICKS)
   })
 })
