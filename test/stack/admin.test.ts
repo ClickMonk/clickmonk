@@ -1,5 +1,5 @@
 import { SESSION_COOKIE } from '@clickmonk/admin/auth'
-import { passwordCookieName } from '@clickmonk/redirect/password'
+import { passwordCookieName, passwordPage, tooManyAttemptsPage } from '@clickmonk/redirect/password'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import {
   ADMIN_HOST,
@@ -69,9 +69,9 @@ function api(
   o: {
     body?: string
     cookie?: string
-    host?: string
     origin?: string
     forwardedFor?: string
+    /** Extra arguments for the client itself, such as which address family to use. */
     client?: string[]
   } = {},
 ) {
@@ -83,7 +83,7 @@ function api(
   if (o.cookie) args.push('-H', `cookie: ${o.cookie}`)
   if (o.origin !== undefined) args.push('-H', `origin: ${o.origin}`)
   if (o.forwardedFor !== undefined) args.push('-H', `x-forwarded-for: ${o.forwardedFor}`)
-  args.push(`https://${o.host ?? ADMIN_HOST}${path}`)
+  args.push(`https://${ADMIN_HOST}${path}`)
   return curl(args, CA_MOUNT, { body: true })
 }
 
@@ -523,6 +523,8 @@ describe('a link with a password, end to end', () => {
       const r = visit('/open')
       return r.exit === 0 && r.status === 302
     })
+    // Each guess prints one line of JSON, so a page full of newlines is still one
+    // line per guess and the answer is read as a whole rather than as a status.
     const r = compose(
       'exec',
       '-T',
@@ -530,17 +532,23 @@ describe('a link with a password, end to end', () => {
       'sh',
       '-c',
       `for i in 1 2 3 4 5 6 7 8; do
-         node -e "fetch('http://${LINK_HOST}/secret',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'password=still-not-it',redirect:'manual'}).then(r=>console.log(r.status)).catch(()=>console.log(0))"
+         node -e "fetch('http://${LINK_HOST}/secret',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'password=still-not-it',redirect:'manual'}).then(async r=>console.log(JSON.stringify({status:r.status,body:await r.text()}))).catch(e=>console.log(JSON.stringify({status:0,body:String(e)})))"
        done`,
     )
-    const statuses = r
+    const answers = r
       .split('\n')
-      .map((l) => Number(l.trim()))
-      .filter((n) => n > 0)
-    // Five wrong answers are answered with the page, and every guess after them
-    // is refused. Written out rather than counted from the limit, so a limit
-    // that moved is a red here instead of a test that follows it.
-    expect(statuses, r).toEqual([200, 200, 200, 200, 200, 429, 429, 429])
+      .filter((l) => l.trim().startsWith('{'))
+      .map((l) => JSON.parse(l) as { status: number; body: string })
+    // Five wrong answers get the page that says so, and every guess after them is
+    // refused with the page that says *that* — the pages themselves, built here by
+    // the same functions the service renders, because a 429 from somewhere else in
+    // the stack would satisfy a status on its own. Eight and five are written out
+    // rather than counted from the limit, so a limit that moved is a red here
+    // instead of a test that quietly follows it.
+    expect(answers, r).toEqual([
+      ...Array(5).fill({ status: 200, body: passwordPage({ wrong: true }) }),
+      ...Array(3).fill({ status: 429, body: tooManyAttemptsPage() }),
+    ])
   })
 })
 
