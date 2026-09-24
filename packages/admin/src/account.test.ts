@@ -274,23 +274,49 @@ describe('signing in', () => {
     }
   })
 
+  // The address, not a counter's key. The limiter counts an IPv6 client by its
+  // /64, and this row is the other reader of the same value: it is shown to the
+  // admin in their own session list, so it has to be the address the request
+  // came from, interface identifier and all. Built with the shipped
+  // trusted-proxy list, because a forwarded address is the only kind this ever
+  // records in the stack.
   it('records the session with the device and address it came from', async () => {
-    await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
-    const r = await app.inject({
-      method: 'POST',
-      url: '/api/session',
-      headers: { ...write(), 'user-agent': 'A browser' },
-      payload: { email: ADMIN_EMAIL, password: ADMIN_PASSWORD },
-    })
-    expect(r.statusCode).toBe(200)
-    const list = await app.inject({
-      method: 'GET',
-      url: '/api/sessions',
-      headers: read(cookieFrom(r.headers['set-cookie'])),
-    })
-    expect(list.json().sessions).toHaveLength(1)
-    expect(list.json().sessions[0].userAgent).toBe('A browser')
-    expect(list.json().sessions[0].current).toBe(true)
+    const trusting = testApp(pg, clock, {}, { trustProxy: SHIPPED_TRUSTED_PROXIES })
+    try {
+      await createAccount(pg, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+      const signIn = (ip: string) =>
+        trusting.inject({
+          method: 'POST',
+          url: '/api/session',
+          headers: { ...write(), 'user-agent': 'A browser', 'x-forwarded-for': ip },
+          payload: { email: ADMIN_EMAIL, password: ADMIN_PASSWORD },
+        })
+      const listed = async (r: Awaited<ReturnType<typeof signIn>>) => {
+        const list = await trusting.inject({
+          method: 'GET',
+          url: '/api/sessions',
+          headers: read(cookieFrom(r.headers['set-cookie'])),
+        })
+        return list.json().sessions.find((s: { current: boolean }) => s.current)
+      }
+
+      const v6 = await signIn('2001:db8::5')
+      expect(v6.statusCode).toBe(200)
+      const session = await listed(v6)
+      expect(session.userAgent).toBe('A browser')
+      expect(session.current).toBe(true)
+      // The whole address. A /64 here would tell the admin less than the
+      // request carried, and would read as an address that nothing came from.
+      expect(session.ip).toBe('2001:db8::5')
+
+      // One text form per address, so the list does not show one client twice
+      // under two spellings: the port a proxy may append is not part of it, and
+      // an IPv4-mapped address is the IPv4 address it carries.
+      expect((await listed(await signIn('[2001:db8::6]:443'))).ip).toBe('2001:db8::6')
+      expect((await listed(await signIn('::ffff:192.0.2.7'))).ip).toBe('192.0.2.7')
+    } finally {
+      await trusting.close()
+    }
   })
 
   it('removes sessions that have run out, when someone signs in', async () => {

@@ -1,4 +1,5 @@
 import { MAX_PASSWORD_LENGTH, MIN_ADMIN_PASSWORD_LENGTH, totpUri } from '@clickmonk/core'
+import { rateKey } from '@clickmonk/ipdata'
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import {
@@ -175,7 +176,15 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: AdminContext): 
     }
     const now = ctx.now()
     const tick = ctx.monotonic()
-    const key = clientAddress(req)
+    const address = clientAddress(req)
+    // The limiter counts per /64 for IPv6, for the reason `rateKey` states: a
+    // client usually holds a whole /64 and can pick a new address from it for
+    // every request, so ten failures per address is no bound at all for one —
+    // at the form where the password being guessed owns the install. Taken here
+    // rather than inside `clientAddress`, because `address` is also what the
+    // session row records and what the admin reads back in their session list.
+    // An address the parser cannot read keys on itself.
+    const key = rateKey(address) ?? address
     const attempt = ctx.loginAttempts.check(key, tick)
     if (!attempt.allowed) {
       fail(429, 'too_many_attempts', 'too many sign-in attempts; wait and try again', {
@@ -223,7 +232,7 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: AdminContext): 
     const session = await createSession(ctx.pg, {
       now,
       userAgent: String(req.headers['user-agent'] ?? ''),
-      ip: key,
+      ip: address,
     })
     // Cheap, bounded, and only after a successful sign-in, so nobody
     // unauthenticated can make this run.

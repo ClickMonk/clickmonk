@@ -1,6 +1,6 @@
 import { AttemptCounter, ConcurrencyGate, newSlug, normaliseHost } from '@clickmonk/core'
 import type { Pool } from '@clickmonk/db'
-import { MAX_IP_LENGTH, addressOnly, rateKey } from '@clickmonk/ipdata'
+import { MAX_IP_LENGTH, addressOnly, canonicalIp } from '@clickmonk/ipdata'
 import type { DomainResolver } from '@clickmonk/worker/domains'
 import Fastify, {
   type FastifyInstance,
@@ -94,21 +94,26 @@ declare module 'fastify' {
 }
 
 /**
- * The key a limiter counts by: the caller's address, through Caddy, reduced to
- * one key per client.
+ * The address a request came from: the caller's, through Caddy, in one text
+ * form per address.
  *
- * `rateKey` rather than the address itself, and the same function the redirect's
- * counters use, because an IPv6 client usually holds a whole /64 and can pick a
- * new address from it for every request — so ten failures per address is no
- * bound at all for one, at the form where the password being guessed owns the
- * install. `addressOnly` first, because a forwarded address may arrive with a
- * port or in brackets and `[2001:db8::5]:443` is the same client as
- * `2001:db8::5`. An address the parser cannot read keys on itself rather than
- * sharing one key with every other unreadable value.
+ * **This is an address, not a counter's key**, and it has two readers that want
+ * different things. It is written to the session row and handed back by
+ * `GET /api/sessions`, where the admin reads it to recognise their own devices,
+ * so it must be the address the request carried — a /64 there would show
+ * something no request ever came from. The sign-in limiter wants the /64, and
+ * takes it with `rateKey` at its own call site. One function returning the
+ * narrower value served the limiter and quietly changed what the session list
+ * showed.
+ *
+ * `addressOnly` because a forwarded address may arrive with a port or in
+ * brackets, and `canonicalIp` so that one client is one string — the same
+ * normalisation the redirect does before it records a click, so the two
+ * services name the same client the same way. A string that is not an address
+ * is returned unchanged.
  */
 export function clientAddress(req: FastifyRequest): string {
-  const addr = addressOnly(req.ip ?? '').slice(0, MAX_IP_LENGTH)
-  return rateKey(addr) ?? addr
+  return canonicalIp(addressOnly(req.ip ?? '').slice(0, MAX_IP_LENGTH))
 }
 
 export function buildAdminApp(
@@ -166,7 +171,7 @@ export function buildAdminApp(
     // the same bargain: Caddy replaces that header rather than appending to
     // it, so a value reaching here came from Caddy, and the only way to forge
     // one is to already be a container inside the install. The limiter below
-    // still counts by the address `req.ip` gives, through `clientAddress`.
+    // still counts by the address `req.ip` gives, per /64 for IPv6.
     //
     // The port is stripped here rather than by Fastify, which is the one thing
     // `req.hostname` did for free: a browser sends `Host: name:443` and that is

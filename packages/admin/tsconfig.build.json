@@ -12,6 +12,9 @@
       "path": "../db/tsconfig.build.json"
     },
     {
+      "path": "../ipdata/tsconfig.build.json"
+    },
+    {
       "path": "../worker/tsconfig.build.json"
     }
   ]
