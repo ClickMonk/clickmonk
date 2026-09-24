@@ -16,7 +16,6 @@
  */
 import {
   DEFAULT_INSTALL_SETTINGS,
-  DEFAULT_RETENTION,
   DEFAULT_TRAFFIC_SETTINGS,
   type InstallSettings,
   InstallSettingsSchema,
@@ -41,10 +40,15 @@ const COLUMNS = 'traffic_actions, safe_url, abuser_threshold, raw_retention_days
 export interface SettingsRead {
   traffic: TrafficSettings
   /**
-   * Null when the stored row cannot be read as retention at all. Not the
-   * defaults: applying a retention default deletes clicks, and it is the only
-   * default in this product that does. A caller that deletes things does
-   * nothing while this is null.
+   * What this install asked to keep, or null when nobody knows what it asked
+   * for: the row is missing, or it cannot be read as retention. **Never the
+   * defaults in either case.** Applying a retention default deletes clicks,
+   * and it is the only default in this product that does — so a caller that
+   * deletes things does nothing while this is null.
+   *
+   * Null is not `{ rawRetentionDays: null, ipRetentionDays: null }`. That pair
+   * is an answer: keep both for ever. This is the absence of one, and the two
+   * are one `??` apart, which is why each has a test of its own.
    */
   retention: RetentionSettings | null
   problem: string | null
@@ -97,15 +101,28 @@ function parseRow(row: SettingsRow): ParsedRow {
   }
 }
 
-/** What this install is actually running, and anything wrong with the row it came from. */
+/**
+ * What this install is actually running, and anything wrong with the row it
+ * came from.
+ *
+ * The two halves answer a missing row differently, and the difference is the
+ * point. **Traffic falls back to its defaults**, because the redirect has to
+ * answer the next click with something, and being wrong there means
+ * classifying a visitor a little differently. **Retention answers null**,
+ * because being wrong there means deleting clicks an operator asked to keep —
+ * including an operator who asked to keep them for ever, whose stored row
+ * says so and whose deleted row says nothing at all. A default that deletes
+ * is not a default.
+ */
 export async function readSettings(pg: Pool): Promise<SettingsRead> {
   const r = await pg.query<SettingsRow>(`SELECT ${COLUMNS} FROM settings`)
   const row = r.rows[0]
   if (!row) {
     return {
       traffic: DEFAULT_TRAFFIC_SETTINGS,
-      retention: DEFAULT_RETENTION,
-      problem: 'no settings are stored; the defaults apply',
+      retention: null,
+      problem:
+        'no settings are stored; the traffic defaults apply, and nothing is deleted until the row is written back',
     }
   }
   return parseRow(row).read

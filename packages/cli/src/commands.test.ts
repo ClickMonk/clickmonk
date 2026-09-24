@@ -305,20 +305,23 @@ describe('clickmonk settings', () => {
     ])
   })
 
-  it('shows the defaults, and says so, when the settings row is missing', async () => {
+  // The traffic half falls back and the retention half does not, and the
+  // output says both: printing "keep clicks: 90 days" for a row that is not
+  // there would tell the operator a period this install is not enforcing.
+  it('shows the traffic defaults, and no period at all, when the settings row is missing', async () => {
     await pg.query('DELETE FROM settings')
     lines.length = 0
     expect(await run('settings', 'show')).toBe(0)
     expect(lines).toEqual([
-      'note: no settings are stored; the defaults apply',
+      'note: no settings are stored; the traffic defaults apply, and nothing is deleted until the row is written back',
       'bot: flag',
       'abuser: flag',
       'anonymous: flag',
       'datacenter: flag',
       'safe url: (none)',
       'abuser threshold: 60 requests a minute from one client',
-      'keep clicks: 90 days',
-      'keep addresses: 30 days',
+      'keep clicks: unknown, so nothing is being deleted',
+      'keep addresses: unknown, so nothing is being deleted',
     ])
   })
 
@@ -416,8 +419,8 @@ describe('clickmonk settings', () => {
       await pg.query('UPDATE settings SET raw_retention_days = -5')
       lines.length = 0
       expect(await run('settings', 'show')).toBe(0)
-      expect(lines).toContain('keep clicks: unreadable, so nothing is being deleted')
-      expect(lines).toContain('keep addresses: unreadable, so nothing is being deleted')
+      expect(lines).toContain('keep clicks: unknown, so nothing is being deleted')
+      expect(lines).toContain('keep addresses: unknown, so nothing is being deleted')
       expect(lines.some((l) => l.startsWith('keep clicks: 90'))).toBe(false)
       expect(lines[0]).toMatch(/^note: the stored retention is invalid \(/)
     } finally {

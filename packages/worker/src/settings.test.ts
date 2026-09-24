@@ -38,12 +38,36 @@ describe('readSettings', () => {
     expect(r.problem).toBeNull()
   })
 
-  it('falls back to the defaults and says so when there is no row at all', async () => {
+  /**
+   * A missing row and an unreadable one are the same answer, and it is not the
+   * defaults. The pass that deletes clicks reads `retention`, so a row deleted
+   * by hand answering `{90, 30}` would delete every click older than ninety
+   * days on an install whose operator had set "never" — the row that said so
+   * being exactly the row that is gone. Traffic still falls back, because the
+   * redirect has to answer the next click with something.
+   */
+  it('answers null retention, not the defaults, when there is no row at all', async () => {
     await pool.query('TRUNCATE settings')
     expect(await readSettings(pool)).toEqual({
       traffic: DEFAULT_TRAFFIC_SETTINGS,
-      retention: { rawRetentionDays: 90, ipRetentionDays: 30 },
-      problem: 'no settings are stored; the defaults apply',
+      retention: null,
+      problem:
+        'no settings are stored; the traffic defaults apply, and nothing is deleted until the row is written back',
+    })
+  })
+
+  /**
+   * The other side of that null, and one `??` away from it: a stored pair of
+   * nulls is an answer — keep both for ever — and must never read as "nobody
+   * knows". Collapsing the two is how "never delete" becomes "delete on the
+   * defaults".
+   */
+  it('answers a stored pair of nulls as for ever, which is not the absence of an answer', async () => {
+    await pool.query('UPDATE settings SET raw_retention_days = NULL, ip_retention_days = NULL')
+    expect(await readSettings(pool)).toEqual({
+      traffic: DEFAULT_TRAFFIC_SETTINGS,
+      retention: { rawRetentionDays: null, ipRetentionDays: null },
+      problem: null,
     })
   })
 

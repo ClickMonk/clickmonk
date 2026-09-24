@@ -19,6 +19,7 @@ import {
   MAX_PASSWORD_LENGTH,
   MIN_ADMIN_PASSWORD_LENGTH,
   NON_HUMAN_CLASSES,
+  type TrafficSettings,
   isDomainUrl,
   normaliseHost,
   parseLinkInput,
@@ -610,10 +611,20 @@ async function apikeyRevoke(args: string[], d: CliDeps): Promise<void> {
   d.out(`key ${id} revoked`)
 }
 
+/**
+ * The traffic half, printed once. `settings show` prints it a second way —
+ * without the retention lines, when the retention half cannot be read — and
+ * two copies of the threshold sentence is how the two drift into disagreeing
+ * about what the number counts.
+ */
+function printTraffic(t: TrafficSettings, d: CliDeps): void {
+  for (const c of NON_HUMAN_CLASSES) d.out(`${c}: ${t.actions[c]}`)
+  d.out(`safe url: ${t.safeUrl ?? '(none)'}`)
+  d.out(`abuser threshold: ${t.abuserThreshold} requests a minute from one client`)
+}
+
 function printSettings(s: InstallSettings, d: CliDeps): void {
-  for (const c of NON_HUMAN_CLASSES) d.out(`${c}: ${s.traffic.actions[c]}`)
-  d.out(`safe url: ${s.traffic.safeUrl ?? '(none)'}`)
-  d.out(`abuser threshold: ${s.traffic.abuserThreshold} requests a minute from one client`)
+  printTraffic(s.traffic, d)
   d.out(`keep clicks: ${days(s.retention.rawRetentionDays)}`)
   d.out(`keep addresses: ${days(s.retention.ipRetentionDays)}`)
   const note = retentionNote(s.retention)
@@ -628,11 +639,12 @@ async function settingsShow(d: CliDeps): Promise<void> {
   if (read.retention === null) {
     // Printing the defaults here would tell the operator this install is
     // deleting after ninety days, when in fact it is deleting nothing.
-    for (const c of NON_HUMAN_CLASSES) d.out(`${c}: ${read.traffic.actions[c]}`)
-    d.out(`safe url: ${read.traffic.safeUrl ?? '(none)'}`)
-    d.out(`abuser threshold: ${read.traffic.abuserThreshold} requests a minute from one client`)
-    d.out('keep clicks: unreadable, so nothing is being deleted')
-    d.out('keep addresses: unreadable, so nothing is being deleted')
+    // "unknown" rather than "unreadable" because both states arrive here: a
+    // row that cannot be read as retention, and no row at all. The note
+    // printed above says which.
+    printTraffic(read.traffic, d)
+    d.out('keep clicks: unknown, so nothing is being deleted')
+    d.out('keep addresses: unknown, so nothing is being deleted')
     return
   }
   printSettings({ traffic: read.traffic, retention: read.retention }, d)

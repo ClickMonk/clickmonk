@@ -85,11 +85,20 @@ describe('reading the settings', () => {
     })
   })
 
-  it('reports the defaults, and says why, when the row was deleted by hand', async () => {
+  // The two halves answer a missing row differently on purpose. Traffic falls
+  // back, because the redirect has to answer the next click. Retention does
+  // not: a number here would be a number the pass deletes by, on an install
+  // whose stored period is gone and may have said "never".
+  it('reports the traffic defaults but no retention, and says why, when the row was deleted by hand', async () => {
     await pg.query('DELETE FROM settings')
     const r = await get()
-    expect(r.json().traffic.abuserThreshold).toBe(DEFAULT_TRAFFIC_SETTINGS.abuserThreshold)
-    expect(r.json().problem).toContain('no settings are stored')
+    expect(r.json()).toEqual({
+      traffic: DEFAULT_TRAFFIC_SETTINGS,
+      retention: null,
+      note: null,
+      problem:
+        'no settings are stored; the traffic defaults apply, and nothing is deleted until the row is written back',
+    })
   })
 
   // The column checks are looser than core in places, so what is stored is
