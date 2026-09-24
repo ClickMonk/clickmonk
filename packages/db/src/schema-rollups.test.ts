@@ -386,9 +386,31 @@ describe('clickhouse schema 008: the key columns that keep rows apart', () => {
  * These clicks are in February rather than the September the rest of the file
  * accumulates in, because parts in different partitions never merge together:
  * the only rows the forced merge can collapse are the ones these tests wrote.
+ * **That isolation is the monthly partition key**, so these tests depend on it
+ * as much as on the sort key they are named for — which is why the first test
+ * here pins the partition expression, rather than leaving a partition change to
+ * surface as a sort-key test failing for a reason its name does not describe.
  */
 describe('clickhouse schema 008: the sort keys, across a merge', () => {
   const FEB = 'toYYYYMM(hour) = 202602'
+
+  /**
+   * The expression, read from the engine, and not a row count that would follow
+   * from it: a count can come out right under a different partitioning, and
+   * whatever a rollup is partitioned by has to be derived from `hour` alone for
+   * a report's window to read whole months rather than every part in the table.
+   */
+  it('partitions both rollup tables by the month of the hour', async () => {
+    const keys = await rows<{ name: string; partition_key: string }>(
+      `SELECT name, partition_key FROM system.tables
+         WHERE database = currentDatabase() AND name IN ('clicks_hourly', 'clicks_hourly_dim')
+         ORDER BY name`,
+    )
+    expect(keys).toEqual([
+      { name: 'clicks_hourly', partition_key: 'toYYYYMM(hour)' },
+      { name: 'clicks_hourly_dim', partition_key: 'toYYYYMM(hour)' },
+    ])
+  })
 
   /** A click that reached no target, from an address no database knew, with no referrer. */
   const nothingToShow = (clickId: string, time: string) =>
