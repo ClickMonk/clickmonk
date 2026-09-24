@@ -558,6 +558,25 @@ describe('two-factor authentication', () => {
     }
   })
 
+  // Every timestamp on this row comes from the clock the service was built
+  // with. One written by SQL `now()` instead cannot be compared with the
+  // others, and is a row whose history reads as out of order on any install
+  // where the two clocks differ.
+  it('stamps the change from the service clock, not the database one', async () => {
+    const cookie = await signedIn(app, pg)
+    clock.advance(90 * 60 * 1000)
+    const at = clock.now()
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/password',
+      headers: write(cookie),
+      payload: { currentPassword: ADMIN_PASSWORD, newPassword: 'a new decent password' },
+    })
+    expect(r.statusCode).toBe(200)
+    const row = await pg.query<{ updated_at: Date }>('SELECT updated_at FROM admin_account')
+    expect(row.rows[0]?.updated_at.toISOString()).toBe(at.toISOString())
+  })
+
   // A session cookie is not a bound. A wrong password here costs the account
   // exactly what a wrong password at the sign-in form costs, so a cookie taken
   // off a shared machine is not an oracle.
