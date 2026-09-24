@@ -81,15 +81,19 @@ describe('clickhouse schema 008: the hourly rollups', () => {
       ['clicks_state', 'AggregateFunction(uniqExact, UUID)'],
       ['visitors_state', 'AggregateFunction(uniqExact, String)'],
     ])
-    const dim = await rows<{ name: string }>('DESCRIBE TABLE clicks_hourly_dim')
-    expect(dim.map((c) => c.name)).toEqual([
-      'hour',
-      'link_id',
-      'domain_id',
-      'dimension',
-      'value',
-      'clicks_state',
-      'visitors_state',
+    const dim = await rows<{ name: string; type: string }>('DESCRIBE TABLE clicks_hourly_dim')
+    expect(dim.map((c) => [c.name, c.type])).toEqual([
+      ['hour', "DateTime('UTC')"],
+      ['link_id', 'UUID'],
+      ['domain_id', 'UUID'],
+      ['dimension', 'LowCardinality(String)'],
+      // A referrer host is whatever somebody linked from, so `value` is a plain
+      // String: the dictionary a LowCardinality column keeps would grow without
+      // a bound here, which is the same reason these six dimensions are rows
+      // rather than keys of the table above.
+      ['value', 'String'],
+      ['clicks_state', 'AggregateFunction(uniqExact, UUID)'],
+      ['visitors_state', 'AggregateFunction(uniqExact, String)'],
     ])
   })
 
@@ -226,13 +230,15 @@ describe('clickhouse schema 008: the hourly rollups', () => {
       `SELECT value, uniqExactMerge(clicks_state) AS clicks FROM clicks_hourly_dim
          WHERE dimension = 'referrer' GROUP BY value ORDER BY value`,
     )
-    // These three are the only clicks in this file that override the referrer,
-    // and two of the three have no host: an empty string, and a value that is
-    // not a URL, which `domain()` also reads as no host. Every earlier click —
-    // the first fixture, the second link, the bot, and the 404 pair — keeps
-    // the default `https://blog.example.com/post`, which is six distinct
-    // clicks with that host against two with none. Counted, not guessed: this
-    // file's inserts accumulate, and the arithmetic is easy to get backwards.
+    // The three clicks above are the only ones in the file that override the
+    // referrer. Two of them have no host — an empty string, and a value that is
+    // not a URL, which `domain()` also reads as no host — and the third is a
+    // second path on the default host. The five earlier clicks (the first
+    // fixture, the second link, the bot, and the 404 pair) all keep the default
+    // `https://blog.example.com/post`, so that host has those five plus this
+    // test's third: six, against the two with none. Counted, not guessed —
+    // this file's inserts accumulate and the arithmetic is easy to get
+    // backwards.
     expect(byReferrer).toEqual([
       { value: '', clicks: '2' },
       { value: 'blog.example.com', clicks: '6' },
@@ -279,11 +285,16 @@ describe('clickhouse schema 008: the hourly rollups', () => {
  * running arithmetic above, and they run after the partition drop because a
  * rollup does not need the raw rows.
  *
- * Each inserts its clicks in ONE call on purpose. A materialized view fires
- * once per inserted block and aggregates within it, and AggregatingMergeTree
- * collapses equal sort keys as it writes the part — so a key column left out
- * of the table shows up immediately, rather than only once a background merge
- * happens to run.
+ * Each inserts its clicks in ONE call, which is what makes these two
+ * deterministic: a materialized view fires once per inserted block and
+ * aggregates within it, and AggregatingMergeTree collapses equal sort keys as
+ * it writes the part, so a column missing from the key shows up here without
+ * waiting on a merge.
+ *
+ * That reaches only the columns one block can vary. Rows in two parts stay
+ * apart until the parts are merged, whatever the key, so a column these
+ * fixtures vary across insert calls is not tested here at all — which is what
+ * the describe below forces with OPTIMIZE.
  */
 describe('clickhouse schema 008: the key columns that keep rows apart', () => {
   const H11 = "toDateTime('2026-09-24 11:00:00', 'UTC')"
@@ -362,5 +373,154 @@ describe('clickhouse schema 008: the key columns that keep rows apart', () => {
       { link_id: LINK_A, clicks: '1' },
       { link_id: LINK_B, clicks: '1' },
     ])
+  })
+})
+
+/**
+ * The sort keys themselves, which nothing above reaches: a column can be
+ * missing from a key for as long as no two rows that differ only in it ever sit
+ * in one part. `OPTIMIZE TABLE … FINAL` forces that merge, synchronously, and
+ * against the committed schema it changes no number — so every expectation here
+ * is the same before and after it.
+ *
+ * These clicks are in February rather than the September the rest of the file
+ * accumulates in, because parts in different partitions never merge together:
+ * the only rows the forced merge can collapse are the ones these tests wrote.
+ */
+describe('clickhouse schema 008: the sort keys, across a merge', () => {
+  const FEB = 'toYYYYMM(hour) = 202602'
+
+  /** A click that reached no target, from an address no database knew, with no referrer. */
+  const nothingToShow = (clickId: string, time: string) =>
+    click({
+      click_id: clickId,
+      time,
+      outcome: 'blocked',
+      step: 'traffic',
+      status: 403,
+      destination: '',
+      target_id: '',
+      country: '',
+      referrer: '',
+      traffic_class: 'bot',
+      action: 'block',
+      signals: ['ua_bot'],
+    })
+
+  const dimsAt = (hour: string) =>
+    rows<{ dimension: string; value: string; clicks: string }>(
+      `SELECT dimension, value, uniqExactMerge(clicks_state) AS clicks FROM clicks_hourly_dim
+         WHERE hour = toDateTime('${hour}', 'UTC') GROUP BY dimension, value ORDER BY dimension`,
+    )
+
+  /**
+   * What that one click must read as in every dimension. The value is asserted
+   * and not only the dimension name: a view whose SELECT alias does not match a
+   * target column is created without complaint and writes that column's
+   * default, so a dimension can be present and empty for a reason that has
+   * nothing to do with the click.
+   */
+  const ONE_CLICK_EVERY_DIMENSION = [
+    { dimension: 'browser', value: 'chrome', clicks: '1' },
+    { dimension: 'country', value: '', clicks: '1' },
+    { dimension: 'device', value: 'desktop', clicks: '1' },
+    { dimension: 'os', value: 'windows', clicks: '1' },
+    { dimension: 'referrer', value: '', clicks: '1' },
+    { dimension: 'target', value: '', clicks: '1' },
+  ]
+
+  /**
+   * The hour, the link and the class: the three columns a report filters or
+   * groups on before anything else. Each of these four clicks differs from the
+   * first in exactly one of them, and each is inserted on its own so that no
+   * two of them are ever in one part until the merge. The total is asserted
+   * beside the breakdowns because that is the shape of the bug: a key column
+   * missing from the table leaves the total right and destroys every breakdown
+   * under it, so a report would answer 4 and then account for it wrongly.
+   */
+  it('keeps the hour, the link and the class apart when a merge collapses the parts', async () => {
+    const base = { time: '2026-02-01 01:05:00.000', action: 'nothing' }
+    await insert([click({ ...base, click_id: '01920000-0000-7000-8000-00000000005a' })])
+    await insert([
+      click({
+        ...base,
+        click_id: '01920000-0000-7000-8000-00000000005b',
+        time: '2026-02-01 02:05:00.000',
+      }),
+    ])
+    await insert([
+      click({
+        ...base,
+        click_id: '01920000-0000-7000-8000-00000000005c',
+        link_id: LINK_B,
+        path: '/b',
+      }),
+    ])
+    await insert([
+      click({
+        ...base,
+        click_id: '01920000-0000-7000-8000-00000000005d',
+        traffic_class: 'bot',
+        signals: ['ua_bot'],
+      }),
+    ])
+    await ch.command({ query: 'OPTIMIZE TABLE clicks_hourly FINAL' })
+
+    // `AS at` rather than `AS hour`: an alias that repeats the column's name
+    // shadows the column for the WHERE beside it, and this query would fail
+    // with "Illegal type String of argument of function toYYYYMM" — the same
+    // trap the state columns carry their `_state` suffix to avoid.
+    const byHour = await rows<{ at: string; clicks: string }>(
+      `SELECT toString(hour) AS at, uniqExactMerge(clicks_state) AS clicks FROM clicks_hourly
+         WHERE ${FEB} GROUP BY hour ORDER BY hour`,
+    )
+    expect(byHour).toEqual([
+      { at: '2026-02-01 01:00:00', clicks: '3' },
+      { at: '2026-02-01 02:00:00', clicks: '1' },
+    ])
+    const byLink = await rows<{ link_id: string; clicks: string }>(
+      `SELECT link_id, uniqExactMerge(clicks_state) AS clicks FROM clicks_hourly
+         WHERE ${FEB} GROUP BY link_id ORDER BY link_id`,
+    )
+    expect(byLink).toEqual([
+      { link_id: LINK_A, clicks: '3' },
+      { link_id: LINK_B, clicks: '1' },
+    ])
+    const byClass = await rows<{ traffic_class: string; clicks: string }>(
+      `SELECT traffic_class, uniqExactMerge(clicks_state) AS clicks FROM clicks_hourly
+         WHERE ${FEB} GROUP BY traffic_class ORDER BY traffic_class`,
+    )
+    expect(byClass).toEqual([
+      { traffic_class: 'bot', clicks: '1' },
+      { traffic_class: 'human', clicks: '3' },
+    ])
+    const feb = await rows<{ clicks: string }>(
+      `SELECT uniqExactMerge(clicks_state) AS clicks FROM clicks_hourly WHERE ${FEB}`,
+    )
+    expect(feb).toEqual([{ clicks: '4' }])
+  })
+
+  /**
+   * An empty value is a value, for each of the three dimensions that can hold
+   * one. A view that filtered them out would leave a breakdown that no longer
+   * adds up to the total beside it, and the click below is the one that has all
+   * three at once.
+   */
+  it('keeps an empty country, referrer and target as values of their own', async () => {
+    await insert([nothingToShow('01920000-0000-7000-8000-00000000006a', '2026-02-01 03:05:00.000')])
+    expect(await dimsAt('2026-02-01 03:00:00')).toEqual(ONE_CLICK_EVERY_DIMENSION)
+  })
+
+  /**
+   * And `dimension` is a key column, which the click above is also what proves:
+   * its country, referrer and target rows share an hour, a link, a domain and
+   * an empty value, so they differ in nothing else. Without `dimension` in the
+   * key a merge folds the three into one and two of the six dimensions are
+   * gone — not a blurred breakdown but a missing report.
+   */
+  it('keeps the six dimensions apart when three of them share an empty value', async () => {
+    await insert([nothingToShow('01920000-0000-7000-8000-00000000007a', '2026-02-01 04:05:00.000')])
+    await ch.command({ query: 'OPTIMIZE TABLE clicks_hourly_dim FINAL' })
+    expect(await dimsAt('2026-02-01 04:00:00')).toEqual(ONE_CLICK_EVERY_DIMENSION)
   })
 })

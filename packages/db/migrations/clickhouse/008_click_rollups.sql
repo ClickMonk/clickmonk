@@ -34,6 +34,18 @@
 --
 -- Nothing here is ever dropped by the retention pass. These tables are small,
 -- and they are what answers a question older than the raw window.
+--
+-- WHY THE KEY BELOW IS WHAT IT IS. `hour` leads it because every report bounds
+-- a window first, and the link comes next because per-link is the other filter
+-- every report has. Every one of the six columns is in the key rather than
+-- merely carried, and a column left out of it is not a smaller breakdown but a
+-- wrong one: AggregatingMergeTree merges rows that share a sort key, so two
+-- rows differing only in the missing column become one, its value taken from
+-- whichever row the merge read first, while the total over the table stays
+-- right. `domain_id` needs saying twice over, because a click on no link at
+-- all — an unknown slug, a domain root — has the zero link id and its domain
+-- is whichever domain was asked, so without it in the key those rows merge
+-- across domains.
 CREATE TABLE IF NOT EXISTS clicks_hourly (
   hour           DateTime('UTC'),
   link_id        UUID,
@@ -48,14 +60,13 @@ ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(hour)
 ORDER BY (hour, link_id, domain_id, traffic_class, action, outcome);
 
--- `domain_id` is in the sort key and not merely carried: a click on no link at
--- all — an unknown slug, a domain root — has the zero link id, and its domain
--- is whichever domain was asked. Left out of the key, rows with the same hour
--- and zero link id would merge and one arbitrary domain id would win.
+-- The same holds for the key below, and `dimension` is the column it is
+-- easiest to think safe: the six views write one table, and a click with no
+-- country, no referrer and no target writes an empty value under three
+-- different dimensions in the same hour for the same link. Those three rows
+-- differ in nothing but `dimension`, so leaving it out of the key does not
+-- blur a breakdown — it makes two of the six dimensions disappear.
 --
--- `hour` leads the key because every report bounds a window first, and the
--- link comes next because per-link is the other filter every report has.
-
 -- `domain_id` is here although nothing reads it yet, and that is a decision
 -- rather than an oversight. A per-domain breakdown is the first thing an
 -- operator with several domains asks for, and adding a key column to an
