@@ -310,9 +310,10 @@ export function checkExportRowCap(cap: number): number {
  * The CSV's columns, in order, by the same names the JSON uses: one vocabulary
  * for one resource in two representations.
  *
- * Written out rather than taken from an example row, so that a field added to
- * `asClick` and forgotten here is a failing test rather than a column that
- * quietly stopped being exported.
+ * Written out rather than taken from an example row, and held to `asClick` by a
+ * test that compares this list against the keys that mapper returns: a field
+ * added to one and forgotten in the other is then a failure rather than a column
+ * that quietly stopped being exported.
  */
 export const CSV_FIELDS = [
   'clickId',
@@ -347,7 +348,16 @@ export const CSV_FIELDS = [
 
 const ExportQuery = z.object({ ...CLICK_FILTER_FIELDS }).strict()
 
-/** `20260924T000000Z`: a filename with no colons and nothing from the request in it. */
+/**
+ * `20260924T000000Z`: the instant as digits, with the colons a filename cannot
+ * carry taken out.
+ *
+ * The filename is the window the caller asked for, so it is not free of the
+ * request — what it is free of is anything the caller chose the *shape* of. Both
+ * halves are numbers by the time they reach here: `parseWindow` has turned the
+ * caller's text into milliseconds, and this formats those, so the only characters
+ * that can appear are the ones `toISOString` produces.
+ */
 const stamp = (ms: number): string =>
   new Date(ms)
     .toISOString()
@@ -530,11 +540,13 @@ export function registerClickRoutes(app: FastifyInstance, ctx: AdminContext): vo
         } catch (err) {
           // **A download cannot be retracted.** The 200 and every header went
           // out before the first row, so there is no status left to change and
-          // nothing honest to append: what the caller gets is a truncated file
-          // and a connection that ended mid-line, and what they see is a broken
-          // download. Appending a well-formed last line would be worse — a file
-          // that looks complete with half the rows missing is the one thing this
-          // endpoint exists not to produce.
+          // nothing honest to append. What the caller is left with is a file of
+          // whole, well-formed lines that stops early — the rows written so far,
+          // each one complete — inside a chunked body that never got its
+          // terminating chunk, which is what makes the transfer an error the
+          // client can see rather than a short file it cannot. Appending a last
+          // line would throw that away: a file that ends cleanly with half the
+          // rows missing is the one thing this endpoint exists not to produce.
           //
           // So this line is the only record that the file is short, which is why
           // it is at error level: an operator who reads it counts the rows, and

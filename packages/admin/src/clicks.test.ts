@@ -1,10 +1,12 @@
 import { request as httpRequest } from 'node:http'
+import { Readable } from 'node:stream'
 import { ClickHouseLogLevel } from '@clickhouse/client'
 import { ConcurrencyGate } from '@clickmonk/core'
 import { type ClickHouseClient, createChClient } from '@clickmonk/db'
 import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import type { FastifyInstance } from 'fastify'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { CSV_FIELDS, type ClickRow, asClick } from './clicks.js'
 import { ADMIN_HOST, clockFrom, read, signedIn, testApp } from './testing.js'
 
 const pool = testPg()
@@ -98,8 +100,9 @@ const TIED_TIMES = [
 const tied = TIED_IDS.map((id, i) => click({ click_id: id, time: TIED_TIMES[i] }))
 
 /**
- * Fifty-one clicks in one instant, in a month of its own and older than every
- * other click in this file.
+ * Fifty-one clicks in one instant, in a month of its own. Older than every click
+ * in the windows above, and newer than the one in the formula block below, which
+ * is the oldest in the file.
  *
  * The page size a caller gets when they name none cannot be read off a window of
  * three or six clicks: any default of three or more answers every assertion in
@@ -682,14 +685,17 @@ describe('GET /api/clicks.csv', () => {
       '01920000-0000-7000-8000-000000000002',
       '01920000-0000-7000-8000-000000000001',
     ])
-    // The bot click, whole: a list of signals joined into one cell, four columns
-    // that are empty because the click had nothing in them, and no network
-    // because its address column was blanked.
+    // The bot click, whole: a list of signals joined into one cell, and seven
+    // empty ones — the four this click had nothing in (destination, target,
+    // country, geo source), the two no click carries yet (region, city), and the
+    // network, because its address column was blanked.
     expect(out[1]).toBe(
       `"01920000-0000-7000-8000-000000000003","2026-09-24T10:02:00.000Z","go.example.test","/a","${DOMAIN}","${LINK_A}","blocked","classify","403","","","v1","false","","","","","desktop","windows","chrome","64500","bot","ua_bot head","block","https://blog.example.com/post","Mozilla/5.0 (Windows NT 10.0) Chrome/130","","true"`,
     )
-    // The oldest click, whole: the network the address was truncated to, the
-    // instant as the JSON spells it, and every other column at a real value.
+    // The oldest click in this window, whole: the network the address was
+    // truncated to, the instant as the JSON spells it, and a real value in every
+    // column but four — region and city, which no click carries yet, and the
+    // signals and action a click nothing was decided about has none of.
     expect(out[3]).toBe(
       `"01920000-0000-7000-8000-000000000001","2026-09-24T10:00:00.000Z","go.example.test","/a","${DOMAIN}","${LINK_A}","target","destination","302","https://example.com/?c=01920000-0000-7000-8000-000000000001","${TARGET}","v1","false","DE","","","dbip","desktop","windows","chrome","64500","human","","","https://blog.example.com/post","Mozilla/5.0 (Windows NT 10.0) Chrome/130","198.51.100.0/24","false"`,
     )
@@ -1073,6 +1079,37 @@ describe('GET /api/clicks, addresses a proxy may have spelled oddly', () => {
       ['01920000-0000-7000-8000-000000000004', '2001:db8:1234:5678::/64'],
     ])
   })
+
+  /**
+   * The same two rows through the file, which is cover rather than a second
+   * check: the export maps with `asClick`, so it cannot answer differently
+   * without the page answering differently too. It is here because this is the
+   * surface where a wrong answer is a privacy incident, and because "it goes
+   * through the same mapper" is a claim about the code that a test should not
+   * have to take on trust.
+   */
+  it('exports the same two, as a network and as nothing', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/clicks.csv?${DAY_BEFORE}`,
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(200)
+    const rows = r.body
+      .split('\r\n')
+      .filter((l) => l.length > 0)
+      .slice(1)
+    expect(rows).toHaveLength(2)
+    // The id and the network of each, read as cells rather than as substrings of
+    // the whole body: a `toContain` on `2001:db8:1234:5678::/64` would pass on a
+    // file that had written it into the wrong row.
+    expect(rows.map((l) => [l.slice(1, l.indexOf('","')), l.split(',').at(-2)])).toEqual([
+      ['01920000-0000-7000-8000-000000000005', '""'],
+      ['01920000-0000-7000-8000-000000000004', '"2001:db8:1234:5678::/64"'],
+    ])
+    // And the whole address neither of them may carry.
+    expect(r.body).not.toContain('2001:db8:1234:5678:9abc:def0:1234:5678')
+  })
 })
 
 /**
@@ -1274,16 +1311,19 @@ describe('the log and the export when ClickHouse is not there', () => {
   })
 
   /**
-   * The export asks for the credential before it takes a slot and before it
-   * reads anything, and this is what pins it there.
+   * The export asks for the credential before it takes a slot, and this is what
+   * pins it there rather than merely pinning that it asks at all.
    *
-   * Three positions, three answers, and the 401 beside the other export tests
-   * can only see the first of them. With the export gate full and the store
-   * unreachable: asked for after the probe, an unauthenticated request scans the
-   * window it chose and gets a 503; asked for inside the gate but before the
-   * probe, it gets a 429; only asked for before both is the answer 401. The
-   * query-failure line is asserted absent as well, because a status alone cannot
-   * tell a refusal from a query that happened to fail.
+   * **Two positions on this route, not three.** The gate comes before the query
+   * here, so an unauthenticated request whose credential check has been moved
+   * anywhere below `tryEnter` is answered 429 by the full gate — after the probe
+   * or before it, the answer is the same. Only asked for first is it 401. The
+   * three-answer shape belongs to the report routes, where the query is inside
+   * the gate; the numbers depend on the order a route actually has and are worth
+   * measuring rather than copying.
+   *
+   * The query-failure line is asserted absent as well, because a status alone
+   * cannot tell a refusal from a query that happened to fail.
    */
   it('refuses an export without a credential before taking a slot or reading anything', async () => {
     const lines: string[] = []
@@ -1308,6 +1348,128 @@ describe('the log and the export when ClickHouse is not there', () => {
       expect(r.statusCode).toBe(401)
       expect(r.json().error).toBe('unauthenticated')
       expect(lines.filter((l) => l.includes('clickhouse query failed'))).toEqual([])
+    } finally {
+      await on.close()
+    }
+  })
+
+  /**
+   * The gate comes before the store read, and this is the case that says so.
+   *
+   * The same app as above and a credential this time: a full gate and an
+   * unreachable store. Refused in front of the probe, the answer is 429 and
+   * nothing was read; refused behind it, the probe fails first and the answer is
+   * 503 with a query-failure line — which is a refused export that has already
+   * scanned a window the caller chose, and a flood of them is a scan each. The
+   * log line is what separates the two, because a 429 could also be a 429 that
+   * happened after a successful read.
+   */
+  it('refuses a full gate before reading anything at all', async () => {
+    const lines: string[] = []
+    const on = testApp(pool, clock, {
+      ch: dead,
+      exportGate: new ConcurrencyGate(0),
+      log: {
+        level: 'error',
+        stream: {
+          write(line: string) {
+            lines.push(line)
+          },
+        },
+      },
+    })
+    try {
+      const r = await on.inject({
+        method: 'GET',
+        url: `/api/clicks.csv?${WINDOW}`,
+        headers: read(cookie),
+      })
+      expect(r.statusCode).toBe(429)
+      expect(r.json().error).toBe('too_many_exports')
+      expect(lines.filter((l) => l.includes('clickhouse query failed'))).toEqual([])
+    } finally {
+      await on.close()
+    }
+  })
+})
+
+/**
+ * The file's columns against the mapper's fields.
+ *
+ * Two lists written in two places for one resource, so the failure to design
+ * against is a field added to `asClick` — the next geo column, say — that the
+ * export silently stops carrying. Nothing in the export's own tests can see that:
+ * the header row and the values both come from `CSV_FIELDS`, so a file missing a
+ * column is internally consistent and every assertion about it passes.
+ *
+ * The two sides come from different places, which is the point: the keys the
+ * mapper actually returns, against the list the file is written from.
+ */
+describe('the export columns and the fields a click has', () => {
+  it('names every field the log maps, and no others', () => {
+    // The fixture row as `JSONEachRow` hands it over: the stored column names,
+    // with `time` replaced by the millisecond form the column list selects. The
+    // leftover `time` key is ignored by the mapper and by this comparison.
+    const row = { ...click(), at_ms: '1758708000000' } as unknown as ClickRow
+    expect([...CSV_FIELDS].sort()).toEqual(Object.keys(asClick(row)).sort())
+  })
+})
+
+/**
+ * A store that stops answering partway through a file.
+ *
+ * A stub client, because there is no way to ask a healthy ClickHouse to fail in
+ * the middle of a result set — and the line under test is the only record an
+ * operator ever gets that a file they downloaded is short. The stub answers the
+ * probe, hands over one row, and then fails.
+ */
+describe('GET /api/clicks.csv, a store that fails mid-file', () => {
+  const failingCh = (row: Record<string, unknown>): ClickHouseClient =>
+    ({
+      query: async ({ query }: { query: string }) =>
+        query.includes('count()')
+          ? { json: async () => [{ n: '1' }] }
+          : {
+              close: () => {},
+              stream: () =>
+                Readable.from(
+                  (async function* () {
+                    yield [{ json: () => row }]
+                    throw new Error('the store stopped answering')
+                  })(),
+                  { objectMode: true },
+                ),
+            },
+    }) as unknown as ClickHouseClient
+
+  it('logs that the file is short, and gives the slot back', async () => {
+    const lines: string[] = []
+    const gate = new CountingGate(1)
+    const on = testApp(pool, clock, {
+      ch: failingCh({ ...click(), at_ms: '1758708000000' }),
+      exportGate: gate,
+      log: {
+        level: 'error',
+        stream: {
+          write(line: string) {
+            lines.push(line)
+          },
+        },
+      },
+    })
+    try {
+      // The body is what a caller would be left holding, so a rejected inject is
+      // as much of an answer as a resolved one: what is asserted is the log line
+      // and the slot, which are what the server owes either way.
+      await on
+        .inject({ method: 'GET', url: `/api/clicks.csv?${WINDOW}`, headers: read(cookie) })
+        .then(() => undefined)
+        .catch(() => undefined)
+      expect(gate.entered).toBe(1)
+      expect(
+        lines.filter((l) => l.includes('clickhouse failed while an export was streaming')),
+      ).toHaveLength(1)
+      expect(gate.stats().inFlight).toBe(0)
     } finally {
       await on.close()
     }

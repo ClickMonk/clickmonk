@@ -39,8 +39,13 @@ describe('csvCell', () => {
     ['+1+1', `"'+1+1"`],
     ['-1+1', `"'-1+1"`],
     ['@SUM(A1)', `"'@SUM(A1)"`],
+    // The three whitespace leads together: a spreadsheet skips them before it
+    // decides whether the cell is a formula, so each one hides an `=` from a
+    // check that reads only the first character.
     ['\tlead', `"'\tlead"`],
     ['\rlead', `"'\rlead"`],
+    ['\nlead', `"'\nlead"`],
+    ['\t=1+1', `"'\t=1+1"`],
   ])('defuses a cell that opens with %s', (value, expected) => {
     expect(csvCell(value)).toBe(expected)
   })

@@ -22,8 +22,15 @@ export const CSV_EOL = '\r\n'
  * and does not run, and which a parser reads as one more character of the
  * value. That is the trade, and it is the right way round for a file an
  * operator opens by double-clicking it.
+ *
+ * The three whitespace characters are in the list for one reason: a spreadsheet
+ * skips leading whitespace before it decides whether a cell is a formula, so a
+ * tab, a carriage return or a newline in front of an `=` hides it from a check
+ * that only looks at the first character. All three, not two of them — a list
+ * missing one of a set that is here for a single reason is an asymmetry somebody
+ * will later read as a decision.
  */
-const FORMULA_LEAD = /^[=+\-@\t\r]/
+const FORMULA_LEAD = /^[=+\-@\t\r\n]/
 
 export function csvCell(value: unknown): string {
   if (value === null || value === undefined) return '""'
