@@ -666,20 +666,38 @@ async function settingsSet(args: string[], d: CliDeps): Promise<void> {
     if (given === 'never') return null
     return Number(given)
   }
-  const next = await updateSettings(d.pg, d.now?.() ?? new Date(), (current) => ({
-    traffic: {
-      actions: { ...current.traffic.actions, ...parseActions(values.action) },
-      safeUrl: values['no-safe-url'] ? null : (values['safe-url'] ?? current.traffic.safeUrl),
-      abuserThreshold:
-        values['abuser-threshold'] === undefined
-          ? current.traffic.abuserThreshold
-          : Number(values['abuser-threshold']),
-    },
-    retention: {
-      rawRetentionDays: period(values['keep-clicks'], current.retention.rawRetentionDays),
-      ipRetentionDays: period(values['keep-addresses'], current.retention.ipRetentionDays),
-    },
-  }))
+  // An array rather than a nullable local: the hook runs inside the call
+  // below, and a `let` assigned only from a callback is narrowed to its
+  // initialiser by the compiler.
+  const replaced: string[] = []
+  const next = await updateSettings(
+    d.pg,
+    d.now?.() ?? new Date(),
+    (current) => ({
+      traffic: {
+        actions: { ...current.traffic.actions, ...parseActions(values.action) },
+        safeUrl: values['no-safe-url'] ? null : (values['safe-url'] ?? current.traffic.safeUrl),
+        abuserThreshold:
+          values['abuser-threshold'] === undefined
+            ? current.traffic.abuserThreshold
+            : Number(values['abuser-threshold']),
+      },
+      retention: {
+        rawRetentionDays: period(values['keep-clicks'], current.retention.rawRetentionDays),
+        ipRetentionDays: period(values['keep-addresses'], current.retention.ipRetentionDays),
+      },
+    }),
+    { onRetentionReplaced: (why) => replaced.push(why) },
+  )
+  // Said, not done quietly. This command may have been about the abuser
+  // threshold, and it has just rewritten how long this install keeps clicks,
+  // which is not a change an operator should first learn about from data that
+  // is no longer there.
+  for (const why of replaced) {
+    d.out(
+      `note: the stored retention could not be read (${why}), so this command has rewritten it as keep clicks ${days(next.retention.rawRetentionDays)}, keep addresses ${days(next.retention.ipRetentionDays)}`,
+    )
+  }
   printSettings(next, d)
 }
 

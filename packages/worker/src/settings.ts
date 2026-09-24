@@ -53,8 +53,19 @@ export interface SettingsRead {
 const why = (issues: { path: (string | number)[]; message: string }[]): string =>
   issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')
 
+/**
+ * What `parseRow` knows and `SettingsRead` does not: why the retention half
+ * was refused, without the sentence built around it. `updateSettings` hands it
+ * to a caller that is about to overwrite the bad row, so the caller can say
+ * which value it could not read.
+ */
+interface ParsedRow {
+  read: SettingsRead
+  retentionIssues: string | null
+}
+
 /** Each half validated on its own, so one bad column cannot take the other down. */
-function parseRow(row: SettingsRow): SettingsRead {
+function parseRow(row: SettingsRow): ParsedRow {
   const traffic = TrafficSettingsSchema.safeParse({
     actions: row.traffic_actions,
     safeUrl: row.safe_url,
@@ -70,15 +81,19 @@ function parseRow(row: SettingsRow): SettingsRead {
       `the stored traffic settings are invalid (${why(traffic.error.issues)}); the defaults apply`,
     )
   }
-  if (!retention.success) {
+  const retentionIssues = retention.success ? null : why(retention.error.issues)
+  if (retentionIssues !== null) {
     problems.push(
-      `the stored retention is invalid (${why(retention.error.issues)}); nothing is deleted until it is corrected`,
+      `the stored retention is invalid (${retentionIssues}); nothing is deleted until it is corrected`,
     )
   }
   return {
-    traffic: traffic.success ? traffic.data : DEFAULT_TRAFFIC_SETTINGS,
-    retention: retention.success ? retention.data : null,
-    problem: problems.length === 0 ? null : problems.join(' '),
+    read: {
+      traffic: traffic.success ? traffic.data : DEFAULT_TRAFFIC_SETTINGS,
+      retention: retention.success ? retention.data : null,
+      problem: problems.length === 0 ? null : problems.join(' '),
+    },
+    retentionIssues,
   }
 }
 
@@ -93,7 +108,7 @@ export async function readSettings(pg: Pool): Promise<SettingsRead> {
       problem: 'no settings are stored; the defaults apply',
     }
   }
-  return parseRow(row)
+  return parseRow(row).read
 }
 
 /**
@@ -136,10 +151,27 @@ export async function writeSettings(pg: Pool, next: InstallSettings, now: Date):
  * That costs one extra `config_changed` on a command an operator typed, which
  * is cheaper than a read-modify-write with nothing to lock.
  */
+export interface UpdateSettingsHooks {
+  /**
+   * Called, before the write and inside the transaction, when the stored
+   * retention could not be read and the defaults stood in for it. The argument
+   * is why it could not be read.
+   *
+   * It exists because this substitution is the one silent data decision in
+   * this module: a command about something else — a threshold, a safe URL —
+   * rewrites a retention period the operator never mentioned, and a period
+   * they learn about from a deleted partition is worse than one they learn
+   * about from a line of output. The surface that has somewhere to say it
+   * says it; a caller with nowhere to say it passes no hook and is unchanged.
+   */
+  onRetentionReplaced?: (why: string) => void
+}
+
 export async function updateSettings(
   pg: Pool,
   now: Date,
   change: (current: InstallSettings) => InstallSettings,
+  hooks: UpdateSettingsHooks = {},
 ): Promise<InstallSettings> {
   const client: PoolClient = await pg.connect()
   try {
@@ -148,13 +180,17 @@ export async function updateSettings(
     const r = await client.query<SettingsRow>(`SELECT ${COLUMNS} FROM settings FOR UPDATE`)
     const row = r.rows[0]
     if (!row) throw new Error('the settings row is missing after writing it')
-    const read = parseRow(row)
+    const { read, retentionIssues } = parseRow(row)
+    if (read.retention === null && retentionIssues !== null) {
+      hooks.onRetentionReplaced?.(retentionIssues)
+    }
     const current: InstallSettings = {
       traffic: read.traffic,
       // A row this build cannot read as retention starts from the defaults
       // *for a deliberate write*, which is the one place that is right: the
       // operator is here, changing it, and the alternative is a command that
-      // cannot repair the row it is complaining about.
+      // cannot repair the row it is complaining about. The hook above is what
+      // keeps it from being silent.
       retention: read.retention ?? DEFAULT_INSTALL_SETTINGS.retention,
     }
     const next = InstallSettingsSchema.parse(change(current))

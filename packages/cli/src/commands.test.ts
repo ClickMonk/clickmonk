@@ -369,6 +369,44 @@ describe('clickmonk settings', () => {
     expect(await stored()).toEqual({ raw_retention_days: 90, ip_retention_days: 30 })
   })
 
+  // A command about the abuser threshold rewrites an unreadable retention
+  // period as a side effect, because the alternative is refusing an operator
+  // who needs the threshold changed on exactly the install whose retention is
+  // broken. So it says what it did: a period learned from a line of output
+  // beats one learned from data that is no longer there.
+  it('says which period it rewrote when the stored retention could not be read', async () => {
+    await pg.query('ALTER TABLE settings DROP CONSTRAINT settings_raw_retention_valid')
+    try {
+      await pg.query('UPDATE settings SET raw_retention_days = -5, ip_retention_days = 7')
+      lines.length = 0
+      expect(await run('settings', 'set', '--abuser-threshold', '120')).toBe(0)
+      expect(lines[0]).toBe(
+        'note: the stored retention could not be read (rawRetentionDays: Number must be greater than or equal to 1), so this command has rewritten it as keep clicks 90 days, keep addresses 30 days',
+      )
+      // **Both** periods, not only the unreadable one: retention is validated
+      // as one half by one strict schema, so a single bad column loses the
+      // other with it. The address period stored here was 7, and it is 30
+      // afterwards — which is the whole reason this line has to be printed.
+      expect(await stored()).toEqual({ raw_retention_days: 90, ip_retention_days: 30 })
+      // And the change the operator actually asked for landed.
+      expect(lines).toContain('abuser threshold: 120 requests a minute from one client')
+    } finally {
+      await pg.query('UPDATE settings SET raw_retention_days = 90, ip_retention_days = 30')
+      await pg.query(
+        'ALTER TABLE settings ADD CONSTRAINT settings_raw_retention_valid CHECK (raw_retention_days IS NULL OR raw_retention_days BETWEEN 1 AND 3650)',
+      )
+    }
+  })
+
+  // A command that changed nothing about retention says nothing about it: the
+  // line above is a report of a rewrite, not a banner.
+  it('says nothing about retention when the stored row reads fine', async () => {
+    await setRetention(90, 30)
+    lines.length = 0
+    expect(await run('settings', 'set', '--abuser-threshold', '60')).toBe(0)
+    expect(lines.some((l) => l.includes('could not be read'))).toBe(false)
+  })
+
   // Printing the defaults for a row this build cannot read as retention would
   // tell the operator their clicks are deleted after ninety days when nothing
   // is being deleted at all.
