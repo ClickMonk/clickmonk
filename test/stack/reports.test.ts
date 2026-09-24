@@ -306,13 +306,15 @@ describe('a report of real clicks', () => {
 
   // **What the absent length does and does not prove.** It proves no length was
   // decided before the first row, which is what a handler that hands back the
-  // whole file as a string does: measured, that shape fails here and fails
-  // exactly one unit test, `holds nothing: no content-length, and a chunked
-  // body`. It does not prove the file was never held in memory — a body read to
-  // the end and handed over as a single-chunk stream is still chunked and still
-  // carries no length, and measured, it passes here and passes all 398 of the
-  // admin service's unit tests. Nothing catches that shape today. Do not read
-  // this assertion as more than the header it reads.
+  // whole file as a string does: measured, that shape fails here and fails the
+  // unit test `holds nothing: no content-length, and a chunked body`. It does not
+  // prove the file was never held in memory — a body read to the end and handed
+  // over as a single-chunk stream is still chunked and still carries no length,
+  // and measured, it passes this assertion. What catches that shape is the unit
+  // test `gives the caller bytes before the store has produced the last block`,
+  // which asks the question a length cannot: whether the caller was reading while
+  // the store was still producing. Do not read this assertion as more than the
+  // header it reads.
   //
   // This one answer travels through Caddy rather than through `inject`, and a
   // reverse proxy may buffer a small chunked body and add a length of its own.
