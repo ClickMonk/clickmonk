@@ -1,3 +1,4 @@
+import { ClickHouseLogLevel } from '@clickhouse/client'
 import { ConcurrencyGate } from '@clickmonk/core'
 import { type ClickHouseClient, createChClient } from '@clickmonk/db'
 import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
@@ -257,12 +258,18 @@ describe('when ClickHouse is not there', () => {
   beforeEach(() => {
     // A port nothing listens on, in the range no service in this repository
     // binds. The client does not connect until it is asked to.
+    //
+    // Its own logger is off, as the shipper's unreachable client is: the
+    // refused connection is what these tests arrange, so printing it on every
+    // green run teaches a reader to skim the stderr a real failure appears in.
+    // What this service logged is asserted below, not printed.
     dead = createChClient({
       url: 'http://127.0.0.1:1',
       username: 'clickmonk',
       password: 'clickmonk',
       database: 'clickmonk_test',
       requestTimeoutMs: 2000,
+      logLevel: ClickHouseLogLevel.OFF,
     })
     deadApp = testApp(pool, clock, { ch: dead })
   })
@@ -290,7 +297,10 @@ describe('when ClickHouse is not there', () => {
   // pins nothing: with no guard at all the query is attempted on nothing, the
   // TypeError is caught where a ClickHouse failure is caught, and the caller
   // sees the same body. The log is the difference, and it is the difference an
-  // operator reads — so the log is what this asserts.
+  // operator reads — so the log is what this asserts. **Do not turn this into
+  // a status code**: answering the two cases differently would tell a caller
+  // which of them it was, which is the one thing this surface set out not to
+  // say, so the log line is the claim and the log line is what pins it.
   it('answers a report 503 when there is no client at all, and says which it was', async () => {
     const lines: string[] = []
     const none = testApp(pool, clock, {
