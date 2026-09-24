@@ -142,6 +142,18 @@ describe('updateSettings', () => {
   })
 
   it('refuses a change that does not validate, and writes nothing', async () => {
+    // A safe URL with a token in its host first: the column CHECK takes it
+    // (printable ASCII, an http scheme) and core does not, so it is a change
+    // only the schema in front of the write can refuse. A period of 0 alone
+    // would not pin that schema at all — the column refuses it as well, so a
+    // build that had stopped validating would still be rejected, by Postgres.
+    await expect(
+      updateSettings(pool, NOW, (current) => ({
+        ...current,
+        traffic: { ...current.traffic, safeUrl: 'https://{param:h}/safe' },
+      })),
+    ).rejects.toThrow()
+    expect((await readSettings(pool)).traffic.safeUrl).toBeNull()
     await expect(
       updateSettings(pool, NOW, (current) => ({
         ...current,
