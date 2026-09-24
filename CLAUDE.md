@@ -61,10 +61,11 @@ Compose stack, and the restart durability and stack test suites.
 **A retention period is a floor, not a deadline, and it is never defaulted by a reader
 that deletes.** `clicks` is partitioned by month and dropped whole, so 90 days keeps 90 to
 121 days; and a settings row that is missing or cannot be read as retention means the pass
-deletes nothing at all, rather than the defaults. **A report counts whole hours** — it
-aligns the window to the rollups' grain and echoes what it counted — while the click log
-and the export use the window to the millisecond, so the two can answer the same request
-differently and both are right.
+deletes nothing at all, rather than the defaults. **A report counts whole buckets** — it
+aligns the window to the grain it answers at, the hour for the summary and the breakdown
+and the requested bucket for the chart, so `bucket=day` counts whole days — and echoes what
+it counted, while the click log and the export use the window to the millisecond. So one
+request can be answered differently by all three and every answer is right.
 
 **The two services read `CLICKMONK_ADMIN_HOST` differently on purpose.** The admin service
 refuses to boot on a value it cannot parse; the redirect logs `ADMIN_HOST_IGNORED` once and

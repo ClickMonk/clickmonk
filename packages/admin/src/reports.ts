@@ -13,12 +13,14 @@
  * the answer is a refusal with `retry-after` rather than a queued query. The
  * same argument as the on-demand DNS check, for the same reason.
  *
- * **A report counts whole hours.** The rollups are hourly, so `from` is
- * floored to the hour and `to` is raised to the next one, and the response
- * says which window was counted rather than echoing the one that was asked
- * for. The click log reads raw clicks and uses the window exactly as given;
- * the two can therefore differ over a ragged window, which is why both of them
- * say what they counted.
+ * **A report counts whole buckets**, and the bucket is the grain that report
+ * answers at: the hour for the summary and the breakdown, because the rollups
+ * are hourly, and the requested bucket size for the chart, because a chart by
+ * day has to align to days. So `from` is floored and `to` raised to the next
+ * boundary of that grain, and the response says which window was counted rather
+ * than echoing the one that was asked for. The click log reads raw clicks and
+ * uses the window exactly as given; all of them can therefore differ over a
+ * ragged window, which is why every one of them says what it counted.
  */
 import {
   BUCKET_MS,

@@ -58,8 +58,9 @@ on your own infrastructure, and your click data stays yours.
   read hourly rollups written as the clicks arrive rather than the clicks themselves, so a
   window of a year is read as hours and not as every click inside it, and every number
   counts a click once even if the worker shipped its spool segment twice. **A report counts
-  whole hours** and says in its answer which hours it counted: ask for
-  `from=2026-09-24T10:30:00Z` and you are told you were given 10:00 onwards.
+  whole buckets** and says in its answer which window it counted: ask for
+  `from=2026-09-24T10:30:00Z` and the summary tells you you were given 10:00 onwards, while
+  a chart by day tells you it gave you the whole day.
 - **The click log, and a CSV of it.** `GET /api/clicks` lists the clicks themselves, newest
   first, filterable by link, traffic class, outcome, country and time, and exact to the
   millisecond. `GET /api/clicks.csv` is the same rows as a file: it streams, so the window
@@ -377,6 +378,13 @@ periods cannot be read — and nothing is deleted while it reads that way. A mis
 the likelier of the two: it is one `DELETE` away, and the defaults would answer it with a
 period nobody chose.
 
+**`clickmonk settings set` is what repairs that row, and the `PUT` is not.** The `PUT`
+requires a `retention` object, so the body a `GET` hands back in this state — with
+`"retention": null` — is one the `PUT` refuses: a script that reads, changes a field and
+writes back cannot fix the state the read just told it about. Use the CLI, which writes the
+periods you name over the defaults for the rest and prints what it wrote; after that the
+`GET` and the `PUT` agree again.
+
 The worker enforces both periods, and **each one is a floor rather than a deadline** —
 [How long ClickMonk keeps things](#how-long-clickmonk-keeps-things) below has the numbers
 and what a missing row does. What is deleted is the raw clicks and the addresses on them;
@@ -450,14 +458,16 @@ Add `&link=<id>` to any of them for one link instead of all of them. **Nothing l
 link up**, so an id that belongs to no link is an empty answer rather than an error, on all
 five of these.
 
-**A report counts whole hours; the log counts milliseconds.** Before a report is counted,
-`from` is floored to the hour and `to` raised to the next one, because that is the grain the
-rollups hold; the log and the export use the two instants exactly as they were sent. So the
-same window can answer differently through the two surfaces and neither is broken — a window
-starting one millisecond after the newest click was measured giving three clicks from the
-summary and none from the log, because the summary counted the whole hour that click is in.
-Every one of these five answers repeats the window it actually counted, in its own `window`
-field. Read that before comparing two numbers.
+**A report counts whole buckets; the log counts milliseconds.** Before a report is counted,
+`from` is floored and `to` raised to the next boundary, and **the boundary is the grain that
+report answers at**: the hour for the summary and the breakdown, because that is the grain
+the rollups hold, and the bucket you asked for on the chart — so `bucket=day` counts whole
+days. The log and the export use the two instants exactly as they were sent. So the same
+window can answer differently through these surfaces and none of them is broken: one
+`from=2026-09-24T10:30:00Z&to=2026-09-24T10:50:00Z` gives two clicks from the summary, the
+hourly chart and the breakdown, three from a chart by day, and one from the log. Every one
+of these five answers repeats the window it actually counted, in its own `window` field.
+Read that before comparing two numbers.
 
 **What the numbers mean.** `clicks` counts distinct clicks and `visitors` distinct visitor
 cookies, and both are counted as sets rather than added up: a click the worker shipped twice
@@ -607,7 +617,9 @@ why in the worker's log, `settings show` prints `keep clicks: unknown, so nothin
 deleted`, and `GET /api/settings` answers `"retention": null` with a `problem`. That is
 deliberate rather than a gap: applying the defaults there would delete clicks for an
 operator who never chose a period, including one who had chosen to keep them for ever and
-whose row was since deleted. `settings set` writes the row back, and says that it did.
+whose row was since deleted. `settings set` writes the row back, and says that it did — and
+it is the only thing that does: `PUT /api/settings` will not take a body with
+`"retention": null` in it, so the repair is the CLI's.
 
 Setting the address period longer than the click period does nothing: the address goes when
 the click does. `settings show` and `GET /api/settings` say so in a note rather than letting

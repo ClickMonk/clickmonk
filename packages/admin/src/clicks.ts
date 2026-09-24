@@ -392,8 +392,9 @@ export function registerClickRoutes(app: FastifyInstance, ctx: AdminContext): vo
    * One page of the log, newest first.
    *
    * The window is used exactly as it was sent — to the millisecond, half-open —
-   * unlike a report, which can only answer whole hours. Both say what they
-   * counted, because the two answers over the same ragged window are allowed to
+   * unlike a report, which answers whole buckets: whole hours for the summary and
+   * the breakdown, and whole days for a chart asked for by day. All of them say
+   * what they counted, because the answers over one ragged window are allowed to
    * differ and an operator comparing them deserves to know why.
    */
   app.get('/api/clicks', async (req) => {
