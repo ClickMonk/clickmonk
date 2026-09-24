@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { loadConfig } from './config.js'
+import { type WorkerConfig, loadConfig } from './config.js'
 import { RETENTION_MAX_EXECUTION_SECONDS } from './retention.js'
 
 const base = {
@@ -79,6 +79,23 @@ describe('loadConfig', () => {
     expect(
       loadConfig({ ...base, CLICKMONK_RETENTION_INTERVAL_MS: '1000' }).retentionIntervalMs,
     ).toBe(1000)
+  })
+
+  /**
+   * And the other end, which is not a preference: `setTimeout` holds a signed
+   * 32-bit delay and replaces anything larger with 1 ms, so an interval a little
+   * over twenty-five days is a pass running continuously.
+   *
+   * The two numbers are written out rather than computed from `MAX_TIMER_MS`: a
+   * bound derived from the constant it is testing accepts whatever that constant
+   * becomes. `2147483648` is the value an operator asking for a month types.
+   */
+  it.each([
+    ['CLICKMONK_RETENTION_INTERVAL_MS', (c: WorkerConfig) => c.retentionIntervalMs],
+    ['CLICKMONK_DNS_CHECK_INTERVAL_MS', (c: WorkerConfig) => c.dnsCheckIntervalMs],
+  ])('refuses %s past the longest delay a timer holds', (name, read) => {
+    expect(() => loadConfig({ ...base, [name]: '2147483648' })).toThrow(new RegExp(name))
+    expect(read(loadConfig({ ...base, [name]: '2147483647' }))).toBe(2147483647)
   })
 
   it('turns the checks off, and refuses any value but on or off', () => {

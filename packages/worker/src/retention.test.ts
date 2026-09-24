@@ -513,6 +513,26 @@ describe('runRetention', () => {
 })
 
 describe('startRetention', () => {
+  /**
+   * The interval against what a timer can hold, in the loop rather than only in
+   * the configuration schema.
+   *
+   * `setTimeout` keeps its delay in a signed 32-bit integer and replaces anything
+   * larger with 1 ms, so 2,147,483,648 — a little under twenty-five days, which is
+   * what someone asking for a monthly pass types — was measured running 342 passes
+   * in two seconds, each one taking the settings row's lock. It throws rather than
+   * clamping: a loop that quietly ran at a different period than it was asked for
+   * is the same surprise in a smaller font.
+   *
+   * Nothing is started, which is the point — so there is no loop to stop and no
+   * pass to settle.
+   */
+  it('refuses an interval no timer can hold', () => {
+    expect(() => startRetention({ pg: pool, ch, intervalMs: 2147483648, now: () => NOW })).toThrow(
+      /intervalMs/,
+    )
+  })
+
   it('runs a pass and stops when it is told to', async () => {
     const passes: string[] = []
     const loop = startRetention({

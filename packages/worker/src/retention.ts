@@ -64,6 +64,7 @@
  * writers carry a lock timeout of their own — the operator is told to try
  * again rather than left holding a command that has printed nothing.
  */
+import { checkIntervalMs } from '@clickmonk/core'
 import type { ClickHouseClient, Pool, PoolClient } from '@clickmonk/db'
 import { readSettingsLocked } from './settings.js'
 
@@ -334,7 +335,11 @@ export function startRetention(o: {
   now?: () => Date
   log?: (msg: string, err?: unknown) => void
 }): { stop(): Promise<void> } {
-  const interval = o.intervalMs ?? 3_600_000
+  // Against what a timer can hold, here and not only in the configuration
+  // schema: an interval past `setTimeout`'s 32-bit ceiling is not clamped, it is
+  // replaced by 1 ms, and a monthly pass then runs a hundred and seventy times a
+  // second — each one taking the settings row's lock.
+  const interval = checkIntervalMs('intervalMs', o.intervalMs ?? 3_600_000)
   const now = o.now ?? (() => new Date())
   const log = (msg: string, err?: unknown) => {
     try {

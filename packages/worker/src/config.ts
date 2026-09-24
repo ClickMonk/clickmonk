@@ -1,4 +1,4 @@
-import { DEFAULT_SPOOL_DIR, formatConfigError } from '@clickmonk/core'
+import { DEFAULT_SPOOL_DIR, MAX_TIMER_MS, formatConfigError } from '@clickmonk/core'
 import type { ChConfig } from '@clickmonk/db'
 import { DEFAULT_IPDATA_DIR } from '@clickmonk/ipdata'
 import { z } from 'zod'
@@ -51,7 +51,17 @@ const Schema = z.object({
   // Off on an install whose domains are verified some other way, or in a
   // test stack with no DNS to ask.
   CLICKMONK_DNS_CHECK: z.enum(['on', 'off']).default('on'),
-  CLICKMONK_DNS_CHECK_INTERVAL_MS: z.coerce.number().int().min(1000).default(300_000),
+  // Bounded at both ends. The ceiling is `setTimeout`'s, not a preference: past
+  // it Node substitutes a delay of 1 ms, so an interval a little over twenty-five
+  // days becomes a check running a hundred and seventy times a second. The loop
+  // this reaches refuses the same range, because a bound that lives only here is
+  // one a direct caller does not have.
+  CLICKMONK_DNS_CHECK_INTERVAL_MS: z.coerce
+    .number()
+    .int()
+    .min(1000)
+    .max(MAX_TIMER_MS)
+    .default(300_000),
   // Empty: the host's own resolvers. Otherwise the addresses to ask, each
   // validated here rather than inside node:dns, which throws at the first
   // query with a message that names nothing.
@@ -59,7 +69,15 @@ const Schema = z.object({
   // How often the retention pass runs. There is no on/off here on purpose:
   // "never" is a value the setting takes, and two ways to turn one thing off
   // is how they come to disagree.
-  CLICKMONK_RETENTION_INTERVAL_MS: z.coerce.number().int().min(1000).default(3_600_000),
+  // The same ceiling as the DNS interval above, and for the same reason: this one
+  // is where it was measured. A monthly pass typed as 2,147,483,648 ms ran 342
+  // times in two seconds, each pass taking the settings row's lock.
+  CLICKMONK_RETENTION_INTERVAL_MS: z.coerce
+    .number()
+    .int()
+    .min(1000)
+    .max(MAX_TIMER_MS)
+    .default(3_600_000),
 })
 
 export interface WorkerConfig {
