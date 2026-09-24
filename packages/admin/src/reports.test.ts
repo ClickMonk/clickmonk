@@ -258,6 +258,151 @@ describe('GET /api/reports/summary', () => {
   })
 })
 
+describe('GET /api/reports/timeseries', () => {
+  it('gives one bucket an hour, including the hours with nothing in them', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/reports/timeseries?from=2026-09-24T09:00:00.000Z&to=2026-09-24T13:00:00.000Z&bucket=hour',
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.json()).toEqual({
+      window: { from: '2026-09-24T09:00:00.000Z', to: '2026-09-24T13:00:00.000Z' },
+      link: null,
+      bucket: 'hour',
+      buckets: [
+        { at: '2026-09-24T09:00:00.000Z', clicks: 0, visitors: 0 },
+        { at: '2026-09-24T10:00:00.000Z', clicks: 4, visitors: 2 },
+        { at: '2026-09-24T11:00:00.000Z', clicks: 1, visitors: 1 },
+        { at: '2026-09-24T12:00:00.000Z', clicks: 0, visitors: 0 },
+      ],
+    })
+  })
+
+  it('gives one bucket a day, and counts a visitor across the hours of that day once', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/reports/timeseries?from=2026-09-24T00:00:00.000Z&to=2026-09-25T00:00:00.000Z&bucket=day',
+      headers: read(cookie),
+    })
+    expect(r.json().buckets).toEqual([
+      // Five clicks by three visitors: v1 clicked in both hours and is one
+      // visitor for the day, which summing the two hourly numbers would not
+      // give.
+      { at: '2026-09-24T00:00:00.000Z', clicks: 5, visitors: 3 },
+    ])
+  })
+
+  // The bucket the window's end names is the one it stops before, the same way
+  // the summary's is: with `<= to` this day chart would carry a second bucket
+  // holding the click at 2026-09-25 00:30, and two adjacent charts drawn a day
+  // apart would each show it.
+  it('stops before the bucket its end names', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/reports/timeseries?from=2026-09-24T00:00:00.000Z&to=2026-09-25T00:00:00.000Z&bucket=day',
+      headers: read(cookie),
+    })
+    expect(r.json().buckets).toHaveLength(1)
+    // And the day it stops before does hold a click, so the single bucket is
+    // the bound rather than an empty table beyond it.
+    const next = await app.inject({
+      method: 'GET',
+      url: '/api/reports/timeseries?from=2026-09-25T00:00:00.000Z&to=2026-09-26T00:00:00.000Z&bucket=day',
+      headers: read(cookie),
+    })
+    expect(next.json().buckets).toEqual([
+      { at: '2026-09-25T00:00:00.000Z', clicks: 1, visitors: 1 },
+    ])
+  })
+
+  it('aligns a day chart to whole days, and says so', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/reports/timeseries?from=2026-09-24T10:30:00.000Z&to=2026-09-24T11:30:00.000Z&bucket=day',
+      headers: read(cookie),
+    })
+    expect(r.json().window).toEqual({
+      from: '2026-09-24T00:00:00.000Z',
+      to: '2026-09-25T00:00:00.000Z',
+    })
+    expect(r.json().buckets).toHaveLength(1)
+  })
+
+  it('counts one link when asked for one', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/reports/timeseries?from=2026-09-24T10:00:00.000Z&to=2026-09-24T11:00:00.000Z&bucket=hour&link=${LINK_B}`,
+      headers: read(cookie),
+    })
+    expect(r.json().buckets).toEqual([{ at: '2026-09-24T10:00:00.000Z', clicks: 1, visitors: 1 }])
+  })
+
+  it('refuses more buckets than one response carries, and says to ask for days', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      // A hundred days of hours: 2,400 buckets, past the ceiling of 2,000.
+      url: '/api/reports/timeseries?from=2026-06-16T00:00:00.000Z&to=2026-09-24T00:00:00.000Z&bucket=hour',
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(400)
+    expect(r.json().error).toBe('too_many_buckets')
+    expect(r.json().message).toContain('bucket=day')
+  })
+
+  it('takes a hundred days of days, which is inside the ceiling', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/reports/timeseries?from=2026-06-16T00:00:00.000Z&to=2026-09-24T00:00:00.000Z&bucket=day',
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(200)
+    const buckets = r.json().buckets as { at: string; clicks: number; visitors: number }[]
+    expect(buckets).toHaveLength(100)
+    expect(buckets[0]?.at).toBe('2026-06-16T00:00:00.000Z')
+    expect(buckets[99]?.at).toBe('2026-09-23T00:00:00.000Z')
+    // Every fixture click is on the 24th, which is the instant this window
+    // ends at, so every one of the hundred buckets is a real zero rather than
+    // a row that was not returned.
+    expect(buckets.reduce((n, b) => n + b.clicks, 0)).toBe(0)
+  })
+
+  it.each([
+    ['no bucket at all', 'from=2026-09-24T00:00:00.000Z&to=2026-09-25T00:00:00.000Z'],
+    [
+      'a bucket nobody has',
+      'from=2026-09-24T00:00:00.000Z&to=2026-09-25T00:00:00.000Z&bucket=week',
+    ],
+    [
+      'a field nobody knows',
+      'from=2026-09-24T00:00:00.000Z&to=2026-09-25T00:00:00.000Z&bucket=hour&tz=CET',
+    ],
+  ])('refuses %s', async (_label, query) => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/reports/timeseries?${query}`,
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(400)
+    expect(r.json().error).toBe('invalid_query')
+  })
+
+  it('refuses when every report slot is taken', async () => {
+    const other = testApp(pool, clock, { ch, reportGate: new ConcurrencyGate(0) })
+    try {
+      const r = await other.inject({
+        method: 'GET',
+        url: '/api/reports/timeseries?from=2026-09-24T00:00:00.000Z&to=2026-09-25T00:00:00.000Z&bucket=hour',
+        headers: read(cookie),
+      })
+      expect(r.statusCode).toBe(429)
+      expect(r.json().error).toBe('too_many_reports')
+    } finally {
+      await other.close()
+    }
+  })
+})
+
 // The route cannot reach this: `from` is a datetime in the schema, so an
 // unreadable date is a 400 before the parser sees it. The parser is exported
 // and the chart and the log will call it too, so the bound lives in the
@@ -387,6 +532,40 @@ describe('when ClickHouse is not there', () => {
       })
       expect(r.statusCode).toBe(400)
       expect(r.json().error).toBe('window_too_long')
+      expect(lines.filter((l) => l.includes('clickhouse query failed'))).toEqual([])
+    } finally {
+      await logging.close()
+    }
+  })
+
+  // The same claim for the chart's own ceiling, and it needs making separately:
+  // a hundred days is well inside the four hundred the window bound allows, so
+  // the only thing that can refuse 2,400 hourly buckets is the bucket count. A
+  // count taken after the query would be no ceiling at all — the scan it exists
+  // to stop would already have happened — and against a store that cannot
+  // answer, anything that reaches it is a 503, so the 400 is what says the
+  // count came first.
+  it('refuses too many buckets without reading anything', async () => {
+    const lines: string[] = []
+    const logging = testApp(pool, clock, {
+      ch: dead,
+      log: {
+        level: 'error',
+        stream: {
+          write(line: string) {
+            lines.push(line)
+          },
+        },
+      },
+    })
+    try {
+      const r = await logging.inject({
+        method: 'GET',
+        url: '/api/reports/timeseries?from=2026-06-16T00:00:00.000Z&to=2026-09-24T00:00:00.000Z&bucket=hour',
+        headers: read(cookie),
+      })
+      expect(r.statusCode).toBe(400)
+      expect(r.json().error).toBe('too_many_buckets')
       expect(lines.filter((l) => l.includes('clickhouse query failed'))).toEqual([])
     } finally {
       await logging.close()

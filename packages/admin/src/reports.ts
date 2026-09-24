@@ -20,7 +20,16 @@
  * the two can therefore differ over a ragged window, which is why both of them
  * say what they counted.
  */
-import { type ConcurrencyGate, MAX_REPORT_WINDOW_DAYS, MAX_REPORT_WINDOW_MS } from '@clickmonk/core'
+import {
+  BUCKET_MS,
+  type ConcurrencyGate,
+  MAX_REPORT_BUCKETS,
+  MAX_REPORT_WINDOW_DAYS,
+  MAX_REPORT_WINDOW_MS,
+  REPORT_BUCKETS,
+  type ReportBucket,
+  bucketCount,
+} from '@clickmonk/core'
 import type { ClickHouseClient } from '@clickmonk/db'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 import { z } from 'zod'
@@ -219,6 +228,18 @@ export function windowParams(w: ReportWindow): Record<string, unknown> {
 
 const SummaryQuery = z.object({ ...WINDOW_FIELDS }).strict()
 
+/**
+ * How each bucket size is grouped. A module constant per bucket rather than
+ * anything built from the request: the value that reaches the query text is
+ * one of exactly two strings written here.
+ */
+const BUCKET_EXPR: Record<ReportBucket, string> = {
+  hour: 'hour',
+  day: 'toStartOfDay(hour)',
+}
+
+const TimeseriesQuery = z.object({ ...WINDOW_FIELDS, bucket: z.enum(REPORT_BUCKETS) }).strict()
+
 export function registerReportRoutes(app: FastifyInstance, ctx: AdminContext): void {
   /**
    * The numbers at the top of a dashboard: how many clicks, how many people,
@@ -297,6 +318,85 @@ export function registerReportRoutes(app: FastifyInstance, ctx: AdminContext): v
           byAction,
           byOutcome,
           newestHour: newestHourOrNull(newest?.newest),
+        }
+      },
+    )
+  })
+
+  /**
+   * The chart: one row per bucket, with the empty ones filled in.
+   *
+   * Filled here rather than by ClickHouse's `WITH FILL`, because the loop that
+   * fills is then the same loop whose count decided whether this window was
+   * allowed at all — a response cannot come back longer than the ceiling that
+   * let it through. The other way round, the ceiling is in this file and the
+   * filling is in a query, and nothing holds them to each other.
+   *
+   * The bucket count is checked here and not by `parseWindow`, because the two
+   * bounds do not compose: four hundred days is inside the window bound and
+   * 9,600 hourly buckets, nearly five times the ceiling. The window bound alone
+   * would let that through.
+   *
+   * A visitor is merged per bucket and never summed across buckets: somebody
+   * who clicked at ten and at eleven is two hourly visitors and one daily one,
+   * and both of those are the right answer to their own question.
+   */
+  app.get('/api/reports/timeseries', async (req) => {
+    requireCredential(req)
+    const q = readQuery(TimeseriesQuery, req.query)
+    const step = BUCKET_MS[q.bucket]
+    const w = parseWindow(q, { alignMs: step })
+    const buckets = bucketCount(w.fromMs, w.toMs, q.bucket)
+    if (buckets > MAX_REPORT_BUCKETS) {
+      // `return fail(…)` rather than a bare call, for the reason `requireCh`
+      // spells out: `fail` is a const arrow, so TypeScript does not treat a
+      // bare call as ending the path.
+      return fail(
+        400,
+        'too_many_buckets',
+        `that window is ${buckets} buckets and at most ${MAX_REPORT_BUCKETS} are returned; ask for bucket=day or a shorter window`,
+      )
+    }
+    const ch = requireCh(ctx, req)
+    return withSlot(
+      ctx.reportGate,
+      { code: 'too_many_reports', message: 'too many reports at once; try again' },
+      async () => {
+        // The alias is `at` and not `hour`: an alias that shadows the column
+        // would be what the `WHERE` below reads, and a string where a DateTime
+        // belongs fails with an illegal-type error.
+        const rows = await chRows<{ at: string; clicks: string; visitors: string }>({
+          ch,
+          req,
+          query: `SELECT toString(${BUCKET_EXPR[q.bucket]}) AS at,
+                         uniqExactMerge(clicks_state) AS clicks,
+                         uniqExactMerge(visitors_state) AS visitors
+                    FROM clicks_hourly WHERE ${windowClause(w)}
+                   GROUP BY at ORDER BY at`,
+          params: windowParams(w),
+        })
+        // Keyed by the same text ClickHouse returned, so nothing has to agree
+        // about how to format an instant twice. `toString` of a DateTime gives
+        // nineteen characters and `chTime` gives milliseconds too, so the key
+        // is the sliced form of ours.
+        const found = new Map(rows.map((row) => [row.at, row]))
+        const out: { at: string; clicks: number; visitors: number }[] = []
+        // `at < w.toMs`, matching the half-open clause the query ran with: the
+        // bucket the window's end names belongs to the next window, and filling
+        // it here would draw a bar two adjacent charts both claim.
+        for (let at = w.fromMs; at < w.toMs; at += step) {
+          const row = found.get(chTime(at).slice(0, 19))
+          out.push({
+            at: new Date(at).toISOString(),
+            clicks: count(row?.clicks),
+            visitors: count(row?.visitors),
+          })
+        }
+        return {
+          window: { from: new Date(w.fromMs).toISOString(), to: new Date(w.toMs).toISOString() },
+          link: w.linkId,
+          bucket: q.bucket,
+          buckets: out,
         }
       },
     )
