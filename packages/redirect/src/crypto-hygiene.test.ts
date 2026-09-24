@@ -100,11 +100,6 @@ const CONFIG: HygieneConfig = {
    */
   alwaysSeed: ['index.ts'],
   /**
-   * `cap.ts` is on the floor because the walk reaches it: `app.ts` imports it
-   * for a value, so it is scanned, and a file that is scanned belongs on the
-   * floor or the floor is not one.
-   */
-  /**
    * Empty because the floor is not a list any more: seeded from the entry point
    * the walk reaches every file in the package, so the test asserts exactly that
    * and there is no list to keep in step. A list would have had to be edited
