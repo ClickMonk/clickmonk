@@ -505,9 +505,15 @@ describe('an API key', () => {
     // expired key's id, the row would pass whether the secret was compared or
     // not — which is what made this assertion pin nothing.
     const good = await keyFor(pg, 'good')
-    await pg.query('UPDATE api_keys SET revoked_at = now() WHERE name = $1', ['revoked'])
-    await pg.query("UPDATE api_keys SET expires_at = now() - interval '1 day' WHERE name = $1", [
+    // Both stamps come from the clock this app was built with, not from SQL
+    // `now()`. The key check compares `expires_at` against that clock, so a
+    // fixture a day before the *database's* clock stops being in the past as
+    // soon as the real date walks a day past the frozen one, and this test
+    // then fails every run over a date rather than over the check it is about.
+    await pg.query('UPDATE api_keys SET revoked_at = $2 WHERE name = $1', ['revoked', clock.now()])
+    await pg.query('UPDATE api_keys SET expires_at = $2 WHERE name = $1', [
       'live',
+      new Date(clock.now().getTime() - 86_400_000),
     ])
     const expired = live
     // That live key's own id, with 43 characters of the wrong secret.

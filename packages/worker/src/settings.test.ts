@@ -169,6 +169,13 @@ describe('updateSettings', () => {
     // very connection that leaked, which sees its own uncommitted work and
     // answers as if the rollback had happened. A second connection is what
     // can see a backend left sitting inside a transaction.
+    //
+    // **Do not narrow this to one connection.** It counts every backend on
+    // this database on purpose: the leaked one cannot be addressed from here,
+    // because the pool hands the same client straight back to whoever asks
+    // next. Counting database-wide is exact under this repository's rule that
+    // one suite runs at a time, and nothing narrower fails when the ROLLBACK
+    // is removed.
     const probe = testPg()
     try {
       const open = await probe.query<{ n: number }>(

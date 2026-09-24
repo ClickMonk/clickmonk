@@ -893,10 +893,13 @@ describe('the admin account and API keys from the CLI', () => {
   it('changes the password and signs every browser out', async () => {
     await withPassword('a decent admin password', 'admin', 'create', 'admin@example.com')
     const before = (await account()).rows[0]?.password_hash as string
-    await pg.query(
-      "INSERT INTO sessions (token_hash, expires_at) VALUES ($1, now() + interval '1 day')",
-      ['a'.repeat(64)],
-    )
+    // Live at NOW, which is the clock every command in this block runs on. A
+    // day past SQL `now()` is a day past the *database's* clock, and the two
+    // only agree while the real date sits near the frozen one.
+    await pg.query('INSERT INTO sessions (token_hash, expires_at) VALUES ($1, $2)', [
+      'a'.repeat(64),
+      new Date(NOW.getTime() + 86_400_000),
+    ])
     lines.length = 0
     expect(await withPassword('a new decent password', 'admin', 'passwd')).toBe(0)
     expect(lines.join('\n')).toContain('1 session(s) signed out')
@@ -911,10 +914,21 @@ describe('the admin account and API keys from the CLI', () => {
   // once, rather than waiting out a lock on a password that no longer exists.
   it('clears a standing lockout, so the new password works at once', async () => {
     await withPassword('a decent admin password', 'admin', 'create', 'admin@example.com')
+    // Both stamps from NOW, the clock this block's commands run on: a lockout
+    // an hour past SQL `now()` is not standing at NOW once the real date has
+    // walked past the frozen one, and this test would then be clearing a lock
+    // that was never holding anything shut.
     await pg.query(
-      `UPDATE admin_account SET failed_logins = 9, last_failed_at = now(),
-                                locked_until = now() + interval '1 hour'`,
+      `UPDATE admin_account SET failed_logins = 9, last_failed_at = $1,
+                                locked_until = $2`,
+      [NOW, new Date(NOW.getTime() + 3_600_000)],
     )
+    // It really is standing, before the command that clears it: without this,
+    // the fixture could sit on either side of NOW and every assertion below
+    // would still pass.
+    expect(
+      await signIn(pg, { email: 'admin@example.com', password: 'a decent admin password' }, NOW),
+    ).toEqual({ ok: false, reason: 'locked', retryAfterSeconds: 3600 })
     expect(await withPassword('a new decent password', 'admin', 'passwd')).toBe(0)
     const r = await pg.query<{
       failed_logins: number
@@ -970,10 +984,14 @@ describe('the admin account and API keys from the CLI', () => {
         NOW,
       ])
     }
-    await pg.query(
-      "INSERT INTO sessions (token_hash, expires_at) VALUES ($1, now() + interval '1 day')",
-      ['b'.repeat(64)],
-    )
+    // From NOW, like the recovery codes and the lockout above it: this test
+    // reads the account through `signIn(…, NOW)`, so one fixture on the
+    // database's clock and the rest on the frozen one is a mixture that only
+    // holds while the two dates are close.
+    await pg.query('INSERT INTO sessions (token_hash, expires_at) VALUES ($1, $2)', [
+      'b'.repeat(64),
+      new Date(NOW.getTime() + 86_400_000),
+    ])
     const credentials = { email: 'admin@example.com', password: 'a decent admin password' }
     // Before: the password alone gets nowhere, and the lockout the lost codes
     // earned is standing.

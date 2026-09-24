@@ -326,7 +326,15 @@ describe('signing in', () => {
     // the name is still there in front of an empty value.
     expect(cookie.startsWith(`${SESSION_COOKIE}=`)).toBe(true)
     expect(cookie.slice(SESSION_COOKIE.length + 1).length).toBeGreaterThan(20)
-    await pg.query("UPDATE sessions SET expires_at = now() - interval '1 day'")
+    // A day before the clock this app was built with, not before SQL `now()`.
+    // The two agree only while the real date sits near the frozen one, so a
+    // fixture written with `now() - interval '1 day'` stops looking expired
+    // the moment the real clock walks past the frozen clock by a day — and
+    // then this test fails every run, for a reason that has nothing to do
+    // with the sweep it is about.
+    await pg.query('UPDATE sessions SET expires_at = $1', [
+      new Date(clock.now().getTime() - 86_400_000),
+    ])
     await signInWith({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
     const rows = await pg.query<{ n: number }>('SELECT count(*)::int AS n FROM sessions')
     expect(rows.rows[0]?.n).toBe(1)
