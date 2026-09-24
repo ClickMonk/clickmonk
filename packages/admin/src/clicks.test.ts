@@ -612,6 +612,243 @@ describe('GET /api/clicks', () => {
 })
 
 /**
+ * The same log, as a file.
+ *
+ * Every data row is asserted whole where the fixture gives it an interesting
+ * value, rather than by a substring: the header row and the values come from one
+ * list, so a column dropped from it changes both — and what a substring could
+ * not see is a value written into the wrong column, or a cell that stopped being
+ * quoted. The two rows read whole are the bot click, which carries a list, four
+ * empty columns and no network, and the oldest click, which carries a value in
+ * every column but two.
+ */
+describe('GET /api/clicks.csv', () => {
+  const lines = (body: string): string[] => body.split('\r\n').filter((l) => l.length > 0)
+
+  /**
+   * The first cell of every data row. Not a `toContain` on the whole body for an
+   * id: the base fixture click's `destination` carries its own click id, so a
+   * body holding the second click also holds the first click's id and an
+   * absent-id assertion would pass against an export that had not dropped it.
+   */
+  const idsOf = (body: string): string[] =>
+    lines(body)
+      .slice(1)
+      .map((l) => l.slice(1, l.indexOf('","')))
+
+  const HEADER =
+    '"clickId","at","host","path","domainId","linkId","outcome","step","status","destination","targetId","visitorId","returning","country","region","city","geoSource","device","os","browser","asn","class","signals","action","referrer","userAgent","network","capUnchecked"'
+
+  it('exports the rows the log would have listed, newest first, as a file', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/clicks.csv?${WINDOW}`,
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.headers['content-type']).toBe('text/csv; charset=utf-8')
+    expect(r.headers['content-disposition']).toBe(
+      'attachment; filename="clicks-20260924T000000Z-20260925T000000Z.csv"',
+    )
+    expect(r.headers['x-clickmonk-truncated']).toBe('false')
+    expect(r.headers['x-clickmonk-row-cap']).toBe('1000000')
+    const out = lines(r.body)
+    expect(out[0]).toBe(HEADER)
+    expect(out).toHaveLength(4)
+    expect(idsOf(r.body)).toEqual([
+      '01920000-0000-7000-8000-000000000003',
+      '01920000-0000-7000-8000-000000000002',
+      '01920000-0000-7000-8000-000000000001',
+    ])
+    // The bot click, whole: a list of signals joined into one cell, four columns
+    // that are empty because the click had nothing in them, and no network
+    // because its address column was blanked.
+    expect(out[1]).toBe(
+      `"01920000-0000-7000-8000-000000000003","2026-09-24T10:02:00.000Z","go.example.test","/a","${DOMAIN}","${LINK_A}","blocked","classify","403","","","v1","false","","","","","desktop","windows","chrome","64500","bot","ua_bot head","block","https://blog.example.com/post","Mozilla/5.0 (Windows NT 10.0) Chrome/130","","true"`,
+    )
+    // The oldest click, whole: the network the address was truncated to, the
+    // instant as the JSON spells it, and every other column at a real value.
+    expect(out[3]).toBe(
+      `"01920000-0000-7000-8000-000000000001","2026-09-24T10:00:00.000Z","go.example.test","/a","${DOMAIN}","${LINK_A}","target","destination","302","https://example.com/?c=01920000-0000-7000-8000-000000000001","${TARGET}","v1","false","DE","","","dbip","desktop","windows","chrome","64500","human","","","https://blog.example.com/post","Mozilla/5.0 (Windows NT 10.0) Chrome/130","198.51.100.0/24","false"`,
+    )
+  })
+
+  /**
+   * The re-shipped pair is still two rows in the table, asserted first for the
+   * reason the log's own dedup test asserts it: without that, a fixture a merge
+   * had already collapsed would pass this whether the export says FINAL or not.
+   */
+  it('writes a click that was shipped twice once', async () => {
+    const rs = await ch.query({
+      query: `SELECT count() AS n FROM clicks WHERE click_id = '01920000-0000-7000-8000-000000000001'`,
+      format: 'JSONEachRow',
+    })
+    expect(
+      await rs.json(),
+      'the re-shipped copy is no longer a second row, so this test would pass whether or not the export deduplicates. The fixture holds the pair with optimize_on_insert: 0 on its INSERT.',
+    ).toEqual([{ n: '2' }])
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/clicks.csv?${WINDOW}`,
+      headers: read(cookie),
+    })
+    expect(
+      idsOf(r.body).filter((id) => id === '01920000-0000-7000-8000-000000000001'),
+    ).toHaveLength(1)
+  })
+
+  it('holds nothing: no content-length, and a chunked body', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/clicks.csv?${WINDOW}`,
+      headers: read(cookie),
+    })
+    expect(r.headers['content-length']).toBeUndefined()
+    expect(r.headers['transfer-encoding']).toBe('chunked')
+  })
+
+  it('says in a header when the window held more than the cap, and stops at the cap', async () => {
+    const capped = testApp(pool, clock, { ch, exportRowCap: 2 })
+    try {
+      const r = await capped.inject({
+        method: 'GET',
+        url: `/api/clicks.csv?${WINDOW}`,
+        headers: read(cookie),
+      })
+      expect(r.headers['x-clickmonk-truncated']).toBe('true')
+      expect(r.headers['x-clickmonk-row-cap']).toBe('2')
+      // A header row and the two newest clicks; the third is not there.
+      expect(lines(r.body)).toHaveLength(3)
+      expect(idsOf(r.body)).toEqual([
+        '01920000-0000-7000-8000-000000000003',
+        '01920000-0000-7000-8000-000000000002',
+      ])
+    } finally {
+      await capped.close()
+    }
+  })
+
+  it('does not claim truncation when the window held exactly the cap', async () => {
+    const capped = testApp(pool, clock, { ch, exportRowCap: 3 })
+    try {
+      const r = await capped.inject({
+        method: 'GET',
+        url: `/api/clicks.csv?${WINDOW}`,
+        headers: read(cookie),
+      })
+      expect(r.headers['x-clickmonk-truncated']).toBe('false')
+      expect(lines(r.body)).toHaveLength(4)
+    } finally {
+      await capped.close()
+    }
+  })
+
+  it('takes the same filters as the log', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/clicks.csv?${WINDOW}&class=bot`,
+      headers: read(cookie),
+    })
+    expect(lines(r.body)).toHaveLength(2)
+    expect(idsOf(r.body)).toEqual(['01920000-0000-7000-8000-000000000003'])
+  })
+
+  it.each([
+    ['a class nobody has', 'class=spider'],
+    ['a field nobody knows', 'limit=10'],
+    [
+      'a cursor, which an export does not take',
+      'cursor=1758708000000.01920000-0000-7000-8000-000000000001',
+    ],
+  ])('refuses %s, before a single byte is written', async (_label, extra) => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/clicks.csv?${WINDOW}&${extra}`,
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(400)
+    expect(r.json().error).toBe('invalid_query')
+    // No file began: a query parsed after the headers were set answers a 400
+    // that a browser saves as a download.
+    expect(r.headers['content-type']).toMatch(/application\/json/)
+    expect(r.headers['content-disposition']).toBeUndefined()
+  })
+
+  it('needs a credential, and writes no bytes of a file', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/clicks.csv?${WINDOW}`,
+      headers: { host: ADMIN_HOST },
+    })
+    expect(r.statusCode).toBe(401)
+    // A refusal that had already started the body would be a 401 with CSV in
+    // it, which is what a guard moved below the stream looks like.
+    expect(r.headers['content-type']).toMatch(/application\/json/)
+    expect(r.body).not.toContain('"clickId"')
+  })
+
+  it('gives the export slot back when the stream has ended', async () => {
+    const one = new ConcurrencyGate(1)
+    const shared = testApp(pool, clock, { ch, exportGate: one })
+    try {
+      const first = await shared.inject({
+        method: 'GET',
+        url: `/api/clicks.csv?${WINDOW}`,
+        headers: read(cookie),
+      })
+      expect(first.statusCode).toBe(200)
+      // The first export has finished, so the slot is back and the second is not
+      // refused. A slot given back when the handler returned would make this
+      // pass while bounding nothing, which is why the refusal below is the test
+      // that pins the gate.
+      const second = await shared.inject({
+        method: 'GET',
+        url: `/api/clicks.csv?${WINDOW}`,
+        headers: read(cookie),
+      })
+      expect(second.statusCode).toBe(200)
+      expect(one.stats().inFlight).toBe(0)
+    } finally {
+      await shared.close()
+    }
+  })
+
+  it('refuses when the export slot is taken', async () => {
+    const full = testApp(pool, clock, { ch, exportGate: new ConcurrencyGate(0) })
+    try {
+      const r = await full.inject({
+        method: 'GET',
+        url: `/api/clicks.csv?${WINDOW}`,
+        headers: read(cookie),
+      })
+      expect(r.statusCode).toBe(429)
+      expect(r.json().error).toBe('too_many_exports')
+      expect(r.headers['retry-after']).toBe('1')
+      // And no file began: the refusal is in front of the query, not in front
+      // of the last row.
+      expect(r.headers['content-type']).toMatch(/application\/json/)
+      expect(r.body).not.toContain('"clickId"')
+    } finally {
+      await full.close()
+    }
+  })
+
+  it('uses the report gate for nothing, so an export does not lock out a dashboard', async () => {
+    const busy = testApp(pool, clock, { ch, reportGate: new ConcurrencyGate(0) })
+    try {
+      const r = await busy.inject({
+        method: 'GET',
+        url: `/api/clicks.csv?${WINDOW}`,
+        headers: read(cookie),
+      })
+      expect(r.statusCode).toBe(200)
+    } finally {
+      await busy.close()
+    }
+  })
+})
+
+/**
  * Two addresses the parser reads differently, in a window of their own.
  *
  * `truncateIp` answers null for anything that is not bare address text, so the
@@ -728,7 +965,7 @@ describe('GET /api/clicks, the page size nobody asked for', () => {
   })
 })
 
-describe('the log when ClickHouse is not there', () => {
+describe('the log and the export when ClickHouse is not there', () => {
   let dead: ClickHouseClient
 
   beforeEach(() => {
@@ -798,6 +1035,82 @@ describe('the log when ClickHouse is not there', () => {
       const r = await on.inject({
         method: 'GET',
         url: `/api/clicks?${WINDOW}`,
+        headers: { host: ADMIN_HOST },
+      })
+      expect(r.statusCode).toBe(401)
+      expect(r.json().error).toBe('unauthenticated')
+      expect(lines.filter((l) => l.includes('clickhouse query failed'))).toEqual([])
+    } finally {
+      await on.close()
+    }
+  })
+
+  /**
+   * The export answers the same 503, and gives its slot back, so a store that is
+   * down does not read as a queue that is full.
+   *
+   * Two requests in a row through the same app, whose export gate holds one
+   * slot: the probe fails inside the gate, and the slot is given back by the
+   * handler's own `finally` because the generator never took ownership of it.
+   * Without that `finally` the second request is a 429 about an export nobody is
+   * running.
+   */
+  it('answers 503 for an export and does not keep the slot it took', async () => {
+    const on = testApp(pool, clock, { ch: dead })
+    try {
+      const first = await on.inject({
+        method: 'GET',
+        url: `/api/clicks.csv?${WINDOW}`,
+        headers: read(cookie),
+      })
+      expect(first.statusCode).toBe(503)
+      expect(first.json().error).toBe('reporting_unavailable')
+      // No file began, and no header of one: the probe runs before any of them
+      // is set.
+      expect(first.headers['content-type']).toMatch(/application\/json/)
+      expect(first.headers['content-disposition']).toBeUndefined()
+      const second = await on.inject({
+        method: 'GET',
+        url: `/api/clicks.csv?${WINDOW}`,
+        headers: read(cookie),
+      })
+      expect(second.statusCode).toBe(503)
+      expect(second.json().error).toBe('reporting_unavailable')
+    } finally {
+      await on.close()
+    }
+  })
+
+  /**
+   * The export asks for the credential before it takes a slot and before it
+   * reads anything, and this is what pins it there.
+   *
+   * Three positions, three answers, and the 401 beside the other export tests
+   * can only see the first of them. With the export gate full and the store
+   * unreachable: asked for after the probe, an unauthenticated request scans the
+   * window it chose and gets a 503; asked for inside the gate but before the
+   * probe, it gets a 429; only asked for before both is the answer 401. The
+   * query-failure line is asserted absent as well, because a status alone cannot
+   * tell a refusal from a query that happened to fail.
+   */
+  it('refuses an export without a credential before taking a slot or reading anything', async () => {
+    const lines: string[] = []
+    const on = testApp(pool, clock, {
+      ch: dead,
+      exportGate: new ConcurrencyGate(0),
+      log: {
+        level: 'error',
+        stream: {
+          write(line: string) {
+            lines.push(line)
+          },
+        },
+      },
+    })
+    try {
+      const r = await on.inject({
+        method: 'GET',
+        url: `/api/clicks.csv?${WINDOW}`,
         headers: { host: ADMIN_HOST },
       })
       expect(r.statusCode).toBe(401)

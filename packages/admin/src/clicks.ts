@@ -1,5 +1,10 @@
 /**
- * The raw click log.
+ * The raw click log, as a page of JSON and as a file.
+ *
+ * Two representations of one resource rather than two endpoints: the filters,
+ * the column list, the dedup and the truncation are written once here and both
+ * readers use them, so a rule about what an operator may see cannot come to be
+ * stated differently in the download than in the page.
  *
  * Everything else in these reports reads an hourly rollup; this reads the
  * clicks themselves, which is why it is the only place that has to think about
@@ -30,14 +35,17 @@
  * about what an operator may see is stated once, in one place, so that a second
  * reader of these rows cannot come to state it differently.
  */
+import { Readable } from 'node:stream'
 import { OUTCOMES, TRAFFIC_CLASSES } from '@clickmonk/core'
 import { addressOnly, truncateIp } from '@clickmonk/ipdata'
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import type { AdminContext } from './app.js'
 import { requireCredential } from './auth.js'
+import { csvLine } from './csv.js'
 import { fail } from './http.js'
 import {
+  CH_MAX_EXECUTION_SECONDS,
   MAX_STORE_MS,
   type ReportWindow,
   WINDOW_FIELDS,
@@ -56,9 +64,10 @@ export const MAX_CLICK_PAGE = 200
  * The filters the product promises: link, class, outcome, country and time.
  *
  * Exported, with the column list and the row mapper below, so that a second
- * reader of these rows — a download of the same log is the one this product
- * wants next — filters and maps them with this module's rules rather than with
- * its own. This route is the only caller today.
+ * reader of these rows filters and maps them with this module's rules rather
+ * than with its own. The export below is that second reader, and it takes these
+ * fields and no others: a page size and a cursor are how a page of JSON is
+ * walked and mean nothing to a file.
  */
 export const CLICK_FILTER_FIELDS = {
   ...WINDOW_FIELDS,
@@ -262,6 +271,57 @@ export function clickFilter(
   return { where: parts.join(' AND '), params }
 }
 
+/** Rows one export writes at most. */
+export const EXPORT_ROW_CAP = 1_000_000
+
+/**
+ * The CSV's columns, in order, by the same names the JSON uses: one vocabulary
+ * for one resource in two representations.
+ *
+ * Written out rather than taken from an example row, so that a field added to
+ * `asClick` and forgotten here is a failing test rather than a column that
+ * quietly stopped being exported.
+ */
+export const CSV_FIELDS = [
+  'clickId',
+  'at',
+  'host',
+  'path',
+  'domainId',
+  'linkId',
+  'outcome',
+  'step',
+  'status',
+  'destination',
+  'targetId',
+  'visitorId',
+  'returning',
+  'country',
+  'region',
+  'city',
+  'geoSource',
+  'device',
+  'os',
+  'browser',
+  'asn',
+  'class',
+  'signals',
+  'action',
+  'referrer',
+  'userAgent',
+  'network',
+  'capUnchecked',
+] as const
+
+const ExportQuery = z.object({ ...CLICK_FILTER_FIELDS }).strict()
+
+/** `20260924T000000Z`: a filename with no colons and nothing from the request in it. */
+const stamp = (ms: number): string =>
+  new Date(ms)
+    .toISOString()
+    .replace(/[-:]/g, '')
+    .replace(/\.\d{3}/, '')
+
 export function registerClickRoutes(app: FastifyInstance, ctx: AdminContext): void {
   /**
    * One page of the log, newest first.
@@ -301,5 +361,119 @@ export function registerClickRoutes(app: FastifyInstance, ctx: AdminContext): vo
         }
       },
     )
+  })
+
+  /**
+   * The log as a file.
+   *
+   * A year of clicks is a file this process must never hold, so the rows are
+   * read from the store a block at a time and written out a row at a time. The
+   * response therefore has no `content-length`: a body with one is a body
+   * somebody buffered.
+   *
+   * **Its own gate, taken by hand.** The handler returns as soon as the stream
+   * is handed to Fastify, while the body is still being written, so a slot
+   * released in a `finally` around this handler — which is what `withSlot` does
+   * — would be given back at the beginning of the export rather than at the end
+   * and would bound nothing. It is given back in the generator's own `finally`,
+   * which runs whether the stream ended, failed, or the client hung up. The gate
+   * is the export's own and not the report gate, so that a download an operator
+   * started does not lock their dashboard out.
+   *
+   * **What bounds the slot.** `max_execution_time` on both statements, and
+   * nothing else: Fastify's `requestTimeout` does not bound a handler — a
+   * three-second handler was measured answering after 3,029 ms under a
+   * one-second setting — and the handler has returned before most of this work
+   * happens anyway. The slot is held for the probe plus the export, so it is
+   * held for the sum of the two bounds; a client that reads slowly holds it
+   * until the store ends the query, which is why the ceiling on how many run at
+   * once is one.
+   *
+   * **Why a probe query.** An export cut at the cap says so in a header, and a
+   * header has to be decided before the first byte of the body. A trailer would
+   * be the obvious answer and is not one: `curl` does not show trailers and most
+   * clients drop them. So one query asks whether there is a row past the cap,
+   * which stops as soon as it has found cap + 1 rows and therefore costs no more
+   * than the export it precedes.
+   */
+  app.get('/api/clicks.csv', async (req, reply) => {
+    requireCredential(req)
+    const q = readQuery(ExportQuery, req.query)
+    const w = parseWindow(q, { alignMs: null })
+    const ch = requireCh(ctx, req)
+    const cap = ctx.exportRowCap
+
+    // Every refusal above this line is answered before a slot is taken and
+    // before a byte of a file exists: a bad field, a window the store cannot
+    // hold and a missing credential are all JSON, with no `content-disposition`
+    // on them.
+    if (!ctx.exportGate.tryEnter()) {
+      // `return fail(…)`, never a bare call: `fail` is a const arrow, so
+      // TypeScript does not treat a bare call as ending the path.
+      return fail(429, 'too_many_exports', 'an export is already running; try again', {
+        'retry-after': '1',
+      })
+    }
+    let started = false
+    try {
+      const { where, params } = clickFilter(q, w, null)
+      const [probe] = await chRows<{ n: string }>({
+        ch,
+        req,
+        query: `SELECT count() AS n FROM (SELECT 1 FROM clicks FINAL WHERE ${where} LIMIT ${cap + 1})`,
+        params,
+      })
+      const truncated = Number(probe?.n ?? 0) > cap
+
+      // Not through `chRows`, which waits for every row and hands back an
+      // array. This one is read a block at a time below, and carries the same
+      // server-side bound.
+      const rows = await ch.query({
+        query: `SELECT ${CLICK_COLUMNS} FROM clicks FINAL WHERE ${where}
+                 ORDER BY time DESC, click_id DESC LIMIT ${cap}`,
+        query_params: params,
+        format: 'JSONEachRow',
+        clickhouse_settings: { max_execution_time: CH_MAX_EXECUTION_SECONDS },
+      })
+
+      async function* body(): AsyncGenerator<string> {
+        try {
+          yield csvLine([...CSV_FIELDS])
+          for await (const block of rows.stream<ClickRow>()) {
+            for (const row of block) {
+              // The same mapper the page of JSON uses, so the file carries the
+              // network and never the address it was truncated from.
+              const click = asClick(row.json())
+              yield csvLine(CSV_FIELDS.map((f) => click[f]))
+            }
+          }
+        } catch (err) {
+          // The status and the headers are long gone. Ending the connection
+          // without a well-formed last line is the only honest thing left: a
+          // 200 that ends in a complete-looking file with half the rows missing
+          // is exactly what this endpoint exists not to do.
+          req.log.error({ err }, 'clickhouse failed while an export was streaming')
+          throw err
+        } finally {
+          ctx.exportGate.leave()
+        }
+      }
+
+      reply.header('content-type', 'text/csv; charset=utf-8')
+      reply.header(
+        'content-disposition',
+        `attachment; filename="clicks-${stamp(w.fromMs)}-${stamp(w.toMs)}.csv"`,
+      )
+      reply.header('x-clickmonk-row-cap', String(cap))
+      // Before the body, which is the whole reason for the probe above.
+      reply.header('x-clickmonk-truncated', truncated ? 'true' : 'false')
+      started = true
+      return reply.send(Readable.from(body()))
+    } finally {
+      // Only when the generator never took ownership of the slot — the probe
+      // failed, say. Once the stream is handed over, its own `finally` is what
+      // gives it back.
+      if (!started) ctx.exportGate.leave()
+    }
   })
 }

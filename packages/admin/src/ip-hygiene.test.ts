@@ -38,6 +38,7 @@ const WINDOW = 'from=2026-09-24T00:00:00.000Z&to=2026-09-25T00:00:00.000Z'
 // its own. A read added later belongs here.
 const READS = [
   `/api/clicks?${WINDOW}`,
+  `/api/clicks.csv?${WINDOW}`,
   `/api/reports/summary?${WINDOW}`,
   `/api/reports/timeseries?${WINDOW}&bucket=hour`,
   `/api/reports/breakdown?${WINDOW}&dimension=country`,
@@ -148,7 +149,7 @@ describe('no response carries a whole address', () => {
     expect(r.body).not.toContain(V6_ADDRESS)
   })
 
-  it('shows the network instead, in both families', async () => {
+  it('shows the network instead, in both families, in the log and the export', async () => {
     const log = await app.inject({
       method: 'GET',
       url: `/api/clicks?${WINDOW}`,
@@ -156,6 +157,15 @@ describe('no response carries a whole address', () => {
     })
     expect(log.body).toContain('198.51.100.0/24')
     expect(log.body).toContain('2001:db8:1234:5678::/64')
+    // The file too, and quoted as a cell: the export maps its rows through the
+    // same truncation rather than writing the column it selected.
+    const csv = await app.inject({
+      method: 'GET',
+      url: `/api/clicks.csv?${WINDOW}`,
+      headers: read(cookie),
+    })
+    expect(csv.body).toContain('"198.51.100.0/24"')
+    expect(csv.body).toContain('"2001:db8:1234:5678::/64"')
   })
 
   it('has no field called ip anywhere in the log', async () => {

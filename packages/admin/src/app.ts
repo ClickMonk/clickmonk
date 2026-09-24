@@ -8,7 +8,7 @@ import Fastify, {
   type FastifyServerOptions,
 } from 'fastify'
 import { type Credential, authenticate, checkCsrf, hasBearer } from './auth.js'
-import { registerClickRoutes } from './clicks.js'
+import { EXPORT_ROW_CAP, registerClickRoutes } from './clicks.js'
 import { registerDomainRoutes } from './domains.js'
 import { HttpError, MAX_BODY_BYTES, securityHeaders } from './http.js'
 import { registerKeyRoutes } from './keys.js'
@@ -36,10 +36,10 @@ export const DNS_CHECKS_IN_FLIGHT = 2
  * Past these the answer is a refusal with `retry-after`, never a queued query,
  * for the same reason the on-demand DNS check refuses rather than queues.
  *
- * The export gate is declared here and nothing takes it yet: the endpoint it
- * bounds does not exist. It is separate from the report gate, and smaller,
- * because an export holds a ClickHouse result open for as long as its client
- * takes to read it, which is not a bound this process can set.
+ * The export gate is separate from the report gate, and smaller, because an
+ * export holds a ClickHouse result open for as long as its client takes to read
+ * it, which is not a bound this process can set. Separate so that a download an
+ * operator started does not lock their own dashboard out.
  */
 export const REPORT_QUERIES_IN_FLIGHT = 2
 export const EXPORTS_IN_FLIGHT = 1
@@ -90,6 +90,12 @@ export interface AdminDeps {
   reportGate?: ConcurrencyGate
   exportGate?: ConcurrencyGate
   /**
+   * Rows one export writes at most. Injectable only so that a test can reach
+   * the cap with three rows instead of a million; nothing in the product sets
+   * it.
+   */
+  exportRowCap?: number
+  /**
    * Where a link with no slug of its own gets one. `newSlug` unless a caller
    * says otherwise, and nothing in the product says otherwise: it is here so
    * that a test can hand out a slug that is already taken, which is the only
@@ -113,6 +119,7 @@ export interface AdminContext extends AdminDeps {
   checkGate: ConcurrencyGate
   reportGate: ConcurrencyGate
   exportGate: ConcurrencyGate
+  exportRowCap: number
   slugSource: () => string
 }
 
@@ -160,6 +167,7 @@ export function buildAdminApp(
     checkGate: deps.checkGate ?? new ConcurrencyGate(DNS_CHECKS_IN_FLIGHT),
     reportGate: deps.reportGate ?? new ConcurrencyGate(REPORT_QUERIES_IN_FLIGHT),
     exportGate: deps.exportGate ?? new ConcurrencyGate(EXPORTS_IN_FLIGHT),
+    exportRowCap: deps.exportRowCap ?? EXPORT_ROW_CAP,
     slugSource: deps.slugSource ?? newSlug,
   }
 
