@@ -325,11 +325,15 @@ For a script, mint an API key and send it as `Authorization: Bearer …`:
 docker compose exec -T worker node packages/cli/dist/index.js apikey create reporting
 ```
 
-A key can read and write domains, links and settings, and nothing else. Every route that
-touches a credential wants a session instead: listing or ending sessions, changing the
-password, anything to do with two-factor authentication, and minting or revoking a key. So
-a key that leaks cannot lock you out of your own install, and cannot make itself a second
-key.
+A key can read and write domains, links and settings, and it can read the account's
+identity at `GET /api/me`: the email address, whether two-factor authentication is on, and
+how many recovery codes are unspent. It can change no credential at all. Every route that
+touches one wants a session instead: listing or ending sessions, changing the password,
+anything to do with two-factor authentication, and minting or revoking a key. So a key
+that leaks cannot lock you out of your own install, and cannot make itself a second key.
+`GET /api/me` also reports the failed sign-in count and any standing lockout, and those two
+it reports only to a session: they say whether someone is attacking the account right now,
+which is not a key's business.
 
 **What the API cannot do, on purpose:** it cannot mark a domain verified. Only a DNS check
 that finds this install's token, or `clickmonk domain add --verified` typed on the server,
@@ -379,11 +383,14 @@ visitor is sent to is whatever you set, and anyone who already has that URL reac
 without answering anything. A visitor who has answered holds a proof cookie for that link
 until it expires or you change the password, and nothing stops them passing the cookie, or
 the password, to someone else. It also does not replace the other checks, and does not
-stand in front of them: a link blocked by its traffic class answers 403, and one that has
-expired or used up its click cap goes to its backup URL or answers 410, all without the
-password being asked for at all. A country rule is applied after it, so answering the
-password does not get a visitor past one. Use it to keep a link out of casual
-hands, not to protect something that matters if it gets out.
+stand in front of all of them: a link blocked by its traffic class answers 403, and one
+that has expired goes to its backup URL or answers 410, both without the password being
+asked for at all. The click cap and a country rule are the other way round — both are
+decided after the password, so a protected link whose cap is used up still answers the
+password page, and answering it correctly gets the visitor no further than the 410 or the
+backup URL. That ordering is deliberate: the page a protected link shows says nothing
+about the link's state, and posting a guess at one must not say anything either. Use it to
+keep a link out of casual hands, not to protect something that matters if it gets out.
 
 ## IP data
 

@@ -10,9 +10,14 @@ import { fail, parseCookies } from './http.js'
  * signed in with the password and, when it is enrolled, a one-time code: it
  * can do everything, including changing the password and minting API keys. An
  * **API key** is a string in a script: it can read and write domains, links
- * and settings, and it can do nothing to the credentials themselves. A stolen
- * key is therefore a key that cannot lock the admin out, cannot mint a second
- * key, and cannot become a login.
+ * and settings, it can read the account's identity — the email address,
+ * whether a second factor is enrolled, and how many recovery codes are unspent
+ * — and it can *change* nothing about any credential. A stolen key is
+ * therefore a key that cannot lock the admin out, cannot mint a second key,
+ * and cannot become a login. The failed-sign-in count and any standing lockout
+ * are the two things `GET /api/me` withholds from a key, because they are a
+ * running commentary on someone else's attempts rather than the account's own
+ * shape.
  *
  * Neither is ever taken from a request field. There is one admin account, so
  * "the tenant comes from the credential" reads here as: no endpoint accepts an

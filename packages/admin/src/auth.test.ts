@@ -440,6 +440,15 @@ describe('an API key', () => {
     })
     expect(me.statusCode).toBe(200)
     expect(me.json().credential).toBe('key')
+    // Exactly what a key reads of the account, because the documented sentence
+    // is a claim about this: the address, whether a second factor is on, and how
+    // many recovery codes are unspent.
+    expect(Object.keys(me.json()).sort()).toEqual([
+      'credential',
+      'email',
+      'recoveryCodesLeft',
+      'totpEnabled',
+    ])
   })
 
   // What a key may read there stops short of the account's sign-in history.
