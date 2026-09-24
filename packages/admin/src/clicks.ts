@@ -283,6 +283,29 @@ export const EXPORT_ROW_CAP = 1_000_000
 export const MAX_EXPORT_ROW_CAP = 10_000_000
 
 /**
+ * How long one export may hold the only export slot while writing its body.
+ *
+ * **What it is for.** Nothing else bounds the body. `max_execution_time` bounds a
+ * query that is executing; a query blocked writing into a socket nobody drains is
+ * not executing, so neither it nor the client's request timeout ends it, and
+ * Fastify's `connectionTimeout` is 0 by default. Measured before this existed: a
+ * credentialed client that took the headers and then stopped reading held the slot
+ * for eighty seconds and was still holding it — every later export answered 429 —
+ * until its socket was destroyed. One leaked key and one request, and the operator
+ * cannot download their own log, with nothing in the log to say why.
+ *
+ * **What it costs.** It is a deadline on the whole body, not an idle timer, so an
+ * honest slow reader on a poor connection loses a large export: the default cap is
+ * a million rows, which is a few hundred megabytes, and ten minutes of it is
+ * roughly what a five-megabit link delivers. That reader gets a file of whole lines
+ * that stops early inside a chunked body with no terminating chunk — the same thing
+ * a store failure mid-stream gives them, and visible as a failed transfer rather
+ * than a short file that looks complete. They can ask for a narrower window, or the
+ * install can raise this. An unbounded hold has no such remedy, which is the trade.
+ */
+export const EXPORT_BODY_DEADLINE_MS = 600_000
+
+/**
  * The cap, checked against the range it is bound into and not only its type.
  *
  * It reaches the query text as a `LIMIT`, and the probe's as `LIMIT cap + 1`, so
@@ -422,14 +445,18 @@ export function registerClickRoutes(app: FastifyInstance, ctx: AdminContext): vo
    * report gate, so that a download an operator started does not lock their
    * dashboard out.
    *
-   * **What bounds the slot.** `max_execution_time` on both statements, and
-   * nothing else: Fastify's `requestTimeout` does not bound a handler — a
-   * three-second handler was measured answering after 3,029 ms under a
-   * one-second setting — and the handler has returned before most of this work
-   * happens anyway. The slot is held for the probe plus the export, so it is
-   * held for the sum of the two bounds; a client that reads slowly holds it
-   * until the store ends the query, which is why the ceiling on how many run at
-   * once is one.
+   * **What bounds the slot.** Two different things, because the slot is held
+   * across two phases that fail differently. The probe is bounded by
+   * `max_execution_time` and, outside it, by the client's own request timeout:
+   * that one is a query this process is waiting for. The body is bounded by
+   * `EXPORT_BODY_DEADLINE_MS`, a timer armed when the stream is handed over,
+   * because **nothing else bounds it at all** — a query blocked writing into a
+   * socket nobody drains is not executing, so no server-side execution bound
+   * applies to it, and Fastify's `requestTimeout` does not bound a handler
+   * either: a three-second handler was measured answering after 3,029 ms under a
+   * one-second setting, and this handler has returned before most of the work
+   * happens anyway. So the slot is held for the probe's bound plus this
+   * deadline, and never for as long as a caller cares to keep a socket open.
    *
    * **Why a probe query.** An export cut at the cap says so in a header, and a
    * header has to be decided before the first byte of the body. A trailer would
@@ -464,6 +491,8 @@ export function registerClickRoutes(app: FastifyInstance, ctx: AdminContext): vo
      * type, which nothing else in this service names.
      */
     let result: { close: () => void } | null = null
+    /** The body's deadline, once there is a body. Cleared by `release`. */
+    let deadline: NodeJS.Timeout | null = null
 
     /**
      * Gives the slot back, once, from whichever path reaches it first.
@@ -486,6 +515,10 @@ export function registerClickRoutes(app: FastifyInstance, ctx: AdminContext): vo
     const release = (): void => {
       if (released) return
       released = true
+      // Before the slot goes back, and on every path: a timer left armed after
+      // an export finished would fire against a stream that is already gone, and
+      // would keep this process awake for the rest of the deadline.
+      if (deadline !== null) clearTimeout(deadline)
       result?.close()
       ctx.exportGate.leave()
     }
@@ -574,6 +607,22 @@ export function registerClickRoutes(app: FastifyInstance, ctx: AdminContext): vo
       // `error` is a stream that failed, which on a hangup can arrive first.
       file.on('close', release)
       file.on('error', release)
+      // The body's deadline, armed here because here is where the unbounded wait
+      // begins. Destroying the stream is what ends it: that is the same path a
+      // caller hanging up takes, so `close` fires and `release` gives the slot
+      // back through the one function every path already goes through.
+      //
+      // The line is the only record that an export was cut off — the 200 and every
+      // header went out before the first row, so there is no status left to change
+      // — and it names the caller's behaviour rather than a fault here, because
+      // that is what it is.
+      deadline = setTimeout(() => {
+        req.log.warn(
+          { deadlineMs: ctx.exportDeadlineMs },
+          'an export was cut off: the caller stopped reading its body',
+        )
+        file.destroy()
+      }, ctx.exportDeadlineMs)
       started = true
       return reply.send(file)
     } finally {

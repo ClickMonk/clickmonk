@@ -1668,3 +1668,146 @@ describe('GET /api/clicks.csv, a caller reading while the store produces', () =>
     }
   })
 })
+
+/**
+ * A caller that takes the headers and then stops reading.
+ *
+ * This is the one hold in the service that nothing else bounds. A ClickHouse
+ * query blocked writing into a socket nobody drains is not *executing*, so
+ * `max_execution_time` never fires on it, the client's request timeout never
+ * fires either, and Fastify's `connectionTimeout` is 0. Measured before the
+ * deadline existed: the slot was still held after eighty seconds, and every
+ * later export answered 429 until the stalled socket was destroyed. One leaked
+ * key, one request.
+ *
+ * A real socket and a store with more rows than the buffers between here and the
+ * kernel can hold: with the three-row fixture the whole file fits in one write
+ * and finishes whether the caller reads it or not, which would make the case
+ * vacuous.
+ */
+describe('GET /api/clicks.csv, a caller that stops reading', () => {
+  const settle = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+  /**
+   * A body of tens of megabytes, as a few rows carrying a long cell rather than
+   * very many short ones.
+   *
+   * The size is what the case needs: measured, the buffers between the generator
+   * and a paused reader — the stream's, Node's socket, and the kernel's windows on
+   * loopback — swallowed two megabytes whole, so a body that size finished on its
+   * own and proved nothing. The shape is what keeps it quick: a hundred thousand
+   * one-row blocks through an object-mode stream took longer than the bytes did.
+   */
+  const ROWS = 4000
+  const LONG_CELL = 'u'.repeat(8000)
+  /** The deadline this app is built with, short enough to wait out in a test. */
+  const DEADLINE_MS = 500
+
+  /** A store that hands over `ROWS` rows, one block each, as fast as it is asked. */
+  const bigCh = (): ClickHouseClient => {
+    async function* blocks(): AsyncGenerator<{ json: () => ClickRow }[]> {
+      for (let i = 0; i < ROWS; i++) {
+        const row = {
+          ...click(),
+          click_id: `01920000-0000-7000-8000-${String(i).padStart(12, '0')}`,
+          at_ms: '1758708000000',
+          user_agent: LONG_CELL,
+        } as unknown as ClickRow
+        yield [{ json: () => row }]
+      }
+    }
+    return {
+      query: async ({ query }: { query: string }) =>
+        query.includes('count()')
+          ? { json: async () => [{ n: String(ROWS) }] }
+          : { close: () => {}, stream: () => Readable.from(blocks(), { objectMode: true }) },
+    } as unknown as ClickHouseClient
+  }
+
+  it('cuts the body off at the deadline, gives the slot back, and says so once', async () => {
+    const gate = new CountingGate(1)
+    const logged: string[] = []
+    const served = testApp(pool, clock, {
+      ch: bigCh(),
+      exportGate: gate,
+      exportDeadlineMs: DEADLINE_MS,
+      log: {
+        level: 'warn',
+        stream: {
+          write(line: string) {
+            logged.push(line)
+          },
+        },
+      },
+    })
+    try {
+      await served.listen({ host: '127.0.0.1', port: 0 })
+      const at = served.server.address()
+      const port = typeof at === 'object' && at !== null ? at.port : 0
+      let status = 0
+      const req = httpRequest(
+        {
+          host: '127.0.0.1',
+          port,
+          path: `/api/clicks.csv?${WINDOW}`,
+          headers: { host: ADMIN_HOST, cookie },
+        },
+        (res) => {
+          status = res.statusCode ?? 0
+          // The whole arrangement: the headers are taken and the body is never
+          // read. Nothing is resumed and nothing is destroyed.
+          res.pause()
+        },
+      )
+      // The server destroying the stream ends this request, which is not a
+      // failure of anything here.
+      req.on('error', () => {})
+      req.end()
+      // Waited for the headers rather than for the slot: the slot is taken before
+      // the status line goes out, so a loop on the gate alone would reach the
+      // assertion below before the caller had been answered at all.
+      for (let waited = 0; waited < 5000 && status === 0; waited += 5) await settle(5)
+      // The premise: the export took the slot and answered 200, so what follows
+      // is about a body in flight rather than about a refusal.
+      expect(status, 'the export was never answered').toBe(200)
+      expect(gate.entered).toBe(1)
+
+      // A fixed wait several times the deadline, not a poll: a loop that waited
+      // for the gate to empty would pass whatever the release took, including
+      // never — which is precisely the behaviour being fixed. Eighty seconds was
+      // measured and was not the end of it.
+      await settle(DEADLINE_MS * 6)
+      expect(gate.stats().inFlight, 'the slot was still held past the deadline').toBe(0)
+      // And the line, which is the only record an operator has: the 200 and every
+      // header went out before the first row, so nothing about the answer can say
+      // the file is short.
+      expect(logged.filter((l) => l.includes('the caller stopped reading its body'))).toHaveLength(
+        1,
+      )
+
+      // The consequence, end to end: with one export slot, a slot still held
+      // answers every later export 429 for the life of the process. Over a socket
+      // and drained, because this store's file is tens of megabytes and `inject`
+      // would hold all of it as one string.
+      const second = await new Promise<number>((resolve, reject) => {
+        const other = httpRequest(
+          {
+            host: '127.0.0.1',
+            port,
+            path: `/api/clicks.csv?${WINDOW}`,
+            headers: { host: ADMIN_HOST, cookie },
+          },
+          (res) => {
+            res.on('data', () => {})
+            res.on('end', () => resolve(res.statusCode ?? 0))
+          },
+        )
+        other.on('error', reject)
+        other.end()
+      })
+      expect(second).toBe(200)
+    } finally {
+      await served.close()
+    }
+  })
+})

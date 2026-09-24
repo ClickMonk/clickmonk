@@ -522,7 +522,12 @@ over none of them.
 
 **A slow reader holds the export's slot**, because the slot is given back when the last row
 has been written rather than when the request was accepted. A second export started while
-one is still being read is refused.
+one is still being read is refused. **That hold ends after ten minutes**, whether the caller
+has finished or not: a client that takes the headers and then stops reading would otherwise
+hold the only slot for as long as it kept the socket open, and nothing else would end it.
+The cost falls on an honest slow reader — a very large file over a slow link is cut off the
+same way a store failure cuts one off, mid-body, which the client sees as a failed transfer.
+Ask for a narrower window.
 
 **A store failure after the first byte is a short file and nothing else.** The 200 and every
 header have already gone, so there is no status left to change and nothing honest to append:

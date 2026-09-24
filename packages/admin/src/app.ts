@@ -8,7 +8,12 @@ import Fastify, {
   type FastifyServerOptions,
 } from 'fastify'
 import { type Credential, authenticate, checkCsrf, hasBearer } from './auth.js'
-import { EXPORT_ROW_CAP, checkExportRowCap, registerClickRoutes } from './clicks.js'
+import {
+  EXPORT_BODY_DEADLINE_MS,
+  EXPORT_ROW_CAP,
+  checkExportRowCap,
+  registerClickRoutes,
+} from './clicks.js'
 import { registerDomainRoutes } from './domains.js'
 import { HttpError, MAX_BODY_BYTES, securityHeaders } from './http.js'
 import { registerKeyRoutes } from './keys.js'
@@ -37,8 +42,9 @@ export const DNS_CHECKS_IN_FLIGHT = 2
  * for the same reason the on-demand DNS check refuses rather than queues.
  *
  * The export gate is separate from the report gate, and smaller, because an
- * export holds a ClickHouse result open for as long as its client takes to read
- * it, which is not a bound this process can set. Separate so that a download an
+ * export holds a ClickHouse result open while its client reads it — for as long
+ * as `EXPORT_BODY_DEADLINE_MS`, which is the bound this process sets on it, and
+ * far longer than a report's own query bound. Separate so that a download an
  * operator started does not lock their own dashboard out.
  */
 export const REPORT_QUERIES_IN_FLIGHT = 2
@@ -97,6 +103,12 @@ export interface AdminDeps {
    */
   exportRowCap?: number
   /**
+   * How long one export may hold the export slot while writing its body.
+   * Injectable so a test can reach the deadline in milliseconds instead of ten
+   * minutes — `EXPORT_BODY_DEADLINE_MS` says what it is for and what it costs.
+   */
+  exportDeadlineMs?: number
+  /**
    * Where a link with no slug of its own gets one. `newSlug` unless a caller
    * says otherwise, and nothing in the product says otherwise: it is here so
    * that a test can hand out a slug that is already taken, which is the only
@@ -121,6 +133,7 @@ export interface AdminContext extends AdminDeps {
   reportGate: ConcurrencyGate
   exportGate: ConcurrencyGate
   exportRowCap: number
+  exportDeadlineMs: number
   slugSource: () => string
 }
 
@@ -172,6 +185,7 @@ export function buildAdminApp(
     // how this service was built, so it belongs at boot with the name of the
     // thing that is wrong, not in the 503 every export would answer with.
     exportRowCap: checkExportRowCap(deps.exportRowCap ?? EXPORT_ROW_CAP),
+    exportDeadlineMs: deps.exportDeadlineMs ?? EXPORT_BODY_DEADLINE_MS,
     slugSource: deps.slugSource ?? newSlug,
   }
 
