@@ -4,6 +4,13 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { partitionEndMs, runRetention, startRetention } from './retention.js'
 
 const pool: Pool = testPg()
+/**
+ * A second pool, for the two tests that have to ask a question from outside
+ * the connection the pass is using — which is what an operator's own
+ * `settings set` is. Asking through `pool` risks asking on the pass's own
+ * client, and a connection cannot notice that it is itself the problem.
+ */
+const operators: Pool = testPg()
 const ch: ClickHouseClient = testCh()
 
 /**
@@ -120,6 +127,7 @@ beforeEach(async () => {
 
 afterAll(async () => {
   await pool.end()
+  await operators.end()
   await ch.close()
 })
 
@@ -288,13 +296,13 @@ describe('runRetention', () => {
   // started.
   it('cannot enforce a period an operator changed while the pass was waiting for the row', async () => {
     const blocked = async (): Promise<boolean> => {
-      const r = await pool.query<{ n: string }>(
+      const r = await operators.query<{ n: string }>(
         `SELECT count(*) AS n FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
           WHERE NOT l.granted AND a.datname = current_database()`,
       )
       return Number(r.rows[0]?.n ?? 0) > 0
     }
-    const operator = await pool.connect()
+    const operator = await operators.connect()
     try {
       await operator.query('BEGIN')
       await operator.query('SELECT raw_retention_days FROM settings FOR UPDATE')
@@ -330,13 +338,6 @@ describe('runRetention', () => {
   // coming back — one failed pass, and the install cannot change its settings
   // until the worker restarts.
   it('holds no lock after a pass that threw', async () => {
-    const idleInTransaction = async (): Promise<number> => {
-      const r = await pool.query<{ n: string }>(
-        `SELECT count(*) AS n FROM pg_stat_activity
-          WHERE datname = current_database() AND state LIKE 'idle in transaction%'`,
-      )
-      return Number(r.rows[0]?.n ?? 0)
-    }
     await expect(
       runRetention({
         pg: pool,
@@ -347,14 +348,24 @@ describe('runRetention', () => {
         },
       }),
     ).rejects.toThrow('the partition list is unreadable')
-    // Bounded rather than immediate: a backend's reported state settles a
-    // moment after the statement that changed it.
-    let open = await idleInTransaction()
-    for (let i = 0; i < 40 && open > 0; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 25))
-      open = await idleInTransaction()
+    // From `operators`, never from `pool`: the pool hands the most recently
+    // released client back first, so a question asked through it would be asked
+    // *inside* the very transaction this is checking is over — and answered
+    // yes. A separate pool is a separate backend, which is what an operator
+    // running `settings set` is. This first cost the check its whole point: the
+    // same assertion through `pool` passed with the rollback taken out.
+    const operator = await operators.connect()
+    try {
+      await operator.query('BEGIN')
+      // Bounded, so a lock nobody will release fails this test rather than
+      // hanging it until the suite's own timeout.
+      await operator.query("SET LOCAL lock_timeout = '5s'")
+      await operator.query('SELECT 1 FROM settings FOR UPDATE')
+      await operator.query('COMMIT')
+    } finally {
+      await operator.query('ROLLBACK').catch(() => {})
+      operator.release()
     }
-    expect(open, 'a connection went back to the pool inside a transaction').toBe(0)
   })
 
   it('considers at most as many partitions as it is given, oldest first', async () => {
