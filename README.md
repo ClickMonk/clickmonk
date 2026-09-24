@@ -400,7 +400,29 @@ bad-asn-list's licence:
 
 ## Upgrading
 
-Four things change for an install that was running before TLS was added.
+Two things change when you pull this release, and four more if you are coming from before
+TLS was added.
+
+**`docker compose up -d --build` adds one container.** The `admin` service starts beside
+the others, and Caddy is recreated because it reads the new setting too. **There is
+nothing to run by hand:** the worker applies the schema change when it starts, as it does
+for every release, and `up -d --wait` waits for the new container, which becomes healthy
+whether or not you have configured it. Nothing else about the stack moves — Caddy still
+binds 80 and 443 and is still the only service with a published port. Clicks are written
+at record version 3 from here on, which the last paragraph of this section covers.
+
+**The admin API is off until you name a host for it, and your existing `.env` names
+none.** `CLICKMONK_ADMIN_HOST` is optional and defaults to empty, so an `.env` written by
+an earlier `install.sh` needs no edit, Compose warns about nothing, and the upgraded
+install behaves exactly as it did: every name goes to the redirect, and the admin
+container answers 503 to everything but its own healthcheck. Naming a host is what turns
+it on, and that has one consequence to decide before you do it rather than after: the
+first HTTPS request for that name makes Caddy ask a certificate authority for a
+certificate in it. ["The admin API"](#the-admin-api) above is how to set it up, and
+[Password-protected links](#password-protected-links) is the other half of what this
+release adds.
+
+The four below are for an install that was running before TLS was added.
 
 **Ports 80 and 443 on the host have to be free, and the redirect publishes nothing.**
 Caddy binds both, so the stack does not start while something else holds either one —
