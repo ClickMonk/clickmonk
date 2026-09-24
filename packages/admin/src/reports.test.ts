@@ -286,12 +286,30 @@ describe('when ClickHouse is not there', () => {
     expect(r.statusCode).toBe(200)
   })
 
-  it('answers a report 503 when there is no client at all', async () => {
-    const none = testApp(pool, clock)
+  // The answer is the same 503 as an unreachable store, so the status alone
+  // pins nothing: with no guard at all the query is attempted on nothing, the
+  // TypeError is caught where a ClickHouse failure is caught, and the caller
+  // sees the same body. The log is the difference, and it is the difference an
+  // operator reads — so the log is what this asserts.
+  it('answers a report 503 when there is no client at all, and says which it was', async () => {
+    const lines: string[] = []
+    const none = testApp(pool, clock, {
+      log: {
+        level: 'error',
+        stream: {
+          write(line: string) {
+            lines.push(line)
+          },
+        },
+      },
+    })
     try {
       const r = await summary(none)
       expect(r.statusCode).toBe(503)
       expect(r.json().error).toBe('reporting_unavailable')
+      expect(lines.filter((l) => l.includes('has no clickhouse client')).length).toBe(1)
+      // And nothing was asked of a store that is not there.
+      expect(lines.filter((l) => l.includes('clickhouse query failed'))).toEqual([])
     } finally {
       await none.close()
     }
