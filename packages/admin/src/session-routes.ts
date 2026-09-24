@@ -386,7 +386,10 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: AdminContext): 
     // Removing the second factor needs the second factor, for the same reason
     // replacing it does: without this, disable-then-enrol is the bypass.
     await confirmSecondFactor(ctx, body)
-    await disableTotp(ctx.pg, ctx.now())
+    // The counters are left alone: this caller has just shown both factors, so
+    // there is no lockout to lift that this request has not already passed, and
+    // a route is not the place to decide an operator is locked out.
+    await disableTotp(ctx.pg, ctx.now(), { clearLockout: false })
     return { ok: true }
   })
 

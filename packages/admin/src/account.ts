@@ -609,14 +609,36 @@ export async function enrolTotp(
   }
 }
 
-/** Turns it off, and deletes the recovery codes with it. */
-export async function disableTotp(pg: Pool, now: Date): Promise<void> {
+/**
+ * Turns it off, and deletes the recovery codes with it.
+ *
+ * `clearLockout` is required, and it decides whether the failure count, its
+ * clock and any standing lockout go too. A caller has to say, because the two
+ * callers are answering different questions and neither answer is a default.
+ * The route that removes the factor has just been shown the factor, so it
+ * changes nothing about the counters; the command that removes it from the
+ * server is a way back in for an operator who has lost the factor, and the
+ * failures that earned any standing lockout were guesses at the very thing
+ * being removed — leaving that lock over a factor that no longer exists would
+ * hold the only account out for nothing, which is the same argument
+ * `setAccountPassword` makes one credential along.
+ */
+export async function disableTotp(
+  pg: Pool,
+  now: Date,
+  o: { clearLockout: boolean },
+): Promise<void> {
   const client = await pg.connect()
   try {
     await client.query('BEGIN')
     await client.query(
       `UPDATE admin_account SET totp_secret = NULL, totp_last_step = 0, updated_at = $1,
-                                totp_pending_secret = NULL, totp_pending_at = NULL`,
+                                totp_pending_secret = NULL, totp_pending_at = NULL${
+                                  o.clearLockout
+                                    ? `,
+                                failed_logins = 0, last_failed_at = NULL, locked_until = NULL`
+                                    : ''
+                                }`,
       [now],
     )
     await client.query('DELETE FROM admin_recovery_codes')

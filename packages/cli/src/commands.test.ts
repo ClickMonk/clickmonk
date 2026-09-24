@@ -2,6 +2,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gzipSync } from 'node:zlib'
+import { signIn } from '@clickmonk/admin/account'
 import { MAX_KEYS_LISTED, MAX_KEY_DAYS, MAX_KEY_NAME_LENGTH } from '@clickmonk/admin/keys'
 import {
   ADMIN_SCRYPT,
@@ -868,6 +869,86 @@ describe('the admin account and API keys from the CLI', () => {
     expect(await withPassword('', 'apikey', 'create', 'reporting')).toBe(0)
   })
 
+  // Lose the authenticator app and all ten recovery codes and there is no way
+  // back over the network: removing the factor through the API requires the
+  // factor, because disable-then-enrol would otherwise be the bypass. This
+  // command is the way back, and it runs where only whoever can already open a
+  // shell in the container can run it.
+  it('is the way back in when the authenticator and every recovery code are gone', async () => {
+    await withPassword('a decent admin password', 'admin', 'create', 'admin@example.com')
+    await pg.query(
+      `UPDATE admin_account SET totp_secret = $1, totp_last_step = 99,
+                                failed_logins = 7, last_failed_at = $2, locked_until = $3`,
+      ['A'.repeat(32), NOW, new Date(NOW.getTime() + 3_600_000)],
+    )
+    for (const code of ['one-unused-code', 'another-unused-code']) {
+      await pg.query('INSERT INTO admin_recovery_codes (code_hash, created_at) VALUES ($1, $2)', [
+        await hashPassword(code, LINK_SCRYPT),
+        NOW,
+      ])
+    }
+    await pg.query(
+      "INSERT INTO sessions (token_hash, expires_at) VALUES ($1, now() + interval '1 day')",
+      ['b'.repeat(64)],
+    )
+    const credentials = { email: 'admin@example.com', password: 'a decent admin password' }
+    // Before: the password alone gets nowhere, and the lockout the lost codes
+    // earned is standing.
+    expect(await signIn(pg, credentials, NOW)).toEqual({
+      ok: false,
+      reason: 'locked',
+      retryAfterSeconds: 3600,
+    })
+
+    lines.length = 0
+    // Reset after the setup above, which created the account and did read one.
+    stdin.reads = 0
+    expect(await withPassword('', 'admin', 'totp', 'disable')).toBe(0)
+    // It asks for no password: there is nothing here to authenticate, and a
+    // command that demanded one would be asking an operator who is locked out
+    // for the one credential they still have.
+    expect(stdin.reads).toBe(0)
+
+    // Read before the sign-in below, so that what cleared these is this command
+    // and not the successful sign-in that follows it.
+    const after = await pg.query<{ totp_secret: string | null; totp_last_step: string }>(
+      'SELECT totp_secret, totp_last_step FROM admin_account',
+    )
+    expect(after.rows[0]?.totp_secret).toBeNull()
+    expect(Number(after.rows[0]?.totp_last_step)).toBe(0)
+    expect((await pg.query('SELECT 1 FROM admin_recovery_codes')).rowCount).toBe(0)
+    expect((await pg.query('SELECT 1 FROM sessions')).rowCount).toBe(0)
+
+    // After: the password alone signs in. `ok` and not `totp_required` is what
+    // says the factor is gone; `ok` and not `locked` is what says the lockout
+    // went with it.
+    expect(await signIn(pg, credentials, NOW)).toEqual({ ok: true, email: 'admin@example.com' })
+
+    // Never quiet about it: an install left on one factor with nobody aware of
+    // it is worse than the lockout this just fixed.
+    const out = lines.join('\n')
+    expect(out).toContain('two-factor authentication disabled')
+    expect(out).toContain('2 unused recovery code(s) deleted')
+    expect(out).toContain('1 session(s) signed out')
+    expect(out).toContain('Enrol an authenticator app again')
+  })
+
+  it('says nothing was removed when the account was never enrolled', async () => {
+    await withPassword('a decent admin password', 'admin', 'create', 'admin@example.com')
+    lines.length = 0
+    expect(await withPassword('', 'admin', 'totp', 'disable')).toBe(0)
+    expect(lines.join('\n')).toContain('was not enabled')
+    // The reminder stands whatever it found, because the account is on one
+    // factor either way.
+    expect(lines.join('\n')).toContain('Enrol an authenticator app again')
+  })
+
+  it('refuses to disable the second factor before there is an account', async () => {
+    lines.length = 0
+    expect(await withPassword('', 'admin', 'totp', 'disable')).toBe(2)
+    expect(lines.join('\n')).toContain('run "clickmonk admin create <email>" first')
+  })
+
   it('mints an API key, shows it once, and stores only its digest', async () => {
     await anAccount()
     expect(await withPassword('', 'apikey', 'create', 'reporting', '--expires-days', '7')).toBe(0)
@@ -991,6 +1072,7 @@ describe('the admin account and API keys from the CLI', () => {
   it('names the new commands in its usage', async () => {
     expect(await run('admin')).toBe(1)
     expect(lines.join('\n')).toContain('clickmonk admin create <email>')
+    expect(lines.join('\n')).toContain('clickmonk admin totp disable')
     expect(lines.join('\n')).toContain('clickmonk apikey create <name>')
   })
 })

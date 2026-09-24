@@ -1,5 +1,12 @@
 import { parseArgs } from 'node:util'
-import { AccountExistsError, createAccount, setAccountPassword } from '@clickmonk/admin/account'
+import {
+  AccountExistsError,
+  createAccount,
+  disableTotp,
+  loadAccount,
+  setAccountPassword,
+  unusedRecoveryCodeCount,
+} from '@clickmonk/admin/account'
 import {
   MAX_KEY_DAYS,
   MAX_KEY_NAME_LENGTH,
@@ -92,6 +99,7 @@ const USAGE = `usage:
   clickmonk ipdata status
   clickmonk admin create <email>      # the password is read from standard input
   clickmonk admin passwd              # the new password is read from standard input
+  clickmonk admin totp disable        # the way back in when the authenticator is gone
   clickmonk apikey create <name> [--expires-days <n>]
   clickmonk apikey list
   clickmonk apikey revoke <id>`
@@ -505,6 +513,41 @@ async function adminPasswd(d: CliDeps): Promise<void> {
   d.out(`password changed; ${r.rowCount ?? 0} session(s) signed out`)
 }
 
+/**
+ * Removes the second factor from the server, which is the only way back in once
+ * the authenticator app and every recovery code are gone.
+ *
+ * The API cannot do this: removing the factor there requires the factor, for the
+ * good reason that disable-then-enrol would otherwise be the bypass. So the way
+ * back has to be somewhere a request cannot reach, and this is it — it runs as
+ * whoever can already open a shell in the container, which is the authority
+ * `admin create` and `admin passwd` already assume, so it adds no privilege that
+ * shell does not have. What it must not be is quiet: an install left with one
+ * factor and nobody aware of it is worse than the lockout it just fixed.
+ */
+async function adminTotpDisable(d: CliDeps): Promise<void> {
+  await requireAccount(d)
+  // Read before the write, because the write is what makes both unknowable.
+  const account = await loadAccount(d.pg)
+  const unused = await unusedRecoveryCodeCount(d.pg)
+  await disableTotp(d.pg, d.now?.() ?? new Date(), { clearLockout: true })
+  // Every session too: one minted while the factor was on was minted by
+  // something that proved a factor this account no longer has.
+  const sessions = await d.pg.query('DELETE FROM sessions')
+  d.out(
+    account?.totpSecret
+      ? 'two-factor authentication disabled'
+      : 'two-factor authentication was not enabled; nothing was removed',
+  )
+  d.out(
+    `${unused} unused recovery code(s) deleted; ${sessions.rowCount ?? 0} session(s) signed out; any lockout cleared`,
+  )
+  d.out('')
+  d.out('The password alone now signs this account in. Enrol an authenticator app again as')
+  d.out('soon as you can: until you do, that password is the only thing standing between')
+  d.out('this install and whoever learns it.')
+}
+
 async function apikeyCreate(args: string[], d: CliDeps): Promise<void> {
   const { values, positionals } = parseArgs({
     args,
@@ -758,6 +801,10 @@ export async function runCli(argv: string[], d: CliDeps): Promise<number> {
     }
     if (cmd === 'admin' && sub === 'passwd' && rest.length === 0) {
       await adminPasswd(d)
+      return 0
+    }
+    if (cmd === 'admin' && sub === 'totp' && rest.length === 1 && rest[0] === 'disable') {
+      await adminTotpDisable(d)
       return 0
     }
     if (cmd === 'apikey' && sub === 'create') {
