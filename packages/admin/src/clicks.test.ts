@@ -90,9 +90,13 @@ beforeAll(async () => {
       cap_unchecked: 1,
     }),
     // A day earlier, so outside every window above, and recorded through a
-    // proxy that spelled the address as a bracketed literal with a port. Its
-    // own window, because a fifth row inside the day would move every count and
-    // every page boundary the block above asserts.
+    // proxy that spelled the address as a bracketed literal with a port. The
+    // redirect writes a canonical bare address, so this is a claim about what
+    // the column may hold — a plain String bounded only in length, written by
+    // whatever shipped the record — rather than about what the redirect writes
+    // today, and that is exactly why it earns a test. Its own window, because a
+    // fifth row inside the day would move every count and every page boundary
+    // the block above asserts.
     click({
       click_id: '01920000-0000-7000-8000-000000000004',
       time: '2026-09-23 10:00:00.000',
@@ -180,9 +184,15 @@ describe('GET /api/clicks', () => {
   it('shows a click that was shipped twice once', async () => {
     await insert([click()])
     const rs = await ch.query({ query: 'SELECT count() AS n FROM clicks', format: 'JSONEachRow' })
-    // Four fixture rows — three in this window and the day before's — plus the
-    // copy just written.
-    expect(await rs.json()).toEqual([{ n: '5' }])
+    // Five rows: four from the fixture — three in this window and the day
+    // before's — plus the copy just written. The message is the whole point of
+    // asserting this before reading the log: four rows here means a background
+    // merge collapsed the pair between the INSERT and this count, which is a
+    // race in the fixture and not a regression in the query below.
+    expect(
+      await rs.json(),
+      'a background merge collapsed the re-shipped copy before the log was read, so this test could not see whether FINAL deduplicated anything. That is a race in the fixture, not a failure of the query. If it recurs, give this suite a ClickHouse database of its own; never SYSTEM STOP MERGES, which these shared test databases would hand to every other suite.',
+    ).toEqual([{ n: '5' }])
     const r = await app.inject({
       method: 'GET',
       url: `/api/clicks?${WINDOW}`,
