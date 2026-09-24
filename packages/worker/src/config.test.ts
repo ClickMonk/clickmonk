@@ -57,6 +57,19 @@ describe('loadConfig', () => {
     ])
   })
 
+  it('looks for clicks past their retention every hour', () => {
+    expect(loadConfig(base).retentionIntervalMs).toBe(3_600_000)
+  })
+
+  it('refuses a retention interval under a second', () => {
+    expect(() => loadConfig({ ...base, CLICKMONK_RETENTION_INTERVAL_MS: '999' })).toThrow(
+      /CLICKMONK_RETENTION_INTERVAL_MS/,
+    )
+    expect(
+      loadConfig({ ...base, CLICKMONK_RETENTION_INTERVAL_MS: '1000' }).retentionIntervalMs,
+    ).toBe(1000)
+  })
+
   it('turns the checks off, and refuses any value but on or off', () => {
     expect(loadConfig({ ...base, CLICKMONK_DNS_CHECK: 'off' }).dnsCheck).toBe(false)
     expect(() => loadConfig({ ...base, CLICKMONK_DNS_CHECK: 'no' })).toThrow(/CLICKMONK_DNS_CHECK/)

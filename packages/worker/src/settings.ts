@@ -8,6 +8,10 @@
  * in the worker package because that is where the other functions two
  * surfaces share already live.
  *
+ * The reader comes in two spellings — on the pool, and on a caller's client
+ * under the row's lock — sharing one fallback rule. The locked one exists for
+ * the retention pass, whose read has to hold still while it deletes.
+ *
  * The redirect is the deliberate exception. It reads these settings inside
  * the snapshot's single REPEATABLE READ READ ONLY transaction, together with
  * the domains and links, so that the configuration it serves is one
@@ -121,7 +125,37 @@ function parseRow(row: SettingsRow): ParsedRow {
  */
 export async function readSettings(pg: Pool): Promise<SettingsRead> {
   const r = await pg.query<SettingsRow>(`SELECT ${COLUMNS} FROM settings`)
-  const row = r.rows[0]
+  return fromRow(r.rows[0])
+}
+
+/**
+ * The same read, on a caller's client and under the row's lock.
+ *
+ * For a caller that only answers a request, the plain read above is right: the
+ * answer is a moment old and the next request reads again. For a caller that
+ * **deletes** on what it read, a moment is the whole problem — an operator can
+ * set a period to `never`, or delete the row outright, in the window between
+ * the read and the delete, and the pass would go on to enforce a period that
+ * is no longer stored. There is no transaction that can span both stores, so
+ * the lock is the join: this takes the same `FOR UPDATE` on the same row that
+ * `updateSettings` takes, so a write and a deleting pass serialise and the
+ * pass acts on the row as it stands for as long as it holds the lock.
+ *
+ * It takes no lock when the row is missing — there is nothing to lock — and
+ * that needs none: a missing row answers `retention: null`, and a caller that
+ * deletes does nothing at all on that answer.
+ *
+ * The caller owns the transaction, and owes it a `BEGIN` before this and a
+ * `COMMIT` or `ROLLBACK` after: the lock is held to the end of the
+ * transaction, and that duration is the point.
+ */
+export async function readSettingsLocked(client: PoolClient): Promise<SettingsRead> {
+  const r = await client.query<SettingsRow>(`SELECT ${COLUMNS} FROM settings FOR UPDATE`)
+  return fromRow(r.rows[0])
+}
+
+/** One fallback rule, whether the row was read under the lock or not. */
+function fromRow(row: SettingsRow | undefined): SettingsRead {
   if (!row) {
     return {
       traffic: DEFAULT_TRAFFIC_SETTINGS,

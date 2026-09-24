@@ -116,6 +116,9 @@ services:
       CLICKMONK_IPDATA_UPDATE: ${CLICKMONK_IPDATA_UPDATE:-on}
       CLICKMONK_DNS_CHECK: ${CLICKMONK_DNS_CHECK:-on}
       CLICKMONK_DNS_SERVERS: ${CLICKMONK_DNS_SERVERS:-}
+      # An hour by default. The periods themselves are settings on the install,
+      # not here: `clickmonk settings set --keep-clicks 30`.
+      CLICKMONK_RETENTION_INTERVAL_MS: ${CLICKMONK_RETENTION_INTERVAL_MS:-3600000}
       # The worker itself never reads this. The CLI runs in this container, and
       # `domain add` refuses a link domain equal to the admin host name: a
       # domain under that name would take its requests to the admin API and

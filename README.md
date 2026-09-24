@@ -329,6 +329,16 @@ periods cannot be read — and nothing is deleted while it reads that way. A mis
 the likelier of the two: it is one `DELETE` away, and the defaults would answer it with a
 period nobody chose.
 
+The worker enforces both periods once an hour, and **each one is a floor rather than a
+deadline.** Clicks are stored a month at a time and deleted the same way, so a month of
+them goes only once its newest possible click is past the period: 90 days keeps between 90
+and 121 days, and 30 days of addresses keeps them between 30 and 61. Lowering a period
+takes effect on the next pass and never rewrites anything already deleted. What is deleted
+is the raw clicks and the addresses on them; the hourly totals every report but the click
+log reads are kept, which is why a chart still answers for a window older than the clicks
+behind it. A blanked address leaves an empty network in an export, the same as an address
+that could never be looked up.
+
 For a script, mint an API key and send it as `Authorization: Bearer …`:
 
 ```sh

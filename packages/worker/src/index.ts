@@ -3,6 +3,7 @@ import { createChClient, createPgPool, migrateToLatest } from '@clickmonk/db'
 import { startUpdater } from '@clickmonk/ipdata'
 import { loadConfig } from './config.js'
 import { createResolver, startDomainChecker } from './domains.js'
+import { startRetention } from './retention.js'
 import { startShipper } from './shipper.js'
 
 const config = loadConfig(process.env)
@@ -14,11 +15,12 @@ let stopping = false
 let shipper: { stop(): Promise<void> } | null = null
 let updater: { stop(): Promise<void> } | null = null
 let domains: { stop(): Promise<void> } | null = null
+let retention: { stop(): Promise<void> } | null = null
 
 async function shutdown(): Promise<void> {
   if (stopping) return
   stopping = true
-  await Promise.all([shipper?.stop(), updater?.stop(), domains?.stop()])
+  await Promise.all([shipper?.stop(), updater?.stop(), domains?.stop(), retention?.stop()])
   await Promise.allSettled([pg.end(), ch.close()])
 }
 process.on('SIGTERM', () => void shutdown())
@@ -59,4 +61,6 @@ if (!stopping) {
   } else {
     log('domain DNS checks are off: a domain stays as it was added')
   }
+  retention = startRetention({ pg, ch, intervalMs: config.retentionIntervalMs, log })
+  log('deleting raw clicks and addresses past their retention periods')
 }

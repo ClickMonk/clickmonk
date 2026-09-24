@@ -42,6 +42,10 @@ const Schema = z.object({
   // validated here rather than inside node:dns, which throws at the first
   // query with a message that names nothing.
   CLICKMONK_DNS_SERVERS: DnsServers,
+  // How often the retention pass runs. There is no on/off here on purpose:
+  // "never" is a value the setting takes, and two ways to turn one thing off
+  // is how they come to disagree.
+  CLICKMONK_RETENTION_INTERVAL_MS: z.coerce.number().int().min(1000).default(3_600_000),
 })
 
 export interface WorkerConfig {
@@ -53,6 +57,7 @@ export interface WorkerConfig {
   dnsCheck: boolean
   dnsCheckIntervalMs: number
   dnsServers: string[]
+  retentionIntervalMs: number
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv): WorkerConfig {
@@ -73,5 +78,6 @@ export function loadConfig(env: NodeJS.ProcessEnv): WorkerConfig {
     dnsCheck: e.CLICKMONK_DNS_CHECK === 'on',
     dnsCheckIntervalMs: e.CLICKMONK_DNS_CHECK_INTERVAL_MS,
     dnsServers: e.CLICKMONK_DNS_SERVERS,
+    retentionIntervalMs: e.CLICKMONK_RETENTION_INTERVAL_MS,
   }
 }
