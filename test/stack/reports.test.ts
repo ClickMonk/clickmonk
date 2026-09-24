@@ -431,12 +431,20 @@ describe('the install', () => {
     const old = `SELECT count() FROM clicks WHERE outcome = '${OLD_OUTCOME}'`
     expect(storeCount(old)).toBe(1)
 
-    // The pass, watched for by its effect rather than by anything it printed.
-    // Sixty seconds against a five-second interval, and half the file's test
-    // timeout so that a worker which never runs a pass fails with the sentence
-    // naming what was missing: measured, with the pass not started at all the two
-    // deadlines landed on the same millisecond and vitest's own "test timed out"
-    // won, which says nothing about retention.
+    // **The pass is provoked, not waited for.** A pass runs at start and then once
+    // an interval, and the interval is the shipped hour, so restarting the worker
+    // is a pass on demand — and it is what makes the count above a premise rather
+    // than a race. On a short interval a pass lands between the insert and that
+    // count often enough to have failed this test on its second run: the row was
+    // already gone, and "it is there" is not something a test can check while
+    // something else is removing it.
+    //
+    // Watched for by its effect, never by anything it printed. Sixty seconds, half
+    // the file's test timeout, so that a worker which never runs a pass fails with
+    // the sentence naming what was missing: measured, with the two deadlines equal
+    // they landed on the same millisecond and vitest's own "test timed out" won,
+    // which says nothing about retention.
+    compose('restart', 'worker')
     await until('the pass to drop the month past the period', 60_000, () => storeCount(old) === 0)
 
     // And the month this run is in, which the same pass considered and had to

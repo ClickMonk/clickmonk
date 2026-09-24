@@ -39,13 +39,6 @@ services:
       CLICKMONK_DNS_CHECK: "on"
       CLICKMONK_DNS_SERVERS: 172.30.0.53
       CLICKMONK_DNS_CHECK_INTERVAL_MS: "2000"
-      # An hour is the shipped period, and an hour means exactly one pass ever
-      # runs in a suite — the one at start, over an empty table. A test that a
-      # period is a floor has to watch a pass decide about a partition that
-      # holds clicks, so a pass has to happen after they arrive. Five seconds
-      # rather than two: a writer waits two seconds for the settings row the
-      # pass holds, and one suite does write it.
-      CLICKMONK_RETENTION_INTERVAL_MS: "5000"
 
   # A miniature ACME server. NOSLEEP and NONCEREJECT turn off the randomness
   # it adds on purpose to shake out client bugs, which here would only make
