@@ -793,6 +793,82 @@ describe('GET /api/reports/breakdown', () => {
   })
 })
 
+/**
+ * How many rows a breakdown returns, in a window of its own.
+ *
+ * Neither the default nor the ceiling can be read off the fixture above: no
+ * dimension there holds more than three values, so any default of three or more
+ * and any ceiling of three or more answers every assertion in it. Both numbers
+ * need more values than they are, and more values than they are would move every
+ * count in every other block — so this owns its own window, which is the rule a
+ * per-window total follows.
+ *
+ * Its hour is in another month, so another partition, and it is older than the
+ * newest hour the install holds, so the freshness the summary and the chart
+ * assert does not move. No other window in this file reaches it: the hundred-day
+ * chart starts on 2026-06-16, the two-thousand-bucket one on 2026-07-02, and the
+ * window that would contain it is refused for being too long.
+ */
+describe('how many rows a breakdown returns', () => {
+  const WINDOW_OF_ITS_OWN = 'from=2026-05-10T03:00:00.000Z&to=2026-05-10T04:00:00.000Z'
+
+  /** One host per click, in ascending order, so the tie-break decides the list. */
+  const host = (i: number): string => `h${String(i).padStart(3, '0')}.example.com`
+
+  const rows = (query: string) =>
+    app.inject({
+      method: 'GET',
+      url: `/api/reports/breakdown?${WINDOW_OF_ITS_OWN}&dimension=referrer&${query}`,
+      headers: read(cookie),
+    })
+
+  beforeAll(async () => {
+    // Five hundred and one values, one click each. A hundred and one would pin
+    // the default and leave the ceiling where it is — read off a fixture too
+    // small to reach it — so there are enough here to see five hundred rows come
+    // back and a five hundred and first left behind.
+    await insert(
+      Array.from({ length: 501 }, (_, i) => {
+        const n = String(i + 1).padStart(3, '0')
+        return click({
+          click_id: `01920000-0000-7000-8000-100000000${n}`,
+          time: '2026-05-10 03:20:00.000',
+          visitor_id: `m${n}`,
+          referrer: `https://${host(i + 1)}/post`,
+        })
+      }),
+    )
+  })
+
+  // A hundred written out, not taken from DEFAULT_BREAKDOWN_ROWS: a bound
+  // derived from the constant it is testing moves when the constant does and
+  // goes on passing. Ninety-nine and a hundred and one both fail this.
+  it('returns a hundred rows when no limit is asked for, and says it cut the rest', async () => {
+    const r = await rows('')
+    expect(r.statusCode).toBe(200)
+    expect(r.json().truncated).toBe(true)
+    const got = r.json().rows as { value: string; clicks: number; visitors: number }[]
+    expect(got).toHaveLength(100)
+    // The top of the ordered list rather than a hundred of the five hundred and
+    // one: every value has one click, so which hundred come back is the
+    // tie-break and nothing else.
+    expect(got[0]).toEqual({ value: 'h001.example.com', clicks: 1, visitors: 1 })
+    expect(got[99]).toEqual({ value: 'h100.example.com', clicks: 1, visitors: 1 })
+  })
+
+  // The other half of the ceiling. That 500 is accepted and 501 refused is
+  // pinned above; this is that five hundred rows actually come back when five
+  // hundred values exist, which no window with three values in it can say.
+  it('returns five hundred rows when five hundred are asked for', async () => {
+    const r = await rows('limit=500')
+    expect(r.statusCode).toBe(200)
+    expect(r.json().truncated).toBe(true)
+    const got = r.json().rows as { value: string; clicks: number; visitors: number }[]
+    expect(got).toHaveLength(500)
+    expect(got[499]).toEqual({ value: 'h500.example.com', clicks: 1, visitors: 1 })
+  })
+})
+
 // The route cannot reach this: `from` is a datetime in the schema, so an
 // unreadable date is a 400 before the parser sees it. The parser is exported
 // and the chart and the log will call it too, so the bound lives in the
