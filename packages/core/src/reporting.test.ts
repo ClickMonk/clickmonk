@@ -4,6 +4,7 @@ import {
   KEYED_DIMENSIONS,
   MAX_REPORT_BUCKETS,
   MAX_REPORT_WINDOW_DAYS,
+  MAX_REPORT_WINDOW_MS,
   REPORT_BUCKETS,
   REPORT_DIMENSIONS,
   ROLLUP_DIMENSIONS,
@@ -45,6 +46,10 @@ describe('bucketCount', () => {
     expect(MAX_REPORT_BUCKETS).toBe(2000)
     expect(MAX_REPORT_WINDOW_DAYS).toBe(400)
     expect(BUCKET_MS).toEqual({ hour: 3_600_000, day: 86_400_000 })
+    // The window bound in the unit the check will compare in, written out
+    // rather than multiplied back up, so a wrong factor is a failure here and
+    // not a window of 400 hours on an endpoint that says 400 days.
+    expect(MAX_REPORT_WINDOW_MS).toBe(34_560_000_000)
   })
 })
 
