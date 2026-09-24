@@ -306,9 +306,14 @@ describe('the install', () => {
     // count taken once the clicks were countable, so at least one of them began
     // after they were in the store: a pass logs its result at the end, so the
     // first one past that count could have read the partition before them.
+    // Half the file's test timeout, so a worker that never runs a pass fails
+    // with the sentence naming what was missing rather than with vitest's own
+    // "test timed out", which says nothing about retention. Measured: with the
+    // pass not started at all, the two deadlines landed on the same millisecond
+    // and the timeout won.
     await until(
       'a retention pass over a partition holding the clicks',
-      120_000,
+      60_000,
       () => passes().length >= passesWithClicks + 2,
     )
     // The line the worker writes at start, which says the pass was started at
