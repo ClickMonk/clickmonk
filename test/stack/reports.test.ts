@@ -235,7 +235,7 @@ afterAll(() => {
 }, 300_000)
 
 describe('a report of real clicks', () => {
-  it('counts them, and counts the one client as one visitor', () => {
+  it('counts every click, under the outcome it took, and says how fresh it is', () => {
     const r = api('GET', `/api/reports/summary?${window()}`, { cookie })
     expect(r.status, r.body).toBe(200)
     const body = JSON.parse(r.body) as {
@@ -245,10 +245,16 @@ describe('a report of real clicks', () => {
       newestHour: string | null
     }
     expect(body.clicks).toBe(CLICKS)
-    // Three requests from one client that kept no cookies: three visitor ids,
-    // because a visitor without a cookie is a new visitor. Stated rather than
-    // asserted as one, because it is the honest behaviour and the README says
-    // so.
+    // **This number is the one above, and the test is not named for it.** Three
+    // requests that kept no cookies are three visitors, because a request with no
+    // visitor cookie is minted a new id — `mints a new visitor when there is no
+    // cookie` in the redirect's own suite is where that is pinned, not the README,
+    // which does not say it. So `visitors` here is a second reading of the click
+    // count and replacing it with that count would pass. It is asserted because
+    // the field has to be populated at all in the shipped stack; the property
+    // worth pinning — one visitor merged across buckets rather than summed — needs
+    // a visitor who clicked twice, which is `gives one bucket a day, and counts a
+    // visitor across the hours of that day once` in the admin service's suite.
     expect(body.visitors).toBe(CLICKS)
     expect(body.byOutcome.target).toBe(CLICKS)
     expect(body.newestHour).not.toBeNull()
