@@ -187,14 +187,20 @@ describe('writing the settings', () => {
     expect(back.json().retention).toEqual({ rawRetentionDays: 90, ipRetentionDays: 30 })
   })
 
-  it('refuses a settings body with a field nobody knows', async () => {
+  it('refuses a settings body with a field nobody knows, and writes nothing', async () => {
+    const before = await get()
     const r = await put({
-      traffic: DEFAULT_TRAFFIC_SETTINGS,
-      retention: { rawRetentionDays: 90, ipRetentionDays: 30 },
+      // A body whose two known halves are *changes*, so that a handler which
+      // ignored the unknown field instead of refusing would leave both of them
+      // written and the read-back below would catch it. With the halves equal
+      // to what is stored, a refusal and a silent acceptance look the same.
+      traffic: { ...DEFAULT_TRAFFIC_SETTINGS, abuserThreshold: 77 },
+      retention: { rawRetentionDays: 11, ipRetentionDays: 3 },
       keepEverything: true,
     })
     expect(r.statusCode).toBe(400)
     expect(r.json().error).toBe('invalid_body')
+    expect((await get()).json()).toEqual(before.json())
   })
 
   it('refuses a body that leaves a half out, rather than defaulting it', async () => {

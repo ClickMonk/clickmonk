@@ -121,17 +121,20 @@ export async function createAccount(
 export async function setAccountPassword(
   pg: Pool,
   password: string,
-  o: { clearLockout: boolean },
+  o: { clearLockout: boolean; now: Date },
 ): Promise<string> {
   const hash = await hashPassword(password, ADMIN_SCRYPT)
+  // `updated_at` from the caller's clock, not SQL `now()`: every other write in
+  // this module is stamped from the injected one, and a row half on each is a
+  // row whose timestamps cannot be compared with each other.
   const r = await pg.query(
-    `UPDATE admin_account SET password_hash = $1, updated_at = now()${
+    `UPDATE admin_account SET password_hash = $1, updated_at = $2${
       o.clearLockout
         ? `,
                               failed_logins = 0, last_failed_at = NULL, locked_until = NULL`
         : ''
     }`,
-    [hash],
+    [hash, o.now],
   )
   if ((r.rowCount ?? 0) === 0) throw new Error('this install has no admin account yet')
   return hash

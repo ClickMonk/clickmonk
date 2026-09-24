@@ -1,10 +1,17 @@
 import { DEFAULT_INSTALL_SETTINGS, DEFAULT_TRAFFIC_SETTINGS } from '@clickmonk/core'
-import type { Pool } from '@clickmonk/db'
-import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
+import { type Pool, createPgPool } from '@clickmonk/db'
+import { TEST_PG_URL, resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { readSettings, updateSettings, writeSettings } from './settings.js'
 
-const pool: Pool = testPg()
+/**
+ * Every connection this file's pool opens reports this name to Postgres, so
+ * that the leaked-transaction probe below can ask about *these* connections
+ * and no others. Set on the connection string, because that is the only place
+ * it reaches every connection the pool opens, including ones it opens later.
+ */
+const APP_NAME = 'clickmonk-worker-settings-test'
+const pool: Pool = createPgPool(`${TEST_PG_URL}?application_name=${APP_NAME}`)
 const ch = testCh()
 const NOW = new Date('2026-09-24T12:00:00.000Z')
 
@@ -128,6 +135,39 @@ describe('readSettings', () => {
       )
     }
   })
+
+  // Both halves at once, which nothing else covers and which is where the two
+  // sentences meet. Run together they read as one saying the defaults apply to
+  // the retention as well, which is the opposite of what the second one says.
+  it('reports both halves separately when neither can be read', async () => {
+    await pool.query('ALTER TABLE settings DROP CONSTRAINT settings_traffic_actions_check')
+    await pool.query('ALTER TABLE settings DROP CONSTRAINT settings_raw_retention_valid')
+    try {
+      await pool.query(
+        `UPDATE settings SET traffic_actions = '{"bot":"drop"}'::jsonb, raw_retention_days = -5`,
+      )
+      const r = await readSettings(pool)
+      expect(r.traffic).toEqual(DEFAULT_TRAFFIC_SETTINGS)
+      expect(r.retention).toBeNull()
+      // Exact, and the separator between the two halves is the point: without
+      // one, "…the defaults apply" runs straight into "the stored retention is
+      // invalid…".
+      expect(r.problem).toBe(
+        `the stored traffic settings are invalid (actions.bot: Invalid enum value. Expected 'nothing' | 'flag' | 'block' | 'safe', received 'drop'; actions.abuser: Required; actions.anonymous: Required; actions.datacenter: Required); the defaults apply; the stored retention is invalid (rawRetentionDays: Number must be greater than or equal to 1); nothing is deleted until it is corrected`,
+      )
+    } finally {
+      await pool.query(
+        `UPDATE settings SET raw_retention_days = 90, traffic_actions =
+           '{"bot":"flag","abuser":"flag","anonymous":"flag","datacenter":"flag"}'::jsonb`,
+      )
+      await pool.query(
+        'ALTER TABLE settings ADD CONSTRAINT settings_traffic_actions_check CHECK (valid_traffic_actions(traffic_actions, true))',
+      )
+      await pool.query(
+        'ALTER TABLE settings ADD CONSTRAINT settings_raw_retention_valid CHECK (raw_retention_days IS NULL OR raw_retention_days BETWEEN 1 AND 3650)',
+      )
+    }
+  })
 })
 
 describe('writeSettings', () => {
@@ -194,17 +234,17 @@ describe('updateSettings', () => {
     // answers as if the rollback had happened. A second connection is what
     // can see a backend left sitting inside a transaction.
     //
-    // **Do not narrow this to one connection.** It counts every backend on
-    // this database on purpose: the leaked one cannot be addressed from here,
-    // because the pool hands the same client straight back to whoever asks
-    // next. Counting database-wide is exact under this repository's rule that
-    // one suite runs at a time, and nothing narrower fails when the ROLLBACK
-    // is removed.
+    // Scoped to this file's own connections by `application_name`, which is
+    // what makes it exact rather than dependent on nothing else running: the
+    // pool above tags every connection it opens, this probe opens its own
+    // untagged one, and a suite in another process cannot be counted here.
     const probe = testPg()
     try {
       const open = await probe.query<{ n: number }>(
         `SELECT count(*)::int AS n FROM pg_stat_activity
-          WHERE datname = current_database() AND state LIKE 'idle in transaction%'`,
+          WHERE datname = current_database() AND application_name = $1
+            AND state LIKE 'idle in transaction%'`,
+        [APP_NAME],
       )
       expect(open.rows[0]?.n).toBe(0)
     } finally {

@@ -510,7 +510,7 @@ async function adminPasswd(d: CliDeps): Promise<void> {
   // alone: it is the way back in, and a lock over a password that no longer
   // exists would keep the only account out for nothing. The API route asks for
   // the opposite, because it never has to show the second factor.
-  await setAccountPassword(d.pg, password, { clearLockout: true })
+  await setAccountPassword(d.pg, password, { clearLockout: true, now: d.now?.() ?? new Date() })
   const r = await d.pg.query('DELETE FROM sessions')
   d.out(`password changed; ${r.rowCount ?? 0} session(s) signed out`)
 }
@@ -678,10 +678,11 @@ async function settingsSet(args: string[], d: CliDeps): Promise<void> {
     if (given === 'never') return null
     return Number(given)
   }
-  // An array rather than a nullable local: the hook runs inside the call
-  // below, and a `let` assigned only from a callback is narrowed to its
-  // initialiser by the compiler.
+  // Arrays rather than nullable locals: the hooks run inside the call below,
+  // and a `let` assigned only from a callback is narrowed to its initialiser
+  // by the compiler.
   const replaced: string[] = []
+  const replacedTraffic: string[] = []
   const next = await updateSettings(
     d.pg,
     d.now?.() ?? new Date(),
@@ -699,12 +700,24 @@ async function settingsSet(args: string[], d: CliDeps): Promise<void> {
         ipRetentionDays: period(values['keep-addresses'], current.retention.ipRetentionDays),
       },
     }),
-    { onRetentionReplaced: (why) => replaced.push(why) },
+    {
+      onRetentionReplaced: (why) => replaced.push(why),
+      onTrafficReplaced: (why) => replacedTraffic.push(why),
+    },
   )
-  // Said, not done quietly. This command may have been about the abuser
-  // threshold, and it has just rewritten how long this install keeps clicks,
-  // which is not a change an operator should first learn about from data that
-  // is no longer there.
+  // Both rewrites are said, not done quietly. This command may have been about
+  // one field and have overwritten the other half of the row on its way past,
+  // and neither is a change an operator should first learn about from clicks
+  // that are gone or from traffic that stopped being blocked.
+  //
+  // The traffic note points at the lines below rather than naming the values,
+  // because there are five of them and they are already about to be printed;
+  // the retention note names its two, because they are two.
+  for (const why of replacedTraffic) {
+    d.out(
+      `note: the stored traffic settings could not be read (${why}), so this command has rewritten them; what is stored now is below`,
+    )
+  }
   for (const why of replaced) {
     d.out(
       `note: the stored retention could not be read (${why}), so this command has rewritten it as keep clicks ${days(next.retention.rawRetentionDays)}, keep addresses ${days(next.retention.ipRetentionDays)}`,

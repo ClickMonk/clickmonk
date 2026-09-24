@@ -196,7 +196,7 @@ export function buildRedirectApp(
       userAgent: o.userAgent,
       head: o.head,
       // A monotonic clock: a wall clock stepped back would restart every count.
-      clicksThisMinute: deps.rate.hit(o.ip, performance.now()),
+      requestsThisMinute: deps.rate.hit(o.ip, performance.now()),
       abuserThreshold: o.snapshot.settings.abuserThreshold,
       ip: ipFacts,
     })

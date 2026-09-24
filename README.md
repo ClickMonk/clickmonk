@@ -53,7 +53,9 @@ on your own infrastructure, and your click data stays yours.
 - **The CLI**: `clickmonk migrate`, `clickmonk domain add|list|verify`, `clickmonk link add`,
   `clickmonk settings show|set`, `clickmonk ipdata status|update`, `clickmonk admin create`,
   `clickmonk admin passwd`, `clickmonk admin totp disable`, `clickmonk apikey create|list|revoke`.
-  `settings set` covers the traffic actions, the safe URL and the abuser threshold.
+  `settings set` covers the traffic actions, the safe URL, the abuser threshold and how
+  long this install keeps clicks and the addresses on them (`--keep-clicks`,
+  `--keep-addresses`, each taking a number of days or `never`).
   `admin create` and `admin passwd` read the password from standard input and from nowhere
   else; `admin totp disable` reads none, and is the way back in when both factors are lost.
 - **A Docker Compose stack** that runs all of it, and a test that restarts each service
@@ -317,10 +319,12 @@ setting `"truncated": true` when there were more. `clickmonk domain list` has no
 `clickmonk apikey list` has the same one and says when it hit it. `GET /api/links` pages
 properly, with `limit` and `cursor`.
 
-The install-wide traffic settings are `GET /api/settings` and `PUT /api/settings` — the
-same three things `clickmonk settings set` covers. The `PUT` takes the whole object rather
-than the fields you want to change, because the safe action and the safe URL depend on each
-other and a half-written pair is how a link ends up sent to nowhere.
+The install-wide settings are `GET /api/settings` and `PUT /api/settings` — the same
+things `clickmonk settings set` covers, in two halves: `traffic` and `retention`. The
+`PUT` takes the whole object rather than the fields you want to change, because the safe
+action and the safe URL depend on each other and a half-written pair is how a link ends up
+sent to nowhere. A stored retention period this build cannot read is reported as `null`
+rather than as the defaults, and nothing is deleted while it reads that way.
 
 For a script, mint an API key and send it as `Authorization: Bearer …`:
 

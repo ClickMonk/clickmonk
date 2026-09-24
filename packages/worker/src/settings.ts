@@ -58,13 +58,14 @@ const why = (issues: { path: (string | number)[]; message: string }[]): string =
   issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')
 
 /**
- * What `parseRow` knows and `SettingsRead` does not: why the retention half
- * was refused, without the sentence built around it. `updateSettings` hands it
+ * What `parseRow` knows and `SettingsRead` does not: why each half was
+ * refused, without the sentence built around it. `updateSettings` hands both
  * to a caller that is about to overwrite the bad row, so the caller can say
- * which value it could not read.
+ * which values it could not read.
  */
 interface ParsedRow {
   read: SettingsRead
+  trafficIssues: string | null
   retentionIssues: string | null
 }
 
@@ -80,10 +81,9 @@ function parseRow(row: SettingsRow): ParsedRow {
     ipRetentionDays: row.ip_retention_days,
   })
   const problems: string[] = []
-  if (!traffic.success) {
-    problems.push(
-      `the stored traffic settings are invalid (${why(traffic.error.issues)}); the defaults apply`,
-    )
+  const trafficIssues = traffic.success ? null : why(traffic.error.issues)
+  if (trafficIssues !== null) {
+    problems.push(`the stored traffic settings are invalid (${trafficIssues}); the defaults apply`)
   }
   const retentionIssues = retention.success ? null : why(retention.error.issues)
   if (retentionIssues !== null) {
@@ -95,8 +95,13 @@ function parseRow(row: SettingsRow): ParsedRow {
     read: {
       traffic: traffic.success ? traffic.data : DEFAULT_TRAFFIC_SETTINGS,
       retention: retention.success ? retention.data : null,
-      problem: problems.length === 0 ? null : problems.join(' '),
+      // Joined with a separator, not a space: both halves can be invalid at
+      // once, and run together the two sentences read as one that says the
+      // defaults apply to the retention as well — which is the opposite of
+      // what the second one says.
+      problem: problems.length === 0 ? null : problems.join('; '),
     },
+    trafficIssues,
     retentionIssues,
   }
 }
@@ -160,29 +165,34 @@ export async function writeSettings(pg: Pool, next: InstallSettings, now: Date):
 }
 
 /**
+ * Told, before the write and inside the transaction, that a half of the stored
+ * row could not be read and the defaults stood in for it. The argument is why.
+ *
+ * **There are two of these, not one.** Either half of a row can be unreadable,
+ * and in both cases this function writes the defaults over it while the
+ * operator was changing something else — a threshold, a period — and says
+ * nothing unless the surface in front of it does. Both are the same harm in
+ * different units: a retention period nobody was told about is learned from
+ * clicks that are gone, and a traffic action nobody was told about is learned
+ * from traffic that was being blocked and is now only flagged. A caller with
+ * nowhere to print a note passes no hook and is unchanged.
+ */
+export interface UpdateSettingsHooks {
+  onRetentionReplaced?: (why: string) => void
+  onTrafficReplaced?: (why: string) => void
+}
+
+/**
  * Read, change, validate, write — with the row locked for the whole of it, so
  * two callers changing different fields cannot lose one of the changes.
  *
  * The row is written back as the defaults first when it is missing, in the
  * same transaction, so that concurrent writers still serialise on its lock.
- * That costs one extra `config_changed` on a command an operator typed, which
- * is cheaper than a read-modify-write with nothing to lock.
+ * Postgres collapses identical notifications on one channel inside a
+ * transaction, so that insert and the update after it reach the redirect as
+ * one `config_changed` and this costs no extra reload — measured, because the
+ * comment here used to charge for one.
  */
-export interface UpdateSettingsHooks {
-  /**
-   * Called, before the write and inside the transaction, when the stored
-   * retention could not be read and the defaults stood in for it. The argument
-   * is why it could not be read.
-   *
-   * It exists because this substitution is the one silent data decision in
-   * this module: a command about something else — a threshold, a safe URL —
-   * rewrites a retention period the operator never mentioned, and a period
-   * they learn about from a deleted partition is worse than one they learn
-   * about from a line of output. The surface that has somewhere to say it
-   * says it; a caller with nowhere to say it passes no hook and is unchanged.
-   */
-  onRetentionReplaced?: (why: string) => void
-}
 
 export async function updateSettings(
   pg: Pool,
@@ -197,11 +207,14 @@ export async function updateSettings(
     const r = await client.query<SettingsRow>(`SELECT ${COLUMNS} FROM settings FOR UPDATE`)
     const row = r.rows[0]
     if (!row) throw new Error('the settings row is missing after writing it')
-    const { read, retentionIssues } = parseRow(row)
+    const { read, trafficIssues, retentionIssues } = parseRow(row)
+    if (trafficIssues !== null) hooks.onTrafficReplaced?.(trafficIssues)
     if (read.retention === null && retentionIssues !== null) {
       hooks.onRetentionReplaced?.(retentionIssues)
     }
     const current: InstallSettings = {
+      // The defaults, when the stored half could not be read — and the hook
+      // above is what keeps that from being silent.
       traffic: read.traffic,
       // A row this build cannot read as retention starts from the defaults
       // *for a deliberate write*, which is the one place that is right: the

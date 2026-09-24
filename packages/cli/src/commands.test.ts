@@ -401,6 +401,44 @@ describe('clickmonk settings', () => {
     }
   })
 
+  // The same rule one half along, and the harm is the same in different
+  // units: an unreadable traffic half is overwritten with the all-flag
+  // defaults by a command about a retention period, so traffic that was being
+  // blocked is only flagged from here on. Learning that from a line beats
+  // learning it from traffic that got through.
+  it('says so when it rewrote the traffic half it could not read', async () => {
+    await pg.query('ALTER TABLE settings DROP CONSTRAINT settings_traffic_actions_check')
+    try {
+      await pg.query(`UPDATE settings SET traffic_actions = '{"bot":"block"}'::jsonb`)
+      lines.length = 0
+      expect(await run('settings', 'set', '--keep-clicks', '45')).toBe(0)
+      expect(lines[0]).toMatch(
+        /^note: the stored traffic settings could not be read \(.+\), so this command has rewritten them; what is stored now is below$/,
+      )
+      // The rewrite happened and it is the defaults: `bot` was `block` and is
+      // `flag`, which is the whole reason the line has to be printed.
+      const stored = await pg.query<{ traffic_actions: unknown }>(
+        'SELECT traffic_actions FROM settings',
+      )
+      expect(stored.rows[0]?.traffic_actions).toEqual({
+        bot: 'flag',
+        abuser: 'flag',
+        anonymous: 'flag',
+        datacenter: 'flag',
+      })
+      // And the command's own change still landed.
+      expect(lines).toContain('keep clicks: 45 days')
+    } finally {
+      await pg.query(
+        `UPDATE settings SET traffic_actions =
+           '{"bot":"flag","abuser":"flag","anonymous":"flag","datacenter":"flag"}'::jsonb`,
+      )
+      await pg.query(
+        'ALTER TABLE settings ADD CONSTRAINT settings_traffic_actions_check CHECK (valid_traffic_actions(traffic_actions, true))',
+      )
+    }
+  })
+
   // A command that changed nothing about retention says nothing about it: the
   // line above is a report of a rewrite, not a banner.
   it('says nothing about retention when the stored row reads fine', async () => {
