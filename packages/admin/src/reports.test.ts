@@ -4,6 +4,7 @@ import { type ClickHouseClient, createChClient } from '@clickmonk/db'
 import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import type { FastifyInstance } from 'fastify'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import type { AdminDeps } from './app.js'
 import { HttpError } from './http.js'
 import { HOUR_MS, newestHourOrNull, parseWindow } from './reports.js'
 import { ADMIN_HOST, clockFrom, read, signedIn, testApp } from './testing.js'
@@ -64,12 +65,13 @@ beforeAll(async () => {
   await resetDatabases(pool, ch)
   await insert([
     click(),
-    // Another visitor, another country, and the second value of every open
-    // dimension a breakdown reads: a fixture in which `device`, `os`, `browser`
-    // and `referrer` each held one value could not tell a rollup that wrote the
-    // real column from one that wrote a constant, and could not tell a
-    // breakdown that read the dimension it was asked for from one that read
-    // some other.
+    // Another visitor, another country, and a second value for five of the six
+    // open dimensions a breakdown reads — every one but the target, which gets
+    // its second value from the blocked click below, the one that reached none.
+    // A fixture in which `device`, `os`, `browser` and `referrer` each held one
+    // value could not tell a rollup that wrote the real column from one that
+    // wrote a constant, and could not tell a breakdown that read the dimension
+    // it was asked for from one that read some other.
     click({
       click_id: '01920000-0000-7000-8000-00000000000b',
       visitor_id: 'v2',
@@ -551,9 +553,10 @@ describe('GET /api/reports/breakdown', () => {
 
   // Whole, and this is one of the four bodies asserted whole: `link`,
   // `dimension` and `truncated` are each echoed or derived, and each one is
-  // asserted somewhere off the value it carries here — the link below, the
-  // keyed dimension below that, and the cut list further down. A field only
-  // ever seen at its least interesting value can be replaced by a constant.
+  // asserted somewhere off the value it carries here — the keyed dimension
+  // immediately below, the link further down, and the cut list after that. A
+  // field only ever seen at its least interesting value can be replaced by a
+  // constant.
   //
   // The click half an hour past the end of this window is what pins the
   // clause's upper bound here: counted, DE would be five clicks by two
@@ -664,9 +667,10 @@ describe('GET /api/reports/breakdown', () => {
   // Both ends of the shared clause in one window, and the numbers rather than
   // the length: the hour this starts at holds a click, so `>= from` written as
   // `> from` empties the list, and the hour it ends at holds another by its own
-  // visitor, so `< to` written as `<= to` doubles both numbers. The chart
-  // cannot see the upper bound at all, so an endpoint that reuses the clause
-  // pins it or nothing does.
+  // visitor, so `< to` written as `<= to` doubles both numbers. The summary
+  // catches an inclusive upper bound too — the chart is the one that cannot see
+  // it — so what this adds is that the bound is pinned in this endpoint's own
+  // window rather than inherited from another route's fixture.
   it('starts at the hour it names and stops before the hour it ends at', async () => {
     const r = await app.inject({
       method: 'GET',
@@ -741,11 +745,13 @@ describe('GET /api/reports/breakdown', () => {
     expect(r.json().rows).toHaveLength(2)
   })
 
-  // The ceiling itself, from both sides. Written out rather than computed from
-  // MAX_BREAKDOWN_ROWS: a bound derived from the constant it is testing moves
-  // when the constant does and goes on passing. Without the 500 the ceiling
-  // could be one row tighter than the number it promises and nothing would say
-  // so; without the 501 it could be absent.
+  // The ceiling itself, from both sides: the 500 is what says it is not one row
+  // tighter than the number it promises, and the 501 that it is there at all.
+  // Both written out rather than computed from MAX_BREAKDOWN_ROWS, since a bound
+  // derived from the constant it is testing moves when the constant does and
+  // goes on passing. What this window cannot say is that five hundred rows come
+  // back when five hundred values exist — three values is all it holds — which
+  // is what the block at the end of the file is for.
   it('takes the most rows it will return, and refuses one more', async () => {
     const at = await breakdown('dimension=country&limit=500')
     expect(at.statusCode).toBe(200)
@@ -761,6 +767,13 @@ describe('GET /api/reports/breakdown', () => {
     ['a limit of zero', 'dimension=country&limit=0'],
     ['a limit past the ceiling', 'dimension=country&limit=501'],
     ['a limit that is not a number', 'dimension=country&limit=all'],
+    // Its own case, and the one the status code matters for: `all` does not
+    // coerce to a number at all, but 2.5 does, and without `.int()` it reaches
+    // ClickHouse as `LIMIT 3.5` and comes back as a 503 saying reporting is
+    // unavailable on this install. That is the failure the link's shape was
+    // moved into the parser to stop — a caller's own bad field reported to them
+    // as an outage — so what this pins is the 400 and not the refusal.
+    ['a limit that is not a whole number', 'dimension=country&limit=2.5'],
     ['a field nobody knows', 'dimension=country&order=value'],
   ])('refuses %s', async (_label, extra) => {
     const r = await breakdown(extra)
@@ -973,13 +986,21 @@ describe('when ClickHouse is not there', () => {
    * query failure would have written is asserted absent as well, because a
    * guard moved after the query would otherwise leave only the status to tell
    * the two apart.
+   *
+   * `reportGate` is for the guards that have to come before the queue as well as
+   * before the query. A full gate and an unreachable store together give a
+   * misplaced guard two different wrong answers — 429 from inside the gate, 503
+   * from after the query — and one right one, so the caller's own status pins the
+   * position rather than merely the presence.
    */
   const onDeadWithLog = async (
     fn: (on: FastifyInstance, lines: string[]) => Promise<void>,
+    extra: Partial<AdminDeps> = {},
   ): Promise<void> => {
     const lines: string[] = []
     const on = testApp(pool, clock, {
       ch: dead,
+      ...extra,
       log: {
         level: 'error',
         stream: {
@@ -1032,14 +1053,27 @@ describe('when ClickHouse is not there', () => {
     ['the summary', `/api/reports/summary?${WINDOW}`],
     ['the chart', `/api/reports/timeseries?${WINDOW}&bucket=hour`],
     ['a breakdown', `/api/reports/breakdown?${WINDOW}&dimension=country`],
-  ])('refuses %s without a credential before reading anything', async (_label, url) => {
-    await onDeadWithLog(async (on, lines) => {
-      const r = await on.inject({ method: 'GET', url, headers: { host: ADMIN_HOST } })
-      expect(r.statusCode).toBe(401)
-      expect(r.json().error).toBe('unauthenticated')
-      expect(lines.filter((l) => l.includes('clickhouse query failed'))).toEqual([])
-    })
-  })
+  ])(
+    'refuses %s without a credential before taking a slot or reading anything',
+    async (_label, url) => {
+      // The gate is full as well as the store unreachable, and that is the half
+      // the 401 tests could not see. Asked for after the query, the credential
+      // lets an unauthenticated request scan the window it chose — a 503 here.
+      // Asked for inside the gate but before the query, it lets that request
+      // take a report slot, so a flood of them answers the operator 429 without
+      // a row being read — and every test in this file stayed green on that one
+      // until this gate was put here. Only the position answers 401.
+      await onDeadWithLog(
+        async (on, lines) => {
+          const r = await on.inject({ method: 'GET', url, headers: { host: ADMIN_HOST } })
+          expect(r.statusCode).toBe(401)
+          expect(r.json().error).toBe('unauthenticated')
+          expect(lines.filter((l) => l.includes('clickhouse query failed'))).toEqual([])
+        },
+        { reportGate: new ConcurrencyGate(0) },
+      )
+    },
+  )
 
   // The same claim for the chart's own ceiling, and it needs making separately:
   // a hundred days is well inside the four hundred the window bound allows, so
