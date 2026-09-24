@@ -272,3 +272,95 @@ describe('clickhouse schema 008: the hourly rollups', () => {
     expect(await totals()).toEqual([{ clicks: '8', visitors: '1' }])
   })
 })
+
+/**
+ * The rest of the file reads whatever has accumulated in the 10:00 hour. These
+ * two use hours of their own instead, so they neither shift nor depend on the
+ * running arithmetic above, and they run after the partition drop because a
+ * rollup does not need the raw rows.
+ *
+ * Each inserts its clicks in ONE call on purpose. A materialized view fires
+ * once per inserted block and aggregates within it, and AggregatingMergeTree
+ * collapses equal sort keys as it writes the part — so a key column left out
+ * of the table shows up immediately, rather than only once a background merge
+ * happens to run.
+ */
+describe('clickhouse schema 008: the key columns that keep rows apart', () => {
+  const H11 = "toDateTime('2026-09-24 11:00:00', 'UTC')"
+  const H12 = "toDateTime('2026-09-24 12:00:00', 'UTC')"
+
+  /**
+   * Class, action and outcome are keys rather than rows of the per-dimension
+   * table, which only holds if each of them keeps rows apart on its own. Two of
+   * these four clicks differ from a third only in their outcome, and two only
+   * in their action, so dropping either column from the key merges a pair and
+   * an arbitrary value wins.
+   */
+  it('keeps two clicks apart when they differ only in outcome, and only in action', async () => {
+    await insert([
+      click({ click_id: '01920000-0000-7000-8000-00000000003a', time: '2026-09-24 11:05:00.000' }),
+      click({
+        click_id: '01920000-0000-7000-8000-00000000003b',
+        time: '2026-09-24 11:05:00.000',
+        outcome: 'capped',
+      }),
+      click({
+        click_id: '01920000-0000-7000-8000-00000000003c',
+        time: '2026-09-24 11:05:00.000',
+        traffic_class: 'bot',
+        action: 'flag',
+        signals: ['ua_bot'],
+      }),
+      click({
+        click_id: '01920000-0000-7000-8000-00000000003d',
+        time: '2026-09-24 11:05:00.000',
+        traffic_class: 'bot',
+        action: 'nothing',
+        signals: ['ua_bot'],
+      }),
+    ])
+    const byOutcome = await rows<{ outcome: string; clicks: string }>(
+      `SELECT outcome, uniqExactMerge(clicks_state) AS clicks FROM clicks_hourly
+         WHERE hour = ${H11} GROUP BY outcome ORDER BY outcome`,
+    )
+    expect(byOutcome).toEqual([
+      { outcome: 'capped', clicks: '1' },
+      { outcome: 'target', clicks: '3' },
+    ])
+    const byAction = await rows<{ action: string; clicks: string }>(
+      `SELECT action, uniqExactMerge(clicks_state) AS clicks FROM clicks_hourly
+         WHERE hour = ${H11} GROUP BY action ORDER BY action`,
+    )
+    expect(byAction).toEqual([
+      { action: '', clicks: '2' },
+      { action: 'flag', clicks: '1' },
+      { action: 'nothing', clicks: '1' },
+    ])
+  })
+
+  /**
+   * The link is a key of the per-dimension table too, and every report that
+   * breaks a single link down by country or device reads it that way. These two
+   * clicks differ only in their link, so without the column in the key they
+   * merge into one row under whichever link won.
+   */
+  it('keeps two clicks apart in the per-dimension rollup when they differ only in link', async () => {
+    await insert([
+      click({ click_id: '01920000-0000-7000-8000-00000000004a', time: '2026-09-24 12:05:00.000' }),
+      click({
+        click_id: '01920000-0000-7000-8000-00000000004b',
+        time: '2026-09-24 12:05:00.000',
+        link_id: LINK_B,
+        path: '/b',
+      }),
+    ])
+    const perLink = await rows<{ link_id: string; clicks: string }>(
+      `SELECT link_id, uniqExactMerge(clicks_state) AS clicks FROM clicks_hourly_dim
+         WHERE dimension = 'country' AND hour = ${H12} GROUP BY link_id ORDER BY link_id`,
+    )
+    expect(perLink).toEqual([
+      { link_id: LINK_A, clicks: '1' },
+      { link_id: LINK_B, clicks: '1' },
+    ])
+  })
+})
