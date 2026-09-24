@@ -813,7 +813,10 @@ describe('clickmonk domain list and verify', () => {
     expect(await withResolver(fakeResolver({}), 'domain', 'verify', 'stillok.example.test')).toBe(0)
     const out = lines.join('\n')
     expect(out).toContain('stillok.example.test: still verified')
-    expect(out).not.toContain('404')
+    // The whole transcript embeds a 32-character hex token, and about one run in
+    // a few hundred puts `404` inside it — this asserts the warning line is
+    // absent, so it matches the line rather than the digits.
+    expect(out.split('\n').filter((l) => l.startsWith('Until the TXT record is found'))).toEqual([])
     expect(out).toContain('_clickmonk.stillok.example.test  TXT')
     const after = await pg.query<{ verified: boolean }>(
       'SELECT verified FROM domains WHERE host = $1',
