@@ -23,12 +23,15 @@
 import {
   BUCKET_MS,
   type ConcurrencyGate,
+  type KeyedDimension,
   MAX_REPORT_BUCKETS,
   MAX_REPORT_WINDOW_DAYS,
   MAX_REPORT_WINDOW_MS,
   REPORT_BUCKETS,
+  REPORT_DIMENSIONS,
   type ReportBucket,
   bucketCount,
+  isKeyedDimension,
 } from '@clickmonk/core'
 import type { ClickHouseClient } from '@clickmonk/db'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
@@ -126,8 +129,16 @@ export function parseWindow(
   }
 }
 
-/** A parsed query, or a 400 that names the field. Query strings, not bodies. */
-export function readQuery<T>(schema: z.ZodType<T>, query: unknown): T {
+/**
+ * A parsed query, or a 400 that names the field. Query strings, not bodies.
+ *
+ * `T` is the schema's *output*, which is why the third parameter is `unknown`
+ * rather than left to default to `T` as well: a schema with a `.default()` has
+ * an input in which that field is optional, and inferring `T` from both ends at
+ * once makes every defaulted field possibly-undefined in the handler that just
+ * asked for it to be filled in.
+ */
+export function readQuery<T>(schema: z.ZodType<T, z.ZodTypeDef, unknown>, query: unknown): T {
   const r = schema.safeParse(query ?? {})
   if (r.success) return r.data
   const issues = r.error.issues
@@ -243,6 +254,30 @@ const BUCKET_EXPR: Record<ReportBucket, string> = {
 }
 
 const TimeseriesQuery = z.object({ ...WINDOW_FIELDS, bucket: z.enum(REPORT_BUCKETS) }).strict()
+
+/** Values in one breakdown, and the ceiling a caller may ask for. */
+export const DEFAULT_BREAKDOWN_ROWS = 100
+export const MAX_BREAKDOWN_ROWS = 500
+
+/**
+ * The column each keyed dimension is stored under. A `Record` over the union
+ * rather than a lookup with a fallback: adding a dimension to the shared
+ * vocabulary without deciding where it comes from is then a type error here,
+ * not a breakdown that quietly returns nothing.
+ */
+const KEYED_COLUMN: Record<KeyedDimension, string> = {
+  class: 'traffic_class',
+  action: 'action',
+  outcome: 'outcome',
+}
+
+const BreakdownQuery = z
+  .object({
+    ...WINDOW_FIELDS,
+    dimension: z.enum(REPORT_DIMENSIONS),
+    limit: z.coerce.number().int().min(1).max(MAX_BREAKDOWN_ROWS).default(DEFAULT_BREAKDOWN_ROWS),
+  })
+  .strict()
 
 export function registerReportRoutes(app: FastifyInstance, ctx: AdminContext): void {
   /**
@@ -423,6 +458,87 @@ export function registerReportRoutes(app: FastifyInstance, ctx: AdminContext): v
           bucket: q.bucket,
           buckets: out,
           newestHour: newestHourOrNull(newest?.newest),
+        }
+      },
+    )
+  })
+
+  /**
+   * The top values of one dimension over the window.
+   *
+   * Two tables answer it. The six open dimensions are rows of the per-dimension
+   * rollup, keyed by the dimension name; the three closed ones are keys of the
+   * hourly rollup, so they are read from there and grouped by their own column.
+   * Nothing in the query text comes from the request: the dimension chooses
+   * between two statements written here, and the only interpolated value is a
+   * row count the schema has already bounded to 1–500.
+   *
+   * Ordered by clicks descending and then by value ascending, because a tie
+   * broken by nothing at all is broken by whatever order the parts were read
+   * in — which makes a cut list arbitrary and a test pass or fail depending on
+   * the machine. The cut itself is one row past the limit: asking for one more
+   * than will be shown is how `truncated` can be true without a second query.
+   *
+   * No freshness here, unlike the summary and the chart. A breakdown is read
+   * beside one of those, which is where "nothing has shipped yet" is already
+   * said; a third copy of that query would be a third reader of the same text
+   * for a question this response does not raise. An empty list here is the
+   * window being empty, and what tells the operator why is the number above it.
+   *
+   * The per-dimension rollup also carries the domain a click was served on, and
+   * nothing here reads it. That is deliberate: a per-domain breakdown is the
+   * next thing an operator with several domains asks for, and adding a key
+   * column to an aggregating rollup afterwards is a migration and a backfill of
+   * every row already in it.
+   */
+  app.get('/api/reports/breakdown', async (req) => {
+    requireCredential(req)
+    const q = readQuery(BreakdownQuery, req.query)
+    const w = parseWindow(q, { alignMs: HOUR_MS })
+    const ch = requireCh(ctx, req)
+    return withSlot(
+      ctx.reportGate,
+      { code: 'too_many_reports', message: 'too many reports at once; try again' },
+      async () => {
+        // Hoisted to a local const before the guard runs. `isKeyedDimension`
+        // narrows a local; it does not narrow a property of the parsed query,
+        // so `KEYED_COLUMN[q.dimension]` behind the same condition is an
+        // implicit-any index and does not compile.
+        const dimension = q.dimension
+        const keyed = isKeyedDimension(dimension)
+        const column = keyed ? KEYED_COLUMN[dimension] : 'value'
+        const table = keyed ? 'clicks_hourly' : 'clicks_hourly_dim'
+        const where = keyed
+          ? windowClause(w)
+          : `${windowClause(w)} AND dimension = {dimension:String}`
+        // The alias is `value` on both statements, and on the per-dimension
+        // rollup it is the name of the column it aliases. That is the one case
+        // where an alias shadowing a column is safe: it means what the column
+        // means. Nothing in the `WHERE` reads it — the clause names `hour`,
+        // `link_id` and `dimension` — so the trap that turns a shadowed column
+        // into an illegal-type error is not reachable here.
+        const rows = await chRows<{ value: string; clicks: string; visitors: string }>({
+          ch,
+          req,
+          query: `SELECT ${column} AS value,
+                         uniqExactMerge(clicks_state) AS clicks,
+                         uniqExactMerge(visitors_state) AS visitors
+                    FROM ${table} WHERE ${where}
+                   GROUP BY value
+                   ORDER BY clicks DESC, value ASC
+                   LIMIT ${q.limit + 1}`,
+          params: { ...windowParams(w), ...(keyed ? {} : { dimension }) },
+        })
+        return {
+          window: { from: new Date(w.fromMs).toISOString(), to: new Date(w.toMs).toISOString() },
+          link: w.linkId,
+          dimension,
+          truncated: rows.length > q.limit,
+          rows: rows.slice(0, q.limit).map((row) => ({
+            value: row.value,
+            clicks: count(row.clicks),
+            visitors: count(row.visitors),
+          })),
         }
       },
     )

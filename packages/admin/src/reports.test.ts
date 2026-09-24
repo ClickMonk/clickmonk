@@ -64,12 +64,30 @@ beforeAll(async () => {
   await resetDatabases(pool, ch)
   await insert([
     click(),
-    click({ click_id: '01920000-0000-7000-8000-00000000000b', visitor_id: 'v2', country: 'US' }),
+    // Another visitor, another country, and the second value of every open
+    // dimension a breakdown reads: a fixture in which `device`, `os`, `browser`
+    // and `referrer` each held one value could not tell a rollup that wrote the
+    // real column from one that wrote a constant, and could not tell a
+    // breakdown that read the dimension it was asked for from one that read
+    // some other.
+    click({
+      click_id: '01920000-0000-7000-8000-00000000000b',
+      visitor_id: 'v2',
+      country: 'US',
+      device: 'tablet',
+      os: 'android',
+      browser: 'safari',
+      referrer: 'https://news.example.com/other',
+    }),
     // The same visitor as the first, on another link: one visitor, two clicks.
     click({ click_id: '01920000-0000-7000-8000-00000000000c', link_id: LINK_B, path: '/b' }),
     // A bot, blocked, in the same hour, by the same visitor as the first. It
     // reached no target, so its target id is empty — which is also the only
     // empty dimension value in these fixtures.
+    //
+    // Its device is a third value nobody else has, which is what gives the
+    // device breakdown two values on one click each: the order of those two is
+    // the tie-break and nothing else.
     click({
       click_id: '01920000-0000-7000-8000-00000000000d',
       traffic_class: 'bot',
@@ -80,6 +98,10 @@ beforeAll(async () => {
       signals: ['ua_bot'],
       destination: '',
       target_id: '',
+      device: 'mobile',
+      os: 'android',
+      browser: 'safari',
+      referrer: 'https://news.example.com/other',
     }),
     // An hour later, and outside the narrow window one test asks for. The same
     // visitor as the first, which is what makes a day's visitor count something
@@ -474,6 +496,10 @@ describe('GET /api/reports/timeseries', () => {
   // for a name nobody has, the alignment becomes NaN, and the caller is told
   // their `to` is not after their `from` — about a field they got right. So what
   // pins the enum is the field the refusal names.
+  //
+  // The breakdown's own enum needs no such test: a dimension nobody has is a
+  // 400 from the schema and, as a plain string, a query that reads no rows and
+  // answers 200.
   it('names the bucket when the bucket is one nobody has', async () => {
     const r = await app.inject({
       method: 'GET',
@@ -506,6 +532,259 @@ describe('GET /api/reports/timeseries', () => {
         url: '/api/reports/timeseries?from=2026-09-24T00:00:00.000Z&to=2026-09-25T00:00:00.000Z&bucket=hour',
         headers: read(cookie),
       })
+      expect(r.statusCode).toBe(429)
+      expect(r.json().error).toBe('too_many_reports')
+    } finally {
+      await other.close()
+    }
+  })
+})
+
+describe('GET /api/reports/breakdown', () => {
+  const url = (extra: string) => `/api/reports/breakdown?${WINDOW}&${extra}`
+
+  const breakdown = (extra: string, on: FastifyInstance = app) =>
+    on.inject({ method: 'GET', url: url(extra), headers: read(cookie) })
+
+  /** The window every whole-body assertion below echoes back. */
+  const COUNTED = { from: '2026-09-24T00:00:00.000Z', to: '2026-09-25T00:00:00.000Z' }
+
+  // Whole, and this is one of the four bodies asserted whole: `link`,
+  // `dimension` and `truncated` are each echoed or derived, and each one is
+  // asserted somewhere off the value it carries here — the link below, the
+  // keyed dimension below that, and the cut list further down. A field only
+  // ever seen at its least interesting value can be replaced by a constant.
+  //
+  // The click half an hour past the end of this window is what pins the
+  // clause's upper bound here: counted, DE would be five clicks by two
+  // visitors rather than four by one.
+  it('breaks a window down by country, most clicks first', async () => {
+    const r = await breakdown('dimension=country')
+    expect(r.statusCode).toBe(200)
+    expect(r.json()).toEqual({
+      window: COUNTED,
+      link: null,
+      dimension: 'country',
+      truncated: false,
+      rows: [
+        // Four clicks by one visitor, which is the number no arithmetic over
+        // the rows gives: the four are three rollup rows — two hours and two
+        // links — and adding their visitor counts gives three.
+        { value: 'DE', clicks: 4, visitors: 1 },
+        { value: 'US', clicks: 1, visitors: 1 },
+      ],
+    })
+  })
+
+  // The other table, and whole for the `dimension` echo: a constant `'country'`
+  // there answers the test above correctly and this one wrongly.
+  it('breaks it down by a dimension that keys the hourly rollup instead', async () => {
+    const r = await breakdown('dimension=class')
+    expect(r.statusCode).toBe(200)
+    expect(r.json()).toEqual({
+      window: COUNTED,
+      link: null,
+      dimension: 'class',
+      truncated: false,
+      rows: [
+        // Two visitors over four clicks that are three rollup rows of one, two
+        // and one visitor: summed they are four, merged they are two.
+        { value: 'human', clicks: 4, visitors: 2 },
+        { value: 'bot', clicks: 1, visitors: 1 },
+      ],
+    })
+  })
+
+  it.each<[string, { value: string; clicks: number; visitors: number }[]]>([
+    [
+      'action',
+      [
+        { value: '', clicks: 4, visitors: 2 },
+        { value: 'block', clicks: 1, visitors: 1 },
+      ],
+    ],
+    [
+      'outcome',
+      [
+        { value: 'target', clicks: 4, visitors: 2 },
+        { value: 'blocked', clicks: 1, visitors: 1 },
+      ],
+    ],
+    [
+      'os',
+      [
+        { value: 'windows', clicks: 3, visitors: 1 },
+        { value: 'android', clicks: 2, visitors: 2 },
+      ],
+    ],
+    [
+      'browser',
+      [
+        { value: 'chrome', clicks: 3, visitors: 1 },
+        { value: 'safari', clicks: 2, visitors: 2 },
+      ],
+    ],
+    [
+      'referrer',
+      [
+        { value: 'blog.example.com', clicks: 3, visitors: 1 },
+        { value: 'news.example.com', clicks: 2, visitors: 2 },
+      ],
+    ],
+  ])('answers %s from whichever table holds it', async (dimension, rows) => {
+    const r = await breakdown(`dimension=${dimension}`)
+    expect(r.statusCode).toBe(200)
+    expect(r.json().rows).toEqual(rows)
+  })
+
+  // The tie-break, which is the only thing that decides the last two rows here:
+  // one click each, so ordered by clicks alone they come back in whatever order
+  // the parts were read in, and a cut list would be arbitrary.
+  it('breaks a tie between two values on the value, ascending', async () => {
+    const r = await breakdown('dimension=device')
+    expect(r.statusCode).toBe(200)
+    expect(r.json().rows).toEqual([
+      { value: 'desktop', clicks: 3, visitors: 1 },
+      { value: 'mobile', clicks: 1, visitors: 1 },
+      { value: 'tablet', clicks: 1, visitors: 1 },
+    ])
+  })
+
+  // An empty value is a real answer — a click that reached no target — and is
+  // shown as one rather than dropped, so the rows add up to the total beside
+  // them.
+  it('keeps an empty value rather than dropping it', async () => {
+    const r = await breakdown('dimension=target')
+    expect(r.json().rows).toEqual([
+      { value: '00000000-0000-4000-8000-0000000000b1', clicks: 4, visitors: 2 },
+      { value: '', clicks: 1, visitors: 1 },
+    ])
+  })
+
+  // Both ends of the shared clause in one window, and the numbers rather than
+  // the length: the hour this starts at holds a click, so `>= from` written as
+  // `> from` empties the list, and the hour it ends at holds another by its own
+  // visitor, so `< to` written as `<= to` doubles both numbers. The chart
+  // cannot see the upper bound at all, so an endpoint that reuses the clause
+  // pins it or nothing does.
+  it('starts at the hour it names and stops before the hour it ends at', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/reports/breakdown?from=2026-09-24T11:00:00.000Z&to=2026-09-25T00:00:00.000Z&dimension=country',
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.json().rows).toEqual([{ value: 'DE', clicks: 1, visitors: 1 }])
+  })
+
+  it('counts whole hours and says which hours it counted', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/reports/breakdown?from=2026-09-24T10:30:00.000Z&to=2026-09-24T11:10:00.000Z&dimension=country',
+      headers: read(cookie),
+    })
+    // Asked for 10:30 to 11:10; counted 10:00 to 12:00, which is both hours.
+    expect(r.json().window).toEqual({
+      from: '2026-09-24T10:00:00.000Z',
+      to: '2026-09-24T12:00:00.000Z',
+    })
+    // Unaligned, the four clicks at 10:15 fall outside their own window and
+    // only the one at 11:30 is counted, so these numbers are the alignment.
+    expect(r.json().rows).toEqual([
+      { value: 'DE', clicks: 4, visitors: 1 },
+      { value: 'US', clicks: 1, visitors: 1 },
+    ])
+  })
+
+  // Whole, for the `link` echo: the bodies above carry `link: null`, which a
+  // constant would answer too.
+  it('counts one link when asked for one', async () => {
+    const r = await breakdown(`dimension=country&link=${LINK_B}`)
+    expect(r.statusCode).toBe(200)
+    expect(r.json()).toEqual({
+      window: COUNTED,
+      link: LINK_B,
+      dimension: 'country',
+      truncated: false,
+      rows: [{ value: 'DE', clicks: 1, visitors: 1 }],
+    })
+  })
+
+  // Whole, for `truncated`: it is false in every other body asserted whole.
+  it('cuts the list at the limit asked for and says it was cut', async () => {
+    const r = await breakdown('dimension=country&limit=1')
+    expect(r.statusCode).toBe(200)
+    expect(r.json()).toEqual({
+      window: COUNTED,
+      link: null,
+      dimension: 'country',
+      truncated: true,
+      rows: [{ value: 'DE', clicks: 4, visitors: 1 }],
+    })
+  })
+
+  // Away from one, where a cut and an off-by-one in either direction look
+  // different: three values, two asked for. The row past the limit is read —
+  // that is how `truncated` is known without a second query — and not shown.
+  it('cuts a longer list at the limit too, and shows neither more nor fewer', async () => {
+    const r = await breakdown('dimension=device&limit=2')
+    expect(r.json().truncated).toBe(true)
+    expect(r.json().rows).toEqual([
+      { value: 'desktop', clicks: 3, visitors: 1 },
+      { value: 'mobile', clicks: 1, visitors: 1 },
+    ])
+  })
+
+  it('does not say it was cut when it was not', async () => {
+    const r = await breakdown('dimension=country&limit=2')
+    expect(r.json().truncated).toBe(false)
+    expect(r.json().rows).toHaveLength(2)
+  })
+
+  // The ceiling itself, from both sides. Written out rather than computed from
+  // MAX_BREAKDOWN_ROWS: a bound derived from the constant it is testing moves
+  // when the constant does and goes on passing. Without the 500 the ceiling
+  // could be one row tighter than the number it promises and nothing would say
+  // so; without the 501 it could be absent.
+  it('takes the most rows it will return, and refuses one more', async () => {
+    const at = await breakdown('dimension=country&limit=500')
+    expect(at.statusCode).toBe(200)
+    expect(at.json().truncated).toBe(false)
+    const over = await breakdown('dimension=country&limit=501')
+    expect(over.statusCode).toBe(400)
+    expect(over.json().error).toBe('invalid_query')
+  })
+
+  it.each([
+    ['a dimension nobody has', 'dimension=asn'],
+    ['no dimension at all', 'limit=10'],
+    ['a limit of zero', 'dimension=country&limit=0'],
+    ['a limit past the ceiling', 'dimension=country&limit=501'],
+    ['a limit that is not a number', 'dimension=country&limit=all'],
+    ['a field nobody knows', 'dimension=country&order=value'],
+  ])('refuses %s', async (_label, extra) => {
+    const r = await breakdown(extra)
+    expect(r.statusCode).toBe(400)
+    expect(r.json().error).toBe('invalid_query')
+  })
+
+  // Its own, because the credential is asked for route by route with no hook
+  // over all of them: a route that forgot to ask would read every click the
+  // install has with the other two routes' 401 tests still green.
+  it('needs a credential', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: url('dimension=country'),
+      headers: { host: ADMIN_HOST },
+    })
+    expect(r.statusCode).toBe(401)
+    expect(r.json().error).toBe('unauthenticated')
+  })
+
+  it('refuses when every report slot is taken', async () => {
+    const other = testApp(pool, clock, { ch, reportGate: new ConcurrencyGate(0) })
+    try {
+      const r = await breakdown('dimension=country', other)
       expect(r.statusCode).toBe(429)
       expect(r.json().error).toBe('too_many_reports')
     } finally {
@@ -671,11 +950,12 @@ describe('when ClickHouse is not there', () => {
   // and the 401 tests pin that each route asks — not where it asks. Moved below
   // the query, an unauthenticated request takes a report slot and scans the
   // window it chose before being told it was never allowed to ask, which is the
-  // scan the credential is there to stop. Both routes, because each one asks
+  // scan the credential is there to stop. Every route, because each one asks
   // for its own and a rule one route knows is not inherited by its neighbour.
   it.each([
     ['the summary', `/api/reports/summary?${WINDOW}`],
     ['the chart', `/api/reports/timeseries?${WINDOW}&bucket=hour`],
+    ['a breakdown', `/api/reports/breakdown?${WINDOW}&dimension=country`],
   ])('refuses %s without a credential before reading anything', async (_label, url) => {
     await onDeadWithLog(async (on, lines) => {
       const r = await on.inject({ method: 'GET', url, headers: { host: ADMIN_HOST } })
