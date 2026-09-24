@@ -43,38 +43,46 @@ run it on their own infrastructure; their click data stays theirs.
 
 **Early, unreleased, not for production.** What exists: the redirect (in-memory snapshot,
 spool before response, click caps, traffic classification and actions, country rules
-from an in-memory IP lookup), Caddy in front of it with on-demand TLS gated on a verified
-domain, the worker (spool to ClickHouse, migrations on boot, IP data updates, domain DNS
-verification), the CLI (`migrate`, `domain add|list|verify`, `link add`,
-`settings show|set`, `ipdata status|update`), `install.sh`, a Compose stack, and the
-restart durability and stack test suites.
+from an in-memory IP lookup, the password gate on a link), Caddy in front of it with
+on-demand TLS gated on a verified domain or the configured admin host, the worker (spool
+to ClickHouse, migrations on boot, IP data updates, domain DNS verification), the admin
+API (one account, sessions, TOTP with recovery codes, API keys, domain/link/settings
+CRUD, answering on `CLICKMONK_ADMIN_HOST` alone — unset, every route but `/health` is a
+503 and links serve exactly as before), the CLI (`migrate`,
+`domain add|list|verify`, `link add`, `settings show|set`, `ipdata status|update`,
+`admin create|passwd`, `apikey create|list|revoke`), `install.sh`, a Compose stack, and
+the restart durability and stack test suites.
 
 What does not exist yet, and must not be implied by any documentation:
 
-- **An admin hostname.** Caddy serves link domains only; there is no admin service to
-  route one to.
-- **Admin API and UI.** Links and domains are added with the CLI.
+- **A web UI.** There is an admin API; nothing draws it yet.
+- **Reports and exports, over the API or anywhere else.** Clicks reach ClickHouse and
+  nothing reads them back out. The API covers domains, links and settings only.
+- **Notifications of any kind.** No mail configuration exists; `GET /api/alerts` is what
+  an operator reads instead.
 - **Most link settings in the CLI.** `link add` takes `--target`, `--backup`, `--cap`,
   `--expires`, `--no-passthrough` and `--action` only, and no command changes a link
   after `link add`. `settings set` sets the install-wide traffic actions, the safe URL
-  and the abuser threshold. The evaluator supports device URLs, a returning URL,
-  country rules, a name and the disabled state; the CLI cannot set them yet, so they
-  need hand-written SQL. A returning URL also needs HTTPS to do anything: its cookie
-  is marked `Secure`, so a browser drops it over plain HTTP.
-- **Reporting.** Clicks reach ClickHouse; there are no reports or exports.
+  and the abuser threshold. Device URLs, a returning URL, country rules, a name, a
+  password and the disabled state are the admin API's, or hand-written SQL without it.
+  A returning URL also needs HTTPS to do anything: its cookie is marked `Secure`, so a
+  browser drops it over plain HTTP.
 - **Proxy/VPN detection beyond Tor exits, cloud providers' published ranges, and region
   or city.** No licensed VPN or proxy list has been found; datacenter traffic is
   recognised by ASN only, since no cloud provider's range file states a licence.
-- **Password links, backup and restore.**
+- **Backup and restore.**
 - Segments ClickHouse rejects are set aside as `.bad` files, and nothing reports them.
 - One redirect process per spool directory.
 - A full spool stops recording without stopping redirects; the drop count is on
   `/health` on the internal port and nowhere else.
-- The internal port (`redirect:9091`, which serves `/ask`) is published nowhere on the
-  host, but any container on the compose network can reach it, not only Caddy.
+- The internal port (`redirect:9091`, which serves `/ask`) and the admin port
+  (`admin:9100`) are published nowhere on the host, but any container on the compose
+  network can reach both, not only Caddy. The admin service's own `Host` guard — read
+  from the connection, never from a forwarded header — and its credential check are what
+  stand behind that, and `/health` sits in front of the guard on purpose.
 - The worker has no healthcheck, so `docker compose up -d --wait` can return before its
-  boot migration has finished; a `domain add` run immediately after can hit a missing
-  relation.
+  boot migration has finished; a `domain add` run immediately after refuses with "this
+  database has not been migrated yet".
 - The published-port IPv6 test is skipped on a host with no IPv6 address of its own;
   see "The stack suites" below for what still runs when it is.
 
@@ -88,14 +96,16 @@ reading a record version ships no later than writing it.
 A pnpm workspace of TypeScript packages, Node 22, ESM throughout. TypeScript is `strict`
 with `noUncheckedIndexedAccess`; avoid `any`, and justify it inline on the rare occasion
 it is unavoidable. Biome handles lint and format. Vitest runs the tests. Two stores:
-**Postgres** for domains, links, counters and the single migration ledger; **ClickHouse**
-for click events.
+**Postgres** for domains, links, counters, the admin account and its credentials, and the
+single migration ledger; **ClickHouse** for click events.
 
 ```
 packages/core/      pure logic, no I/O: link schemas (zod), the redirect evaluator,
                     device, OS and browser detection, traffic classification,
                     destination tokens, passthrough, rotation, click IDs, the click
-                    record. Owns SCHEMA_VERSION.
+                    record, and the credential primitives (password hashing, opaque
+                    tokens, TOTP, recovery codes, attempt counting). Owns
+                    SCHEMA_VERSION.
 packages/db/        Postgres and ClickHouse clients and the migrator. Migrations live
                     in packages/db/migrations/{postgres,clickhouse} as one shared
                     version sequence.
@@ -104,17 +114,23 @@ packages/ipdata/    IP data: the compact range-table format, the source parsers
                     updater the worker runs.
 packages/redirect/  the service that answers link domains: an in-memory snapshot,
                     the IP data and the per-address rate counter, the spool
-                    writer, the click-cap counter.
+                    writer, the click-cap counter, the password gate and its
+                    proof cookie.
 packages/worker/    ships the spool into ClickHouse; runs migrations on boot;
                     updates the IP data; checks domain DNS verification on a schedule.
-packages/cli/       `clickmonk migrate | domain add|list|verify | link add | settings | ipdata`.
+packages/admin/     the admin API: sessions, API keys, TOTP, domain/link/settings CRUD.
+packages/cli/       `clickmonk migrate | domain | link add | settings | ipdata | admin | apikey`.
 caddy/              the Caddyfile, and the tls.d/ and proxy.d/ drop-in directories an
                     operator edits: where certificates come from, and a proxy in
-                    front of Caddy.
+                    front of Caddy. The Caddyfile routes CLICKMONK_ADMIN_HOST to the
+                    admin service and every other name to the redirect, with a CEL
+                    expression rather than a host matcher so an unset value starts.
 install.sh          writes .env once, with fresh secrets, and starts the stack.
 test/stack/         brings the whole stack up against a local certificate authority
-                    and DNS server; proves TLS issuance, domain verification, and
-                    real client addresses over IPv4 and IPv6.
+                    and DNS server; proves TLS issuance, domain verification, real
+                    client addresses over IPv4 and IPv6, and the admin host — its
+                    certificate, a sign-in over HTTPS, and a password-protected link
+                    answered end to end.
 ```
 
 Three properties of the product shape every change:
@@ -136,7 +152,8 @@ pnpm build        # required before the first `pnpm test`
 pnpm test
 ```
 
-**Build before the first test run, and after changing `core`, `db` or `ipdata`.**
+**Build before the first test run, and after changing `core`, `db`, `ipdata`, `worker` or
+`admin`.**
 Packages import each other by name, which resolves to the *built* `dist/`, and `dist/`
 is not committed.
 A test in `packages/redirect` exercising a change in `packages/core` runs against the
@@ -185,7 +202,9 @@ They bring the whole stack up with a certificate authority and a DNS server of t
 so no ACME traffic and no public DNS lookup leaves the machine (the images themselves
 are still pulled over the network, once): a domain gets no certificate until it
 publishes its verification record, the address every visitor arrives from is the
-visitor's, and `install.sh` writes its secrets once. They bind **80 and 443**; the
+visitor's, and `install.sh` writes its secrets once. They also bring the admin service
+up, sign in to it over HTTPS on the admin host, and drive a password-protected link from
+the form to the redirect. They bind **80 and 443**; the
 durability suite binds 8080 and 8123 and the test databases 8123 and 5433. Run one at a
 time.
 

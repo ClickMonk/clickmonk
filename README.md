@@ -22,14 +22,23 @@ on your own infrastructure, and your click data stays yours.
 - **TLS on every link domain.** Caddy sits in front and obtains a certificate the first
   time someone asks for a domain over HTTPS, then renews it without anyone touching a
   file. It asks ClickMonk first, and ClickMonk says yes only for a domain you added and
-  verified, so a host name somebody else points at your server never makes your install
-  ask a certificate authority for anything.
+  verified, and for the admin host name if you set one, so a host name somebody else
+  points at your server never makes your install ask a certificate authority for anything.
 - **Domain verification.** `clickmonk domain add` prints a TXT record to publish. The
   worker looks for it every five minutes, and `clickmonk domain verify` looks now. Until
   it is found, links on that domain answer 404 and it gets no certificate. A check that
   fails later is recorded and shown, and never takes a verified domain back down.
 - **`./install.sh`**, which writes `.env` with fresh secrets the first time, builds the
   image and starts the stack. Running it again changes nothing that is already set.
+- **An admin API.** One admin account, created on the server with `clickmonk admin
+  create`, a session cookie for a browser and API keys for a script, two-factor
+  authentication with recovery codes, and endpoints for domains, links and the
+  install-wide settings. It answers on one host name of its own — set
+  `CLICKMONK_ADMIN_HOST` — and Caddy gets it a certificate the first time you visit it.
+- **Password-protected links.** Set a password on a link and visitors are asked for it on
+  a ClickMonk page on your own domain before they are sent on. Attempts are counted per
+  address per link, and the proof a visitor holds stops working the moment you change the
+  password.
 - **Traffic classification.** Every click is classed as human, bot, abuser, anonymous
   (a Tor exit), datacenter, or unknown when the IP checks could not run, from its
   user-agent, the number of requests from its address in the current one-minute window,
@@ -41,47 +50,57 @@ on your own infrastructure, and your click data stays yours.
   click also records its country, network (ASN), operating system and browser.
 - **Country rules** use the country looked up from the visitor's address.
 - **The CLI**: `clickmonk migrate`, `clickmonk domain add|list|verify`, `clickmonk link add`,
-  `clickmonk settings show|set` for the traffic actions, the safe URL and the abuser
-  threshold, and `clickmonk ipdata status|update`.
+  `clickmonk settings show|set`, `clickmonk ipdata status|update`, `clickmonk admin create|passwd`,
+  `clickmonk apikey create|list|revoke`. `settings set` covers the traffic actions, the
+  safe URL and the abuser threshold; the two `admin` commands read the password from
+  standard input and from nowhere else.
 - **A Docker Compose stack** that runs all of it, and a test that restarts each service
   under continuous traffic and requires every redirect the client received to arrive in
   ClickHouse as a click.
 
 What does not work yet:
 
-- **An admin hostname.** Caddy serves link domains. There is nothing to serve on the
-  hostname you would run the admin interface on, because there is no admin interface.
-- **An admin API or UI.** Domains and links are added with the CLI.
-- **Most link settings.** `clickmonk link add` sets targets, a backup URL, a click cap,
-  an expiry, passthrough and traffic action overrides only, and there is no command to
-  change a link once it is added. The redirect supports per-device destinations, a
-  returning-visitor destination, country rules, a link name and disabling a link, but
-  the CLI cannot set any of them yet, so they need SQL written by hand.
+- **A web interface.** There is an admin API but no pages to drive it: a browser can sign
+  in, and there is nothing to click. Driving it means `curl` or the CLI for now. Enrolling
+  an authenticator app hands you the secret and an `otpauth:` URI to paste into it, because
+  nothing here draws a QR code.
+- **Reports and the click log over the API.** The API covers domains, links and settings.
+  Clicks reach ClickHouse and nothing reads them back out yet.
+- **Any notification.** Nothing is emailed, posted or pushed anywhere: there is no mail
+  configuration and no secret for one. `GET /api/alerts` lists every domain whose last DNS
+  check did not find its token, and every domain no check has reached, which is what an
+  operator has instead.
+- **Most link settings in the CLI.** `clickmonk link add` sets targets, a backup URL, a
+  click cap, an expiry, passthrough and traffic action overrides only, and no command
+  changes a link once it is added. Per-device destinations, a returning-visitor
+  destination, country rules, a link name, a password and disabling a link are set
+  through the admin API, or by hand in SQL without it.
   Returning-visitor routing also needs HTTPS to do anything: its cookie is marked
   `Secure`, so a browser drops it over plain HTTP.
-- **Reports.** Clicks are stored in ClickHouse, but there are no reports or exports.
 - **Proxy and VPN detection beyond Tor.** The anonymous class covers Tor exit relays
   only. The well-known lists of VPN and proxy ranges publish no licence, so they are not
   used.
 - **Cloud providers' published address ranges.** Datacenter traffic is recognised by its
   network (ASN) only. The providers' range files state no licence, so they are not used.
 - **Region and city.** A click records its country only.
-- **Password-protected links, and backup and restore.**
+- **Backup and restore.**
 - **Rejected clicks are not reported.** A batch of clicks ClickHouse refuses is set aside
   as a `.bad` file in the spool, and nothing tells you it is there.
 - **More than one redirect process per spool directory.**
 - **A full spool stops recording without stopping redirects.** Above its size bound the
   redirect keeps sending visitors on but drops the click; the running count of drops is
   in `/health` on the internal port, and nowhere else yet.
-- **The redirect is reachable from the whole compose network.** Neither of its ports is
-  published on the host, but any other container on the stack's own Docker network can
-  reach both, not only Caddy. On `redirect:9091` that means reading the `ask` check,
-  which lists this install's verified domains. On `redirect:8080` it means more: the
-  stack trusts a forwarded address from that network (`CLICKMONK_TRUSTED_PROXIES` is
-  `uniquelocal,loopback`), so a container inside the install can set `X-Forwarded-For`
-  and choose the address recorded, counted and looked up for every click it sends. Every
-  container on that network is one you put there, which is what keeps this a limit
-  rather than a way in.
+- **The redirect and the admin API are reachable from the whole compose network.** None of
+  their ports is published on the host, but any other container on the stack's own Docker
+  network can reach all of them, not only Caddy. On `redirect:9091` that means reading the
+  `ask` check, which lists this install's verified domains. On `redirect:8080` it means
+  more: the stack trusts a forwarded address from that network
+  (`CLICKMONK_TRUSTED_PROXIES` is `uniquelocal,loopback`), so a container inside the
+  install can set `X-Forwarded-For` and choose the address recorded, counted and looked up
+  for every click it sends. On `admin:9100` a request still has to carry the admin host
+  name in `Host` — a forwarded header will not do, and every route but `/health` is
+  refused without it — and then it still needs a credential. Every container on that
+  network is one you put there, which is what keeps this a limit rather than a way in.
 - **IPv6 coverage depends on the host the tests run on.** The published-port IPv6 test
   is skipped when that host has no IPv6 address of its own — most CI runners — and is
   meant to be run by hand, on a host that has one, before a release. A second,
@@ -107,8 +126,8 @@ it never changes a value already in `.env`.
 
 `install.sh` waits for the services that declare a healthcheck; the worker does not
 declare one, so `install.sh` can return before its boot migration has finished. If a
-`domain add` run right after it fails with a Postgres error naming a missing relation
-(`domains` does not exist yet), that is why: wait a few seconds and try again.
+`domain add` run right after it says the database has not been migrated yet, that is
+why: wait a few seconds and try again.
 
 **Just trying it out?** A domain serves nothing until it is verified, so for a trial add
 one with `--verified`, which skips the DNS check and makes its links answer at once over
@@ -154,9 +173,9 @@ ClickMonk does not know its own public address, so it records what a domain reso
 rather than judging it — a host behind NAT, a load balancer or a CDN is normal. A domain
 that stops publishing its record is reported, never un-verified: taking live links down
 because a resolver hiccuped would be worse than the problem. If you take a domain back
-down yourself — there is no command for it yet, so that means deleting its row or
-setting `verified` back to false in Postgres — the certificate it already has stays in
-the `caddy-data` volume and Caddy keeps presenting it until it expires. What stops is
+down yourself — `POST /api/domains/:id/unverify` over the admin API, or deleting its row
+in Postgres, since the CLI has no command for it — the certificate it already has stays
+in the `caddy-data` volume and Caddy keeps presenting it until it expires. What stops is
 the renewal, and any new certificate for it.
 
 **IPv6 visitors are only recorded by their own address if the Docker daemon NATs their
@@ -178,6 +197,129 @@ and Caddy exits at boot, unable to find a file that was never there. Flexible mo
 traffic to your server in clear and is not an option.
 
 Certificates live in the `caddy-data` volume. Back it up with the rest.
+
+## The admin API
+
+Pick a host name for it that is **not** a link domain — link slugs and admin routes would
+otherwise share one namespace, and `domain add` refuses a link domain under this name for
+that reason — point it at this server, and put it in `.env`:
+
+```sh
+# in .env
+CLICKMONK_ADMIN_HOST=admin.example.com
+```
+
+The value is a bare lower-case host name: no scheme, no port, no wildcard. Anything else
+fails the configuration at boot with the variable named, rather than quietly routing names
+you did not mean. Then restart, so Compose hands the new value to the services that read
+it:
+
+```sh
+docker compose up -d
+```
+
+Then create the one admin account. The password is read from standard input, never from an
+argument, because arguments are visible in `ps` and left in your shell history. It is at
+least 12 characters. **The `-T` is not optional:** without it Compose allocates a
+terminal, nothing arrives on standard input, and the command refuses rather than reading a
+password off the screen.
+
+```sh
+printf '%s' 'your-admin-password' | docker compose exec -T worker \
+  node packages/cli/dist/index.js admin create you@example.com
+```
+
+Visiting `https://admin.example.com/api/me` is what makes Caddy obtain a certificate for
+that name, on the first request; with no credential it answers `401`, which is the API
+working. Sign in with `POST /api/session`, which sets a session cookie:
+
+```sh
+curl -s -c cookies.txt -X POST https://admin.example.com/api/session \
+  -H 'content-type: application/json' -H 'origin: https://admin.example.com' \
+  -d '{"email":"you@example.com","password":"your-admin-password"}'
+curl -s -b cookies.txt https://admin.example.com/api/me
+```
+
+**Every request that changes something needs an `Origin` header naming that host — the
+sign-in itself included** — which is what stops another site from making your browser
+change your links. An API key is exempt, which is why a script is better off with one.
+
+Turn on two-factor authentication with `POST /api/totp`, which takes the password and
+hands back a secret to put in your authenticator app, then `POST /api/totp/confirm`, which
+takes the password and a code from the app and prints ten recovery codes once. The secret
+is the one the server minted, so `confirm` takes those two fields and nothing else. From
+then on the sign-in body carries a `code` as well, or a `recoveryCode` instead of one; and
+replacing or removing the authenticator needs a code from the app you already have, or one
+of those recovery codes, not just the password.
+
+`GET /health` on that host answers `{"status":"ok"}` to anyone, because Caddy has to be
+able to route it and Compose has to be able to probe it. It tells a stranger nothing else —
+not whether the install is configured, and not whether the account exists. That is
+`GET /api/me`, which needs a credential.
+
+`GET /api/domains` returns at most 500 entries and `GET /api/keys` at most 200, each
+setting `"truncated": true` when there were more. `clickmonk domain list` has no such cap;
+`clickmonk apikey list` has the same one and says when it hit it. `GET /api/links` pages
+properly, with `limit` and `cursor`.
+
+For a script, mint an API key and send it as `Authorization: Bearer …`:
+
+```sh
+docker compose exec -T worker node packages/cli/dist/index.js apikey create reporting
+```
+
+A key can read and write domains, links and settings, and nothing else. Every route that
+touches a credential wants a session instead: listing or ending sessions, changing the
+password, anything to do with two-factor authentication, and minting or revoking a key. So
+a key that leaks cannot lock you out of your own install, and cannot make itself a second
+key.
+
+**What the API cannot do, on purpose:** it cannot mark a domain verified. Only a DNS check
+that finds this install's token, or `clickmonk domain add --verified` typed on the server,
+can do that. It *can* un-verify one, which stops its links serving and stops its
+certificate renewing — but a certificate Caddy already holds is presented until it expires,
+so un-verifying is not a way to take a domain off the air quickly.
+
+`POST /api/domains/:id/check` asks DNS now instead of waiting for the worker's next pass.
+It refuses a second check of the same domain within a minute, naming the result it already
+has, and it runs at most two checks at a time: a credential is not a licence to make this
+install query DNS in a loop.
+
+**If you never set `CLICKMONK_ADMIN_HOST`,** nothing above exists and nothing breaks: the
+stack starts, Caddy routes every name to the redirect exactly as it did before, the admin
+service answers `503` on every route but `/health`, and the CLI is the only way in.
+
+## Password-protected links
+
+Set a password when you create a link, or later with `PATCH /api/links/:id`. It is at
+least 6 characters, and the domain has to be one you have already added:
+
+```sh
+curl -X POST https://admin.example.com/api/links \
+  -H 'authorization: Bearer <your key>' -H 'content-type: application/json' \
+  -d '{"host":"links.example.com","slug":"private","targets":[{"url":"https://example.com/"}],"password":"spring2026"}'
+```
+
+A visitor gets a page on your own domain with one field. A correct password sets a signed
+cookie for that link, good for twelve hours, and they are sent on; the cookie is `Secure`,
+so this needs HTTPS — over a plain-HTTP trial the visitor is asked every time. Wrong
+answers are counted per address per link and refused after five in a minute. Changing the
+password invalidates every cookie issued under the old one.
+
+The password is stored as a slow salted hash and is never in a response, a log or a click
+record. What is recorded is that the page was shown: every prompt, wrong answer, refusal
+and correct answer is a click event with the step that decided it.
+
+**What a link password is not.** It gates the redirect, not the destination. The URL a
+visitor is sent to is whatever you set, and anyone who already has that URL reaches it
+without answering anything. A visitor who has answered holds a proof cookie for that link
+until it expires or you change the password, and nothing stops them passing the cookie, or
+the password, to someone else. It also does not replace the other checks, and does not
+stand in front of them: a link blocked by its traffic class answers 403, and one that has
+expired or used up its click cap goes to its backup URL or answers 410, all without the
+password being asked for at all. A country rule is applied after it, so answering the
+password does not get a visitor past one. Use it to keep a link out of casual
+hands, not to protect something that matters if it gets out.
 
 ## IP data
 
