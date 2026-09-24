@@ -156,3 +156,30 @@ export function rateKey(ip: string): string | null {
   if (!p) return null
   return p.v === 4 ? `4:${p.n}` : `6:${p.w[0]}:${p.w[1]}`
 }
+
+/**
+ * The network an address belongs to, as text: /24 for IPv4 and /64 for IPv6.
+ *
+ * Every address this install shows anybody goes through here — the click log
+ * and the CSV export — so that an operator can see a pattern or a bot without
+ * the file being a file of addresses. The raw column keeps the whole address
+ * until the retention pass blanks it, because classification and the abuser
+ * counter need it; nothing reads it back out.
+ *
+ * It is one function rather than a rule written once in each reader, and it is
+ * here rather than in either service, for the same reason `rateKey` is: two
+ * readers that disagree about the same click are worse than either answer.
+ *
+ * **Null, never the input, for anything that is not an address.** `canonicalIp`
+ * next door returns what it was given when it cannot parse it, which is right
+ * for a canonicaliser and would be exactly wrong here: it would hand back the
+ * whole address the moment the parser stopped recognising a form it used to
+ * accept. Both callers already handle null, because the retention pass blanks
+ * the column to an empty string.
+ */
+export function truncateIp(s: string): string | null {
+  const p = parseIp(s)
+  if (!p) return null
+  if (p.v === 4) return `${[p.n >>> 24, (p.n >>> 16) & 0xff, (p.n >>> 8) & 0xff, 0].join('.')}/24`
+  return `${formatV6([p.w[0], p.w[1], 0, 0])}/64`
+}
