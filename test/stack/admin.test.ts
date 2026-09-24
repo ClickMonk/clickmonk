@@ -250,14 +250,14 @@ describe('the admin host', () => {
     // The `ask` check approves it because the operator named it in the
     // configuration, not because any row says it is verified.
     //
-    // The handshake is what is being waited for, so the request is one that
-    // needs a credential: a 401 over TLS proves the certificate exists, and
-    // asking a route that answers anyone would mean this suite's own liveness
-    // probe was the thing reachable from the internet.
-    await until('a certificate for the admin host', 120_000, () => {
-      const r = api('GET', '/api/me')
-      return r.exit === 0 && r.status === 401
-    })
+    // The handshake is the whole of what is waited for — a client exit of 0
+    // means the certificate exists and this authority signed it — and the route
+    // asked is one that needs a credential, so that what the wait proves and
+    // what the assertions below check are two different things. Asking a route
+    // that answers anyone would mean this suite's own liveness probe was the
+    // thing reachable from the internet; waiting for the refusal itself would
+    // turn a service that stopped refusing into a timeout instead of a red.
+    await until('a certificate for the admin host', 120_000, () => api('GET', '/api/me').exit === 0)
     const r = api('GET', '/api/me')
     expect(r.exit, r.stderr).toBe(0)
     expect(r.status).toBe(401)
@@ -642,6 +642,9 @@ describe('the admin service in the stack', () => {
       '-e',
       "fetch('http://admin:9100/health').then(r=>r.json()).then(j=>console.log(JSON.stringify(j)))",
     )
-    expect(r.trim()).toBe('{"status":"ok"}')
+    // That it answers, on this port, with this status — what it must *not* also
+    // say is the test above's subject, and saying it twice would leave two tests
+    // to change for one decision.
+    expect(r).toContain('"status":"ok"')
   })
 })
