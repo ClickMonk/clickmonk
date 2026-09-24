@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   DEFAULT_RETENTION,
   DEFAULT_TRAFFIC_SETTINGS,
+  MAX_RETENTION_DAYS,
   RetentionSettingsSchema,
   TrafficSettingsSchema,
   retentionNote,
@@ -47,6 +48,17 @@ describe('RetentionSettingsSchema', () => {
   it('accepts the defaults: ninety days of clicks and thirty of addresses', () => {
     expect(DEFAULT_RETENTION).toEqual({ rawRetentionDays: 90, ipRetentionDays: 30 })
     expect(RetentionSettingsSchema.parse(DEFAULT_RETENTION)).toEqual(DEFAULT_RETENTION)
+  })
+
+  // The refusal below names 3651, which pins the bound only relative to
+  // wherever it happens to be. Both numbers here are written out, so lowering
+  // the ceiling — ten years to one, say — fails here rather than passing a
+  // suite that never mentions the constant.
+  it('bounds either period at ten years, and accepts exactly that', () => {
+    expect(MAX_RETENTION_DAYS).toBe(3650)
+    expect(
+      RetentionSettingsSchema.safeParse({ rawRetentionDays: 3650, ipRetentionDays: 3650 }).success,
+    ).toBe(true)
   })
 
   it('takes null for either period, meaning never', () => {

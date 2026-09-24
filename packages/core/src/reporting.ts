@@ -19,7 +19,12 @@
 export const REPORT_BUCKETS = ['hour', 'day'] as const
 export type ReportBucket = (typeof REPORT_BUCKETS)[number]
 
-export const BUCKET_MS: Record<ReportBucket, number> = {
+/**
+ * Readonly because `bucketCount` reads it on every call: an assignment to one
+ * of these two fields anywhere in the process would change every bucket count
+ * afterwards, and nothing would report it.
+ */
+export const BUCKET_MS: Readonly<Record<ReportBucket, number>> = {
   hour: 3_600_000,
   day: 86_400_000,
 }

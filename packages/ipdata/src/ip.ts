@@ -174,8 +174,9 @@ export function rateKey(ip: string): string | null {
  * next door returns what it was given when it cannot parse it, which is right
  * for a canonicaliser and would be exactly wrong here: it would hand back the
  * whole address the moment the parser stopped recognising a form it used to
- * accept. Both callers already handle null, because the retention pass blanks
- * the column to an empty string.
+ * accept. A reader has to have an answer for null regardless of that: the
+ * retention pass blanks the address column to an empty string, so a click old
+ * enough to have been blanked arrives here as something that is not an address.
  */
 export function truncateIp(s: string): string | null {
   const p = parseIp(s)
