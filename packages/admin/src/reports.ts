@@ -66,6 +66,26 @@ export const WINDOW_FIELDS = {
   link: LinkId.optional(),
 }
 
+/**
+ * The instants the store can hold: the range `DateTime64(3, 'UTC')` represents,
+ * which is the type every click time, every rollup hour and both ends of every
+ * window are compared as.
+ *
+ * **A bound on a window's length is not a bound on where it sits.** Four hundred
+ * days in the year 9999 is inside every length and bucket ceiling here, and what
+ * happens to it is the reason this exists: ClickHouse does not refuse a
+ * parameter past 2299, it silently clamps it, so a report asked for 9999 would
+ * be answered for 2299 with nothing in the response saying so. Past year 9999 it
+ * is worse in the other direction — `toISOString()` switches to its extended-year
+ * form, the text built below is not a timestamp at all, and the store's refusal
+ * reaches the caller as `reporting_unavailable`: an install outage for what is
+ * one bad field of one request. The same rule as the row limit, the link and the
+ * log's cursor: **a caller's value is checked against the range of the type it
+ * is bound into, not only against its shape.**
+ */
+export const MIN_STORE_MS = Date.parse('1900-01-01T00:00:00.000Z')
+export const MAX_STORE_MS = Date.parse('2299-12-31T23:59:59.999Z')
+
 export interface ReportWindow {
   fromMs: number
   toMs: number
@@ -111,6 +131,13 @@ export function parseWindow(
   }
   if (toMs - fromMs > MAX_REPORT_WINDOW_MS) {
     return fail(400, 'window_too_long', `a window may be at most ${MAX_REPORT_WINDOW_DAYS} days`)
+  }
+  // After the alignment, because the alignment is what a query is run with — and
+  // because raising `to` to the next hour is itself a way past the end: a window
+  // ending at the last millisecond of 9999 is aligned into year 10000, which is
+  // where the store's refusal turns into a 503.
+  if (fromMs < MIN_STORE_MS || toMs > MAX_STORE_MS) {
+    return fail(400, 'invalid_query', 'from, to: must name instants the store can hold')
   }
   // The shape of the link, here and not only in a route's schema, for the same
   // reason the length is here: this value is bound into a query as a UUID, so a

@@ -96,6 +96,25 @@ const TIED_TIMES = [
 ]
 const tied = TIED_IDS.map((id, i) => click({ click_id: id, time: TIED_TIMES[i] }))
 
+/**
+ * Fifty-one clicks in one instant, in a month of its own and older than every
+ * other click in this file.
+ *
+ * The page size a caller gets when they name none cannot be read off a window of
+ * three or six clicks: any default of three or more answers every assertion in
+ * them. So this window holds one more click than the default, in a partition of
+ * its own so that it moves nothing else, and all fifty-one share an instant — a
+ * page of them is then cut by the id alone, which is the tie-break, so the same
+ * window says what the default is and which fifty it returns.
+ */
+const PAGE_INSTANT = '2026-08-15 10:00:00.000'
+const PAGE_INSTANT_MS = Date.parse('2026-08-15T10:00:00.000Z')
+const PAGE_IDS = Array.from(
+  { length: 51 },
+  (_, i) => `01920000-0000-7000-8000-0000000002${(i + 1).toString(16).padStart(2, '0')}`,
+)
+const manyInOneInstant = PAGE_IDS.map((id) => click({ click_id: id, time: PAGE_INSTANT }))
+
 /** A well-formed id for a cursor whose instant is the thing under test. */
 const CURSOR_ID = '01920000-0000-7000-8000-0000000000ff'
 
@@ -104,6 +123,7 @@ const WINDOW = 'from=2026-09-24T00:00:00.000Z&to=2026-09-25T00:00:00.000Z'
 /** Two days nothing above reads: see the two blocks at the end of the file. */
 const DAY_BEFORE = 'from=2026-09-23T00:00:00.000Z&to=2026-09-24T00:00:00.000Z'
 const TIED_DAY = 'from=2026-09-22T00:00:00.000Z&to=2026-09-23T00:00:00.000Z'
+const PAGE_DAY = 'from=2026-08-15T00:00:00.000Z&to=2026-08-16T00:00:00.000Z'
 
 beforeAll(async () => {
   await resetDatabases(pool, ch)
@@ -174,6 +194,8 @@ beforeAll(async () => {
     // Six clicks two days earlier, three of them in one millisecond and two in
     // another: see the paging block at the end of the file.
     ...tied,
+    // Fifty-one in another month: see the default-page block at the end.
+    ...manyInOneInstant,
   ])
 })
 
@@ -539,6 +561,21 @@ describe('GET /api/clicks', () => {
     expect(over.json().error).toBe('invalid_query')
   })
 
+  // The window the store cannot hold, refused by this route because the parser
+  // every report route shares refuses it. Four hundred days in 9999 is inside
+  // the length bound, and the store would clamp it to 2299 and answer for a year
+  // nobody asked about — the refusal is what keeps the window this response
+  // echoes the window that was read.
+  it('refuses a window the store could not hold', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/clicks?from=9999-01-01T00:00:00.000Z&to=9999-12-31T00:00:00.000Z',
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(400)
+    expect(r.json().error).toBe('invalid_query')
+  })
+
   it('refuses a window longer than four hundred days', async () => {
     const r = await app.inject({
       method: 'GET',
@@ -646,10 +683,9 @@ describe('GET /api/clicks, paging across a tie', () => {
     expect(seen).toEqual([...TIED_IDS].reverse())
   })
 
-  // The same six in one page, which says two things at once: nothing is lost
-  // without a cursor, and the page size a caller who names none gets is at least
-  // six. The number itself — fifty — is not readable off a fixture of six, the
-  // way the ceiling is readable off a limit of 201.
+  // The same six in one page: nothing is lost when no cursor is given. What the
+  // page size actually is belongs to the block below, which owns a window big
+  // enough to read it off.
   it('returns them all when no page size is asked for', async () => {
     const r = await app.inject({
       method: 'GET',
@@ -658,6 +694,37 @@ describe('GET /api/clicks, paging across a tie', () => {
     })
     expect(idsOf(r)).toEqual([...TIED_IDS].reverse())
     expect(r.json().nextCursor).toBeNull()
+  })
+})
+
+/**
+ * The page a caller gets when they ask for no page size.
+ *
+ * Fifty of fifty-one, and the fifty it returns are the fifty highest ids: with
+ * every click at one instant the order is the id alone, so a cut at the wrong end
+ * — an ascending tie-break — returns a different fifty and not a different
+ * number, which no assertion about the length could see. The one left out is
+ * named, and the cursor is asserted whole, so the page ends where the next one
+ * starts.
+ *
+ * Fifty is written out rather than read from `DEFAULT_CLICK_PAGE`, for the reason
+ * every bound in this file is written out.
+ */
+describe('GET /api/clicks, the page size nobody asked for', () => {
+  it('answers fifty of them, newest id first, and says there are more', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/clicks?${PAGE_DAY}`,
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(200)
+    const ids = r.json().clicks.map((c: { clickId: string }) => c.clickId)
+    expect(ids).toHaveLength(50)
+    // The fifty highest ids, descending: everything but the lowest.
+    expect(ids).toEqual([...PAGE_IDS].slice(1).reverse())
+    expect(ids).not.toContain(PAGE_IDS[0])
+    // And the boundary is the last row of this page, not the end of the window.
+    expect(r.json().nextCursor).toBe(`${PAGE_INSTANT_MS}.${PAGE_IDS[1]}`)
   })
 })
 

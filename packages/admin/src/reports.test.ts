@@ -904,6 +904,74 @@ describe('parseWindow', () => {
     expect((thrown as HttpError).code).toBe('invalid_query')
   })
 
+  /**
+   * The ends of the window against the ends of the type it is compared as.
+   *
+   * The length bound above does not imply a position bound: four hundred days in
+   * the year 9999 is inside it, inside the bucket ceiling, and outside what
+   * `DateTime64(3,'UTC')` can hold. What the store does with it is the reason
+   * this is a refusal rather than a curiosity — below year 10000 it clamps
+   * silently, so a report asked about 9999 is answered about 2299 with nothing
+   * saying so, and above it the parameter is refused and the caller is told the
+   * install is unavailable.
+   *
+   * Every instant is written out rather than taken from `MIN_STORE_MS` and
+   * `MAX_STORE_MS`: a bound derived from the constant it is testing moves when
+   * the constant moves and goes on passing.
+   */
+  it.each([
+    ['the first instant the store holds', '1900-01-01T00:00:00.000Z', '1900-01-02T00:00:00.000Z'],
+    ['the last', '2299-12-30T00:00:00.000Z', '2299-12-31T23:59:59.999Z'],
+  ])('takes a window at %s', (_label, from, to) => {
+    const w = parseWindow({ from, to }, { alignMs: null })
+    expect(w.fromMs).toBe(Date.parse(from))
+    expect(w.toMs).toBe(Date.parse(to))
+  })
+
+  it.each([
+    // One millisecond before the first instant, and a day either side of the
+    // last: the length of each is well inside four hundred days, which is the
+    // half the length bound cannot see.
+    [
+      'a day before the first instant it holds',
+      '1899-12-31T00:00:00.000Z',
+      '1900-01-01T00:00:00.000Z',
+    ],
+    ['a day after its last', '2299-12-31T00:00:00.000Z', '2300-01-01T00:00:00.000Z'],
+    ['a window in the year nine thousand', '9999-01-01T00:00:00.000Z', '9999-12-31T00:00:00.000Z'],
+  ])('refuses a window at %s', (_label, from, to) => {
+    let thrown: unknown
+    try {
+      parseWindow({ from, to }, { alignMs: null })
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(HttpError)
+    expect((thrown as HttpError).status).toBe(400)
+    expect((thrown as HttpError).code).toBe('invalid_query')
+  })
+
+  /**
+   * Raising `to` to the next hour is itself a way past the end, which is why the
+   * check runs after the alignment and not on what the caller sent. The last
+   * millisecond of 9999 aligns into year 10000, where `toISOString` stops
+   * producing a timestamp at all: unaligned this window would be refused for
+   * being past 2299 anyway, so what this pins is that an *aligned* end is what
+   * gets checked.
+   */
+  it('refuses a window the alignment pushes past the end', () => {
+    let thrown: unknown
+    try {
+      parseWindow(
+        { from: '9999-12-31T22:00:00.000Z', to: '9999-12-31T23:59:59.999Z' },
+        { alignMs: HOUR_MS },
+      )
+    } catch (err) {
+      thrown = err
+    }
+    expect((thrown as HttpError).code).toBe('invalid_query')
+  })
+
   // The link's shape belongs here for the same reason the length does. Bound
   // into a query as a UUID, a link that is not one comes back from the store as
   // a failure, so a caller reaching this function without the route's schema
