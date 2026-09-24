@@ -407,6 +407,20 @@ describe('GET /api/reports/timeseries', () => {
     expect(r.json().message).toContain('bucket')
   })
 
+  // Its own test and not the summary's: the credential is asked for per route
+  // here, with no hook over all of them, so a route that forgot to ask would be
+  // an unauthenticated read of every click the install has and the summary's
+  // test would still be green.
+  it('needs a credential', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/reports/timeseries?from=2026-09-24T00:00:00.000Z&to=2026-09-25T00:00:00.000Z&bucket=hour',
+      headers: { host: ADMIN_HOST },
+    })
+    expect(r.statusCode).toBe(401)
+    expect(r.json().error).toBe('unauthenticated')
+  })
+
   it('refuses when every report slot is taken', async () => {
     const other = testApp(pool, clock, { ch, reportGate: new ConcurrencyGate(0) })
     try {
