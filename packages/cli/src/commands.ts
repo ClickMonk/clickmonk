@@ -505,10 +505,11 @@ async function adminCreate(args: string[], d: CliDeps): Promise<void> {
 async function adminPasswd(d: CliDeps): Promise<void> {
   await requireAccount(d)
   const password = await readPassword(d)
-  // The one writer, which clears the failure count and any standing lockout in
-  // the same statement: this command is the way back in, and a lock over a
-  // password that no longer exists would keep the only account out for nothing.
-  await setAccountPassword(d.pg, password)
+  // Clearing the failure count and any standing lockout is this command's
+  // alone: it is the way back in, and a lock over a password that no longer
+  // exists would keep the only account out for nothing. The API route asks for
+  // the opposite, because it never has to show the second factor.
+  await setAccountPassword(d.pg, password, { clearLockout: true })
   const r = await d.pg.query('DELETE FROM sessions')
   d.out(`password changed; ${r.rowCount ?? 0} session(s) signed out`)
 }

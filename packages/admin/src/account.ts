@@ -105,18 +105,32 @@ export async function createAccount(
  * Replaces the password. Returns the new stored hash, whose fingerprint is
  * what every proof issued under the old password was bound to.
  *
- * The failure count, its clock and any lockout go with it, in the same
- * statement: those failures were guesses at a password that no longer exists,
- * so carrying them forward punishes the new one for the old one's history. It
- * is also the way back in from the CLI — an admin locked out at the form can
- * set a new password and use it immediately, rather than waiting out a lock
- * whose only purpose was to protect the password they have just replaced.
+ * `clearLockout` is required, and it decides whether the failure count, its
+ * clock and any standing lockout go with the password. A caller has to say,
+ * because the two callers are answering different questions and neither answer
+ * is a default. The command line clears: it is the way back in for an admin
+ * locked out at the form, who can then set a new password and use it at once
+ * rather than waiting out a lock whose only purpose was to protect the
+ * password they have just replaced, and a shell on the host is already an
+ * authority nothing here can bound. The route does not: it needs a session and
+ * the current password and no second factor, and that count is the only bound
+ * on guesses at the second factor behind a session — clearing it there would
+ * make a password change the way to reset the ladder between guesses and never
+ * reach the lock. It is the same argument `disableTotp` makes one factor along.
  */
-export async function setAccountPassword(pg: Pool, password: string): Promise<string> {
+export async function setAccountPassword(
+  pg: Pool,
+  password: string,
+  o: { clearLockout: boolean },
+): Promise<string> {
   const hash = await hashPassword(password, ADMIN_SCRYPT)
   const r = await pg.query(
-    `UPDATE admin_account SET password_hash = $1, updated_at = now(),
-                              failed_logins = 0, last_failed_at = NULL, locked_until = NULL`,
+    `UPDATE admin_account SET password_hash = $1, updated_at = now()${
+      o.clearLockout
+        ? `,
+                              failed_logins = 0, last_failed_at = NULL, locked_until = NULL`
+        : ''
+    }`,
     [hash],
   )
   if ((r.rowCount ?? 0) === 0) throw new Error('this install has no admin account yet')

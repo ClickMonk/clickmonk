@@ -328,7 +328,10 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: AdminContext): 
     const credential = requireSession(req)
     const body = readBody(PasswordChangeBody, req.body)
     await confirmPassword(ctx, body.currentPassword)
-    await setAccountPassword(ctx.pg, body.newPassword)
+    // The failure count and any lockout stay: this route has been shown a
+    // session and the current password and never the second factor, and that
+    // count is the only bound on guesses at the factor behind a session.
+    await setAccountPassword(ctx.pg, body.newPassword, { clearLockout: false })
     const r = await ctx.pg.query('DELETE FROM sessions WHERE id <> $1', [credential.id])
     return { ok: true, otherSessionsSignedOut: r.rowCount ?? 0 }
   })

@@ -930,25 +930,29 @@ describe('changing the password', () => {
     ).toBe(200)
   })
 
-  // The failures were guesses at a password that no longer exists, so they do
-  // not follow the new one. This is also the way back in from the command line
-  // after a lockout: nothing else clears a lock but waiting it out or a
-  // complete sign-in, and a lock refuses the sign-in.
-  it('clears the failure count and any lockout when the password is replaced', async () => {
+  // The lockout is the only bound on guesses at the second factor behind a
+  // session, and this is the one credential-changing route that never has to
+  // show that factor. If it cleared the count, changing the password to the
+  // same value would reset the ladder between guesses at the code and the
+  // lockout would never arrive. Clearing belongs to the command line, where a
+  // shell is already the operator's way back in.
+  it('does not clear the failure count when the password is changed through the API', async () => {
     const cookie = await signedIn(app, pg)
-    for (let i = 0; i < 3; i++) {
-      await app.inject({
+    const wrong = () =>
+      app.inject({
         method: 'POST',
         url: '/api/password',
         headers: write(cookie),
         payload: { currentPassword: 'not the password', newPassword: 'a new decent password' },
       })
+    for (let i = 0; i < 4; i++) {
+      expect((await wrong()).statusCode).toBe(403)
       clock.advance(1000)
     }
     expect(
       (await app.inject({ method: 'GET', url: '/api/me', headers: read(cookie) })).json()
         .failedLogins,
-    ).toBe(3)
+    ).toBe(4)
 
     const changed = await app.inject({
       method: 'POST',
@@ -957,12 +961,18 @@ describe('changing the password', () => {
       payload: { currentPassword: ADMIN_PASSWORD, newPassword: 'a new decent password' },
     })
     expect(changed.statusCode).toBe(200)
-    const row = await pg.query<{
-      failed_logins: number
-      last_failed_at: Date | null
-      locked_until: Date | null
-    }>('SELECT failed_logins, last_failed_at, locked_until FROM admin_account')
-    expect(row.rows[0]).toEqual({ failed_logins: 0, last_failed_at: null, locked_until: null })
+    const row = await pg.query<{ failed_logins: number; last_failed_at: Date | null }>(
+      'SELECT failed_logins, last_failed_at FROM admin_account',
+    )
+    expect(row.rows[0]?.failed_logins).toBe(4)
+    expect(row.rows[0]?.last_failed_at).not.toBeNull()
+
+    // So the fifth failure still reaches the lock rather than starting over.
+    expect((await wrong()).statusCode).toBe(403)
+    clock.advance(1000)
+    const locked = await wrong()
+    expect(locked.statusCode).toBe(429)
+    expect(locked.json().error).toBe('locked')
   })
 
   it('refuses a new password shorter than the floor', async () => {
