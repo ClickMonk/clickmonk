@@ -15,16 +15,14 @@ import {
   revokeApiKey,
 } from '@clickmonk/admin/keys'
 import {
-  DEFAULT_TRAFFIC_SETTINGS,
+  type InstallSettings,
   MAX_PASSWORD_LENGTH,
   MIN_ADMIN_PASSWORD_LENGTH,
   NON_HUMAN_CLASSES,
-  type TrafficActions,
-  type TrafficSettings,
-  TrafficSettingsSchema,
   isDomainUrl,
   normaliseHost,
   parseLinkInput,
+  retentionNote,
   verificationRecordName,
   verificationRecordValue,
 } from '@clickmonk/core'
@@ -47,6 +45,7 @@ import {
   runDomainChecks,
 } from '@clickmonk/worker/domains'
 import { createLink } from '@clickmonk/worker/links'
+import { readSettings, updateSettings } from '@clickmonk/worker/settings'
 import type { ZodError } from 'zod'
 
 export interface CliDeps {
@@ -94,7 +93,8 @@ const USAGE = `usage:
                      [--action <class>=<action> ...]
   clickmonk settings show
   clickmonk settings set [--action <class>=<action> ...] [--safe-url <url> | --no-safe-url]
-                         [--abuser-threshold <n>]
+                         [--abuser-threshold <n>] [--keep-clicks <days>|never]
+                         [--keep-addresses <days>|never]
   clickmonk ipdata update
   clickmonk ipdata status
   clickmonk admin create <email>      # the password is read from standard input
@@ -366,7 +366,7 @@ async function linkAdd(args: string[], d: CliDeps): Promise<void> {
   d.out(`link ${host}/${created.link.slug} ${created.link.id}`)
 
   const safe = NON_HUMAN_CLASSES.filter((c) => input.trafficActions[c] === 'safe')
-  if (safe.length > 0 && (await servedSettings(d)).settings.safeUrl === null) {
+  if (safe.length > 0 && (await readSettings(d.pg)).traffic.safeUrl === null) {
     d.out(
       `note: ${safe.join(', ')} set to safe, but no safe URL is set, so those clicks are flagged until one is (clickmonk settings set --safe-url <url>)`,
     )
@@ -610,60 +610,38 @@ async function apikeyRevoke(args: string[], d: CliDeps): Promise<void> {
   d.out(`key ${id} revoked`)
 }
 
-function printSettings(s: TrafficSettings, d: CliDeps): void {
-  for (const c of NON_HUMAN_CLASSES) d.out(`${c}: ${s.actions[c]}`)
-  d.out(`safe url: ${s.safeUrl ?? '(none)'}`)
-  d.out(`abuser threshold: ${s.abuserThreshold} clicks a minute from one address`)
+function printSettings(s: InstallSettings, d: CliDeps): void {
+  for (const c of NON_HUMAN_CLASSES) d.out(`${c}: ${s.traffic.actions[c]}`)
+  d.out(`safe url: ${s.traffic.safeUrl ?? '(none)'}`)
+  d.out(`abuser threshold: ${s.traffic.abuserThreshold} requests a minute from one client`)
+  d.out(`keep clicks: ${days(s.retention.rawRetentionDays)}`)
+  d.out(`keep addresses: ${days(s.retention.ipRetentionDays)}`)
+  const note = retentionNote(s.retention)
+  if (note) d.out(`note: ${note}`)
 }
 
-interface SettingsRow {
-  traffic_actions: TrafficActions
-  safe_url: string | null
-  abuser_threshold: number
-}
-
-const toSettings = (r: SettingsRow): TrafficSettings => ({
-  actions: r.traffic_actions,
-  safeUrl: r.safe_url,
-  abuserThreshold: r.abuser_threshold,
-})
-
-/**
- * The settings the redirect serves: a row that is missing (deleted by hand)
- * or that core's schema refuses means the defaults there, so it does here
- * too, with a note saying why.
- */
-async function servedSettings(d: CliDeps): Promise<{ settings: TrafficSettings; note?: string }> {
-  const r = await d.pg.query<SettingsRow>(
-    'SELECT traffic_actions, safe_url, abuser_threshold FROM settings',
-  )
-  const row = r.rows[0]
-  if (!row) {
-    return {
-      settings: DEFAULT_TRAFFIC_SETTINGS,
-      note: 'note: no settings are stored; the defaults apply',
-    }
-  }
-  const parsed = TrafficSettingsSchema.safeParse(toSettings(row))
-  if (parsed.success) return { settings: parsed.data }
-  const why = parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')
-  return {
-    settings: DEFAULT_TRAFFIC_SETTINGS,
-    note: `note: the stored settings are invalid (${why}); the defaults apply`,
-  }
-}
+const days = (n: number | null): string => (n === null ? 'for ever' : `${n} days`)
 
 async function settingsShow(d: CliDeps): Promise<void> {
-  const { settings, note } = await servedSettings(d)
-  if (note) d.out(note)
-  printSettings(settings, d)
+  const read = await readSettings(d.pg)
+  if (read.problem) d.out(`note: ${read.problem}`)
+  if (read.retention === null) {
+    // Printing the defaults here would tell the operator this install is
+    // deleting after ninety days, when in fact it is deleting nothing.
+    for (const c of NON_HUMAN_CLASSES) d.out(`${c}: ${read.traffic.actions[c]}`)
+    d.out(`safe url: ${read.traffic.safeUrl ?? '(none)'}`)
+    d.out(`abuser threshold: ${read.traffic.abuserThreshold} requests a minute from one client`)
+    d.out('keep clicks: unreadable, so nothing is being deleted')
+    d.out('keep addresses: unreadable, so nothing is being deleted')
+    return
+  }
+  printSettings({ traffic: read.traffic, retention: read.retention }, d)
 }
 
 /**
  * Changes only what is given; the result is validated whole before anything
- * is written. A row deleted by hand is first written back as the defaults,
- * in the same transaction, so that concurrent writers still serialise on its
- * lock.
+ * is written. The read, the merge and the write are the shared ones, so a
+ * period set here is the period the retention pass then enforces.
  */
 async function settingsSet(args: string[], d: CliDeps): Promise<void> {
   const { values } = parseArgs({
@@ -673,42 +651,36 @@ async function settingsSet(args: string[], d: CliDeps): Promise<void> {
       'safe-url': { type: 'string' },
       'no-safe-url': { type: 'boolean' },
       'abuser-threshold': { type: 'string' },
+      'keep-clicks': { type: 'string' },
+      'keep-addresses': { type: 'string' },
     },
   })
   if (values['safe-url'] !== undefined && values['no-safe-url']) {
     throw new Rejected('--safe-url and --no-safe-url together')
   }
-  const client = await d.pg.connect()
-  try {
-    await client.query('BEGIN')
-    await client.query('INSERT INTO settings DEFAULT VALUES ON CONFLICT DO NOTHING')
-    const r = await client.query<SettingsRow>(
-      'SELECT traffic_actions, safe_url, abuser_threshold FROM settings FOR UPDATE',
-    )
-    const row = r.rows[0]
-    if (!row) throw new Error('the settings row is missing after writing it')
-    const current = toSettings(row)
-    const next = TrafficSettingsSchema.parse({
-      actions: { ...current.actions, ...parseActions(values.action) },
-      safeUrl: values['no-safe-url'] ? null : (values['safe-url'] ?? current.safeUrl),
+  // `never` is the only word either takes, and it is the stored null. A
+  // number is passed through as written so that core's schema is what
+  // refuses 0, -1 and 1.5, in one place, with one message.
+  const period = (given: string | undefined, current: number | null): number | null => {
+    if (given === undefined) return current
+    if (given === 'never') return null
+    return Number(given)
+  }
+  const next = await updateSettings(d.pg, d.now?.() ?? new Date(), (current) => ({
+    traffic: {
+      actions: { ...current.traffic.actions, ...parseActions(values.action) },
+      safeUrl: values['no-safe-url'] ? null : (values['safe-url'] ?? current.traffic.safeUrl),
       abuserThreshold:
         values['abuser-threshold'] === undefined
-          ? current.abuserThreshold
+          ? current.traffic.abuserThreshold
           : Number(values['abuser-threshold']),
-    })
-    await client.query(
-      `UPDATE settings SET traffic_actions = $1, safe_url = $2, abuser_threshold = $3,
-                           updated_at = now()`,
-      [JSON.stringify(next.actions), next.safeUrl, next.abuserThreshold],
-    )
-    await client.query('COMMIT')
-    printSettings(next, d)
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {})
-    throw err
-  } finally {
-    client.release()
-  }
+    },
+    retention: {
+      rawRetentionDays: period(values['keep-clicks'], current.retention.rawRetentionDays),
+      ipRetentionDays: period(values['keep-addresses'], current.retention.ipRetentionDays),
+    },
+  }))
+  printSettings(next, d)
 }
 
 /**

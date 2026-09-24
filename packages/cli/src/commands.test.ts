@@ -206,6 +206,22 @@ describe('clickmonk settings', () => {
   const settings = async () =>
     (await pg.query('SELECT traffic_actions, safe_url, abuser_threshold FROM settings')).rows[0]
 
+  const stored = async (): Promise<{
+    raw_retention_days: number | null
+    ip_retention_days: number | null
+  }> => {
+    const r = await pg.query('SELECT raw_retention_days, ip_retention_days FROM settings')
+    return r.rows[0] as { raw_retention_days: number | null; ip_retention_days: number | null }
+  }
+
+  /**
+   * The retention half put where a test wants it. Written here rather than
+   * left to whatever the test before it did: these tests share one row, and a
+   * period is exactly the kind of value a neighbouring test changes.
+   */
+  const setRetention = (raw: number | null, ip: number | null) =>
+    pg.query('UPDATE settings SET raw_retention_days = $1, ip_retention_days = $2', [raw, ip])
+
   it('shows the defaults', async () => {
     lines.length = 0
     expect(await run('settings', 'show')).toBe(0)
@@ -215,7 +231,9 @@ describe('clickmonk settings', () => {
       'anonymous: flag',
       'datacenter: flag',
       'safe url: (none)',
-      'abuser threshold: 60 clicks a minute from one address',
+      'abuser threshold: 60 requests a minute from one client',
+      'keep clicks: 90 days',
+      'keep addresses: 30 days',
     ])
   })
 
@@ -273,7 +291,7 @@ describe('clickmonk settings', () => {
     lines.length = 0
     expect(await run('settings', 'show')).toBe(0)
     expect(lines[0]).toMatch(
-      /^note: the stored settings are invalid \(safeUrl: .+\); the defaults apply$/,
+      /^note: the stored traffic settings are invalid \(safeUrl: .+\); the defaults apply$/,
     )
     expect(lines.slice(1)).toEqual([
       'bot: flag',
@@ -281,7 +299,9 @@ describe('clickmonk settings', () => {
       'anonymous: flag',
       'datacenter: flag',
       'safe url: (none)',
-      'abuser threshold: 60 clicks a minute from one address',
+      'abuser threshold: 60 requests a minute from one client',
+      'keep clicks: 90 days',
+      'keep addresses: 30 days',
     ])
   })
 
@@ -296,7 +316,9 @@ describe('clickmonk settings', () => {
       'anonymous: flag',
       'datacenter: flag',
       'safe url: (none)',
-      'abuser threshold: 60 clicks a minute from one address',
+      'abuser threshold: 60 requests a minute from one client',
+      'keep clicks: 90 days',
+      'keep addresses: 30 days',
     ])
   })
 
@@ -308,6 +330,67 @@ describe('clickmonk settings', () => {
       safe_url: null,
       abuser_threshold: 60,
     })
+  })
+
+  it('prints the retention periods, in days and as for ever', async () => {
+    await setRetention(90, null)
+    lines.length = 0
+    expect(await run('settings', 'show')).toBe(0)
+    expect(lines).toContain('keep clicks: 90 days')
+    expect(lines).toContain('keep addresses: for ever')
+    expect(lines).toContain(
+      'note: addresses are set to be kept for ever but clicks for 90 days, so an address goes when its click does, after 90 days',
+    )
+  })
+
+  it('sets a period, and takes never for either', async () => {
+    await setRetention(90, 30)
+    expect(await run('settings', 'set', '--keep-clicks', '30', '--keep-addresses', '7')).toBe(0)
+    expect(await stored()).toEqual({ raw_retention_days: 30, ip_retention_days: 7 })
+    expect(await run('settings', 'set', '--keep-clicks', 'never')).toBe(0)
+    expect(await stored()).toEqual({ raw_retention_days: null, ip_retention_days: 7 })
+  })
+
+  it('refuses a period the schema refuses, and writes nothing', async () => {
+    await setRetention(90, 30)
+    expect(await run('settings', 'set', '--keep-clicks', '0')).toBe(2)
+    expect(await stored()).toEqual({ raw_retention_days: 90, ip_retention_days: 30 })
+  })
+
+  it('refuses a period that is not a number at all, and writes nothing', async () => {
+    await setRetention(90, 30)
+    expect(await run('settings', 'set', '--keep-addresses', 'forever')).toBe(2)
+    expect(await stored()).toEqual({ raw_retention_days: 90, ip_retention_days: 30 })
+  })
+
+  it('leaves the period alone when the command is about something else', async () => {
+    await setRetention(90, 30)
+    expect(await run('settings', 'set', '--abuser-threshold', '120')).toBe(0)
+    expect(await stored()).toEqual({ raw_retention_days: 90, ip_retention_days: 30 })
+  })
+
+  // Printing the defaults for a row this build cannot read as retention would
+  // tell the operator their clicks are deleted after ninety days when nothing
+  // is being deleted at all.
+  it('says nothing is being deleted when the stored retention cannot be read', async () => {
+    await pg.query('ALTER TABLE settings DROP CONSTRAINT settings_raw_retention_valid')
+    try {
+      await pg.query('UPDATE settings SET raw_retention_days = -5')
+      lines.length = 0
+      expect(await run('settings', 'show')).toBe(0)
+      expect(lines).toContain('keep clicks: unreadable, so nothing is being deleted')
+      expect(lines).toContain('keep addresses: unreadable, so nothing is being deleted')
+      expect(lines.some((l) => l.startsWith('keep clicks: 90'))).toBe(false)
+      expect(lines[0]).toMatch(/^note: the stored retention is invalid \(/)
+    } finally {
+      // The row is repaired before the constraint goes back: Postgres refuses
+      // to add a check a stored row already breaks, and every test after this
+      // one would then be running without it.
+      await pg.query('UPDATE settings SET raw_retention_days = 90')
+      await pg.query(
+        'ALTER TABLE settings ADD CONSTRAINT settings_raw_retention_valid CHECK (raw_retention_days IS NULL OR raw_retention_days BETWEEN 1 AND 3650)',
+      )
+    }
   })
 
   it('stores a link override', async () => {

@@ -1,4 +1,4 @@
-import { DEFAULT_TRAFFIC_SETTINGS } from '@clickmonk/core'
+import { DEFAULT_RETENTION, DEFAULT_TRAFFIC_SETTINGS } from '@clickmonk/core'
 import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import type { FastifyInstance } from 'fastify'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
@@ -50,7 +50,10 @@ describe('every route needs a credential', () => {
     {
       name: 'PUT',
       method: 'PUT' as const,
-      payload: { actions: ALL_FLAG, safeUrl: null, abuserThreshold: 99 },
+      payload: {
+        traffic: { actions: ALL_FLAG, safeUrl: null, abuserThreshold: 99 },
+        retention: DEFAULT_RETENTION,
+      },
     },
   ])('refuses an anonymous $name /api/settings, and changes nothing', async (row) => {
     const r = await app.inject({
@@ -71,16 +74,21 @@ describe('every route needs a credential', () => {
 })
 
 describe('reading the settings', () => {
-  it('reports what the redirect serves', async () => {
+  it('reports the retention periods and says nothing when they are the usual way round', async () => {
     const r = await get()
     expect(r.statusCode).toBe(200)
-    expect(r.json()).toEqual({ ...DEFAULT_TRAFFIC_SETTINGS, problem: null })
+    expect(r.json()).toEqual({
+      traffic: DEFAULT_TRAFFIC_SETTINGS,
+      retention: { rawRetentionDays: 90, ipRetentionDays: 30 },
+      note: null,
+      problem: null,
+    })
   })
 
   it('reports the defaults, and says why, when the row was deleted by hand', async () => {
     await pg.query('DELETE FROM settings')
     const r = await get()
-    expect(r.json().abuserThreshold).toBe(DEFAULT_TRAFFIC_SETTINGS.abuserThreshold)
+    expect(r.json().traffic.abuserThreshold).toBe(DEFAULT_TRAFFIC_SETTINGS.abuserThreshold)
     expect(r.json().problem).toContain('no settings are stored')
   })
 
@@ -94,18 +102,40 @@ describe('reading the settings', () => {
     const r = await get()
     // The field the fixture corrupted, not one the defaults happen to match
     // anyway: `safeUrl` is what tells a stored row from the defaults here.
-    expect(r.json().safeUrl).toBe(DEFAULT_TRAFFIC_SETTINGS.safeUrl)
-    expect(r.json().actions).toEqual(DEFAULT_TRAFFIC_SETTINGS.actions)
+    expect(r.json().traffic.safeUrl).toBe(DEFAULT_TRAFFIC_SETTINGS.safeUrl)
+    expect(r.json().traffic.actions).toEqual(DEFAULT_TRAFFIC_SETTINGS.actions)
     expect(r.json().problem).toContain('invalid')
+  })
+
+  // A row the retention half cannot be read from is reported as unreadable
+  // rather than as the defaults: the pass deletes nothing while it is in that
+  // state, and an operator shown "90 days" could not tell the two apart.
+  it('reports retention as null, and says why, when it cannot be read', async () => {
+    await pg.query('ALTER TABLE settings DROP CONSTRAINT settings_raw_retention_valid')
+    try {
+      await pg.query('UPDATE settings SET raw_retention_days = -5')
+      const r = await get()
+      expect(r.json().retention).toBeNull()
+      expect(r.json().note).toBeNull()
+      expect(r.json().problem).toContain('nothing is deleted until it is corrected')
+    } finally {
+      await pg.query('UPDATE settings SET raw_retention_days = 90')
+      await pg.query(
+        'ALTER TABLE settings ADD CONSTRAINT settings_raw_retention_valid CHECK (raw_retention_days IS NULL OR raw_retention_days BETWEEN 1 AND 3650)',
+      )
+    }
   })
 })
 
 describe('writing the settings', () => {
   it('takes the whole object and stores it', async () => {
     const r = await put({
-      actions: { ...ALL_FLAG, bot: 'block' },
-      safeUrl: 'https://example.com/safe',
-      abuserThreshold: 120,
+      traffic: {
+        actions: { ...ALL_FLAG, bot: 'block' },
+        safeUrl: 'https://example.com/safe',
+        abuserThreshold: 120,
+      },
+      retention: DEFAULT_RETENTION,
     })
     expect(r.statusCode).toBe(200)
     const stored = await pg.query<{
@@ -120,11 +150,62 @@ describe('writing the settings', () => {
     })
   })
 
+  it('writes both halves, and notes an address period that outlives its clicks', async () => {
+    const r = await put({
+      traffic: DEFAULT_TRAFFIC_SETTINGS,
+      retention: { rawRetentionDays: 30, ipRetentionDays: 90 },
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.json().note).toBe(
+      'addresses are set to be kept for 90 days but clicks for 30 days, so an address goes when its click does, after 30 days',
+    )
+    const back = await get()
+    expect(back.json().retention).toEqual({ rawRetentionDays: 30, ipRetentionDays: 90 })
+  })
+
+  it('refuses a body whose retention half is invalid, and writes neither half', async () => {
+    const r = await put({
+      traffic: { ...DEFAULT_TRAFFIC_SETTINGS, abuserThreshold: 120 },
+      retention: { rawRetentionDays: 0, ipRetentionDays: 30 },
+    })
+    expect(r.statusCode).toBe(400)
+    expect(r.json().error).toBe('invalid_body')
+    // The traffic half was valid and is still not written: a settings write is
+    // one write, and half of one is how an install ends up in a state nobody
+    // asked for.
+    const back = await get()
+    expect(back.json().traffic.abuserThreshold).toBe(60)
+    expect(back.json().retention).toEqual({ rawRetentionDays: 90, ipRetentionDays: 30 })
+  })
+
+  it('refuses a settings body with a field nobody knows', async () => {
+    const r = await put({
+      traffic: DEFAULT_TRAFFIC_SETTINGS,
+      retention: { rawRetentionDays: 90, ipRetentionDays: 30 },
+      keepEverything: true,
+    })
+    expect(r.statusCode).toBe(400)
+    expect(r.json().error).toBe('invalid_body')
+  })
+
+  it('refuses a body that leaves a half out, rather than defaulting it', async () => {
+    const r = await put({ traffic: DEFAULT_TRAFFIC_SETTINGS })
+    expect(r.statusCode).toBe(400)
+    expect(r.json().error).toBe('invalid_body')
+    // Nothing was written: a refusal that had already written the traffic half
+    // would leave the row half-changed.
+    const back = await get()
+    expect(back.json().retention).toEqual({ rawRetentionDays: 90, ipRetentionDays: 30 })
+  })
+
   // The row can be deleted. A write that assumed it exists would write
   // nothing and report success.
   it('writes the row back when it is missing', async () => {
     await pg.query('DELETE FROM settings')
-    const r = await put({ actions: ALL_FLAG, safeUrl: null, abuserThreshold: 90 })
+    const r = await put({
+      traffic: { actions: ALL_FLAG, safeUrl: null, abuserThreshold: 90 },
+      retention: DEFAULT_RETENTION,
+    })
     expect(r.statusCode).toBe(200)
     const stored = await pg.query<{ abuser_threshold: number }>(
       'SELECT abuser_threshold FROM settings',
@@ -133,6 +214,8 @@ describe('writing the settings', () => {
     expect((await get()).json().problem).toBeNull()
   })
 
+  // Every row here is a traffic half the inner schema refuses, so each one
+  // proves that nesting did not stop the half's own schema from running.
   it.each([
     [
       'the safe action with no safe URL',
@@ -153,16 +236,16 @@ describe('writing the settings', () => {
     ],
     ['a threshold of zero', { actions: ALL_FLAG, safeUrl: null, abuserThreshold: 0 }],
     ['a threshold past the bound', { actions: ALL_FLAG, safeUrl: null, abuserThreshold: 100_001 }],
-    ['a partial write', { abuserThreshold: 90 }],
+    ['a partial traffic half', { abuserThreshold: 90 }],
     // There is one admin, so nothing in a body may name whose settings these
     // are. A strict schema is what makes that checkable rather than ignored.
     [
       'a field it does not know',
       { actions: ALL_FLAG, safeUrl: null, abuserThreshold: 60, accountId: 'a2f' },
     ],
-  ])('refuses %s', async (_label, payload) => {
+  ])('refuses %s', async (_label, traffic) => {
     const before = await get()
-    const r = await put(payload)
+    const r = await put({ traffic, retention: DEFAULT_RETENTION })
     expect(r.statusCode).toBe(400)
     expect((await get()).json()).toEqual(before.json())
   })

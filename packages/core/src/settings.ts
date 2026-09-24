@@ -8,7 +8,7 @@ import {
 } from './traffic.js'
 
 /**
- * Clicks per minute from one client above which it is an abuser, unless the admin
+ * Requests per minute from one client above which it is an abuser, unless the admin
  * sets another. A client is what `rateKey` counts: one IPv4 address, or one IPv6
  * /64, because an IPv6 client usually holds a whole /64.
  */
@@ -105,3 +105,27 @@ export function retentionNote(r: RetentionSettings): string | null {
   const kept = r.ipRetentionDays === null ? 'for ever' : `for ${r.ipRetentionDays} days`
   return `addresses are set to be kept ${kept} but clicks for ${r.rawRetentionDays} days, so an address goes when its click does, after ${r.rawRetentionDays} days`
 }
+
+/**
+ * Everything the one settings row holds, in two halves.
+ *
+ * Two halves rather than one flat object because each half is `.strict()` and
+ * an intersection of two strict objects refuses every field, so a flat body
+ * would have to restate one of the schemas to accept the other's fields —
+ * which is exactly the copy this plan exists to avoid. Nested, each half is
+ * validated by the schema that owns it, and a problem can say which half it
+ * is in.
+ */
+export interface InstallSettings {
+  traffic: TrafficSettings
+  retention: RetentionSettings
+}
+
+export const DEFAULT_INSTALL_SETTINGS: InstallSettings = {
+  traffic: DEFAULT_TRAFFIC_SETTINGS,
+  retention: DEFAULT_RETENTION,
+}
+
+export const InstallSettingsSchema = z
+  .object({ traffic: TrafficSettingsSchema, retention: RetentionSettingsSchema })
+  .strict()

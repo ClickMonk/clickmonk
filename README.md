@@ -42,7 +42,7 @@ on your own infrastructure, and your click data stays yours.
   visitor holds stops working the moment you change the password.
 - **Traffic classification.** Every click is classed as human, bot, abuser, anonymous
   (a Tor exit), datacenter, or unknown when the IP checks could not run, from its
-  user-agent, the number of requests from its address in the current one-minute window,
+  user-agent, the number of requests from the same client in the current one-minute window,
   and IP data held on your server. Each class other than human has an action: flag (the
   default), nothing, block, or send to a safe URL. A flagged click never uses up a click
   cap, but a cap that is used up closes the link to it like any other. A HEAD request,
