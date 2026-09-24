@@ -46,7 +46,12 @@ import {
   runDomainChecks,
 } from '@clickmonk/worker/domains'
 import { createLink } from '@clickmonk/worker/links'
-import { type SettingsSubstitution, readSettings, updateSettings } from '@clickmonk/worker/settings'
+import {
+  SettingsLockedError,
+  type SettingsSubstitution,
+  readSettings,
+  updateSettings,
+} from '@clickmonk/worker/settings'
 import type { ZodError } from 'zod'
 
 export interface CliDeps {
@@ -859,6 +864,16 @@ export async function runCli(argv: string[], d: CliDeps): Promise<number> {
     ) {
       d.out(`error: ${err.message}\n${USAGE}`)
       return 1
+    }
+    // The settings row was held by something else for longer than the writer
+    // waits — almost always the retention pass, which holds it while it deletes.
+    // A refusal rather than an unexpected error because the answer is to run the
+    // command again, and because the alternative was a command that printed
+    // nothing until somebody killed it and then had to guess what it had done.
+    // Its message is written for a person; it is printed as it stands.
+    if (err instanceof SettingsLockedError) {
+      d.out(`error: ${err.message}`)
+      return 2
     }
     // A command run before the migrations. `42P01` is Postgres saying the table
     // is not there, and the answer is always the same one command, so this is a

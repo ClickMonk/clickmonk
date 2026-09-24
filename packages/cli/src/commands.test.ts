@@ -305,6 +305,31 @@ describe('clickmonk settings', () => {
     ])
   })
 
+  // The retention pass holds this row while it deletes. A command that waited
+  // for it would print nothing until somebody killed it, and then they would
+  // have to guess whether it had written anything — so it stops waiting and says
+  // what has the row. One line, and an exit code that says this is a refusal.
+  it('refuses to set the settings while the row is held, and writes nothing', async () => {
+    // A value of its own, and not the one the command below asks for: the tests
+    // in this block share the row, so an assertion on a value this test did not
+    // set would be an assertion about whichever of them ran last.
+    await pg.query('UPDATE settings SET abuser_threshold = 77')
+    const holder = await pg.connect()
+    try {
+      await holder.query('BEGIN')
+      await holder.query('SELECT 1 FROM settings FOR UPDATE')
+      lines.length = 0
+      expect(await run('settings', 'set', '--abuser-threshold', '99')).toBe(2)
+    } finally {
+      await holder.query('ROLLBACK').catch(() => {})
+      holder.release()
+    }
+    expect(lines).toEqual([
+      'error: the settings row is held by another writer, most likely the retention pass, which holds it for the length of one pass; nothing was written, so run this again in a moment',
+    ])
+    expect((await settings())?.abuser_threshold).toBe(77)
+  })
+
   // The traffic half falls back and the retention half does not, and the
   // output says both: printing "keep clicks: 90 days" for a row that is not
   // there would tell the operator a period this install is not enforcing.

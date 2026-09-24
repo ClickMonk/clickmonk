@@ -24,6 +24,20 @@ const DnsServers = z
     }
   })
 
+/**
+ * Client-side bound on one ClickHouse request from this service.
+ *
+ * Not a tuning knob: it is the outer half of what stops a store that has
+ * stopped answering from holding a Postgres row lock open. The retention pass
+ * takes the settings row's lock and then talks to ClickHouse, so a request that
+ * never comes back is a settings write that never goes through. Longer than the
+ * `max_execution_time` the pass sends, so a statement ClickHouse itself ends
+ * arrives as ClickHouse's error and not as an abort with nothing in it, and long
+ * enough for the shipper's largest segment — an insert that times out is kept
+ * and retried, so the cost of being wrong here is a pass, not a click.
+ */
+export const CH_REQUEST_TIMEOUT_MS = 60_000
+
 const Schema = z.object({
   CLICKMONK_POSTGRES_URL: z.string().url(),
   CLICKMONK_CLICKHOUSE_URL: z.string().url(),
@@ -71,6 +85,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): WorkerConfig {
       username: e.CLICKMONK_CLICKHOUSE_USER,
       password: e.CLICKMONK_CLICKHOUSE_PASSWORD,
       database: e.CLICKMONK_CLICKHOUSE_DB,
+      requestTimeoutMs: CH_REQUEST_TIMEOUT_MS,
     },
     spoolDir: e.CLICKMONK_SPOOL_DIR,
     ipdataDir: e.CLICKMONK_IPDATA_DIR,

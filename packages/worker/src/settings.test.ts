@@ -3,6 +3,7 @@ import { type Pool, createPgPool } from '@clickmonk/db'
 import { TEST_PG_URL, resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import {
+  SettingsLockedError,
   type SettingsSubstitution,
   readSettings,
   updateSettings,
@@ -305,5 +306,69 @@ describe('updateSettings', () => {
       { onSubstituted: (s) => subs.push(s) },
     )
     expect(subs).toEqual([])
+  })
+})
+
+/**
+ * The retention pass reads this row under its lock and holds it while it
+ * deletes, which is what makes a write and a delete serialise. A writer that
+ * waited for it would be a command, or a request, that hangs for the length of
+ * a pass with nothing printed — and an operator who kills one of those is left
+ * guessing what it managed to do. So a writer stops waiting and says what has
+ * the row.
+ *
+ * Held here the way a pass holds it, from another connection of this pool, so
+ * the writer under test is served a different one and really does wait.
+ */
+describe('a writer while the row is held', () => {
+  async function whileHeld<T>(body: () => Promise<T>): Promise<T> {
+    const holder = await pool.connect()
+    try {
+      await holder.query('BEGIN')
+      await holder.query('SELECT 1 FROM settings FOR UPDATE')
+      return await body()
+    } finally {
+      await holder.query('ROLLBACK').catch(() => {})
+      holder.release()
+    }
+  }
+
+  it('refuses the merging write, names the pass, and writes nothing', async () => {
+    const failed = await whileHeld(() =>
+      updateSettings(pool, NOW, (current) => ({
+        ...current,
+        retention: { ...current.retention, rawRetentionDays: 5 },
+      })).then(
+        () => null,
+        (err: unknown) => err,
+      ),
+    )
+    expect(failed).toBeInstanceOf(SettingsLockedError)
+    expect((failed as Error).message).toMatch(/retention pass/)
+    expect((await readSettings(pool)).retention).toEqual({
+      rawRetentionDays: 90,
+      ipRetentionDays: 30,
+    })
+  })
+
+  it('refuses the whole-row write the same way, and writes nothing', async () => {
+    const failed = await whileHeld(() =>
+      writeSettings(
+        pool,
+        {
+          traffic: { ...DEFAULT_TRAFFIC_SETTINGS, abuserThreshold: 120 },
+          retention: { rawRetentionDays: 5, ipRetentionDays: 5 },
+        },
+        NOW,
+      ).then(
+        () => null,
+        (err: unknown) => err,
+      ),
+    )
+    expect(failed).toBeInstanceOf(SettingsLockedError)
+    expect((failed as Error).message).toMatch(/retention pass/)
+    const after = await readSettings(pool)
+    expect(after.traffic.abuserThreshold).toBe(DEFAULT_TRAFFIC_SETTINGS.abuserThreshold)
+    expect(after.retention).toEqual({ rawRetentionDays: 90, ipRetentionDays: 30 })
   })
 })

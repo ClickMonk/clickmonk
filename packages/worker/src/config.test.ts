@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { loadConfig } from './config.js'
+import { RETENTION_MAX_EXECUTION_SECONDS } from './retention.js'
 
 const base = {
   CLICKMONK_POSTGRES_URL: 'postgres://u:p@db:5432/clickmonk',
@@ -55,6 +56,16 @@ describe('loadConfig', () => {
     expect(loadConfig({ ...base, CLICKMONK_DNS_SERVERS: '2001:db8::1:5353' }).dnsServers).toEqual([
       '2001:db8::1:5353',
     ])
+  })
+
+  // Not a tuning number but the outer bound on how long the retention pass can
+  // hold the settings row while waiting for ClickHouse, so what is asserted is
+  // the relation that makes it one: above the bound the pass sends with each
+  // statement, and present at all.
+  it('bounds a ClickHouse request above the bound the retention pass sends', () => {
+    expect(loadConfig(base).ch.requestTimeoutMs).toBeGreaterThan(
+      RETENTION_MAX_EXECUTION_SECONDS * 1000,
+    )
   })
 
   it('looks for clicks past their retention every hour', () => {

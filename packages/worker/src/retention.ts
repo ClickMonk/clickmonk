@@ -41,12 +41,38 @@
  * a moment after the read has it enforced anyway, once, by a pass that read it
  * as ninety days. The cost is that a settings write waits for a pass in
  * flight, which is the DDL for at most one pass's worth of partitions.
+ *
+ * **Which is why every statement here is bounded.** A row lock held across
+ * calls to another store is a lock that store can hold open: a ClickHouse that
+ * accepts the connection and then stops answering would leave this transaction
+ * open for as long as it stayed that way, with an operator's `settings set`
+ * waiting behind it. So each statement carries `max_execution_time`, the
+ * worker's client carries a request timeout longer than that, and the settings
+ * writers carry a lock timeout of their own — the operator is told to try
+ * again rather than left holding a command that has printed nothing.
  */
 import type { ClickHouseClient, Pool, PoolClient } from '@clickmonk/db'
 import { readSettingsLocked } from './settings.js'
 
 /** Partitions one pass looks at, oldest first. Two years of months. */
 export const RETENTION_PARTITIONS_PER_PASS = 24
+
+/**
+ * The server-side bound on one statement of a pass, in seconds.
+ *
+ * Under the worker's own request timeout, so a statement ClickHouse itself ends
+ * comes back as ClickHouse's error rather than as a client-side abort with
+ * nothing in it. It is the inner half of what keeps the settings row's lock from
+ * being held by a store that has stopped answering; the client timeout is the
+ * outer half, and it covers whatever a server-side bound does not.
+ */
+export const RETENTION_MAX_EXECUTION_SECONDS = 20
+
+/**
+ * Sent with every statement this pass issues. One object, so that adding a
+ * statement without the bound is a visible omission rather than a default.
+ */
+const BOUND = { max_execution_time: RETENTION_MAX_EXECUTION_SECONDS } as const
 
 const DAY_MS = 86_400_000
 const PARTITION_ID = /^(\d{4})(\d{2})$/
@@ -95,7 +121,12 @@ async function scalar(
   query: string,
   params: Record<string, unknown> = {},
 ): Promise<number> {
-  const rs = await ch.query({ query, query_params: params, format: 'JSONEachRow' })
+  const rs = await ch.query({
+    query,
+    query_params: params,
+    format: 'JSONEachRow',
+    clickhouse_settings: BOUND,
+  })
   const rows = await rs.json<{ n: string }>()
   return Number(rows[0]?.n ?? 0)
 }
@@ -107,6 +138,7 @@ async function partitionsOfClicks(ch: ClickHouseClient): Promise<string[]> {
              WHERE database = currentDatabase() AND table = 'clicks' AND active
              ORDER BY partition_id`,
     format: 'JSONEachRow',
+    clickhouse_settings: BOUND,
   })
   return (await rs.json<{ partition_id: string }>()).map((r) => r.partition_id)
 }
@@ -181,7 +213,10 @@ async function pass(
     // The drop is checked first: a partition past both periods goes whole
     // rather than being rewritten and then dropped.
     if (rawCutoff !== null && end <= rawCutoff) {
-      await o.ch.command({ query: `ALTER TABLE clicks DROP PARTITION ID '${id}'` })
+      await o.ch.command({
+        query: `ALTER TABLE clicks DROP PARTITION ID '${id}'`,
+        clickhouse_settings: BOUND,
+      })
       result.dropped.push(id)
       continue
     }
@@ -206,6 +241,14 @@ async function pass(
         // that is deliberate: this is an existence test bounded at one row, and
         // a duplicate row still means there is an address in this partition. A
         // dedup would cost a merge to answer a question that does not need one.
+        //
+        // **And this is why the condition is not a ledger.** A spool segment
+        // shipped late lands in whichever month its clicks happened in, which
+        // can be a month this pass has already blanked. The condition sees the
+        // address that arrived and blanks it on the next pass. A record of
+        // partitions already done would say that month was finished and leave
+        // that address in place for ever, which is the one outcome this whole
+        // module exists to prevent.
         const left = await scalar(
           o.ch,
           `SELECT count() AS n FROM (
@@ -215,6 +258,7 @@ async function pass(
         if (left === 0) continue
         await o.ch.command({
           query: `ALTER TABLE clicks UPDATE ip = '' IN PARTITION ID '${id}' WHERE ip != ''`,
+          clickhouse_settings: BOUND,
         })
         result.blanked.push(id)
       }

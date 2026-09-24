@@ -1,7 +1,12 @@
 import type { ClickHouseClient, Pool } from '@clickmonk/db'
 import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { partitionEndMs, runRetention, startRetention } from './retention.js'
+import {
+  RETENTION_MAX_EXECUTION_SECONDS,
+  partitionEndMs,
+  runRetention,
+  startRetention,
+} from './retention.js'
 
 const pool: Pool = testPg()
 /**
@@ -177,6 +182,77 @@ describe('runRetention', () => {
       { partition_id: '202608', ip: '198.51.100.8' },
       { partition_id: '202609', ip: '198.51.100.9' },
     ])
+  })
+
+  // What decides whether to blank is the condition — is there an address left
+  // in this partition — and not a record of partitions already done. This is the
+  // difference between the two: a spool segment shipped late lands in the month
+  // its clicks happened in, which can be a month already blanked, and a ledger
+  // would have called that month finished and left the address there for ever.
+  it('blanks an address that arrived after its month was blanked', async () => {
+    const first = await runRetention({ pg: pool, ch, now: NOW })
+    await settleMutations()
+    expect(first.blanked).toEqual(['202606', '202607'])
+    await ch.insert({
+      table: 'clicks',
+      values: [
+        click('01920000-0000-7000-8000-00000000000a', '2026-06-20 10:00:00.000', '198.51.100.10'),
+      ],
+      format: 'JSONEachRow',
+    })
+    const second = await runRetention({ pg: pool, ch, now: NOW })
+    await settleMutations()
+    expect(second.blanked).toEqual(['202606'])
+    expect(await addresses()).toEqual([
+      { partition_id: '202606', ip: '' },
+      { partition_id: '202606', ip: '' },
+      { partition_id: '202607', ip: '' },
+      { partition_id: '202608', ip: '198.51.100.8' },
+      { partition_id: '202609', ip: '198.51.100.9' },
+    ])
+  })
+
+  // A row lock held across calls to another store is a lock that store can hold
+  // open, so every statement of a pass carries a bound. Asserted over every
+  // statement the pass actually sent, not at the call sites: the rule is the
+  // module's, and a statement added without it is the defect this would catch.
+  it('bounds every statement it sends to the store', async () => {
+    const sent: { query: string; clickhouse_settings?: Record<string, unknown> }[] = []
+    const watched: ClickHouseClient = Object.assign(Object.create(ch) as ClickHouseClient, {
+      query: (p: { query: string }) => {
+        sent.push(p)
+        return ch.query(p as Parameters<ClickHouseClient['query']>[0])
+      },
+      command: (p: { query: string }) => {
+        sent.push(p)
+        return ch.command(p as Parameters<ClickHouseClient['command']>[0])
+      },
+    })
+    const r = await runRetention({ pg: pool, ch: watched, now: NOW })
+    await settleMutations()
+    // The pass did its whole job through the wrapper, so all five kinds of
+    // statement it can send are in the list below. Without this the loop under
+    // it would hold over an empty list.
+    expect(r.dropped).toEqual(['202605'])
+    expect(r.blanked).toEqual(['202606', '202607'])
+    const queries = sent.map((p) => p.query)
+    for (const fragment of [
+      'system.parts',
+      'DROP PARTITION',
+      'system.mutations',
+      "ip != ''",
+      'UPDATE ip',
+    ]) {
+      expect(
+        queries.some((q) => q.includes(fragment)),
+        fragment,
+      ).toBe(true)
+    }
+    for (const p of sent) {
+      expect(p.clickhouse_settings, p.query).toEqual({
+        max_execution_time: RETENTION_MAX_EXECUTION_SECONDS,
+      })
+    }
   })
 
   it('does not blank a partition twice', async () => {

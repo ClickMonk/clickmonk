@@ -12,11 +12,11 @@
  * validated by its own strict schema.
  */
 import { type InstallSettings, InstallSettingsSchema, retentionNote } from '@clickmonk/core'
-import { readSettings, writeSettings } from '@clickmonk/worker/settings'
+import { SettingsLockedError, readSettings, writeSettings } from '@clickmonk/worker/settings'
 import type { FastifyInstance } from 'fastify'
 import type { AdminContext } from './app.js'
 import { requireCredential } from './auth.js'
-import { readBody } from './http.js'
+import { fail, readBody } from './http.js'
 
 function body(s: InstallSettings, problem: string | null): Record<string, unknown> {
   return { traffic: s.traffic, retention: s.retention, note: retentionNote(s.retention), problem }
@@ -41,7 +41,19 @@ export function registerSettingsRoutes(app: FastifyInstance, ctx: AdminContext):
   app.put('/api/settings', async (req) => {
     requireCredential(req)
     const next = readBody(InstallSettingsSchema, req.body)
-    await writeSettings(ctx.pg, next, ctx.now())
+    try {
+      await writeSettings(ctx.pg, next, ctx.now())
+    } catch (err) {
+      // The retention pass holds this row while it deletes, and the writer stops
+      // waiting rather than holding a request open for the length of a pass.
+      // 503 with `retry-after`, because nothing is wrong with the request and
+      // sending it again is the whole remedy. `return fail(…)`: a bare call does
+      // not tell the compiler this path ends.
+      if (err instanceof SettingsLockedError) {
+        return fail(503, 'settings_locked', err.message, { 'retry-after': '5' })
+      }
+      throw err
+    }
     return body(next, null)
   })
 }

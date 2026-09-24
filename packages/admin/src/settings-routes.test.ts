@@ -172,6 +172,37 @@ describe('writing the settings', () => {
     expect(back.json().retention).toEqual({ rawRetentionDays: 30, ipRetentionDays: 90 })
   })
 
+  // The retention pass holds this row while it deletes, and the writer stops
+  // waiting rather than holding this request open for the length of a pass —
+  // Fastify's own request timeout does not bound a handler, so waiting here is
+  // waiting with a connection of a pool of four. Nothing is wrong with the
+  // request, which is why it is 503 with a `retry-after` and not a 4xx.
+  it('answers 503 while the settings row is held, and writes nothing', async () => {
+    const holder = await pg.connect()
+    let r: Awaited<ReturnType<typeof put>>
+    try {
+      await holder.query('BEGIN')
+      await holder.query('SELECT 1 FROM settings FOR UPDATE')
+      r = await put({
+        traffic: { ...DEFAULT_TRAFFIC_SETTINGS, abuserThreshold: 120 },
+        retention: { rawRetentionDays: 5, ipRetentionDays: 5 },
+      })
+    } finally {
+      await holder.query('ROLLBACK').catch(() => {})
+      holder.release()
+    }
+    expect(r.statusCode).toBe(503)
+    expect(r.headers['retry-after']).toBe('5')
+    expect(r.json()).toEqual({
+      error: 'settings_locked',
+      message:
+        'the settings row is held by another writer, most likely the retention pass, which holds it for the length of one pass; nothing was written, so run this again in a moment',
+    })
+    const back = await get()
+    expect(back.json().traffic.abuserThreshold).toBe(60)
+    expect(back.json().retention).toEqual({ rawRetentionDays: 90, ipRetentionDays: 30 })
+  })
+
   it('refuses a body whose retention half is invalid, and writes neither half', async () => {
     const r = await put({
       traffic: { ...DEFAULT_TRAFFIC_SETTINGS, abuserThreshold: 120 },

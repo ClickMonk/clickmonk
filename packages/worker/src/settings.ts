@@ -58,6 +58,50 @@ export interface SettingsRead {
   problem: string | null
 }
 
+/**
+ * How long a writer waits for the settings row before refusing, in
+ * milliseconds.
+ *
+ * The retention pass holds this row's lock for the whole of a pass, which is
+ * what makes a write and a delete serialise, and the pass's own statements are
+ * bounded so the wait is bounded too. But a command that has printed nothing
+ * for several seconds is a command an operator kills, and a killed write is one
+ * they then have to guess about. So a writer stops waiting and says what has
+ * the row instead. A pass that is doing its usual work holds the lock for
+ * milliseconds; this is long enough to ride that out and short enough to answer
+ * while somebody is still watching.
+ */
+export const SETTINGS_LOCK_TIMEOUT_MS = 2_000
+
+/**
+ * The row was locked by someone else for longer than a writer waits. Named
+ * rather than anonymous because each surface answers it differently — the
+ * command line prints it and stops, the API answers 503 — and neither can tell
+ * it apart from a real fault otherwise.
+ */
+export class SettingsLockedError extends Error {
+  constructor() {
+    super(
+      'the settings row is held by another writer, most likely the retention pass, which holds it for the length of one pass; nothing was written, so run this again in a moment',
+    )
+    this.name = 'SettingsLockedError'
+  }
+}
+
+/** `55P03` is Postgres saying it stopped waiting for a lock. */
+const isLockTimeout = (err: unknown): boolean =>
+  typeof err === 'object' && err !== null && (err as { code?: unknown }).code === '55P03'
+
+/**
+ * `set_config(…, true)` rather than `SET LOCAL`: it is the spelling that takes
+ * a bound parameter, so the bound stays a value and never becomes SQL text.
+ */
+const boundWait = async (client: PoolClient): Promise<void> => {
+  await client.query(`SELECT set_config('lock_timeout', $1, true)`, [
+    String(SETTINGS_LOCK_TIMEOUT_MS),
+  ])
+}
+
 const why = (issues: { path: (string | number)[]; message: string }[]): string =>
   issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')
 
@@ -175,27 +219,44 @@ function fromRow(row: SettingsRow | undefined): SettingsRead {
  * whole snapshot twice for one write. It upserts rather than assuming the row
  * is there, because it can be deleted by hand and an UPDATE alone would match
  * nothing and report success.
+ *
+ * Still one statement, and now in a transaction of its own so that it can carry
+ * a lock timeout: the retention pass holds this row while it deletes, and an
+ * upsert that waited for it would hang the request that asked for it. A wrapped
+ * single statement notifies exactly once, as it did unwrapped.
  */
 export async function writeSettings(pg: Pool, next: InstallSettings, now: Date): Promise<void> {
-  await pg.query(
-    `INSERT INTO settings (id, traffic_actions, safe_url, abuser_threshold,
+  const client: PoolClient = await pg.connect()
+  try {
+    await client.query('BEGIN')
+    await boundWait(client)
+    await client.query(
+      `INSERT INTO settings (id, traffic_actions, safe_url, abuser_threshold,
                            raw_retention_days, ip_retention_days, updated_at)
-     VALUES (true, $1, $2, $3, $4, $5, $6)
-     ON CONFLICT (id) DO UPDATE
-       SET traffic_actions = EXCLUDED.traffic_actions, safe_url = EXCLUDED.safe_url,
-           abuser_threshold = EXCLUDED.abuser_threshold,
-           raw_retention_days = EXCLUDED.raw_retention_days,
-           ip_retention_days = EXCLUDED.ip_retention_days,
-           updated_at = EXCLUDED.updated_at`,
-    [
-      JSON.stringify(next.traffic.actions),
-      next.traffic.safeUrl,
-      next.traffic.abuserThreshold,
-      next.retention.rawRetentionDays,
-      next.retention.ipRetentionDays,
-      now,
-    ],
-  )
+       VALUES (true, $1, $2, $3, $4, $5, $6)
+       ON CONFLICT (id) DO UPDATE
+         SET traffic_actions = EXCLUDED.traffic_actions, safe_url = EXCLUDED.safe_url,
+             abuser_threshold = EXCLUDED.abuser_threshold,
+             raw_retention_days = EXCLUDED.raw_retention_days,
+             ip_retention_days = EXCLUDED.ip_retention_days,
+             updated_at = EXCLUDED.updated_at`,
+      [
+        JSON.stringify(next.traffic.actions),
+        next.traffic.safeUrl,
+        next.traffic.abuserThreshold,
+        next.retention.rawRetentionDays,
+        next.retention.ipRetentionDays,
+        now,
+      ],
+    )
+    await client.query('COMMIT')
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    if (isLockTimeout(err)) throw new SettingsLockedError()
+    throw err
+  } finally {
+    client.release()
+  }
 }
 
 /**
@@ -251,6 +312,10 @@ export async function updateSettings(
   const client: PoolClient = await pg.connect()
   try {
     await client.query('BEGIN')
+    // Before the first statement that can wait for the row, which is the insert:
+    // an upsert against a locked row blocks exactly as the `FOR UPDATE` below
+    // does.
+    await boundWait(client)
     // Whether this inserted tells us the row was not there, which is the third
     // substitution and the one the earlier two callbacks could not express:
     // before this statement the reader answered "nothing is being deleted",
@@ -299,6 +364,7 @@ export async function updateSettings(
     // client released inside an open transaction is a connection the next
     // caller inherits mid-transaction.
     await client.query('ROLLBACK').catch(() => {})
+    if (isLockTimeout(err)) throw new SettingsLockedError()
     throw err
   } finally {
     client.release()
