@@ -877,16 +877,26 @@ describe('GET /api/clicks.csv', () => {
 })
 
 /**
- * A gate that also counts the slots it handed out, so that a test about giving one
- * back can say the export took one in the first place. A case that asserts an
- * empty gate without that is a case an unserved request satisfies.
+ * A gate that counts the slots it handed out and the times they were given back.
+ *
+ * The first count is so that a test about giving a slot back can say the export
+ * took one: a case asserting an empty gate without it is a case an unserved
+ * request satisfies. The second is because the release is called from three
+ * places and the gate itself cannot tell — `leave()` on an empty gate does
+ * nothing, so a release that ran twice is invisible in `inFlight` until two
+ * exports run at once and one of them gives the other's slot away.
  */
 class CountingGate extends ConcurrencyGate {
   entered = 0
+  left = 0
   override tryEnter(): boolean {
     const ok = super.tryEnter()
     if (ok) this.entered++
     return ok
+  }
+  override leave(): void {
+    this.left++
+    super.leave()
   }
 }
 
@@ -906,6 +916,34 @@ class CountingGate extends ConcurrencyGate {
  */
 describe('GET /api/clicks.csv, a caller that hangs up', () => {
   const settle = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+  /**
+   * The ordinary export, for the count rather than the file.
+   *
+   * Three paths call the release — the generator's `finally` and the stream's
+   * `close` and `error` — and on an export that simply finishes, two of them do.
+   * The gate cannot notice the second: `leave()` on an empty gate does nothing.
+   * So what is asserted is the number of calls, because a release that runs twice
+   * is a slot handed back that was never taken, and with two exports allowed at
+   * once that is one of them freeing the other's.
+   */
+  it('gives the slot back exactly once when the export finishes', async () => {
+    const gate = new CountingGate(1)
+    const one = testApp(pool, clock, { ch, exportGate: gate })
+    try {
+      const r = await one.inject({
+        method: 'GET',
+        url: `/api/clicks.csv?${WINDOW}`,
+        headers: read(cookie),
+      })
+      expect(r.statusCode).toBe(200)
+      expect(gate.entered).toBe(1)
+      expect(gate.left).toBe(1)
+      expect(gate.stats().inFlight).toBe(0)
+    } finally {
+      await one.close()
+    }
+  })
 
   /** Waits until the export holds the slot, so no case here is vacuous. */
   const untilEntered = async (gate: CountingGate): Promise<void> => {
