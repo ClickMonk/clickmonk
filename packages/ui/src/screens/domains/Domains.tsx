@@ -1,6 +1,6 @@
 import { useClient } from '@/api/context'
 import { ApiError } from '@/api/errors'
-import { ErrorNote } from '@/app/ErrorNote'
+import { ErrorNote, explain } from '@/app/ErrorNote'
 import { PageHeader } from '@/app/PageHeader'
 import { useRefresh } from '@/app/refresh'
 import { useLoad } from '@/app/useLoad'
@@ -17,7 +17,7 @@ import { DomainCard } from './DomainCard'
  */
 export function Domains() {
   const client = useClient()
-  const { round } = useRefresh()
+  const { round, refresh } = useRefresh()
   const list = useLoad(() => client.domains(), [round])
   const [host, setHost] = useState('')
   const [addError, setAddError] = useState<ApiError | null>(null)
@@ -35,7 +35,7 @@ export function Domains() {
       try {
         await client.addDomain({ host })
         setHost('')
-        list.reload()
+        refresh()
       } catch (err) {
         if (err instanceof ApiError) setAddError(err)
         else setThrown(err)
@@ -62,7 +62,7 @@ export function Domains() {
           />
           {addError && (
             <p id="domain-host-error" className="text-sm text-destructive">
-              {addError.message}
+              {explain(addError)}
             </p>
           )}
         </div>
@@ -84,7 +84,7 @@ export function Domains() {
           className={list.state === 'loading' ? 'grid gap-4 opacity-50' : 'grid gap-4'}
         >
           {domains.map((d) => (
-            <DomainCard key={d.id} d={d} onChanged={list.reload} />
+            <DomainCard key={d.id} d={d} onChanged={refresh} />
           ))}
         </div>
       )}

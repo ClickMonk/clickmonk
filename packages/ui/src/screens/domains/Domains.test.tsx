@@ -1,7 +1,9 @@
 import { ClientProvider } from '@/api/context'
 import { ApiError } from '@/api/errors'
 import { fakeClient } from '@/api/fake'
-import type { Domain } from '@/api/types'
+import type { Domain, Status } from '@/api/types'
+import { Freshness } from '@/app/Freshness'
+import { RefreshProvider } from '@/app/refresh'
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router'
@@ -49,7 +51,12 @@ function show(list: Domain[], over: Parameters<typeof fakeClient>[0] = {}, trunc
   render(
     <MemoryRouter>
       <ClientProvider client={client}>
-        <Domains />
+        {/* The real app always renders `Domains` inside one `RefreshProvider`
+            (`App.tsx`); a screen test with none would test a `refresh()`
+            that is a no-op, which is not how the screen is ever used. */}
+        <RefreshProvider>
+          <Domains />
+        </RefreshProvider>
       </ClientProvider>
     </MemoryRouter>,
   )
@@ -276,22 +283,37 @@ describe('adding a domain', () => {
   })
 
   it.each([
-    ['host_taken', 'this install already has that domain'],
+    ['host_taken', 'this install already has that domain', 'this install already has that domain.'],
     [
       'host_is_admin_host',
       'that is the host name this API answers on, so links on it would never resolve',
+      'that is the host name this API answers on, so links on it would never resolve.',
     ],
-    ['invalid_host', 'not a valid host name'],
-  ])('says %s beside the host name, and keeps what was typed', async (code, message) => {
+    ['invalid_host', 'not a valid host name', 'not a valid host name.'],
+  ])(
+    'says %s beside the host name, through explain(), and keeps what was typed',
+    async (code, message, shown) => {
+      const { user } = show([], {
+        addDomain: () =>
+          Promise.reject(new ApiError(code === 'invalid_host' ? 400 : 409, code, message)),
+      })
+      await user.type(screen.getByLabelText('Host name'), 'go.example.test')
+      await user.click(screen.getByRole('button', { name: 'Add domain' }))
+      expect(await screen.findByText(shown)).toBeInTheDocument()
+      expect(screen.getByLabelText('Host name')).toHaveAccessibleDescription(shown)
+      expect(screen.getByLabelText('Host name')).toHaveValue('go.example.test')
+    },
+  )
+
+  it('routes a proxy failure through explain(), not the raw message', async () => {
     const { user } = show([], {
-      addDomain: () =>
-        Promise.reject(new ApiError(code === 'invalid_host' ? 400 : 409, code, message)),
+      addDomain: () => Promise.reject(new ApiError(502, 'unknown', 'the service answered 502')),
     })
     await user.type(screen.getByLabelText('Host name'), 'go.example.test')
     await user.click(screen.getByRole('button', { name: 'Add domain' }))
-    expect(await screen.findByText(message)).toBeInTheDocument()
-    expect(screen.getByLabelText('Host name')).toHaveAccessibleDescription(message)
-    expect(screen.getByLabelText('Host name')).toHaveValue('go.example.test')
+    expect(
+      await screen.findByText('Something between this browser and ClickMonk answered 502.'),
+    ).toBeInTheDocument()
   })
 
   it('does not clear the host field before the add answers', async () => {
@@ -486,5 +508,72 @@ describe('a domain’s actions', () => {
     )
     const b = await card('b.example.test')
     expect(within(b).queryByText(UNVERIFY_NOTE)).not.toBeInTheDocument()
+  })
+})
+
+describe('the header, elsewhere on the same refresh round', () => {
+  const status: Status = {
+    newestHour: null,
+    reporting: 'ok',
+    ipData: null,
+    ipDataProblem: null,
+    alerts: 0,
+  }
+
+  function showWithHeader(over: Parameters<typeof fakeClient>[0] = {}) {
+    let statusCalls = 0
+    const client = fakeClient({
+      domains: () => Promise.resolve({ domains: [domain('go.example.test')], truncated: false }),
+      status: (() => {
+        statusCalls += 1
+        return Promise.resolve(status)
+      }) as never,
+      ...over,
+    })
+    render(
+      <MemoryRouter>
+        <ClientProvider client={client}>
+          <RefreshProvider>
+            <Freshness />
+            <Domains />
+          </RefreshProvider>
+        </ClientProvider>
+      </MemoryRouter>,
+    )
+    return { client, user: userEvent.setup(), calls: () => statusCalls }
+  }
+
+  // Domains reloading its own list is not enough: the header's alert count
+  // depends on a separate load, and only the shared refresh round reaches it.
+  it('asks the header to reload too, after adding a domain', async () => {
+    const { user, calls } = showWithHeader({
+      addDomain: () => Promise.resolve(domain('new.example.test')),
+    })
+    await card('go.example.test')
+    expect(calls()).toBe(1)
+    await user.type(screen.getByLabelText('Host name'), 'new.example.test')
+    await user.click(screen.getByRole('button', { name: 'Add domain' }))
+    await waitFor(() => expect(calls()).toBe(2))
+  })
+
+  it('asks the header to reload too, after a check succeeds', async () => {
+    const { user, calls } = showWithHeader({
+      checkDomain: () => Promise.resolve({ status: 'verified', detail: null }),
+    })
+    const c = await card('go.example.test')
+    expect(calls()).toBe(1)
+    await user.click(within(c).getByRole('button', { name: 'Check now' }))
+    await waitFor(() => expect(calls()).toBe(2))
+  })
+
+  it('asks the header to reload too, after a delete', async () => {
+    const { user, calls } = showWithHeader({
+      deleteDomain: () => Promise.resolve({ ok: true as const }),
+    })
+    const c = await card('go.example.test')
+    expect(calls()).toBe(1)
+    await user.click(within(c).getByRole('button', { name: 'Delete' }))
+    await user.click(screen.getByRole('button', { name: 'Delete go.example.test' }))
+    await waitFor(() => expect(calls()).toBe(2))
   })
 })
