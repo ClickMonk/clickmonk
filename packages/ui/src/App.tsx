@@ -82,9 +82,20 @@ export function App({
 
   // Re-reads the account after a change on the account screen (enrolling or
   // turning off two-factor, replacing recovery codes) so that screen shows
-  // what the service now says, not what it said at boot.
+  // what the service now says, not what it said at boot. Called without being
+  // awaited (`onChanged()`, not `await onChanged()`, on the account screen),
+  // so it must never reject: a 401 here already routed to `ended` through
+  // `onUnauthorized`, which moved the phase to `anonymous` itself, and this
+  // only needs to leave that alone rather than set `authenticated` over it.
+  // Any other failure is likewise swallowed — the next screen load surfaces
+  // it — because nothing downstream awaits this promise to catch it.
   const refreshMe = useCallback(async () => {
-    setPhase({ name: 'authenticated', me: await client.me() })
+    try {
+      const me = await client.me()
+      setPhase((p) => (p.name === 'authenticated' ? { name: 'authenticated', me } : p))
+    } catch {
+      // See above: a 401 already moved the phase; anything else is dropped.
+    }
   }, [client])
 
   return (

@@ -57,6 +57,11 @@ export function ApiKeys() {
   const [thrown, setThrown] = useState<unknown>(null)
   if (thrown !== null) throw thrown
 
+  // The one place the new key is discarded — by the dialog's own `onClose`
+  // (Escape included) and by "I have saved it" alike, so there is one place
+  // that clears it, not one per way of leaving.
+  const closeNewKey = () => setNewKey(null)
+
   const create = (e: FormEvent) => {
     e.preventDefault()
     const probs: Record<string, string> = {}
@@ -193,11 +198,11 @@ export function ApiKeys() {
       )}
       {list.state !== 'error' && list.data?.truncated && (
         <p className="text-sm text-muted-foreground">
-          The newest 200 keys are shown; clickmonk apikey list shows every one.
+          The newest 200 keys are shown; <code>clickmonk apikey list</code> shows every one.
         </p>
       )}
 
-      <Modal open={newKey !== null} onClose={() => setNewKey(null)} title="API key created">
+      <Modal open={newKey !== null} onClose={closeNewKey} title="API key created">
         {newKey && (
           <div className="grid gap-4">
             <p className="break-all font-mono text-sm">{newKey.key}</p>
@@ -205,7 +210,7 @@ export function ApiKeys() {
             <p className="text-sm text-muted-foreground">
               This is the only time this key is shown.
             </p>
-            <Button type="button" className="justify-self-start" onClick={() => setNewKey(null)}>
+            <Button type="button" className="justify-self-start" onClick={closeNewKey}>
               I have saved it
             </Button>
           </div>

@@ -21,10 +21,13 @@ import {
  * one, the reload is what reaches the service and comes back 401, which is
  * the only way this browser learns it has been signed out.
  */
-export function Sessions() {
+export function Sessions({ reloadKey = 0 }: { reloadKey?: number } = {}) {
   const client = useClient()
   const zone = browserZone()
-  const list = useLoad(() => client.sessions(), [])
+  // `reloadKey` lets `Account` ask for a reload from outside — after a
+  // password change, which signs out every other session — without this
+  // component patching its own list from a response it never asked for.
+  const list = useLoad(() => client.sessions(), [reloadKey])
   const sessions = list.data ?? []
 
   return (

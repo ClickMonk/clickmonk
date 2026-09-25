@@ -1,4 +1,5 @@
 import { ClientProvider } from '@/api/context'
+import { ApiError } from '@/api/errors'
 import { fakeClient } from '@/api/fake'
 import type { Session } from '@/api/types'
 import { render, screen, waitFor, within } from '@testing-library/react'
@@ -16,10 +17,11 @@ const session = (id: string, current: boolean): Session => ({
   current,
 })
 
-function show() {
+function show(over: Parameters<typeof fakeClient>[0] = {}) {
   const client = fakeClient({
     sessions: () => Promise.resolve([session('s1', true), session('s2', false)]),
     revokeSession: () => Promise.resolve({ ok: true as const }),
+    ...over,
   })
   render(
     <ClientProvider client={client}>
@@ -30,11 +32,12 @@ function show() {
 }
 
 describe('sessions', () => {
-  it('lists each session with where it was opened from, and marks this one', async () => {
+  it('lists each session with where it was opened from, and marks only this one', async () => {
     show()
     const rows = await screen.findAllByRole('row')
     expect(within(rows[1] as HTMLElement).getByText('This browser')).toBeInTheDocument()
     expect(within(rows[1] as HTMLElement).getByText('203.0.113.7')).toBeInTheDocument()
+    expect(within(rows[2] as HTMLElement).queryByText('This browser')).not.toBeInTheDocument()
     expect(screen.getByRole('columnheader', { name: 'Signed in from' })).toBeInTheDocument()
   })
 
@@ -66,5 +69,43 @@ describe('sessions', () => {
     expect(client.calls.filter((c) => c.method === 'revokeSession').map((c) => c.args)).toEqual([
       ['s1'],
     ])
+  })
+
+  it('dims the list and marks it busy while a reload is in flight, rather than blanking it', async () => {
+    let resolveSecond: ((s: Session[]) => void) | undefined
+    let calls = 0
+    const { user } = show({
+      sessions: (() => {
+        calls += 1
+        if (calls === 1) return Promise.resolve([session('s1', true), session('s2', false)])
+        return new Promise<Session[]>((resolve) => {
+          resolveSecond = resolve
+        })
+      }) as never,
+    })
+    const rows = await screen.findAllByRole('row')
+    await user.click(within(rows[2] as HTMLElement).getByRole('button', { name: 'Sign out' }))
+    await user.click(screen.getByRole('button', { name: 'Sign that session out' }))
+    const table = screen.getByRole('table')
+    await waitFor(() => expect(table.closest('[aria-busy]')).toHaveAttribute('aria-busy', 'true'))
+    expect(table.closest('[aria-busy]')).toHaveClass('opacity-50')
+    resolveSecond?.([session('s1', true), session('s2', false)])
+    await waitFor(() => expect(table.closest('[aria-busy]')).toHaveAttribute('aria-busy', 'false'))
+  })
+
+  it('hides the sessions rather than showing stale data once a reload fails', async () => {
+    let calls = 0
+    const { user } = show({
+      sessions: (() => {
+        calls += 1
+        if (calls === 1) return Promise.resolve([session('s1', true), session('s2', false)])
+        return Promise.reject(new ApiError(500, 'server_error', 'the service is down'))
+      }) as never,
+    })
+    const rows = await screen.findAllByRole('row')
+    await user.click(within(rows[2] as HTMLElement).getByRole('button', { name: 'Sign out' }))
+    await user.click(screen.getByRole('button', { name: 'Sign that session out' }))
+    expect(await screen.findByRole('alert')).toBeInTheDocument()
+    expect(screen.queryByRole('table')).not.toBeInTheDocument()
   })
 })

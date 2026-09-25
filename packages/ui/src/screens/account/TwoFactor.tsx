@@ -14,6 +14,15 @@ type Factor = { kind: 'code'; code: string } | { kind: 'recovery'; recoveryCode:
 const factorBody = (f: Factor): { code: string } | { recoveryCode: string } =>
   f.kind === 'code' ? { code: f.code } : { recoveryCode: f.recoveryCode }
 
+/**
+ * An empty attempt refused before it is sent: the service treats `code: ''`
+ * as a guess and counts it against the lockout, the same as a wrong one.
+ */
+const factorProblem = (f: Factor): string | null => {
+  if (f.kind === 'code') return f.code === '' ? 'Enter the code from the app.' : null
+  return f.recoveryCode === '' ? 'Enter the recovery code.' : null
+}
+
 const emptyFactor: Factor = { kind: 'code', code: '' }
 
 type SetupStep =
@@ -95,9 +104,16 @@ function SecondFactorFields({
  * Enrolling an authenticator, replacing the recovery codes, and turning
  * two-factor off — each behind the password the service will check, and,
  * once an authenticator exists, a code or a recovery code alongside it.
- * `onChanged` runs after `confirmTotp` and after `disableTotp`, so the
- * section that shows "on" or "off" shows what the service says, not a local
- * guess.
+ * `onChanged` runs after `confirmTotp`, `disableTotp` and `newRecoveryCodes`,
+ * so the section that shows "on" or "off" and the remaining-codes count shows
+ * what the service says, not a local guess.
+ *
+ * Every one-time secret this component holds — the enrolment secret and uri,
+ * kept together in `setupStep` — is cleared by `closeFlow`, and `closeFlow`
+ * is the one function both a dialog's own `close` event (Escape included) and
+ * every button that leaves the flow call: there is one place that clears it,
+ * not one per way of leaving. The recovery codes follow the same shape in
+ * their own smaller pair, `codes` and `closeCodes`.
  */
 export function TwoFactor({
   enabled,
@@ -113,12 +129,19 @@ export function TwoFactor({
   const [recoveryFactor, setRecoveryFactor] = useState<Factor>(emptyFactor)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<ApiError | null>(null)
+  const [clientProblem, setClientProblem] = useState<string | null>(null)
   const [codes, setCodes] = useState<string[] | null>(null)
   // A failure that is not an `ApiError` is a defect, not a refusal to show,
   // and is rethrown to React the way `Confirm` does.
   const [thrown, setThrown] = useState<unknown>(null)
   if (thrown !== null) throw thrown
 
+  // The one place every secret `setupStep` can hold — the password, the
+  // enrolment secret, the uri — is discarded. Referenced by the setup,
+  // disable and recovery `Modal`s' own `onClose` (which fires for Escape and
+  // a `method="dialog"` form exactly as it does for a click) and by every
+  // successful submit, so there is no separate "and also clear it here" path
+  // to forget.
   const closeFlow = () => {
     setFlow('idle')
     setSetupStep(emptySetup)
@@ -127,10 +150,16 @@ export function TwoFactor({
     setRecoveryPassword('')
     setRecoveryFactor(emptyFactor)
     setError(null)
+    setClientProblem(null)
   }
+
+  // The one place the recovery codes are discarded — by the codes `Modal`'s
+  // own `onClose` and by "I have saved them" alike.
+  const closeCodes = () => setCodes(null)
 
   const open = (f: 'setup' | 'disable' | 'recovery') => {
     setError(null)
+    setClientProblem(null)
     setFlow(f)
   }
 
@@ -159,8 +188,13 @@ export function TwoFactor({
   const confirmSetup = async (e: FormEvent) => {
     e.preventDefault()
     if (setupStep.name !== 'confirm') return
-    setBusy(true)
     setError(null)
+    if (setupStep.code === '') {
+      setClientProblem('Enter the code from the app.')
+      return
+    }
+    setClientProblem(null)
+    setBusy(true)
     try {
       const r = await client.confirmTotp({ password: setupStep.password, code: setupStep.code })
       closeFlow()
@@ -176,8 +210,14 @@ export function TwoFactor({
 
   const submitDisable = async (e: FormEvent) => {
     e.preventDefault()
-    setBusy(true)
     setError(null)
+    const problem = factorProblem(disableFactor)
+    if (problem) {
+      setClientProblem(problem)
+      return
+    }
+    setClientProblem(null)
+    setBusy(true)
     try {
       await client.disableTotp({ password: disablePassword, ...factorBody(disableFactor) })
       closeFlow()
@@ -192,8 +232,14 @@ export function TwoFactor({
 
   const submitRecovery = async (e: FormEvent) => {
     e.preventDefault()
-    setBusy(true)
     setError(null)
+    const problem = factorProblem(recoveryFactor)
+    if (problem) {
+      setClientProblem(problem)
+      return
+    }
+    setClientProblem(null)
+    setBusy(true)
     try {
       const r = await client.newRecoveryCodes({
         password: recoveryPassword,
@@ -201,6 +247,10 @@ export function TwoFactor({
       })
       closeFlow()
       setCodes(r.recoveryCodes)
+      // The remaining-codes count is service state too: without this, "On. 3
+      // recovery codes left." keeps showing the old count after ten new ones
+      // were just issued.
+      onChanged()
     } catch (err) {
       if (err instanceof ApiError) setError(err)
       else setThrown(err)
@@ -269,6 +319,11 @@ export function TwoFactor({
                 onChange={(e) => setSetupStep({ ...setupStep, code: e.target.value })}
               />
             </div>
+            {clientProblem && (
+              <p role="alert" className="text-sm text-destructive">
+                {clientProblem}
+              </p>
+            )}
             {error && <ErrorNote error={error} />}
             <Button type="submit" disabled={busy} className="justify-self-start">
               Turn on two-factor
@@ -286,6 +341,11 @@ export function TwoFactor({
             factor={disableFactor}
             setFactor={setDisableFactor}
           />
+          {clientProblem && (
+            <p role="alert" className="text-sm text-destructive">
+              {clientProblem}
+            </p>
+          )}
           {error && <ErrorNote error={error} />}
           <Button
             type="submit"
@@ -307,6 +367,11 @@ export function TwoFactor({
             factor={recoveryFactor}
             setFactor={setRecoveryFactor}
           />
+          {clientProblem && (
+            <p role="alert" className="text-sm text-destructive">
+              {clientProblem}
+            </p>
+          )}
           {error && <ErrorNote error={error} />}
           <Button type="submit" disabled={busy} className="justify-self-start">
             Replace the codes
@@ -314,7 +379,7 @@ export function TwoFactor({
         </form>
       </Modal>
 
-      <Modal open={codes !== null} onClose={() => setCodes(null)} title="Your recovery codes">
+      <Modal open={codes !== null} onClose={closeCodes} title="Your recovery codes">
         {codes && (
           <div className="grid gap-4">
             <ol className="grid grid-cols-2 gap-1 font-mono text-sm">
@@ -326,7 +391,7 @@ export function TwoFactor({
             <p className="text-sm text-muted-foreground">
               This is the only time these codes are shown.
             </p>
-            <Button type="button" className="justify-self-start" onClick={() => setCodes(null)}>
+            <Button type="button" className="justify-self-start" onClick={closeCodes}>
               I have saved them
             </Button>
           </div>

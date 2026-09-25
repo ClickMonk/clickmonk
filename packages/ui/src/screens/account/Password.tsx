@@ -8,12 +8,21 @@ import { type FormEvent, useState } from 'react'
 
 const MIN_LENGTH = 12
 
+/** "1 other session was" against "2 other sessions were" — the count is never off by the word around it. */
+function signedOutSentence(count: number): string {
+  const session = count === 1 ? 'session' : 'sessions'
+  const was = count === 1 ? 'was' : 'were'
+  return `Password changed. ${count} other ${session} ${was} signed out.`
+}
+
 /**
  * Changing the password. The service signs out every other session when it
  * does, and says how many; that count is the only thing this shows on
- * success, because "Saved" would hide the part that matters.
+ * success, because "Saved" would hide the part that matters. `onChanged`
+ * lets `Account` reload the sessions list, which the service has just
+ * shortened.
  */
-export function Password() {
+export function Password({ onChanged = () => {} }: { onChanged?: () => void } = {}) {
   const client = useClient()
   const [currentPassword, setCurrentPassword] = useState('')
   const [newPassword, setNewPassword] = useState('')
@@ -46,10 +55,11 @@ export function Password() {
     void (async () => {
       try {
         const r = await client.changePassword({ currentPassword, newPassword })
-        setStatus(`Password changed. ${r.otherSessionsSignedOut} other sessions were signed out.`)
+        setStatus(signedOutSentence(r.otherSessionsSignedOut))
         setCurrentPassword('')
         setNewPassword('')
         setAgain('')
+        onChanged()
       } catch (err) {
         if (!(err instanceof ApiError)) {
           setThrown(err)

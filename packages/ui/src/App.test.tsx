@@ -260,6 +260,83 @@ describe('a session that does not stick after signing in', () => {
   })
 })
 
+describe('refreshing the account after a change', () => {
+  // The account screen calls its refresh without awaiting it
+  // (`onChanged()`, not `await onChanged()`), so a rejection this refresh
+  // does not catch would be an unhandled one. Here the refresh's own
+  // `GET /api/me` is what answers 401 — the same request `ended` already
+  // routes to the sign-in screen through `onUnauthorized` — so the fix is
+  // exercised on the most common path: a change that outlives the session it
+  // was made under.
+  it('signs out instead of crashing when the refresh after a change finds the session gone', async () => {
+    let meCalls = 0
+    const s = server({
+      'GET /api/me': () => {
+        meCalls += 1
+        return meCalls === 1
+          ? json(200, ME)
+          : json(401, { error: 'unauthenticated', message: 'sign in' })
+      },
+      'GET /api/status': () => json(200, STATUS),
+      'GET /api/sessions': () => json(200, { sessions: [] }),
+      'GET /api/keys': () => json(200, { keys: [], truncated: false }),
+      'POST /api/totp': () =>
+        json(200, { secret: 'JBSWY3DPEHPK3PXP', uri: 'otpauth://totp/x?secret=JBSWY3DPEHPK3PXP' }),
+      'POST /api/totp/confirm': () => json(200, { ok: true, recoveryCodes: ['ABCDE-FGHJK'] }),
+    })
+    show(s.makeClient, '/account')
+    const user = userEvent.setup()
+    await user.click(await screen.findByRole('button', { name: 'Set up an authenticator app' }))
+    await user.type(screen.getByLabelText('Your password'), 'a decent admin password')
+    await user.click(screen.getByRole('button', { name: 'Continue' }))
+    await user.type(await screen.findByLabelText('Code from the app'), '123456')
+    await user.click(screen.getByRole('button', { name: 'Turn on two-factor' }))
+    expect(await screen.findByRole('heading', { level: 1, name: 'Sign in' })).toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent('Your session ended. Sign in again.')
+  })
+
+  // A refresh that was already in flight when the operator signed out
+  // answers after `signOut` has already moved the phase to `anonymous`.
+  // Setting `authenticated` unconditionally on that answer would put the
+  // application back on a screen for a session that no longer exists.
+  it('does not let a refresh already in flight undo a sign-out that finished while it waited', async () => {
+    let meCalls = 0
+    let resolveSecondMe: ((r: Response) => void) | undefined
+    const s = server({
+      'GET /api/me': () => {
+        meCalls += 1
+        if (meCalls === 1) return json(200, ME)
+        return new Promise<Response>((resolve) => {
+          resolveSecondMe = resolve
+        })
+      },
+      'GET /api/status': () => json(200, STATUS),
+      'GET /api/sessions': () => json(200, { sessions: [] }),
+      'GET /api/keys': () => json(200, { keys: [], truncated: false }),
+      'POST /api/totp': () =>
+        json(200, { secret: 'JBSWY3DPEHPK3PXP', uri: 'otpauth://totp/x?secret=JBSWY3DPEHPK3PXP' }),
+      'POST /api/totp/confirm': () => json(200, { ok: true, recoveryCodes: ['ABCDE-FGHJK'] }),
+      'DELETE /api/session': () => json(200, { ok: true }),
+    })
+    show(s.makeClient, '/account')
+    const user = userEvent.setup()
+    await user.click(await screen.findByRole('button', { name: 'Set up an authenticator app' }))
+    await user.type(screen.getByLabelText('Your password'), 'a decent admin password')
+    await user.click(screen.getByRole('button', { name: 'Continue' }))
+    await user.type(await screen.findByLabelText('Code from the app'), '123456')
+    await user.click(screen.getByRole('button', { name: 'Turn on two-factor' }))
+    // The refresh's own GET /api/me — the second call — is now pending.
+    await waitFor(() => expect(meCalls).toBe(2))
+    await user.click(screen.getByRole('button', { name: 'Sign out' }))
+    expect(await screen.findByRole('heading', { level: 1, name: 'Sign in' })).toBeInTheDocument()
+    await act(async () => {
+      resolveSecondMe?.(json(200, ME))
+      await Promise.resolve()
+    })
+    expect(screen.getByRole('heading', { level: 1, name: 'Sign in' })).toBeInTheDocument()
+  })
+})
+
 describe('an address with nothing at it', () => {
   it('says so, as a screen of its own', async () => {
     const s = server({
