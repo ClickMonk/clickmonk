@@ -1,4 +1,5 @@
 import { NotFound } from '@/screens/NotFound'
+import { LinkForm } from '@/screens/links/LinkForm'
 import { LinkReport } from '@/screens/links/LinkReport'
 import { Links } from '@/screens/links/Links'
 import { Overview } from '@/screens/overview/Overview'
@@ -16,9 +17,9 @@ export function AppRoutes() {
       <Route path="/" element={<Navigate to="/overview" replace />} />
       <Route path="/overview" element={<Overview />} />
       <Route path="/links" element={<Links />} />
-      <Route path="/links/new" element={<Placeholder title="New link" />} />
+      <Route path="/links/new" element={<LinkForm mode="create" />} />
       <Route path="/links/:id" element={<LinkReport />} />
-      <Route path="/links/:id/edit" element={<Placeholder title="Edit link" />} />
+      <Route path="/links/:id/edit" element={<LinkForm mode="edit" />} />
       <Route path="/clicks" element={<Placeholder title="Clicks" />} />
       <Route path="/domains" element={<Placeholder title="Domains" />} />
       <Route path="/settings" element={<Placeholder title="Settings" />} />

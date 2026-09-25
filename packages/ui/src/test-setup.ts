@@ -42,3 +42,14 @@ if (!HTMLDialogElement.prototype.showModal) {
     this.dispatchEvent(new Event('close'))
   }
 }
+
+// jsdom has no ResizeObserver, and Radix's checkbox measures itself with one
+// (to size the hidden native input it keeps for form submission). Nothing in
+// a unit test depends on a size, so an observer that never reports is enough.
+if (!window.ResizeObserver) {
+  window.ResizeObserver = class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+}
