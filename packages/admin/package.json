@@ -5,21 +5,38 @@
   "type": "module",
   "main": "./dist/index.js",
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
-    "./account": { "types": "./dist/account.d.ts", "default": "./dist/account.js" },
-    "./keys": { "types": "./dist/keys.d.ts", "default": "./dist/keys.js" }
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./account": {
+      "types": "./dist/account.d.ts",
+      "default": "./dist/account.js"
+    },
+    "./keys": {
+      "types": "./dist/keys.d.ts",
+      "default": "./dist/keys.js"
+    }
   },
-  "engines": { "node": ">=22 <23" },
-  "scripts": { "build": "tsc -b", "build:image": "tsc -b tsconfig.build.json" },
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "build:image": "tsc -b tsconfig.build.json"
+  },
   "dependencies": {
     "@clickhouse/client": "^1.23.1",
     "@clickmonk/core": "workspace:*",
     "@clickmonk/db": "workspace:*",
     "@clickmonk/ipdata": "workspace:*",
     "@clickmonk/worker": "workspace:*",
+    "@fastify/static": "^10.1.4",
     "fastify": "^5.12.5",
     "pg": "^8.23.0",
     "zod": "^3.25.0"
   },
-  "devDependencies": { "@types/pg": "^8.23.1" }
+  "devDependencies": {
+    "@types/pg": "^8.23.1"
+  }
 }
