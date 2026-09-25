@@ -394,6 +394,9 @@ test("revoking this browser's own session ends it, and says so once", async () =
   const confirm = page.getByRole('alertdialog', { name: 'Sign this browser out?' })
   const reloaded = page.waitForResponse(
     (r) => new URL(r.url()).pathname === '/api/sessions' && r.request().method() === 'GET',
+    // Well above the moment the reload takes; a list that never reloads
+    // fails here, saying so, rather than at the test's own timeout.
+    { timeout: 15_000 },
   )
   await confirm.getByRole('button', { name: 'Sign this browser out' }).click()
   expect((await reloaded).status()).toBe(401)
