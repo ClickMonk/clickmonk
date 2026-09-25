@@ -54,7 +54,8 @@ on your own infrastructure, and your click data stays yours.
 - **Country rules** use the country looked up from the visitor's address.
 - **Reports over the admin API.** Clicks come back out: a summary of a window, a chart by
   hour or by day, and a breakdown by country, device, operating system, browser, referring
-  host, the target rotation chose, the traffic class, the action taken or the outcome. They
+  host, the target rotation chose, the traffic class, the action taken, the outcome, or the
+  link. They
   read hourly rollups written as the clicks arrive rather than the clicks themselves, so a
   window of a year is read as hours and not as every click inside it, and every number
   counts a click once even if the worker shipped its spool segment twice. **A report counts
@@ -108,8 +109,9 @@ What does not work yet:
 - **A CSV of a report.** The export is the click log. A summary or a breakdown is already one
   small answer, and turning it into a file is a job for the web interface rather than
   something this API streams.
-- **A time zone.** Every window, bucket and retention period is UTC. A preset like
-  "yesterday" is for whoever is asking to work out.
+- **A time zone.** Every window and retention period is UTC, and so is a chart's bucket
+  size — `offset` only moves where a day bucket begins, in whole hours, and does nothing
+  for an hourly one. A preset like "yesterday" is for whoever is asking to work out.
 - **A breakdown by two things at once.** One dimension per request: clicks by country, or
   clicks by browser, never clicks by country by browser.
 - **A report of a window older than this install's rollups.** They are written as the clicks
@@ -120,8 +122,8 @@ What does not work yet:
   The redirect keeps answering and keeps spooling throughout, so nothing is lost — it has
   simply not arrived yet.
 - **Reports answer nothing while ClickHouse is down.** `GET /api/reports/…`,
-  `GET /api/clicks` and `GET /api/clicks.csv` answer 503; domains, links and settings keep
-  working.
+  `GET /api/clicks`, `GET /api/clicks.csv` and `GET /api/clicks/count` answer 503; domains,
+  links and settings keep working.
 - **An export that fails part way through ends the connection** rather than finishing the
   file, because a file that looks complete and is not is worse than a download that broke.
 - **Any notification.** Nothing is emailed, posted or pushed anywhere: there is no mail
@@ -437,17 +439,30 @@ needed. Windows are UTC, `from` is included and `to` is not, and a window may be
 curl -H "authorization: Bearer $KEY" \
   "https://admin.example.com/api/reports/summary?from=2026-09-23T00:00:00Z&to=2026-09-24T00:00:00Z"
 
-# A chart: bucket=hour or bucket=day, at most 2000 buckets in one answer
+# A chart: bucket=hour or bucket=day, at most 2000 buckets in one answer.
+# offset moves where a day begins: a whole number of hours from UTC midnight,
+# -12 to 14, default 0. offset=3 counts days from 21:00 UTC — midnight at
+# UTC+3. It changes nothing on an hourly chart, since a whole-hour offset
+# moves no hour boundary, and a half-hour zone is counted from the nearest
+# whole hour.
 curl -H "authorization: Bearer $KEY" \
-  "https://admin.example.com/api/reports/timeseries?from=2026-09-01T00:00:00Z&to=2026-09-24T00:00:00Z&bucket=day"
+  "https://admin.example.com/api/reports/timeseries?from=2026-09-01T00:00:00Z&to=2026-09-24T00:00:00Z&bucket=day&offset=3"
 
-# One dimension: country, device, os, browser, referrer, target, class, action, outcome
+# One dimension: country, device, os, browser, referrer, target, class, action,
+# outcome, link. A breakdown by link carries a link object — slug, host and
+# name — on each row, read from the link table rather than the rollup; null
+# when the id names no link any more.
 curl -H "authorization: Bearer $KEY" \
   "https://admin.example.com/api/reports/breakdown?from=2026-09-23T00:00:00Z&to=2026-09-24T00:00:00Z&dimension=country&limit=20"
 
 # The log itself, newest first, paged with the cursor the previous answer gave
 curl -H "authorization: Bearer $KEY" \
   "https://admin.example.com/api/clicks?from=2026-09-23T00:00:00Z&to=2026-09-24T00:00:00Z&class=bot&limit=100"
+
+# How many rows an export of the same filters would write, before asking for
+# the file: {"window":{...},"link":null,"count":1234,"cap":1000000,"truncated":false}
+curl -H "authorization: Bearer $KEY" \
+  "https://admin.example.com/api/clicks/count?from=2026-09-01T00:00:00Z&to=2026-09-24T00:00:00Z"
 
 # And as a file
 curl -H "authorization: Bearer $KEY" -OJ \
@@ -456,18 +471,19 @@ curl -H "authorization: Bearer $KEY" -OJ \
 
 Add `&link=<id>` to any of them for one link instead of all of them. **Nothing looks the
 link up**, so an id that belongs to no link is an empty answer rather than an error, on all
-five of these.
+six of these.
 
 **A report counts whole buckets; the log counts milliseconds.** Before a report is counted,
 `from` is floored and `to` raised to the next boundary, and **the boundary is the grain that
 report answers at**: the hour for the summary and the breakdown, because that is the grain
 the rollups hold, and the bucket you asked for on the chart — so `bucket=day` counts whole
-days. The log and the export use the two instants exactly as they were sent. So the same
+days, from where `offset` puts midnight. The log, the export and the count use the two
+instants exactly as they were sent. So the same
 window can answer differently through these surfaces and none of them is broken: ask
 `from=2026-09-24T10:30:00Z&to=2026-09-24T10:50:00Z` and the summary, the hourly chart and the
 breakdown all count 10:00 to 11:00, a chart by day counts the whole of the 24th, and the log
 counts the twenty minutes you named — three different numbers from one request. Every one of
-these five answers repeats the window it actually counted, in its own `window` field. Read
+these six answers repeats the window it actually counted, in its own `window` field. Read
 that before comparing two numbers.
 
 **What the numbers mean.** `clicks` counts distinct clicks and `visitors` distinct visitor
@@ -515,6 +531,14 @@ body — which is why a probe query runs in front of the export rather than a tr
 appended, since the clients an operator actually uses do not show trailers. Narrow the
 window and ask again; nothing is lost. The cap can be built as high as 10,000,000, and
 there is no environment variable for it yet.
+
+**`GET /api/clicks/count`** answers the same question ahead of the download: it takes the
+log's own filters and runs the same bounded probe, so `{"count":1234,"cap":1000000,
+"truncated":false}` tells you how many rows the export would write and whether it would
+stop at the cap, before you ask for the file. It is a query rather than a body, so it takes
+a report slot and not the export's — asking it does not compete with a download already
+running. The window can gain clicks between this answer and the export; the export's own
+header stays the authority on the file it actually wrote.
 
 **A cell that would otherwise look like a formula is prefixed with an apostrophe.** A
 spreadsheet runs a cell beginning `=`, `+`, `-` or `@`, or with whitespace in front of one,

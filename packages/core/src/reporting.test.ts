@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest'
 import {
   BUCKET_MS,
   KEYED_DIMENSIONS,
+  MAX_DAY_OFFSET_HOURS,
   MAX_REPORT_BUCKETS,
   MAX_REPORT_WINDOW_DAYS,
   MAX_REPORT_WINDOW_MS,
+  MIN_DAY_OFFSET_HOURS,
   REPORT_BUCKETS,
   REPORT_DIMENSIONS,
   ROLLUP_DIMENSIONS,
@@ -51,12 +53,31 @@ describe('bucketCount', () => {
     // not a window of 400 hours on an endpoint that says 400 days.
     expect(MAX_REPORT_WINDOW_MS).toBe(34_560_000_000)
   })
+
+  it('counts days from where an offset puts midnight', () => {
+    const three = 3 * 3_600_000
+    // 21:00 to 21:00 UTC is one day at UTC+3 and two at UTC.
+    expect(bucketCount(at('2026-09-23T21:00:00Z'), at('2026-09-24T21:00:00Z'), 'day', three)).toBe(
+      1,
+    )
+    expect(bucketCount(at('2026-09-23T21:00:00Z'), at('2026-09-24T21:00:00Z'), 'day')).toBe(2)
+    // West of UTC: midnight at UTC-12 is noon UTC.
+    const minusTwelve = -12 * 3_600_000
+    expect(
+      bucketCount(at('2026-09-23T12:00:00Z'), at('2026-09-25T12:00:00Z'), 'day', minusTwelve),
+    ).toBe(2)
+  })
+
+  it('bounds the offset to the zones in use', () => {
+    expect(MIN_DAY_OFFSET_HOURS).toBe(-12)
+    expect(MAX_DAY_OFFSET_HOURS).toBe(14)
+  })
 })
 
 describe('the dimensions a breakdown may name', () => {
-  it('is the six the per-dimension rollup holds and the three that key the hourly one', () => {
+  it('is the six the per-dimension rollup holds and the four that key the hourly one', () => {
     expect(ROLLUP_DIMENSIONS).toEqual(['country', 'device', 'os', 'browser', 'referrer', 'target'])
-    expect(KEYED_DIMENSIONS).toEqual(['class', 'action', 'outcome'])
+    expect(KEYED_DIMENSIONS).toEqual(['class', 'action', 'outcome', 'link'])
     expect(REPORT_DIMENSIONS).toEqual([
       'country',
       'device',
@@ -67,6 +88,7 @@ describe('the dimensions a breakdown may name', () => {
       'class',
       'action',
       'outcome',
+      'link',
     ])
     expect(REPORT_BUCKETS).toEqual(['hour', 'day'])
   })

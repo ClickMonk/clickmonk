@@ -382,6 +382,17 @@ export const CSV_FIELDS = [
 ] as const
 
 const ExportQuery = z.object({ ...CLICK_FILTER_FIELDS }).strict()
+const CountQuery = z.object({ ...CLICK_FILTER_FIELDS }).strict()
+
+/**
+ * The bounded probe both the count and the export run: at most one row past
+ * the cap, so a window of a billion clicks costs what a window of a million
+ * and one does. Written once, so the rule about how many rows are counted
+ * cannot come to be stated differently in the two places that ask it.
+ */
+function probeQuery(where: string, cap: number): string {
+  return `SELECT count() AS n FROM (SELECT 1 FROM clicks FINAL WHERE ${where} LIMIT ${cap + 1})`
+}
 
 /**
  * `20260924T000000Z`: the instant as digits, with the colons a filename cannot
@@ -436,6 +447,49 @@ export function registerClickRoutes(app: FastifyInstance, ctx: AdminContext): vo
           // Present only when a further page exists, so a caller stops rather
           // than asking for ever.
           nextCursor: rows.length > q.limit && last ? `${last.at_ms}.${last.click_id}` : null,
+        }
+      },
+    )
+  })
+
+  /**
+   * How many clicks an export of these filters would write, and whether it
+   * would stop at the cap — asked before a download starts, so that "the file
+   * stops at a million" is something the operator reads before the file
+   * rather than a header on a file they have already saved.
+   *
+   * The same bounded probe the export runs: it counts at most one row past the
+   * cap, so a window of a billion clicks costs what a window of a million and
+   * one does. Under the report gate rather than the export's: it is a query,
+   * not a body, and taking the only export slot to answer a count would refuse
+   * the export it is asked ahead of. The window can gain clicks between this
+   * answer and the download; the export's own header is still the authority on
+   * the file it wrote.
+   */
+  app.get('/api/clicks/count', async (req) => {
+    requireCredential(req)
+    const q = readQuery(CountQuery, req.query)
+    const w = parseWindow(q, { alignMs: null })
+    const ch = requireCh(ctx, req)
+    const cap = ctx.exportRowCap
+    return withSlot(
+      ctx.reportGate,
+      { code: 'too_many_reports', message: 'too many reports at once; try again' },
+      async () => {
+        const { where, params } = clickFilter(q, w, null)
+        const [probe] = await chRows<{ n: string }>({
+          ch,
+          req,
+          query: probeQuery(where, cap),
+          params,
+        })
+        const n = Number(probe?.n ?? 0)
+        return {
+          window: { from: new Date(w.fromMs).toISOString(), to: new Date(w.toMs).toISOString() },
+          link: w.linkId,
+          count: Math.min(n, cap),
+          cap,
+          truncated: n > cap,
         }
       },
     )
@@ -541,7 +595,7 @@ export function registerClickRoutes(app: FastifyInstance, ctx: AdminContext): vo
       const [probe] = await chRows<{ n: string }>({
         ch,
         req,
-        query: `SELECT count() AS n FROM (SELECT 1 FROM clicks FINAL WHERE ${where} LIMIT ${cap + 1})`,
+        query: probeQuery(where, cap),
         params,
       })
       const truncated = Number(probe?.n ?? 0) > cap
