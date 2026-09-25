@@ -16,6 +16,10 @@ function deferred<T>() {
 const busy = () => new ApiError(429, 'too_many_reports', 'too many reports at once; try again', 1)
 const noWait = () => Promise.resolve()
 
+/** Settles on the next macrotask: what a race against it answers when a promise is stuck. */
+const stillWaiting = () =>
+  new Promise<string>((resolve) => setTimeout(() => resolve('still waiting'), 0))
+
 describe('the report scheduler', () => {
   it('holds two requests in flight and queues the rest, in order', async () => {
     const s = createScheduler({ sleep: noWait })
@@ -120,7 +124,46 @@ describe('the report scheduler', () => {
     const gone = new AbortController()
     gone.abort()
     const task = vi.fn(() => Promise.resolve('x'))
-    await expect(s.run(task, gone.signal)).rejects.toMatchObject({ name: 'AbortError' })
+    const settled = await Promise.race([
+      s.run(task, gone.signal).catch((e: unknown) => e),
+      stillWaiting(),
+    ])
+    expect(settled).toMatchObject({ name: 'AbortError' })
     expect(task).not.toHaveBeenCalled()
+  })
+
+  // A request waiting out a busy server when the operator leaves: it stops
+  // waiting, is not tried again, and the request behind it gets the slot
+  // without waiting for the wait to end.
+  it('stops waiting out a busy server when the request is abandoned, and gives the slot back', async () => {
+    const sleep = vi.fn((_ms: number) => new Promise<void>(() => {}))
+    const s = createScheduler({ limit: 1, sleep })
+    const left = new AbortController()
+    const task = vi.fn<() => Promise<string>>().mockRejectedValue(busy())
+    const abandoned = s.run(task, left.signal).catch((e: unknown) => e)
+    const behind = vi.fn(() => Promise.resolve('behind'))
+    const after = s.run(behind)
+    await stillWaiting()
+    expect(sleep.mock.calls).toEqual([[1000]])
+    expect(behind).not.toHaveBeenCalled()
+    left.abort()
+    expect(await Promise.race([abandoned, stillWaiting()])).toMatchObject({ name: 'AbortError' })
+    expect(await Promise.race([after, stillWaiting()])).toBe('behind')
+    expect(task).toHaveBeenCalledTimes(1)
+  })
+
+  // Abandoned after the busy answer came back but before the wait began: an
+  // abort that already happened fires no event, so it is checked for, not
+  // listened for.
+  it('does not start waiting for a request already abandoned when the busy answer arrives', async () => {
+    const s = createScheduler({ limit: 1, sleep: () => new Promise<void>(() => {}) })
+    const left = new AbortController()
+    const task = vi.fn(() => {
+      left.abort()
+      return Promise.reject(busy())
+    })
+    const abandoned = s.run(task, left.signal).catch((e: unknown) => e)
+    expect(await Promise.race([abandoned, stillWaiting()])).toMatchObject({ name: 'AbortError' })
+    expect(task).toHaveBeenCalledTimes(1)
   })
 })

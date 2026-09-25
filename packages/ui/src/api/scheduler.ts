@@ -11,7 +11,9 @@
  *
  * A request whose signal is aborted while it waits is dropped without being
  * sent — a screen the operator has left should not spend a slot the next screen
- * needs. One already sent is the fetch's to cancel, not this.
+ * needs. The same holds for one aborted while it waits out a 429: it stops
+ * waiting at once and gives its slot back. One already sent is the fetch's to
+ * cancel, not this.
  */
 import { ApiError } from './errors'
 
@@ -26,6 +28,26 @@ const abortError = (): DOMException => new DOMException('the request was abandon
 
 const wait = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
+/** A wait that ends early, with an AbortError, when the signal is aborted. */
+function waitUnless(waiting: Promise<void>, signal?: AbortSignal): Promise<void> {
+  if (!signal) return waiting
+  if (signal.aborted) return Promise.reject(abortError())
+  return new Promise<void>((resolve, reject) => {
+    const abandon = (): void => reject(abortError())
+    signal.addEventListener('abort', abandon, { once: true })
+    waiting.then(
+      () => {
+        signal.removeEventListener('abort', abandon)
+        resolve()
+      },
+      (err: unknown) => {
+        signal.removeEventListener('abort', abandon)
+        reject(err)
+      },
+    )
+  })
+}
+
 export function createScheduler(
   o: { limit?: number; retries?: number; sleep?: (ms: number) => Promise<void> } = {},
 ): Scheduler {
@@ -39,7 +61,7 @@ export function createScheduler(
     while (running < limit && queue.length > 0) queue.shift()?.()
   }
 
-  async function attempt<T>(task: () => Promise<T>): Promise<T> {
+  async function attempt<T>(task: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     for (let tried = 0; ; tried++) {
       try {
         return await task()
@@ -47,7 +69,7 @@ export function createScheduler(
         const busy =
           err instanceof ApiError && err.status === 429 && err.code === 'too_many_reports'
         if (!busy || tried >= retries) throw err
-        await sleep((err.retryAfterSeconds ?? 1) * 1000)
+        await waitUnless(sleep((err.retryAfterSeconds ?? 1) * 1000), signal)
       }
     }
   }
@@ -57,13 +79,13 @@ export function createScheduler(
       if (signal?.aborted) return Promise.reject(abortError())
       return new Promise<T>((resolve, reject) => {
         const start = (): void => {
+          // Called from `next`, whose loop moves on to the one behind.
           if (signal?.aborted) {
             reject(abortError())
-            next()
             return
           }
           running += 1
-          attempt(task)
+          attempt(task, signal)
             .then(resolve, reject)
             .finally(() => {
               running -= 1

@@ -109,10 +109,20 @@ export function createClient(
     }
     if (!res.ok) {
       const err = await errorOf(res)
-      if (res.status === 401 && path !== '/api/session') o.onUnauthorized?.()
+      // Signing in is the one route whose 401 is the form's answer (a wrong
+      // password, a code needed) rather than a session that ended. Signing out
+      // is the same path with another method, and its 401 is a session ending.
+      if (res.status === 401 && !(method === 'POST' && path === '/api/session')) {
+        o.onUnauthorized?.()
+      }
       throw err
     }
-    return (await res.json()) as T
+    try {
+      return (await res.json()) as T
+    } catch {
+      // A success that is not the service's JSON is a proxy's page, not an answer.
+      throw new ApiError(res.status, 'unknown', `the service answered ${res.status}`)
+    }
   }
 
   const report = <T>(path: string, signal?: AbortSignal): Promise<T> =>
@@ -170,9 +180,11 @@ export function createClient(
     links: async (q: { domain?: string; q?: string; limit?: number; cursor?: string }): Promise<
       Page<Link>
     > => {
+      // An empty search box is no search: the route refuses `q=` and `domain=`
+      // as values too short to mean anything.
       const r = await call<{ links: Link[]; nextCursor: string | null }>(
         'GET',
-        `/api/links${qs({ domain: q.domain, q: q.q, limit: q.limit, cursor: q.cursor })}`,
+        `/api/links${qs({ domain: q.domain || undefined, q: q.q || undefined, limit: q.limit, cursor: q.cursor })}`,
       )
       return { items: r.links, nextCursor: r.nextCursor }
     },
