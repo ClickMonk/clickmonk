@@ -62,6 +62,23 @@ describe('loading', () => {
     expect(screen.getByTestId('error')).toHaveTextContent('')
   })
 
+  // A load that failed, then what it depends on changes: the new attempt is
+  // not the one that failed, and must not be shown as already having failed
+  // before it has even answered.
+  it('clears a previous failure once a new load — from changed deps — starts', async () => {
+    let calls = 0
+    const load = vi.fn(() => {
+      calls += 1
+      if (calls === 1) return Promise.reject(new ApiError(503, 'reporting_unavailable', 'down'))
+      return new Promise<string>(() => {})
+    })
+    const { rerender } = render(<Show load={load} dep={1} />)
+    expect(await screen.findByText('reporting_unavailable')).toBeInTheDocument()
+    rerender(<Show load={load} dep={2} />)
+    expect(screen.getByTestId('state')).toHaveTextContent('loading')
+    expect(screen.getByTestId('error')).toHaveTextContent('')
+  })
+
   it('loads again when asked, staying in loading with the old data until the new answer arrives', async () => {
     let n = 0
     let resolveSecond: (v: string) => void = () => {}

@@ -18,7 +18,9 @@ type Loaded<T> = {
  * rethrown to React rather than shown as a service's refusal.
  *
  * The previous data stays visible while a reload is in flight, so Refresh does
- * not blank the screen.
+ * not blank the screen. The previous error does not: a load that starts is a
+ * fresh attempt, and showing the last one's failure while this one is still
+ * running would blame the wrong request once it succeeds.
  */
 export function useLoad<T>(load: (signal: AbortSignal) => Promise<T>, deps: unknown[]) {
   const [loaded, setLoaded] = useState<Loaded<T>>({
@@ -33,7 +35,7 @@ export function useLoad<T>(load: (signal: AbortSignal) => Promise<T>, deps: unkn
   // biome-ignore lint/correctness/useExhaustiveDependencies: `deps` is the caller's list of what this load reads; `load` is a new function every render and must not be one.
   useEffect(() => {
     const controller = new AbortController()
-    setLoaded((l) => ({ ...l, state: 'loading' }))
+    setLoaded((l) => ({ state: 'loading', data: l.data, error: undefined }))
     load(controller.signal).then(
       (data) => {
         if (!controller.signal.aborted) setLoaded({ state: 'ok', data, error: undefined })
