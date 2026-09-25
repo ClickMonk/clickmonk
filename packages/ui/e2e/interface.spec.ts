@@ -171,8 +171,13 @@ test('a policy violation on the page is seen, by the listener and on the console
     s.textContent = 'body { outline: 0 }'
     document.head.append(s)
   })
-  await expect.poll(() => violations.join('\n')).toMatch(/^style-src-elem inline$/m)
+  await expect.poll(() => violations.length).toBeGreaterThan(0)
   await expect.poll(() => policyConsole.length).toBeGreaterThan(0)
+  // Exactly the one this test caused: anything else is the sign-in page's
+  // own, and would be lost by the clearing below.
+  expect(violations).toEqual(['style-src-elem inline'])
+  expect(policyConsole).toHaveLength(1)
+  expect(policyConsole[0]).toMatch(/inline style/)
   // Seen, so the listener works in this browser: set aside, so that only a
   // violation the interface itself causes fails a step.
   violations.length = 0
@@ -290,14 +295,36 @@ test('creates a link through the form and lands on its page', async () => {
   expect(m).not.toBeNull()
   linkId = decodeURIComponent(m?.[1] ?? '')
   expect(linkId).not.toBe('new')
+
+  // And the list shows it, where it lives, serving.
+  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Links' }).click()
+  await h1('Links')
+  const row = page
+    .getByRole('row')
+    .filter({ has: page.getByRole('link', { name: LINK, exact: true }) })
+  await expect(row).toHaveCount(1)
+  await expect(row.getByRole('link', { name: LINK, exact: true })).toHaveAttribute(
+    'href',
+    `/links/${encodeURIComponent(linkId)}`,
+  )
+  await expect(row.getByRole('cell').nth(1)).toHaveText(TARGET)
+  await expect(row.getByRole('cell').nth(2)).toHaveText('Active')
 })
 
 test('the link redirects on its own domain', async () => {
-  // The redirect serves from a snapshot that reloads a quarter of a second
-  // after a link is written, and the form's own navigation takes less than
-  // that. Waited out rather than polled: every request to the link domain is
-  // a click, a 404 included, and the steps after this one count exactly one.
-  await page.waitForTimeout(2_000)
+  // The redirect serves from a snapshot it reloads shortly after a link is
+  // written. Its internal health route says how many links that snapshot
+  // holds, and asking it is not a click — every request to the link domain
+  // is, a 404 included, and the steps after this one count exactly one.
+  await expect
+    .poll(
+      async () => {
+        const health = await page.request.get('http://redirect:9091/health')
+        return ((await health.json()) as { snapshot?: { links?: number } | null }).snapshot?.links
+      },
+      { message: "the redirect's snapshot to hold the new link", timeout: 30_000 },
+    )
+    .toBe(1)
   const r = await page.request.get(`http://${LINK}`, { maxRedirects: 0 })
   expect(r.status()).toBe(302)
   expect(r.headers().location).toBe(TARGET)
@@ -371,6 +398,17 @@ test('saves a setting, and a reload reads it back', async () => {
   await expect(page.getByLabel('Abuser threshold')).toHaveValue('61')
 })
 
+const SCREENS: [name: string, path: () => string][] = [
+  ['overview', () => '/overview'],
+  ['links', () => '/links'],
+  ['link', () => `/links/${encodeURIComponent(linkId)}`],
+  ['link-new', () => '/links/new'],
+  ['clicks', () => '/clicks'],
+  ['domains', () => '/domains'],
+  ['settings', () => '/settings'],
+  ['account', () => '/account'],
+]
+
 test('a stored dark theme is applied before the bundle runs', async () => {
   await page.getByRole('banner').getByRole('button', { name: 'Switch to dark theme' }).click()
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
@@ -380,6 +418,31 @@ test('a stored dark theme is applied before the bundle runs', async () => {
     () => (window as unknown as { __themeAtParse?: string | null }).__themeAtParse,
   )
   expect(atParse).toBe('dark')
+
+  // The browser's own controls follow a stored choice, not only the system:
+  // dark here on a light system, and light on a dark one.
+  const scheme = () => page.evaluate(() => getComputedStyle(document.documentElement).colorScheme)
+  expect(await scheme()).toBe('dark')
+  await page.emulateMedia({ colorScheme: 'dark' })
+  await page.getByRole('banner').getByRole('button', { name: 'Switch to light theme' }).click()
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light')
+  expect(await scheme()).toBe('light')
+  await page.emulateMedia({ colorScheme: 'light' })
+})
+
+test('every signed-in screen fits a phone, with nothing wider than the page', async () => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  for (const [name, path] of SCREENS) {
+    await page.goto(path())
+    await expect(page.getByRole('heading', { level: 1 })).toHaveCount(1)
+    await page.waitForLoadState('networkidle')
+    const { scrollWidth, clientWidth } = await page.evaluate(() => ({
+      scrollWidth: document.documentElement.scrollWidth,
+      clientWidth: document.documentElement.clientWidth,
+    }))
+    expect(scrollWidth, `${name} is wider than the screen`).toBeLessThanOrEqual(clientWidth)
+  }
+  await page.setViewportSize({ width: 1280, height: 720 })
 })
 
 test("revoking this browser's own session ends it, and says so once", async () => {
@@ -404,16 +467,6 @@ test("revoking this browser's own session ends it, and says so once", async () =
   await expect(page.getByText('Your session ended. Sign in again.', { exact: true })).toHaveCount(1)
 })
 
-const SCREENS: [name: string, path: () => string][] = [
-  ['overview', () => '/overview'],
-  ['links', () => '/links'],
-  ['link', () => `/links/${encodeURIComponent(linkId)}`],
-  ['link-new', () => '/links/new'],
-  ['clicks', () => '/clicks'],
-  ['domains', () => '/domains'],
-  ['settings', () => '/settings'],
-  ['account', () => '/account'],
-]
 const WIDTHS: [width: number, height: number][] = [
   [1280, 900],
   [390, 844],
@@ -428,7 +481,19 @@ async function shoot(name: string): Promise<void> {
     for (const theme of THEMES) {
       await page.emulateMedia({ colorScheme: theme })
       await page.waitForLoadState('networkidle')
-      await page.screenshot({ path: join(dir, `${name}-${width}-${theme}.png`), fullPage: true })
+      // With no stored choice the toggle follows the system, so it offers
+      // the theme the page is not showing.
+      await expect(
+        page.getByRole('button', {
+          name: theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme',
+        }),
+      ).toBeVisible()
+      // Colour transitions finished, not caught half-way from the other theme.
+      await page.screenshot({
+        path: join(dir, `${name}-${width}-${theme}.png`),
+        fullPage: true,
+        animations: 'disabled',
+      })
     }
   }
 }

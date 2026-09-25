@@ -15,17 +15,19 @@ export const PEBBLE_IMAGE = 'ghcr.io/letsencrypt/pebble:2.10.1'
  * Playwright's own image, which carries the browsers, at the version of the
  * library the interface installed. Read from the installed package rather than
  * written out, because the two must match exactly and a constant here would be
- * a second place to bump.
+ * a second place to bump. A function, read when the browser suite asks, so
+ * that every other suite importing this module runs without the interface's
+ * dependencies installed.
  */
-export const PLAYWRIGHT_VERSION = (
-  JSON.parse(
+export function playwrightImage(): string {
+  const { version } = JSON.parse(
     readFileSync(
       join(ROOT, 'packages', 'ui', 'node_modules', '@playwright', 'test', 'package.json'),
       'utf8',
     ),
   ) as { version: string }
-).version
-export const PLAYWRIGHT_IMAGE = `mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-noble`
+  return `mcr.microsoft.com/playwright:v${version}-noble`
+}
 
 const FILES = ['-f', 'docker-compose.yml', '-f', 'test/stack/docker-compose.tls.yml']
 

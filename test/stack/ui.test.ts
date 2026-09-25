@@ -5,7 +5,6 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import {
   ADMIN_HOST,
   NETWORK,
-  PLAYWRIGHT_IMAGE,
   ROOT,
   TMP,
   WAIT_TIMEOUT,
@@ -13,6 +12,7 @@ import {
   cliWithInput,
   compose,
   curl,
+  playwrightImage,
   publishZone,
   until,
   writeAcmeRoot,
@@ -123,7 +123,7 @@ describe('the interface in a browser', () => {
           `${ROOT}:${ROOT}`,
           '-w',
           join(ROOT, 'packages', 'ui'),
-          PLAYWRIGHT_IMAGE,
+          playwrightImage(),
           // The runner's own entry point: `.bin/playwright` is a shell shim,
           // and handed to `node` it is a syntax error.
           'node',
@@ -151,7 +151,13 @@ describe('the interface in a browser', () => {
   // failure message is lost. Written by the spec when it finishes; a run that
   // never got that far leaves no file, and reading it then fails.
   it('the browser saw no content-security-policy violation on any page', () => {
-    const log = JSON.parse(readFileSync(join(OUT, 'violations.json'), 'utf8')) as unknown
-    expect(log).toEqual([])
+    try {
+      const log = JSON.parse(readFileSync(join(OUT, 'violations.json'), 'utf8')) as unknown
+      expect(log).toEqual([])
+    } catch (err) {
+      // So that `afterAll` prints the stack's logs for this failure too.
+      failed = true
+      throw err
+    }
   })
 })
