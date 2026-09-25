@@ -9,9 +9,16 @@ import {
   useState,
 } from 'react'
 
-const RefreshContext = createContext<{ round: number; refresh: () => void }>({
+const RefreshContext = createContext<{
+  round: number
+  refresh: () => void
+  refreshing: boolean
+  setRefreshing: (refreshing: boolean) => void
+}>({
   round: 0,
   refresh: () => {},
+  refreshing: false,
+  setRefreshing: () => {},
 })
 
 /** How long away before coming back to the tab reloads what is on screen. */
@@ -22,6 +29,11 @@ export const FOCUS_REFRESH_AFTER_MS = 60_000
  * does coming back to the tab after a minute away — never a timer, because a
  * timer keeps a session alive for as long as a tab is open and spends report
  * slots on a page nobody is reading.
+ *
+ * `refreshing` is not owned here: `Freshness`, the one thing in the header
+ * that always reloads on every round, reports its own load state into it
+ * with `setRefreshing`, and the Refresh button reads it back to show
+ * "Refreshing…" and disable itself for the round's duration.
  */
 export function RefreshProvider({
   children,
@@ -29,6 +41,7 @@ export function RefreshProvider({
   focusAfterMs = FOCUS_REFRESH_AFTER_MS,
 }: { children: ReactNode; now?: () => number; focusAfterMs?: number }) {
   const [round, setRound] = useState(0)
+  const [refreshing, setRefreshing] = useState(false)
   const last = useRef(now())
   const refresh = useCallback(() => {
     last.current = now()
@@ -46,7 +59,10 @@ export function RefreshProvider({
       document.removeEventListener('visibilitychange', back)
     }
   }, [now, focusAfterMs, refresh])
-  const value = useMemo(() => ({ round, refresh }), [round, refresh])
+  const value = useMemo(
+    () => ({ round, refresh, refreshing, setRefreshing }),
+    [round, refresh, refreshing],
+  )
   return <RefreshContext.Provider value={value}>{children}</RefreshContext.Provider>
 }
 

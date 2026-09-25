@@ -2,6 +2,7 @@ import { useClient } from '@/api/context'
 import type { Status } from '@/api/types'
 import { IP_SOURCES, IP_SOURCE_LABELS } from '@/api/vocabulary'
 import { browserZone, useNowMs } from '@/app/clock'
+import { useEffect } from 'react'
 import { Link } from 'react-router'
 import { formatAge, formatInstant, formatNumber } from './format'
 import { useRefresh } from './refresh'
@@ -45,9 +46,14 @@ export function describeStatus(s: Status, nowMs: number, timeZone: string): stri
 
 export function Freshness() {
   const client = useClient()
-  const { round } = useRefresh()
+  const { round, setRefreshing } = useRefresh()
   const now = useNowMs()
   const r = useLoad((signal) => client.status(signal), [round])
+  // The one load in the header that runs on every round: its own loading
+  // state is what the Refresh button reads back as "a round is in flight".
+  useEffect(() => {
+    setRefreshing(r.state === 'loading')
+  }, [r.state, setRefreshing])
   if (r.state === 'error' || !r.data) return null
   const s = r.data
   const alerts = s.alerts > 500 ? '500+' : formatNumber(s.alerts)

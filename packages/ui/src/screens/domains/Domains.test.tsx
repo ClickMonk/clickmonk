@@ -155,7 +155,6 @@ describe('the domain list', () => {
     await user.type(screen.getByLabelText('Host name'), 'added.example.test')
     await user.click(screen.getByRole('button', { name: 'Add domain' }))
     await waitFor(() => expect(heading.closest('[aria-busy]')).toHaveAttribute('aria-busy', 'true'))
-    expect(heading.closest('[aria-busy]')).toHaveClass('opacity-50')
     resolveSecond?.({
       domains: [domain('go.example.test'), domain('added.example.test')],
       truncated: false,

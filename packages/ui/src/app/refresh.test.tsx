@@ -16,6 +16,21 @@ function Round() {
   )
 }
 
+function Refreshing() {
+  const { refreshing, setRefreshing } = useRefresh()
+  return (
+    <>
+      <p>{refreshing ? 'refreshing' : 'idle'}</p>
+      <button type="button" onClick={() => setRefreshing(true)}>
+        start
+      </button>
+      <button type="button" onClick={() => setRefreshing(false)}>
+        stop
+      </button>
+    </>
+  )
+}
+
 describe('refreshing', () => {
   it('counts a press of Refresh', async () => {
     render(
@@ -63,6 +78,19 @@ describe('refreshing', () => {
       stubVisibility('visible')
     }
     expect(screen.getByRole('button')).toHaveTextContent('round 0')
+  })
+
+  it('starts idle, and carries whatever a reporter sets until the next report', async () => {
+    render(
+      <RefreshProvider>
+        <Refreshing />
+      </RefreshProvider>,
+    )
+    expect(screen.getByText('idle')).toBeInTheDocument()
+    await act(async () => screen.getByRole('button', { name: 'start' }).click())
+    expect(screen.getByText('refreshing')).toBeInTheDocument()
+    await act(async () => screen.getByRole('button', { name: 'stop' }).click())
+    expect(screen.getByText('idle')).toBeInTheDocument()
   })
 
   it('stops listening once unmounted', () => {

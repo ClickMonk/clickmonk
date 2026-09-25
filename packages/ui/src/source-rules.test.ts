@@ -274,6 +274,20 @@ describe('the source', () => {
     ).toEqual([])
   })
 
+  it('never dims a screen with opacity-50 while content reloads', () => {
+    // A screen marks the region that is reloading with aria-busy and keeps it
+    // at full contrast; the visible cue belongs on the Refresh button
+    // ("Refreshing…"), not on the content behind it. opacity-50 dropped
+    // muted text to about 2.2:1 and body text to about 3.5:1 in the light
+    // theme for as long as the reload took.
+    const screens = shipped.filter((p) => /[\\/]screens[\\/]/.test(p))
+    const found = find(screens, /opacity-50\b/)
+    expect(
+      found,
+      'Dimming a busy region drops it under 3:1. Mark it aria-busy and leave its opacity alone.',
+    ).toEqual([])
+  })
+
   it('uses no Radix primitive that injects a style element', () => {
     // A named import list can span several lines (one name per line), and
     // `[^}]` already spans newlines on its own — no flag needed for that.

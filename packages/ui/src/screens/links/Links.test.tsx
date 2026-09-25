@@ -345,7 +345,6 @@ describe('the link list', () => {
     await user.click(screen.getByRole('button', { name: 'Search' }))
     const busy = row.closest('[aria-busy]')
     expect(busy).toHaveAttribute('aria-busy', 'true')
-    expect(busy).toHaveClass('opacity-50')
     resolveSecond?.({ items: [link('spring')], nextCursor: null })
     await waitFor(() => expect(row.closest('[aria-busy]')).toHaveAttribute('aria-busy', 'false'))
   })

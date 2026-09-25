@@ -88,7 +88,6 @@ describe('sessions', () => {
     await user.click(screen.getByRole('button', { name: 'Sign that session out' }))
     const table = screen.getByRole('table')
     await waitFor(() => expect(table.closest('[aria-busy]')).toHaveAttribute('aria-busy', 'true'))
-    expect(table.closest('[aria-busy]')).toHaveClass('opacity-50')
     resolveSecond?.([session('s1', true), session('s2', false)])
     await waitFor(() => expect(table.closest('[aria-busy]')).toHaveAttribute('aria-busy', 'false'))
   })

@@ -79,10 +79,7 @@ export function Domains() {
         <p className="text-sm text-muted-foreground">No domains yet.</p>
       )}
       {list.state !== 'error' && domains.length > 0 && (
-        <div
-          aria-busy={list.state === 'loading'}
-          className={list.state === 'loading' ? 'grid gap-4 opacity-50' : 'grid gap-4'}
-        >
+        <div aria-busy={list.state === 'loading'} className="grid gap-4">
           {domains.map((d) => (
             <DomainCard key={d.id} d={d} onChanged={refresh} />
           ))}

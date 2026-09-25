@@ -174,10 +174,7 @@ export function Links() {
         </p>
       )}
       {first.state !== 'error' && items.length > 0 && (
-        <div
-          aria-busy={first.state === 'loading'}
-          className={first.state === 'loading' ? 'opacity-50' : undefined}
-        >
+        <div aria-busy={first.state === 'loading'}>
           <Table>
             <TableHeader>
               <TableRow>

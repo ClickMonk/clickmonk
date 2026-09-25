@@ -41,10 +41,7 @@ export function Settings() {
       <PageHeader title="Settings" />
       {load.state === 'error' && load.error && <ErrorNote error={load.error} />}
       {load.state !== 'error' && load.data && (
-        <div
-          aria-busy={load.state === 'loading'}
-          className={load.state === 'loading' ? 'grid gap-6 opacity-50' : 'grid gap-6'}
-        >
+        <div aria-busy={load.state === 'loading'} className="grid gap-6">
           <SettingsBody settings={load.data} />
         </div>
       )}

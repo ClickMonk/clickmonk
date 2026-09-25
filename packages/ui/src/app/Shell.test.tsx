@@ -84,7 +84,42 @@ describe('the shell', () => {
   it('reloads what is on screen when Refresh is pressed', async () => {
     const client = show()
     await screen.findByText('No clicks have reached the reports yet.')
-    await userEvent.setup().click(screen.getByRole('button', { name: 'Refresh' }))
+    const button = await screen.findByRole('button', { name: 'Refresh' })
+    await userEvent.setup().click(button)
     await waitFor(() => expect(client.calls.filter((c) => c.method === 'status')).toHaveLength(2))
+  })
+
+  // The panel this round is loading stays at full contrast (aria-busy, no
+  // dimming); the visible cue that a round is in flight moves to this
+  // button instead.
+  it('shows Refreshing… and disables itself while a round is in flight', async () => {
+    let resolveSecond: ((s: typeof STATUS) => void) | undefined
+    let calls = 0
+    const client = fakeClient({
+      status: (() => {
+        calls += 1
+        if (calls === 1) return Promise.resolve(STATUS)
+        return new Promise<typeof STATUS>((resolve) => {
+          resolveSecond = resolve
+        })
+      }) as never,
+    })
+    render(
+      <MemoryRouter initialEntries={['/links']}>
+        <ClientProvider client={client}>
+          <RefreshProvider>
+            <Shell email="admin@example.com" onSignOut={() => {}}>
+              <p>screen</p>
+            </Shell>
+          </RefreshProvider>
+        </ClientProvider>
+      </MemoryRouter>,
+    )
+    await screen.findByText('No clicks have reached the reports yet.')
+    const button = await screen.findByRole('button', { name: 'Refresh' })
+    await userEvent.setup().click(button)
+    expect(await screen.findByRole('button', { name: 'Refreshing…' })).toBeDisabled()
+    resolveSecond?.(STATUS)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled())
   })
 })

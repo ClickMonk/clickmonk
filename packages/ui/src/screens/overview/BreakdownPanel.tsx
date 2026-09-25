@@ -129,11 +129,7 @@ export function BreakdownPanel(props: {
         {r.state === 'ok' && rows.length === 0 && (
           <p className="text-sm text-muted-foreground">Nothing in this window.</p>
         )}
-        {rows.length > 0 && (
-          <div data-testid="rows" className={stale ? 'opacity-50' : undefined}>
-            <Bars rows={rows} />
-          </div>
-        )}
+        {rows.length > 0 && <Bars rows={rows} />}
         {r.data?.truncated && rows.length > 0 && limit === FEW && (
           <div className="flex items-center justify-between text-sm text-muted-foreground">
             <span>Top 10 shown.</span>

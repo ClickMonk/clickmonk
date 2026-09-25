@@ -26,7 +26,7 @@ export function Shell({
   onSignOut,
   children,
 }: { email: string; onSignOut: () => void; children: ReactNode }) {
-  const { refresh } = useRefresh()
+  const { refresh, refreshing } = useRefresh()
   return (
     <div className="grid min-h-dvh grid-rows-[auto_1fr_auto] md:grid-cols-[13rem_1fr] md:grid-rows-[1fr_auto]">
       <nav
@@ -59,8 +59,14 @@ export function Shell({
           <Freshness />
           <div className="flex items-center gap-2">
             <span className="text-xs text-muted-foreground">{`Times in ${browserZone()}`}</span>
-            <Button type="button" variant="outline" size="sm" onClick={refresh}>
-              Refresh
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={refresh}
+              disabled={refreshing}
+            >
+              {refreshing ? 'Refreshing…' : 'Refresh'}
             </Button>
             <ThemeToggle />
             <Button type="button" variant="ghost" size="sm" onClick={onSignOut} title={email}>
