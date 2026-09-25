@@ -38,6 +38,7 @@ describe('the theme', () => {
         dispatchEvent: () => false,
       }))
       return {
+        listeners,
         set(next: boolean) {
           dark = next
           for (const l of listeners) l()
@@ -47,13 +48,17 @@ describe('the theme', () => {
 
     it('follows the system scheme when it changes while the page is open', () => {
       const system = systemScheme(false)
-      render(<ThemeToggle />)
+      const { unmount } = render(<ThemeToggle />)
       expect(screen.getByRole('button', { name: 'Switch to dark theme' })).toBeInTheDocument()
       act(() => system.set(true))
       expect(screen.getByRole('button', { name: 'Switch to light theme' })).toBeInTheDocument()
       act(() => system.set(false))
       expect(screen.getByRole('button', { name: 'Switch to dark theme' })).toBeInTheDocument()
       expect(document.documentElement.hasAttribute('data-theme')).toBe(false)
+      // Unmounted, it stops listening: nothing is left subscribed to the system.
+      expect(system.listeners.size).toBeGreaterThan(0)
+      unmount()
+      expect(system.listeners.size).toBe(0)
     })
   })
 })
