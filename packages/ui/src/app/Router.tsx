@@ -5,6 +5,7 @@ import { LinkForm } from '@/screens/links/LinkForm'
 import { LinkReport } from '@/screens/links/LinkReport'
 import { Links } from '@/screens/links/Links'
 import { Overview } from '@/screens/overview/Overview'
+import { Settings } from '@/screens/settings/Settings'
 import { Navigate, Route, Routes } from 'react-router'
 import { PageHeader } from './PageHeader'
 
@@ -24,7 +25,7 @@ export function AppRoutes() {
       <Route path="/links/:id/edit" element={<LinkForm mode="edit" />} />
       <Route path="/clicks" element={<Clicks />} />
       <Route path="/domains" element={<Domains />} />
-      <Route path="/settings" element={<Placeholder title="Settings" />} />
+      <Route path="/settings" element={<Settings />} />
       <Route path="/account" element={<Placeholder title="Account" />} />
       <Route path="*" element={<NotFound />} />
     </Routes>
