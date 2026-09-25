@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { addressOnly, canonicalIp, parseIp, rateKey } from './ip.js'
+import { addressOnly, canonicalIp, parseIp, rateKey, truncateIp } from './ip.js'
 
 describe('parseIp', () => {
   it.each([
@@ -107,5 +107,52 @@ describe('rateKey', () => {
     // an IPv4 key is one decimal number, an IPv6 key always carries a colon.
     expect(rateKey('192.0.2.1')).toMatch(/^4:\d+$/)
     expect(rateKey('2001:db8::1')).toMatch(/^6:\d+:\d+$/)
+  })
+})
+
+describe('truncateIp', () => {
+  it.each([
+    ['198.51.100.77', '198.51.100.0/24'],
+    ['198.51.100.0', '198.51.100.0/24'],
+    ['198.51.100.255', '198.51.100.0/24'],
+    ['192.0.2.1', '192.0.2.0/24'],
+    ['203.0.113.254', '203.0.113.0/24'],
+  ])('keeps the network and drops the host of %s', (ip, expected) => {
+    expect(truncateIp(ip)).toBe(expected)
+  })
+
+  it.each([
+    ['2001:db8:1234:5678:9abc:def0:1234:5678', '2001:db8:1234:5678::/64'],
+    ['2001:db8:1234:5678::', '2001:db8:1234:5678::/64'],
+    ['2001:db8::1', '2001:db8::/64'],
+    ['::1', '::/64'],
+  ])('keeps the first 64 bits of %s', (ip, expected) => {
+    expect(truncateIp(ip)).toBe(expected)
+  })
+
+  // The address the visitor was recorded under is an IPv4 address, so what
+  // comes out is an IPv4 network: one visitor must not appear as two
+  // different kinds of thing depending on how a proxy spelled it.
+  it('truncates an IPv4-mapped IPv6 address as IPv4', () => {
+    expect(truncateIp('::ffff:198.51.100.77')).toBe('198.51.100.0/24')
+  })
+
+  // Deliberately unlike canonicalIp, which returns its input unchanged.
+  // Returning the input is how a whole address escapes if the parser ever
+  // regresses on a form it used to accept, and this function is the only
+  // thing between the stored column and a response.
+  it.each([
+    ['an empty string', ''],
+    ['a host name', 'example.test'],
+    ['an address with a port', '198.51.100.77:443'],
+    ['a zone id', '2001:db8::1%eth0'],
+    ['a CIDR', '198.51.100.0/24'],
+    ['a sentence', 'not an address at all'],
+  ])('answers null for %s rather than handing it back', (_label, value) => {
+    expect(truncateIp(value)).toBeNull()
+  })
+
+  it('answers null for a string longer than the longest address', () => {
+    expect(truncateIp('1'.repeat(46))).toBeNull()
   })
 })

@@ -1,4 +1,5 @@
 import { AdminHostSchema, TrustedProxiesSchema, formatConfigError } from '@clickmonk/core'
+import type { ChConfig } from '@clickmonk/db'
 import { isResolverAddress } from '@clickmonk/worker/domains'
 import { z } from 'zod'
 
@@ -24,6 +25,14 @@ const DnsServers = z
 
 const Schema = z.object({
   CLICKMONK_POSTGRES_URL: z.string().url(),
+  // Reports read ClickHouse. Required rather than optional: an install with a
+  // typo here would otherwise answer 503 on every report for the rest of its
+  // life, and the first person to notice would be whoever opened the
+  // dashboard. Failing at boot names the variable.
+  CLICKMONK_CLICKHOUSE_URL: z.string().url(),
+  CLICKMONK_CLICKHOUSE_USER: z.string().min(1),
+  CLICKMONK_CLICKHOUSE_PASSWORD: z.string(),
+  CLICKMONK_CLICKHOUSE_DB: z.string().min(1),
   // The shared schema, so this service and the redirect cannot come to read
   // the same variable differently. Empty means "not configured": every route
   // answers 503 until an operator names the host, rather than this service
@@ -41,6 +50,7 @@ const Schema = z.object({
 
 export interface AdminConfig {
   postgresUrl: string
+  ch: ChConfig
   /** Null when unset: every route answers 503 until an operator names the host. */
   adminHost: string | null
   port: number
@@ -54,6 +64,12 @@ export function loadConfig(env: NodeJS.ProcessEnv): AdminConfig {
   const e = r.data
   return {
     postgresUrl: e.CLICKMONK_POSTGRES_URL,
+    ch: {
+      url: e.CLICKMONK_CLICKHOUSE_URL,
+      username: e.CLICKMONK_CLICKHOUSE_USER,
+      password: e.CLICKMONK_CLICKHOUSE_PASSWORD,
+      database: e.CLICKMONK_CLICKHOUSE_DB,
+    },
     adminHost: e.CLICKMONK_ADMIN_HOST === '' ? null : e.CLICKMONK_ADMIN_HOST,
     port: e.CLICKMONK_ADMIN_PORT,
     trustedProxies: e.CLICKMONK_TRUSTED_PROXIES,

@@ -45,13 +45,27 @@ run it on their own infrastructure; their click data stays theirs.
 spool before response, click caps, traffic classification and actions, country rules
 from an in-memory IP lookup, the password gate on a link), Caddy in front of it with
 on-demand TLS gated on a verified domain or the configured admin host, the worker (spool
-to ClickHouse, migrations on boot, IP data updates, domain DNS verification), the admin
+to ClickHouse, migrations on boot, IP data updates, domain DNS verification, the retention
+pass), the admin
 API (one account, sessions, TOTP with recovery codes, API keys, domain/link/settings
 CRUD, answering on `CLICKMONK_ADMIN_HOST` alone — unset, every route but `/health` is a
-503 and links serve exactly as before), the CLI (`migrate`,
+503 and links serve exactly as before), reporting over that API (a summary, a chart by
+hour or day, a breakdown over nine dimensions, the raw click log and a streamed CSV of it,
+all reading hourly rollups except the log and its export), retention (two periods on the
+settings row, enforced hourly by the worker, dropping raw clicks a partition at a time and
+blanking the address on a click in place), the CLI (`migrate`,
 `domain add|list|verify`, `link add`, `settings show|set`, `ipdata status|update`,
 `admin create|passwd`, `admin totp disable`, `apikey create|list|revoke`), `install.sh`, a
 Compose stack, and the restart durability and stack test suites.
+
+**A retention period is a floor, not a deadline, and it is never defaulted by a reader
+that deletes.** `clicks` is partitioned by month and dropped whole, so 90 days keeps 90 to
+121 days; and a settings row that is missing or cannot be read as retention means the pass
+deletes nothing at all, rather than the defaults. **A report counts whole buckets** — it
+aligns the window to the grain it answers at, the hour for the summary and the breakdown
+and the requested bucket for the chart, so `bucket=day` counts whole days — and echoes what
+it counted, while the click log and the export use the window to the millisecond. So one
+request can be answered differently by all three and every answer is right.
 
 **The two services read `CLICKMONK_ADMIN_HOST` differently on purpose.** The admin service
 refuses to boot on a value it cannot parse; the redirect logs `ADMIN_HOST_IGNORED` once and
@@ -70,20 +84,29 @@ What does not exist yet, and must not be implied by any documentation:
 - **A way back in over the API when both factors are lost.** Removing the second factor
   there requires the second factor. `clickmonk admin totp disable` is the answer, and it is
   a command on the server for that reason.
-- **Reports and exports, over the API or anywhere else.** Clicks reach ClickHouse and
-  nothing reads them back out. The API covers domains, links and settings only.
+- **Anything drawn.** The reports are JSON and nothing plots them. There is no dashboard,
+  so how fresh the numbers are is `newestHour` in the summary and the chart rather than
+  something on a screen.
+- **A CSV of a report.** The export is the click log. A summary or a breakdown is one small
+  answer already, and turning it into a file belongs to the web interface.
+- **A time zone.** Every window, bucket and retention period is UTC, and a preset like
+  "yesterday" is the caller's to compute. The hourly grain leaves a whole-hour offset
+  possible later without a schema change; a half-hour zone would need one.
 - **Notifications of any kind.** No mail configuration exists; `GET /api/alerts` is what
   an operator reads instead.
 - **Most link settings in the CLI.** `link add` takes `--target`, `--backup`, `--cap`,
   `--expires`, `--no-passthrough` and `--action` only, and no command changes a link
-  after `link add`. `settings set` sets the install-wide traffic actions, the safe URL
-  and the abuser threshold. Device URLs, a returning URL, country rules, a name, a
-  password and the disabled state are the admin API's, or hand-written SQL without it.
+  after `link add`. `settings set` sets the install-wide traffic actions, the safe URL,
+  the abuser threshold and the two retention periods. Device URLs, a returning URL,
+  country rules, a name, a password and the disabled state are the admin API's, or
+  hand-written SQL without it.
   A returning URL also needs HTTPS to do anything: its cookie is marked `Secure`, so a
   browser drops it over plain HTTP.
 - **Proxy/VPN detection beyond Tor exits, cloud providers' published ranges, and region
   or city.** No licensed VPN or proxy list has been found; datacenter traffic is
-  recognised by ASN only, since no cloud provider's range file states a licence.
+  recognised by ASN only, since no cloud provider's range file states a licence. The
+  region and city columns exist on a click and are always empty, and a breakdown by
+  either would be a new materialized view and a backfill of it.
 - **Backup and restore.**
 - Segments ClickHouse rejects are set aside as `.bad` files, and nothing reports them.
 - One redirect process per spool directory.
@@ -110,16 +133,18 @@ reading a record version ships no later than writing it.
 A pnpm workspace of TypeScript packages, Node 22, ESM throughout. TypeScript is `strict`
 with `noUncheckedIndexedAccess`; avoid `any`, and justify it inline on the rare occasion
 it is unavoidable. Biome handles lint and format. Vitest runs the tests. Two stores:
-**Postgres** for domains, links, counters, the admin account and its credentials, and the
-single migration ledger; **ClickHouse** for click events.
+**Postgres** for domains, links, counters, the admin account and its credentials, the one
+install-wide settings row (the traffic actions and the two retention periods) and the
+single migration ledger; **ClickHouse** for click events and the hourly rollups over them.
 
 ```
 packages/core/      pure logic, no I/O: link schemas (zod), the redirect evaluator,
                     device, OS and browser detection, traffic classification,
                     destination tokens, passthrough, rotation, click IDs, the click
-                    record, and the credential primitives (password hashing, opaque
-                    tokens, TOTP, recovery codes, attempt counting). Owns
-                    SCHEMA_VERSION.
+                    record, the vocabulary a report is asked in (bucket sizes,
+                    dimensions, window bounds) and the credential primitives
+                    (password hashing, opaque tokens, TOTP, recovery codes,
+                    attempt counting). Owns SCHEMA_VERSION.
 packages/db/        Postgres and ClickHouse clients and the migrator. Migrations live
                     in packages/db/migrations/{postgres,clickhouse} as one shared
                     version sequence.
@@ -131,8 +156,11 @@ packages/redirect/  the service that answers link domains: an in-memory snapshot
                     writer, the click-cap counter, the password gate and its
                     proof cookie.
 packages/worker/    ships the spool into ClickHouse; runs migrations on boot;
-                    updates the IP data; checks domain DNS verification on a schedule.
-packages/admin/     the admin API: sessions, API keys, TOTP, domain/link/settings CRUD.
+                    updates the IP data; checks domain DNS verification on a schedule;
+                    deletes past the retention periods; owns the one reader and
+                    writer of the settings row that the CLI and the admin API share.
+packages/admin/     the admin API: sessions, API keys, TOTP, domain/link/settings CRUD,
+                    the reports, the click log and its CSV export.
 packages/cli/       `clickmonk migrate | domain | link add | settings | ipdata | admin | apikey`.
                     Two commands here are deliberately not API routes: `admin create`,
                     because nothing can authenticate before the account exists, and
@@ -147,8 +175,10 @@ install.sh          writes .env once, with fresh secrets, and starts the stack.
 test/stack/         brings the whole stack up against a local certificate authority
                     and DNS server; proves TLS issuance, domain verification, real
                     client addresses over IPv4 and IPv6, and the admin host — its
-                    certificate, a sign-in over HTTPS, and a password-protected link
-                    answered end to end.
+                    certificate, a sign-in over HTTPS, a password-protected link
+                    answered end to end, a click driven through the whole stack and
+                    read back as a report, a log page and a CSV, and a retention
+                    period lowered and then enforced.
 ```
 
 Three properties of the product shape every change:
@@ -222,7 +252,10 @@ are still pulled over the network, once): a domain gets no certificate until it
 publishes its verification record, the address every visitor arrives from is the
 visitor's, and `install.sh` writes its secrets once. They also bring the admin service
 up, sign in to it over HTTPS on the admin host, and drive a password-protected link from
-the form to the redirect. They bind **80 and 443**; the
+the form to the redirect. One of them clicks a link through Caddy and then reads that
+click back through the admin host as a summary, a chart, a breakdown, a log page and a
+CSV, and lowers a retention period and watches the worker enforce it — the one path where
+the admin service's own ClickHouse configuration has to be right. They bind **80 and 443**; the
 durability suite binds 8080 and 8123 and the test databases 8123 and 5433. Run one at a
 time.
 

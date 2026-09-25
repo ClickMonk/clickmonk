@@ -206,6 +206,22 @@ describe('clickmonk settings', () => {
   const settings = async () =>
     (await pg.query('SELECT traffic_actions, safe_url, abuser_threshold FROM settings')).rows[0]
 
+  const stored = async (): Promise<{
+    raw_retention_days: number | null
+    ip_retention_days: number | null
+  }> => {
+    const r = await pg.query('SELECT raw_retention_days, ip_retention_days FROM settings')
+    return r.rows[0] as { raw_retention_days: number | null; ip_retention_days: number | null }
+  }
+
+  /**
+   * The retention half put where a test wants it. Written here rather than
+   * left to whatever the test before it did: these tests share one row, and a
+   * period is exactly the kind of value a neighbouring test changes.
+   */
+  const setRetention = (raw: number | null, ip: number | null) =>
+    pg.query('UPDATE settings SET raw_retention_days = $1, ip_retention_days = $2', [raw, ip])
+
   it('shows the defaults', async () => {
     lines.length = 0
     expect(await run('settings', 'show')).toBe(0)
@@ -215,7 +231,9 @@ describe('clickmonk settings', () => {
       'anonymous: flag',
       'datacenter: flag',
       'safe url: (none)',
-      'abuser threshold: 60 clicks a minute from one address',
+      'abuser threshold: 60 requests a minute from one client',
+      'keep clicks: 90 days',
+      'keep addresses: 30 days',
     ])
   })
 
@@ -273,7 +291,7 @@ describe('clickmonk settings', () => {
     lines.length = 0
     expect(await run('settings', 'show')).toBe(0)
     expect(lines[0]).toMatch(
-      /^note: the stored settings are invalid \(safeUrl: .+\); the defaults apply$/,
+      /^note: the stored traffic settings are invalid \(safeUrl: .+\); the defaults apply$/,
     )
     expect(lines.slice(1)).toEqual([
       'bot: flag',
@@ -281,22 +299,54 @@ describe('clickmonk settings', () => {
       'anonymous: flag',
       'datacenter: flag',
       'safe url: (none)',
-      'abuser threshold: 60 clicks a minute from one address',
+      'abuser threshold: 60 requests a minute from one client',
+      'keep clicks: 90 days',
+      'keep addresses: 30 days',
     ])
   })
 
-  it('shows the defaults, and says so, when the settings row is missing', async () => {
+  // The retention pass holds this row while it deletes. A command that waited
+  // for it would print nothing until somebody killed it, and then they would
+  // have to guess whether it had written anything — so it stops waiting and says
+  // what has the row. One line, and an exit code that says this is a refusal.
+  it('refuses to set the settings while the row is held, and writes nothing', async () => {
+    // A value of its own, and not the one the command below asks for: the tests
+    // in this block share the row, so an assertion on a value this test did not
+    // set would be an assertion about whichever of them ran last.
+    await pg.query('UPDATE settings SET abuser_threshold = 77')
+    const holder = await pg.connect()
+    try {
+      await holder.query('BEGIN')
+      await holder.query('SELECT 1 FROM settings FOR UPDATE')
+      lines.length = 0
+      expect(await run('settings', 'set', '--abuser-threshold', '99')).toBe(2)
+    } finally {
+      await holder.query('ROLLBACK').catch(() => {})
+      holder.release()
+    }
+    expect(lines).toEqual([
+      'error: the settings row is held by another writer, most likely the retention pass, which holds it for the length of one pass; nothing was written, so run this again in a moment',
+    ])
+    expect((await settings())?.abuser_threshold).toBe(77)
+  })
+
+  // The traffic half falls back and the retention half does not, and the
+  // output says both: printing "keep clicks: 90 days" for a row that is not
+  // there would tell the operator a period this install is not enforcing.
+  it('shows the traffic defaults, and no period at all, when the settings row is missing', async () => {
     await pg.query('DELETE FROM settings')
     lines.length = 0
     expect(await run('settings', 'show')).toBe(0)
     expect(lines).toEqual([
-      'note: no settings are stored; the defaults apply',
+      'note: no settings are stored; the traffic defaults apply, and nothing is deleted until the row is written back',
       'bot: flag',
       'abuser: flag',
       'anonymous: flag',
       'datacenter: flag',
       'safe url: (none)',
-      'abuser threshold: 60 clicks a minute from one address',
+      'abuser threshold: 60 requests a minute from one client',
+      'keep clicks: unknown, so nothing is being deleted',
+      'keep addresses: unknown, so nothing is being deleted',
     ])
   })
 
@@ -308,6 +358,175 @@ describe('clickmonk settings', () => {
       safe_url: null,
       abuser_threshold: 60,
     })
+  })
+
+  // The third substitution, and the one that is easiest to miss because the
+  // command looks like it worked: before it, nothing was being deleted at all;
+  // after it, clicks go at ninety days. The operator asked about a threshold.
+  it('says so when it wrote a settings row that was not there', async () => {
+    await pg.query('DELETE FROM settings')
+    lines.length = 0
+    expect(await run('settings', 'set', '--abuser-threshold', '61')).toBe(0)
+    expect(lines[0]).toBe(
+      'note: there was no settings row, so this command has written one; nothing was being deleted before, and clicks are now kept for 90 days and addresses for 30 days',
+    )
+    expect(await stored()).toEqual({ raw_retention_days: 90, ip_retention_days: 30 })
+    // And the change the operator actually asked for landed.
+    expect(lines).toContain('abuser threshold: 61 requests a minute from one client')
+  })
+
+  // The same note with the other value of both periods, which is the case the
+  // test above cannot reach: "for ever" already carries its own preposition, so
+  // a sentence that writes one as well says "kept for for ever". A number needs
+  // the preposition and the word does not, which is why the formatter decides
+  // it rather than the sentence.
+  it('says a period of never without stuttering, in the note about a row it wrote', async () => {
+    await pg.query('DELETE FROM settings')
+    lines.length = 0
+    expect(
+      await run('settings', 'set', '--keep-clicks', 'never', '--keep-addresses', 'never'),
+    ).toBe(0)
+    expect(lines[0]).toBe(
+      'note: there was no settings row, so this command has written one; nothing was being deleted before, and clicks are now kept for ever and addresses for ever',
+    )
+    expect(await stored()).toEqual({ raw_retention_days: null, ip_retention_days: null })
+  })
+
+  it('prints the retention periods, in days and as for ever', async () => {
+    await setRetention(90, null)
+    lines.length = 0
+    expect(await run('settings', 'show')).toBe(0)
+    expect(lines).toContain('keep clicks: 90 days')
+    expect(lines).toContain('keep addresses: for ever')
+    expect(lines).toContain(
+      'note: addresses are set to be kept for ever but clicks for 90 days, so an address goes when its click does, after 90 days',
+    )
+  })
+
+  it('sets a period, and takes never for either', async () => {
+    await setRetention(90, 30)
+    expect(await run('settings', 'set', '--keep-clicks', '30', '--keep-addresses', '7')).toBe(0)
+    expect(await stored()).toEqual({ raw_retention_days: 30, ip_retention_days: 7 })
+    expect(await run('settings', 'set', '--keep-clicks', 'never')).toBe(0)
+    expect(await stored()).toEqual({ raw_retention_days: null, ip_retention_days: 7 })
+  })
+
+  it('refuses a period the schema refuses, and writes nothing', async () => {
+    await setRetention(90, 30)
+    expect(await run('settings', 'set', '--keep-clicks', '0')).toBe(2)
+    expect(await stored()).toEqual({ raw_retention_days: 90, ip_retention_days: 30 })
+  })
+
+  it('refuses a period that is not a number at all, and writes nothing', async () => {
+    await setRetention(90, 30)
+    expect(await run('settings', 'set', '--keep-addresses', 'forever')).toBe(2)
+    expect(await stored()).toEqual({ raw_retention_days: 90, ip_retention_days: 30 })
+  })
+
+  it('leaves the period alone when the command is about something else', async () => {
+    await setRetention(90, 30)
+    expect(await run('settings', 'set', '--abuser-threshold', '120')).toBe(0)
+    expect(await stored()).toEqual({ raw_retention_days: 90, ip_retention_days: 30 })
+  })
+
+  // A command about the abuser threshold rewrites an unreadable retention
+  // period as a side effect, because the alternative is refusing an operator
+  // who needs the threshold changed on exactly the install whose retention is
+  // broken. So it says what it did: a period learned from a line of output
+  // beats one learned from data that is no longer there.
+  it('says which period it rewrote when the stored retention could not be read', async () => {
+    await pg.query('ALTER TABLE settings DROP CONSTRAINT settings_raw_retention_valid')
+    try {
+      await pg.query('UPDATE settings SET raw_retention_days = -5, ip_retention_days = 7')
+      lines.length = 0
+      expect(await run('settings', 'set', '--abuser-threshold', '120')).toBe(0)
+      expect(lines[0]).toBe(
+        'note: the stored retention could not be read (rawRetentionDays: Number must be greater than or equal to 1), so this command has rewritten it as keep clicks 90 days, keep addresses 30 days',
+      )
+      // **Both** periods, not only the unreadable one: retention is validated
+      // as one half by one strict schema, so a single bad column loses the
+      // other with it. The address period stored here was 7, and it is 30
+      // afterwards — which is the whole reason this line has to be printed.
+      expect(await stored()).toEqual({ raw_retention_days: 90, ip_retention_days: 30 })
+      // And the change the operator actually asked for landed.
+      expect(lines).toContain('abuser threshold: 120 requests a minute from one client')
+    } finally {
+      await pg.query('UPDATE settings SET raw_retention_days = 90, ip_retention_days = 30')
+      await pg.query(
+        'ALTER TABLE settings ADD CONSTRAINT settings_raw_retention_valid CHECK (raw_retention_days IS NULL OR raw_retention_days BETWEEN 1 AND 3650)',
+      )
+    }
+  })
+
+  // The same rule one half along, and the harm is the same in different
+  // units: an unreadable traffic half is overwritten with the all-flag
+  // defaults by a command about a retention period, so traffic that was being
+  // blocked is only flagged from here on. Learning that from a line beats
+  // learning it from traffic that got through.
+  it('says so when it rewrote the traffic half it could not read', async () => {
+    await pg.query('ALTER TABLE settings DROP CONSTRAINT settings_traffic_actions_check')
+    try {
+      await pg.query(`UPDATE settings SET traffic_actions = '{"bot":"block"}'::jsonb`)
+      lines.length = 0
+      expect(await run('settings', 'set', '--keep-clicks', '45')).toBe(0)
+      expect(lines[0]).toMatch(
+        /^note: the stored traffic settings could not be read \(.+\), so this command has rewritten them; what is stored now is below$/,
+      )
+      // The rewrite happened and it is the defaults: `bot` was `block` and is
+      // `flag`, which is the whole reason the line has to be printed.
+      const stored = await pg.query<{ traffic_actions: unknown }>(
+        'SELECT traffic_actions FROM settings',
+      )
+      expect(stored.rows[0]?.traffic_actions).toEqual({
+        bot: 'flag',
+        abuser: 'flag',
+        anonymous: 'flag',
+        datacenter: 'flag',
+      })
+      // And the command's own change still landed.
+      expect(lines).toContain('keep clicks: 45 days')
+    } finally {
+      await pg.query(
+        `UPDATE settings SET traffic_actions =
+           '{"bot":"flag","abuser":"flag","anonymous":"flag","datacenter":"flag"}'::jsonb`,
+      )
+      await pg.query(
+        'ALTER TABLE settings ADD CONSTRAINT settings_traffic_actions_check CHECK (valid_traffic_actions(traffic_actions, true))',
+      )
+    }
+  })
+
+  // A command that changed nothing about retention says nothing about it: the
+  // line above is a report of a rewrite, not a banner.
+  it('says nothing about retention when the stored row reads fine', async () => {
+    await setRetention(90, 30)
+    lines.length = 0
+    expect(await run('settings', 'set', '--abuser-threshold', '60')).toBe(0)
+    expect(lines.some((l) => l.includes('could not be read'))).toBe(false)
+  })
+
+  // Printing the defaults for a row this build cannot read as retention would
+  // tell the operator their clicks are deleted after ninety days when nothing
+  // is being deleted at all.
+  it('says nothing is being deleted when the stored retention cannot be read', async () => {
+    await pg.query('ALTER TABLE settings DROP CONSTRAINT settings_raw_retention_valid')
+    try {
+      await pg.query('UPDATE settings SET raw_retention_days = -5')
+      lines.length = 0
+      expect(await run('settings', 'show')).toBe(0)
+      expect(lines).toContain('keep clicks: unknown, so nothing is being deleted')
+      expect(lines).toContain('keep addresses: unknown, so nothing is being deleted')
+      expect(lines.some((l) => l.startsWith('keep clicks: 90'))).toBe(false)
+      expect(lines[0]).toMatch(/^note: the stored retention is invalid \(/)
+    } finally {
+      // The row is repaired before the constraint goes back: Postgres refuses
+      // to add a check a stored row already breaks, and every test after this
+      // one would then be running without it.
+      await pg.query('UPDATE settings SET raw_retention_days = 90')
+      await pg.query(
+        'ALTER TABLE settings ADD CONSTRAINT settings_raw_retention_valid CHECK (raw_retention_days IS NULL OR raw_retention_days BETWEEN 1 AND 3650)',
+      )
+    }
   })
 
   it('stores a link override', async () => {
@@ -594,7 +813,10 @@ describe('clickmonk domain list and verify', () => {
     expect(await withResolver(fakeResolver({}), 'domain', 'verify', 'stillok.example.test')).toBe(0)
     const out = lines.join('\n')
     expect(out).toContain('stillok.example.test: still verified')
-    expect(out).not.toContain('404')
+    // The whole transcript embeds a 32-character hex token, and about one run in
+    // a few hundred puts `404` inside it — this asserts the warning line is
+    // absent, so it matches the line rather than the digits.
+    expect(out.split('\n').filter((l) => l.startsWith('Until the TXT record is found'))).toEqual([])
     expect(out).toContain('_clickmonk.stillok.example.test  TXT')
     const after = await pg.query<{ verified: boolean }>(
       'SELECT verified FROM domains WHERE host = $1',
@@ -810,10 +1032,13 @@ describe('the admin account and API keys from the CLI', () => {
   it('changes the password and signs every browser out', async () => {
     await withPassword('a decent admin password', 'admin', 'create', 'admin@example.com')
     const before = (await account()).rows[0]?.password_hash as string
-    await pg.query(
-      "INSERT INTO sessions (token_hash, expires_at) VALUES ($1, now() + interval '1 day')",
-      ['a'.repeat(64)],
-    )
+    // Live at NOW, which is the clock every command in this block runs on. A
+    // day past SQL `now()` is a day past the *database's* clock, and the two
+    // only agree while the real date sits near the frozen one.
+    await pg.query('INSERT INTO sessions (token_hash, expires_at) VALUES ($1, $2)', [
+      'a'.repeat(64),
+      new Date(NOW.getTime() + 86_400_000),
+    ])
     lines.length = 0
     expect(await withPassword('a new decent password', 'admin', 'passwd')).toBe(0)
     expect(lines.join('\n')).toContain('1 session(s) signed out')
@@ -828,10 +1053,21 @@ describe('the admin account and API keys from the CLI', () => {
   // once, rather than waiting out a lock on a password that no longer exists.
   it('clears a standing lockout, so the new password works at once', async () => {
     await withPassword('a decent admin password', 'admin', 'create', 'admin@example.com')
+    // Both stamps from NOW, the clock this block's commands run on: a lockout
+    // an hour past SQL `now()` is not standing at NOW once the real date has
+    // walked past the frozen one, and this test would then be clearing a lock
+    // that was never holding anything shut.
     await pg.query(
-      `UPDATE admin_account SET failed_logins = 9, last_failed_at = now(),
-                                locked_until = now() + interval '1 hour'`,
+      `UPDATE admin_account SET failed_logins = 9, last_failed_at = $1,
+                                locked_until = $2`,
+      [NOW, new Date(NOW.getTime() + 3_600_000)],
     )
+    // It really is standing, before the command that clears it: without this,
+    // the fixture could sit on either side of NOW and every assertion below
+    // would still pass.
+    expect(
+      await signIn(pg, { email: 'admin@example.com', password: 'a decent admin password' }, NOW),
+    ).toEqual({ ok: false, reason: 'locked', retryAfterSeconds: 3600 })
     expect(await withPassword('a new decent password', 'admin', 'passwd')).toBe(0)
     const r = await pg.query<{
       failed_logins: number
@@ -887,10 +1123,14 @@ describe('the admin account and API keys from the CLI', () => {
         NOW,
       ])
     }
-    await pg.query(
-      "INSERT INTO sessions (token_hash, expires_at) VALUES ($1, now() + interval '1 day')",
-      ['b'.repeat(64)],
-    )
+    // From NOW, like the recovery codes and the lockout above it: this test
+    // reads the account through `signIn(…, NOW)`, so one fixture on the
+    // database's clock and the rest on the frozen one is a mixture that only
+    // holds while the two dates are close.
+    await pg.query('INSERT INTO sessions (token_hash, expires_at) VALUES ($1, $2)', [
+      'b'.repeat(64),
+      new Date(NOW.getTime() + 86_400_000),
+    ])
     const credentials = { email: 'admin@example.com', password: 'a decent admin password' }
     // Before: the password alone gets nowhere, and the lockout the lost codes
     // earned is standing.

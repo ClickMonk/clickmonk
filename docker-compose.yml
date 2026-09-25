@@ -42,12 +42,22 @@ services:
   # network, and only for the host name CLICKMONK_ADMIN_HOST names. Unset, it
   # starts and answers 503 on every route rather than refusing to boot — an
   # install that never sets it must still serve its links.
+  #
+  # Started after ClickHouse but not gated on its health, the way the redirect
+  # depends on Postgres: the reports read it, and a report answers 503 while it
+  # is down rather than keeping the rest of this API from starting.
   admin:
     <<: *app
     command: ["node", "packages/admin/dist/index.js"]
-    depends_on: [postgres]
+    depends_on: [postgres, clickhouse]
     environment:
       CLICKMONK_POSTGRES_URL: postgres://clickmonk:${POSTGRES_PASSWORD:?set it in .env}@postgres:5432/clickmonk
+      # Reports read ClickHouse directly. The same four values the worker has;
+      # this service only ever reads.
+      CLICKMONK_CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKMONK_CLICKHOUSE_USER: clickmonk
+      CLICKMONK_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set it in .env}
+      CLICKMONK_CLICKHOUSE_DB: clickmonk
       CLICKMONK_ADMIN_HOST: ${CLICKMONK_ADMIN_HOST:-}
       CLICKMONK_TRUSTED_PROXIES: ${CLICKMONK_TRUSTED_PROXIES:-uniquelocal,loopback}
       CLICKMONK_DNS_SERVERS: ${CLICKMONK_DNS_SERVERS:-}
@@ -106,6 +116,9 @@ services:
       CLICKMONK_IPDATA_UPDATE: ${CLICKMONK_IPDATA_UPDATE:-on}
       CLICKMONK_DNS_CHECK: ${CLICKMONK_DNS_CHECK:-on}
       CLICKMONK_DNS_SERVERS: ${CLICKMONK_DNS_SERVERS:-}
+      # An hour by default. The periods themselves are settings on the install,
+      # not here: `clickmonk settings set --keep-clicks 30`.
+      CLICKMONK_RETENTION_INTERVAL_MS: ${CLICKMONK_RETENTION_INTERVAL_MS:-3600000}
       # The worker itself never reads this. The CLI runs in this container, and
       # `domain add` refuses a link domain equal to the admin host name: a
       # domain under that name would take its requests to the admin API and

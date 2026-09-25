@@ -26,6 +26,9 @@ importers:
 
   packages/admin:
     dependencies:
+      '@clickhouse/client':
+        specifier: ^1.23.1
+        version: 1.23.1
       '@clickmonk/core':
         specifier: workspace:*
         version: link:../core

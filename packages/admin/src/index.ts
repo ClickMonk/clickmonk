@@ -1,4 +1,4 @@
-import { createPgPool } from '@clickmonk/db'
+import { createChClient, createPgPool } from '@clickmonk/db'
 import { buildAdminApp } from './app.js'
 import { loadConfig } from './config.js'
 
@@ -19,9 +19,19 @@ const pg = createPgPool(config.postgresUrl, {
   connectTimeoutMs: 5_000,
 })
 
+// One client, built here rather than per request: it is an HTTP client with a
+// connection pool of its own, and building one per request would open a
+// connection per report. A bounded request timeout for the same reason the
+// pool has one — a query that never answers must not hold a request open for
+// ever — and it is longer than the server-side bound each query carries, so
+// that a query ClickHouse itself refuses comes back as ClickHouse's error and
+// not as a client-side abort with nothing in it.
+const ch = createChClient({ ...config.ch, requestTimeoutMs: 30_000 })
+
 const app = buildAdminApp(
   {
     pg,
+    ch,
     adminHost: config.adminHost,
     dnsServers: config.dnsServers,
   },
@@ -42,8 +52,17 @@ async function shutdown(signal: string): Promise<void> {
   stopping = true
   app.log.info({ signal }, 'draining')
   try {
-    await app.close()
-    await pg.end()
+    // All three, whatever any one of them does. Closed in sequence, a server
+    // that fails to drain leaves the pool and the ClickHouse client open, and
+    // the process exits holding its sockets. `allSettled` never rejects, so a
+    // failure is reported from the results rather than from the catch below —
+    // which still stands, because a throw before the first await is possible.
+    for (const closed of await Promise.allSettled([app.close(), pg.end(), ch.close()])) {
+      if (closed.status === 'rejected') {
+        console.error('shutdown error', closed.reason)
+        process.exitCode = 1
+      }
+    }
   } catch (err) {
     console.error('shutdown error', err)
     process.exitCode = 1

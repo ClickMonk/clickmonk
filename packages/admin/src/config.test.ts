@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { loadConfig } from './config.js'
 
-const base = { CLICKMONK_POSTGRES_URL: 'postgres://u:p@db:5432/clickmonk' }
+const base = {
+  CLICKMONK_POSTGRES_URL: 'postgres://u:p@db:5432/clickmonk',
+  CLICKMONK_CLICKHOUSE_URL: 'http://clickhouse:8123',
+  CLICKMONK_CLICKHOUSE_USER: 'clickmonk',
+  CLICKMONK_CLICKHOUSE_PASSWORD: 'a clickhouse password',
+  CLICKMONK_CLICKHOUSE_DB: 'clickmonk',
+}
 
 describe('loadConfig', () => {
   // The whole object, not a subset: a field this service starts with and
@@ -9,11 +15,37 @@ describe('loadConfig', () => {
   it('applies the documented defaults', () => {
     expect(loadConfig(base)).toEqual({
       postgresUrl: 'postgres://u:p@db:5432/clickmonk',
+      ch: {
+        url: 'http://clickhouse:8123',
+        username: 'clickmonk',
+        password: 'a clickhouse password',
+        database: 'clickmonk',
+      },
       adminHost: null,
       port: 9100,
       trustedProxies: ['127.0.0.1'],
       dnsServers: [],
     })
+  })
+
+  // All four, one row each: the comment on them claims that an install with a
+  // typo fails at boot with the variable named, and three of the four were
+  // otherwise free to become optional with that claim still written down.
+  it.each([
+    'CLICKMONK_CLICKHOUSE_URL',
+    'CLICKMONK_CLICKHOUSE_USER',
+    'CLICKMONK_CLICKHOUSE_PASSWORD',
+    'CLICKMONK_CLICKHOUSE_DB',
+  ])('refuses to start without %s, which the reports read', (name) => {
+    const rest: Record<string, string> = { ...base }
+    delete rest[name]
+    expect(() => loadConfig(rest)).toThrow(new RegExp(name))
+  })
+
+  // The password is the one that needs saying: empty is a value an operator may
+  // have set, and it is not the same as the variable being absent above.
+  it('takes an empty ClickHouse password, which is not the same as none', () => {
+    expect(loadConfig({ ...base, CLICKMONK_CLICKHOUSE_PASSWORD: '' }).ch.password).toBe('')
   })
 
   it('names every missing or bad variable at once', () => {

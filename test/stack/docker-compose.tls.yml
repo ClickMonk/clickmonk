@@ -29,6 +29,9 @@ services:
           # through the API rather than through the CLI.
           - admin.example.test
           - pw.example.test
+          # A link domain the reporting suite clicks through, added with the
+          # CLI's escape hatch rather than through a published DNS token.
+          - rep.example.test
 
   worker:
     environment:

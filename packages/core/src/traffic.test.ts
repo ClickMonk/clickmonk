@@ -23,7 +23,7 @@ const CHECKED: IpFacts = {
 const facts = (over: Partial<TrafficFacts> = {}, ip: Partial<IpFacts> = {}): TrafficFacts => ({
   userAgent: BROWSER,
   head: false,
-  clicksThisMinute: 1,
+  requestsThisMinute: 1,
   abuserThreshold: 60,
   ...over,
   ip: { ...CHECKED, ...ip },
@@ -47,7 +47,7 @@ describe('classifyTraffic', () => {
   it.each([
     ['a missing user-agent', facts({ userAgent: '' }), 'bot', ['ua_missing']],
     ['a crawler user-agent', facts({ userAgent: CRAWLER }), 'bot', ['ua_bot']],
-    ['one click over the threshold', facts({ clicksThisMinute: 61 }), 'abuser', ['rate']],
+    ['one click over the threshold', facts({ requestsThisMinute: 61 }), 'abuser', ['rate']],
     ['a Tor exit', facts({}, { tor: true }), 'anonymous', ['tor']],
     ['a hosting network', facts({}, { datacenter: true }), 'datacenter', ['datacenter']],
   ] as const)('classifies %s', (_label, f, cls, signals) => {
@@ -55,18 +55,21 @@ describe('classifyTraffic', () => {
   })
 
   it('does not call the threshold itself abuse', () => {
-    expect(classifyTraffic(facts({ clicksThisMinute: 60 })).class).toBe('human')
+    expect(classifyTraffic(facts({ requestsThisMinute: 60 })).class).toBe('human')
   })
 
   it('takes the first class in order, and records every signal', () => {
-    const all = facts({ userAgent: CRAWLER, clicksThisMinute: 99 }, { tor: true, datacenter: true })
+    const all = facts(
+      { userAgent: CRAWLER, requestsThisMinute: 99 },
+      { tor: true, datacenter: true },
+    )
     expect(classifyTraffic(all)).toEqual({
       class: 'bot',
       ruleClass: 'bot',
       signals: ['ua_bot', 'rate', 'tor', 'datacenter'],
     })
     expect(
-      classifyTraffic(facts({ clicksThisMinute: 99 }, { tor: true, datacenter: true })).class,
+      classifyTraffic(facts({ requestsThisMinute: 99 }, { tor: true, datacenter: true })).class,
     ).toBe('abuser')
     expect(classifyTraffic(facts({}, { tor: true, datacenter: true })).class).toBe('anonymous')
   })
@@ -79,7 +82,7 @@ describe('classifyTraffic', () => {
 
   it('still classifies by user-agent and rate without IP data', () => {
     expect(classifyTraffic({ ...facts({ userAgent: '' }), ip: NO_IP_FACTS }).class).toBe('bot')
-    expect(classifyTraffic({ ...facts({ clicksThisMinute: 61 }), ip: NO_IP_FACTS }).class).toBe(
+    expect(classifyTraffic({ ...facts({ requestsThisMinute: 61 }), ip: NO_IP_FACTS }).class).toBe(
       'abuser',
     )
   })

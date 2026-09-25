@@ -636,6 +636,20 @@ describe('startDomainChecker', () => {
     await pool.query('TRUNCATE domains CASCADE')
   })
 
+  /**
+   * The same bound the retention loop takes, and this is the neighbour it was
+   * inherited from: `setTimeout` keeps its delay in a signed 32-bit integer and
+   * replaces anything larger with 1 ms, so an interval a little over twenty-five
+   * days is a resolver query every few milliseconds rather than one a month.
+   *
+   * Nothing is started, so there is nothing for `afterEach` to stop.
+   */
+  it('refuses an interval no timer can hold', () => {
+    expect(() =>
+      startDomainChecker({ pg: pool, resolver: fakeResolver({}), intervalMs: 2147483648 }),
+    ).toThrow(/intervalMs/)
+  })
+
   it('runs a pass at once and stops without waiting for the interval', async () => {
     const d = await addDomain('go.example.test')
     const resolver = fakeResolver({ txt: { [NAME]: [[verificationRecordValue(d.token)]] } })

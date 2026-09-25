@@ -88,7 +88,10 @@ jobs:
   # `durability` both call `down -v`.
   stack:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Six suites now, each bringing the stack up for itself, one of them
+    # obtaining certificates from a local authority. Three and a half minutes
+    # with warm images locally; a cold runner builds the image first.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6

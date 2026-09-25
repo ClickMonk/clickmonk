@@ -71,7 +71,7 @@ beforeEach(async () => {
   await pg.query('TRUNCATE domains CASCADE')
   resolver = new FakeResolver()
   app = testApp(pg, clock, { resolver: () => resolver })
-  cookie = await signedIn(app, pg)
+  cookie = await signedIn(app, pg, clock.now())
 })
 
 afterEach(async () => {

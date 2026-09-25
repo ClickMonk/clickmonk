@@ -35,6 +35,11 @@ beforeAll(async () => {
 })
 beforeEach(async () => {
   await ch.command({ query: 'TRUNCATE TABLE clicks' })
+  // The rollups too: a materialized view fires on every insert this file makes,
+  // nothing in the product ever deletes a rollup row, and a test that reads one
+  // must see this test's clicks rather than the whole file's.
+  await ch.command({ query: 'TRUNCATE TABLE clicks_hourly' })
+  await ch.command({ query: 'TRUNCATE TABLE clicks_hourly_dim' })
 })
 afterAll(async () => {
   await pg.end()
@@ -101,6 +106,20 @@ async function rawRowCount(): Promise<number> {
   const rs = await ch.query({ query: 'SELECT count() AS n FROM clicks', format: 'JSONEachRow' })
   const [r] = await rs.json<{ n: string }>()
   return Number(r?.n)
+}
+/**
+ * Every hour the hourly rollup holds, oldest first.
+ *
+ * The alias is `at` rather than `hour`: an alias that shadows the column is what
+ * the `ORDER BY` would then read, and a string where a `DateTime` belongs is an
+ * illegal-type error rather than an ordering.
+ */
+async function rollupHours(): Promise<string[]> {
+  const rs = await ch.query({
+    query: 'SELECT DISTINCT toString(hour) AS at FROM clicks_hourly ORDER BY at',
+    format: 'JSONEachRow',
+  })
+  return (await rs.json<{ at: string }>()).map((r) => r.at)
 }
 
 describe('toClickhouseRow', () => {
@@ -213,6 +232,37 @@ describe('shipOnce', () => {
     const r = await shipOnce({ dir, ch, skipNewer: new Set() })
     expect(r).toMatchObject({ rows: 1, malformed: 2 })
     expect(await clicks()).toBe(1)
+  })
+
+  /**
+   * A click time outside what the rollups' `hour` column holds is a malformed
+   * line, and this is the end of the chain the bound exists for.
+   *
+   * The store refuses none of it. `clicks.time` holds 1900 to 2299, the rollups'
+   * `hour` holds 1970 to 2106, and the materialized views write
+   * `toStartOfHour(time)` into the narrower one — where a click at 1950 wraps
+   * into an hour in 2086. Nothing deletes a rollup row, so `max(hour)`, the only
+   * freshness field the reports have, would then answer that hour for the life of
+   * the install.
+   *
+   * So what is asserted is the rollup, not the count of malformed lines alone: a
+   * line refused by the schema is one that never reached a materialized view.
+   */
+  it('counts a click time no rollup hour can hold as malformed, and lets none of it reach the rollup', async () => {
+    const dir = tmp()
+    const good = rec({ time: '2026-09-24T10:00:00.000Z' })
+    segment(dir, [
+      JSON.stringify(rec({ time: '1950-06-15T10:00:00.000Z' })),
+      JSON.stringify(rec({ time: '2150-06-15T10:00:00.000Z' })),
+      JSON.stringify(good),
+    ])
+    const r = await shipOnce({ dir, ch, skipNewer: new Set() })
+    expect(r).toEqual({ segments: 1, rows: 1, malformed: 2 })
+    expect(await clicks()).toBe(1)
+    // The one hour the good click is in, and no other: the two wrapped hours
+    // would be 2086 and 2014, so a build without the bound answers one of them
+    // here and holds three rows rather than one.
+    expect(await rollupHours()).toEqual(['2026-09-24 10:00:00'])
   })
 
   it('skips a torn final line (no trailing newline, cut mid-write) and still ships the rest', async () => {

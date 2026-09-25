@@ -15,16 +15,15 @@ import {
   revokeApiKey,
 } from '@clickmonk/admin/keys'
 import {
-  DEFAULT_TRAFFIC_SETTINGS,
+  type InstallSettings,
   MAX_PASSWORD_LENGTH,
   MIN_ADMIN_PASSWORD_LENGTH,
   NON_HUMAN_CLASSES,
-  type TrafficActions,
   type TrafficSettings,
-  TrafficSettingsSchema,
   isDomainUrl,
   normaliseHost,
   parseLinkInput,
+  retentionNote,
   verificationRecordName,
   verificationRecordValue,
 } from '@clickmonk/core'
@@ -47,6 +46,12 @@ import {
   runDomainChecks,
 } from '@clickmonk/worker/domains'
 import { createLink } from '@clickmonk/worker/links'
+import {
+  SettingsLockedError,
+  type SettingsSubstitution,
+  readSettings,
+  updateSettings,
+} from '@clickmonk/worker/settings'
 import type { ZodError } from 'zod'
 
 export interface CliDeps {
@@ -94,7 +99,8 @@ const USAGE = `usage:
                      [--action <class>=<action> ...]
   clickmonk settings show
   clickmonk settings set [--action <class>=<action> ...] [--safe-url <url> | --no-safe-url]
-                         [--abuser-threshold <n>]
+                         [--abuser-threshold <n>] [--keep-clicks <days>|never]
+                         [--keep-addresses <days>|never]
   clickmonk ipdata update
   clickmonk ipdata status
   clickmonk admin create <email>      # the password is read from standard input
@@ -366,7 +372,7 @@ async function linkAdd(args: string[], d: CliDeps): Promise<void> {
   d.out(`link ${host}/${created.link.slug} ${created.link.id}`)
 
   const safe = NON_HUMAN_CLASSES.filter((c) => input.trafficActions[c] === 'safe')
-  if (safe.length > 0 && (await servedSettings(d)).settings.safeUrl === null) {
+  if (safe.length > 0 && (await readSettings(d.pg)).traffic.safeUrl === null) {
     d.out(
       `note: ${safe.join(', ')} set to safe, but no safe URL is set, so those clicks are flagged until one is (clickmonk settings set --safe-url <url>)`,
     )
@@ -489,7 +495,7 @@ async function adminCreate(args: string[], d: CliDeps): Promise<void> {
   }
   const password = await readPassword(d)
   try {
-    await createAccount(d.pg, { email, password })
+    await createAccount(d.pg, { email, password, now: d.now?.() ?? new Date() })
   } catch (err) {
     if (err instanceof AccountExistsError) throw new Rejected(err.message)
     throw err
@@ -509,7 +515,7 @@ async function adminPasswd(d: CliDeps): Promise<void> {
   // alone: it is the way back in, and a lock over a password that no longer
   // exists would keep the only account out for nothing. The API route asks for
   // the opposite, because it never has to show the second factor.
-  await setAccountPassword(d.pg, password, { clearLockout: true })
+  await setAccountPassword(d.pg, password, { clearLockout: true, now: d.now?.() ?? new Date() })
   const r = await d.pg.query('DELETE FROM sessions')
   d.out(`password changed; ${r.rowCount ?? 0} session(s) signed out`)
 }
@@ -610,60 +616,60 @@ async function apikeyRevoke(args: string[], d: CliDeps): Promise<void> {
   d.out(`key ${id} revoked`)
 }
 
-function printSettings(s: TrafficSettings, d: CliDeps): void {
-  for (const c of NON_HUMAN_CLASSES) d.out(`${c}: ${s.actions[c]}`)
-  d.out(`safe url: ${s.safeUrl ?? '(none)'}`)
-  d.out(`abuser threshold: ${s.abuserThreshold} clicks a minute from one address`)
+/**
+ * The traffic half, printed once. `settings show` prints it a second way —
+ * without the retention lines, when the retention half cannot be read — and
+ * two copies of the threshold sentence is how the two drift into disagreeing
+ * about what the number counts.
+ */
+function printTraffic(t: TrafficSettings, d: CliDeps): void {
+  for (const c of NON_HUMAN_CLASSES) d.out(`${c}: ${t.actions[c]}`)
+  d.out(`safe url: ${t.safeUrl ?? '(none)'}`)
+  d.out(`abuser threshold: ${t.abuserThreshold} requests a minute from one client`)
 }
 
-interface SettingsRow {
-  traffic_actions: TrafficActions
-  safe_url: string | null
-  abuser_threshold: number
+function printSettings(s: InstallSettings, d: CliDeps): void {
+  printTraffic(s.traffic, d)
+  d.out(`keep clicks: ${days(s.retention.rawRetentionDays)}`)
+  d.out(`keep addresses: ${days(s.retention.ipRetentionDays)}`)
+  const note = retentionNote(s.retention)
+  if (note) d.out(`note: ${note}`)
 }
 
-const toSettings = (r: SettingsRow): TrafficSettings => ({
-  actions: r.traffic_actions,
-  safeUrl: r.safe_url,
-  abuserThreshold: r.abuser_threshold,
-})
+/** A period where a label wants one: `90 days`, or `for ever` when there is none. */
+const days = (n: number | null): string => (n === null ? 'for ever' : `${n} days`)
 
 /**
- * The settings the redirect serves: a row that is missing (deleted by hand)
- * or that core's schema refuses means the defaults there, so it does here
- * too, with a note saying why.
+ * The same period where a sentence wants one, which needs the preposition a
+ * label does not: `for 90 days`, and `for ever` rather than "for for ever".
+ *
+ * A wrapper over `days` and not a second formatter. The number is still spelled
+ * in one place, so the two cannot come to disagree about what `90` reads as;
+ * what is decided here is only whether a `for` goes in front of it.
  */
-async function servedSettings(d: CliDeps): Promise<{ settings: TrafficSettings; note?: string }> {
-  const r = await d.pg.query<SettingsRow>(
-    'SELECT traffic_actions, safe_url, abuser_threshold FROM settings',
-  )
-  const row = r.rows[0]
-  if (!row) {
-    return {
-      settings: DEFAULT_TRAFFIC_SETTINGS,
-      note: 'note: no settings are stored; the defaults apply',
-    }
-  }
-  const parsed = TrafficSettingsSchema.safeParse(toSettings(row))
-  if (parsed.success) return { settings: parsed.data }
-  const why = parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')
-  return {
-    settings: DEFAULT_TRAFFIC_SETTINGS,
-    note: `note: the stored settings are invalid (${why}); the defaults apply`,
-  }
-}
+const keptFor = (n: number | null): string => (n === null ? days(n) : `for ${days(n)}`)
 
 async function settingsShow(d: CliDeps): Promise<void> {
-  const { settings, note } = await servedSettings(d)
-  if (note) d.out(note)
-  printSettings(settings, d)
+  const read = await readSettings(d.pg)
+  if (read.problem) d.out(`note: ${read.problem}`)
+  if (read.retention === null) {
+    // Printing the defaults here would tell the operator this install is
+    // deleting after ninety days, when in fact it is deleting nothing.
+    // "unknown" rather than "unreadable" because both states arrive here: a
+    // row that cannot be read as retention, and no row at all. The note
+    // printed above says which.
+    printTraffic(read.traffic, d)
+    d.out('keep clicks: unknown, so nothing is being deleted')
+    d.out('keep addresses: unknown, so nothing is being deleted')
+    return
+  }
+  printSettings({ traffic: read.traffic, retention: read.retention }, d)
 }
 
 /**
  * Changes only what is given; the result is validated whole before anything
- * is written. A row deleted by hand is first written back as the defaults,
- * in the same transaction, so that concurrent writers still serialise on its
- * lock.
+ * is written. The read, the merge and the write are the shared ones, so a
+ * period set here is the period the retention pass then enforces.
  */
 async function settingsSet(args: string[], d: CliDeps): Promise<void> {
   const { values } = parseArgs({
@@ -673,42 +679,73 @@ async function settingsSet(args: string[], d: CliDeps): Promise<void> {
       'safe-url': { type: 'string' },
       'no-safe-url': { type: 'boolean' },
       'abuser-threshold': { type: 'string' },
+      'keep-clicks': { type: 'string' },
+      'keep-addresses': { type: 'string' },
     },
   })
   if (values['safe-url'] !== undefined && values['no-safe-url']) {
     throw new Rejected('--safe-url and --no-safe-url together')
   }
-  const client = await d.pg.connect()
-  try {
-    await client.query('BEGIN')
-    await client.query('INSERT INTO settings DEFAULT VALUES ON CONFLICT DO NOTHING')
-    const r = await client.query<SettingsRow>(
-      'SELECT traffic_actions, safe_url, abuser_threshold FROM settings FOR UPDATE',
-    )
-    const row = r.rows[0]
-    if (!row) throw new Error('the settings row is missing after writing it')
-    const current = toSettings(row)
-    const next = TrafficSettingsSchema.parse({
-      actions: { ...current.actions, ...parseActions(values.action) },
-      safeUrl: values['no-safe-url'] ? null : (values['safe-url'] ?? current.safeUrl),
-      abuserThreshold:
-        values['abuser-threshold'] === undefined
-          ? current.abuserThreshold
-          : Number(values['abuser-threshold']),
-    })
-    await client.query(
-      `UPDATE settings SET traffic_actions = $1, safe_url = $2, abuser_threshold = $3,
-                           updated_at = now()`,
-      [JSON.stringify(next.actions), next.safeUrl, next.abuserThreshold],
-    )
-    await client.query('COMMIT')
-    printSettings(next, d)
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {})
-    throw err
-  } finally {
-    client.release()
+  // `never` is the only word either takes, and it is the stored null. A
+  // number is passed through as written so that core's schema is what
+  // refuses 0, -1 and 1.5, in one place, with one message.
+  const period = (given: string | undefined, current: number | null): number | null => {
+    if (given === undefined) return current
+    if (given === 'never') return null
+    return Number(given)
   }
+  // Arrays rather than nullable locals: the hooks run inside the call below,
+  // and a `let` assigned only from a callback is narrowed to its initialiser
+  // by the compiler.
+  const substituted: SettingsSubstitution[] = []
+  const next = await updateSettings(
+    d.pg,
+    d.now?.() ?? new Date(),
+    (current) => ({
+      traffic: {
+        actions: { ...current.traffic.actions, ...parseActions(values.action) },
+        safeUrl: values['no-safe-url'] ? null : (values['safe-url'] ?? current.traffic.safeUrl),
+        abuserThreshold:
+          values['abuser-threshold'] === undefined
+            ? current.traffic.abuserThreshold
+            : Number(values['abuser-threshold']),
+      },
+      retention: {
+        rawRetentionDays: period(values['keep-clicks'], current.retention.rawRetentionDays),
+        ipRetentionDays: period(values['keep-addresses'], current.retention.ipRetentionDays),
+      },
+    }),
+    { onSubstituted: (subs) => substituted.push(...subs) },
+  )
+  // Every substitution is said, not done quietly, and they all arrive through
+  // the one report rather than as a note per case. This command may have been
+  // about one field and have written the rest of the row on its way past, and
+  // none of that is a change an operator should first learn about from clicks
+  // that are gone or from traffic that stopped being blocked.
+  //
+  // The kept periods are named in full because there are two of them; the
+  // traffic settings point at the lines printed below instead, because there
+  // are five and they are about to be printed anyway.
+  // `keptFor`, not `days`: this is a sentence rather than a label, so the
+  // preposition comes from the formatter. With `days` and a `for` written here,
+  // `--keep-clicks never` printed "kept for for ever".
+  const kept = `clicks are now kept ${keptFor(next.retention.rawRetentionDays)} and addresses ${keptFor(next.retention.ipRetentionDays)}`
+  for (const sub of substituted) {
+    if (sub.what === 'row') {
+      d.out(
+        `note: there was no settings row, so this command has written one; nothing was being deleted before, and ${kept}`,
+      )
+    } else if (sub.what === 'traffic') {
+      d.out(
+        `note: the stored traffic settings could not be read (${sub.why}), so this command has rewritten them; what is stored now is below`,
+      )
+    } else {
+      d.out(
+        `note: the stored retention could not be read (${sub.why}), so this command has rewritten it as keep clicks ${days(next.retention.rawRetentionDays)}, keep addresses ${days(next.retention.ipRetentionDays)}`,
+      )
+    }
+  }
+  printSettings(next, d)
 }
 
 /**
@@ -841,6 +878,16 @@ export async function runCli(argv: string[], d: CliDeps): Promise<number> {
     ) {
       d.out(`error: ${err.message}\n${USAGE}`)
       return 1
+    }
+    // The settings row was held by something else for longer than the writer
+    // waits — almost always the retention pass, which holds it while it deletes.
+    // A refusal rather than an unexpected error because the answer is to run the
+    // command again, and because the alternative was a command that printed
+    // nothing until somebody killed it and then had to guess what it had done.
+    // Its message is written for a person; it is printed as it stands.
+    if (err instanceof SettingsLockedError) {
+      d.out(`error: ${err.message}`)
+      return 2
     }
     // A command run before the migrations. `42P01` is Postgres saying the table
     // is not there, and the answer is always the same one command, so this is a

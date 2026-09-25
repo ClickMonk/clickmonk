@@ -86,8 +86,13 @@ export interface TrafficFacts {
   /** Already cut to the bounded length the redirect records. */
   userAgent: string
   head: boolean
-  /** Requests from this address in the current minute, this one included. */
-  clicksThisMinute: number
+  /**
+   * Requests from this client in the current minute, this one included. A
+   * client is one IPv4 address or one IPv6 /64, which is what `rateKey`
+   * counts — not one address, since an IPv6 client can pick a new address out
+   * of its /64 for every request.
+   */
+  requestsThisMinute: number
   /** More than this many in a minute is an abuser. */
   abuserThreshold: number
   ip: IpFacts
@@ -115,7 +120,7 @@ export function classifyTraffic(f: TrafficFacts): Traffic {
   if (f.userAgent.length === 0) signals.push('ua_missing')
   else if (isBotUserAgent(f.userAgent)) signals.push('ua_bot')
   if (f.head) signals.push('head')
-  if (f.clicksThisMinute > f.abuserThreshold) signals.push('rate')
+  if (f.requestsThisMinute > f.abuserThreshold) signals.push('rate')
   if (f.ip.tor === true) signals.push('tor')
   if (f.ip.datacenter === true) signals.push('datacenter')
 

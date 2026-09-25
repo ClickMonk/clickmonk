@@ -1,6 +1,7 @@
 import { Resolver } from 'node:dns/promises'
 import { isIP } from 'node:net'
 import {
+  checkIntervalMs,
   isDomainUrl,
   newVerificationToken,
   normaliseHost,
@@ -375,7 +376,10 @@ export function startDomainChecker(o: {
   limit?: number
   log?: (msg: string, err?: unknown) => void
 }): { stop(): Promise<void> } {
-  const interval = o.intervalMs ?? 300_000
+  // The same bound the retention loop takes, for the same reason: past
+  // `setTimeout`'s 32-bit ceiling the delay is replaced by 1 ms, so an interval a
+  // little over twenty-five days is a resolver query every few milliseconds.
+  const interval = checkIntervalMs('intervalMs', o.intervalMs ?? 300_000)
   // The loop must never reject, so a logger that throws is ignored.
   const log = (msg: string, err?: unknown) => {
     try {
