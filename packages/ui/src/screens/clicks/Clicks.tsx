@@ -57,7 +57,16 @@ export function Clicks() {
   const [more, setMore] = useState<{ clicks: Click[]; nextCursor: string | null } | null>(null)
   const [moreError, setMoreError] = useState<ApiError | null>(null)
   const [moreLoading, setMoreLoading] = useState(false)
-  const [count, setCount] = useState<ClickCount | null>(null)
+  // The count and the link a completed export shows are pinned to the query
+  // they were counted under, by its key: a count that answers after the
+  // operator has since changed a filter is never shown, and the download it
+  // offers is always built from the query it counted rather than from
+  // whatever the address names by the time it lands.
+  const [exported, setExported] = useState<{
+    key: string
+    query: ClickFilters
+    count: ClickCount
+  } | null>(null)
   const [exportError, setExportError] = useState<ApiError | null>(null)
   const [exporting, setExporting] = useState(false)
 
@@ -74,7 +83,7 @@ export function Clicks() {
     setMore(null)
     setMoreError(null)
     setMoreLoading(false)
-    setCount(null)
+    setExported(null)
     setExportError(null)
     setExporting(false)
   }, [key, round])
@@ -88,14 +97,30 @@ export function Clicks() {
 
   const [typedCountry, setTypedCountry] = useState(filters.country ?? '')
   const [lastCountry, setLastCountry] = useState(filters.country ?? '')
+  const [countryProblem, setCountryProblem] = useState<string | null>(null)
   if ((filters.country ?? '') !== lastCountry) {
     setLastCountry(filters.country ?? '')
     setTypedCountry(filters.country ?? '')
+    setCountryProblem(null)
   }
+  // A value that is not two letters is never written to the address — the
+  // service would refuse it the same way an unknown class or outcome is
+  // refused, but here the operator is still typing, so the refusal is said
+  // beside the field instead of round-tripping through a dropped filter.
   const applyCountry = () => {
     const v = typedCountry.trim().toUpperCase()
     setTypedCountry(v)
-    setFilter({ country: v || undefined })
+    if (v === '') {
+      setCountryProblem(null)
+      setFilter({ country: undefined })
+      return
+    }
+    if (!/^[A-Z]{2}$/.test(v)) {
+      setCountryProblem('A country is two letters.')
+      return
+    }
+    setCountryProblem(null)
+    setFilter({ country: v })
   }
   const onCountryBlur = (_e: FocusEvent<HTMLInputElement>) => applyCountry()
   const onCountryKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
@@ -132,12 +157,14 @@ export function Clicks() {
 
   const runExport = async () => {
     const gen = generation.current
+    const q = query
+    const k = key
     setExporting(true)
     setExportError(null)
     try {
-      const c = await client.clickCount(query)
+      const c = await client.clickCount(q)
       if (generation.current !== gen) return
-      setCount(c)
+      setExported({ key: k, query: q, count: c })
     } catch (err) {
       if (generation.current !== gen) return
       if (err instanceof ApiError) setExportError(err)
@@ -155,10 +182,12 @@ export function Clicks() {
         actions={<WindowPicker />}
       />
       <div className="flex flex-wrap items-end gap-3">
-        {filters.link && linkName.data && (
+        {filters.link && (
           <div className="flex items-center gap-2">
             <span className="text-sm">
-              {`Link: ${linkName.data.host}/${linkName.data.slug}${linkName.data.name ? ` — ${linkName.data.name}` : ''}`}
+              {linkName.data?.id === filters.link
+                ? `Link: ${linkName.data.host}/${linkName.data.slug}${linkName.data.name ? ` — ${linkName.data.name}` : ''}`
+                : 'Link filter applied'}
             </span>
             <Button
               type="button"
@@ -207,10 +236,17 @@ export function Clicks() {
             maxLength={2}
             className="w-16"
             value={typedCountry}
+            aria-invalid={countryProblem ? true : undefined}
+            aria-describedby={countryProblem ? 'click-country-error' : undefined}
             onChange={(e) => setTypedCountry(e.target.value)}
             onBlur={onCountryBlur}
             onKeyDown={onCountryKeyDown}
           />
+          {countryProblem && (
+            <p id="click-country-error" className="text-sm text-destructive">
+              {countryProblem}
+            </p>
+          )}
         </div>
       </div>
       {problem && <output className="block text-sm text-muted-foreground">{problem}</output>}
@@ -268,30 +304,31 @@ export function Clicks() {
           Export as CSV
         </Button>
         {exportError && <ErrorNote error={exportError} />}
-        {count &&
-          (count.count === 0 ? (
+        {exported &&
+          exported.key === key &&
+          (exported.count.count === 0 ? (
             <p className="text-sm text-muted-foreground">
               There are no clicks to export in this window.
             </p>
-          ) : count.truncated ? (
+          ) : exported.count.truncated ? (
             <div className="grid gap-1">
               <p className="text-sm text-muted-foreground">
-                {`This window holds more than ${formatNumber(count.cap)} clicks. The file stops at ${formatNumber(count.cap)}, newest first; choose a shorter window for the rest.`}
+                {`This window holds more than ${formatNumber(exported.count.cap)} clicks. The file stops at ${formatNumber(exported.count.cap)}, newest first; choose a shorter window for the rest.`}
               </p>
               <a
-                href={client.exportUrl(query)}
+                href={client.exportUrl(exported.query)}
                 className="text-sm font-medium text-primary underline-offset-2 hover:underline"
               >
-                {`Download the first ${formatNumber(count.cap)}`}
+                {`Download the first ${formatNumber(exported.count.cap)}`}
               </a>
             </div>
           ) : (
             <div className="grid gap-1">
               <p className="text-sm text-muted-foreground">
-                {`${formatNumber(count.count)} ${count.count === 1 ? 'click' : 'clicks'} will be in the file.`}
+                {`${formatNumber(exported.count.count)} ${exported.count.count === 1 ? 'click' : 'clicks'} will be in the file.`}
               </p>
               <a
-                href={client.exportUrl(query)}
+                href={client.exportUrl(exported.query)}
                 className="text-sm font-medium text-primary underline-offset-2 hover:underline"
               >
                 Download the CSV

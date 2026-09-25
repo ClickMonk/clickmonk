@@ -297,6 +297,89 @@ describe('a link’s own page', () => {
     expect(screen.getByRole('heading', { level: 1, name: 'Spring offer' })).toBeInTheDocument()
   })
 
+  // A refresh that answers 404, then another refresh started before that
+  // answer's page ever shows anything else: the second refresh has no
+  // previous answer to fall back on — the link the first refresh named is
+  // gone as far as this page knows — so nothing of it (not the title, not
+  // Edit or Delete) may come back on screen while the second refresh is
+  // still in flight.
+  it('never shows the report again while a refresh started after a 404 is still in flight', async () => {
+    let calls = 0
+    let resolveThird: ((l: Link) => void) | undefined
+    const client = fakeClient({
+      link: (() => {
+        calls += 1
+        if (calls === 1) return Promise.resolve(LINK)
+        if (calls === 2) return Promise.reject(new ApiError(404, 'not_found', 'no such link'))
+        return new Promise<Link>((resolve) => {
+          resolveThird = resolve
+        })
+      }) as never,
+      summary: () =>
+        Promise.resolve({
+          window: W,
+          link: 'l1',
+          clicks: 7,
+          visitors: 5,
+          byClass: {},
+          byAction: {},
+          byOutcome: {},
+          newestHour: null,
+        }),
+      timeseries: () =>
+        Promise.resolve({
+          window: W,
+          link: 'l1',
+          bucket: 'day' as const,
+          buckets: [],
+          newestHour: null,
+        }),
+      breakdown: ((_w: unknown, d: string) => Promise.resolve(rows(d))) as never,
+      deleteLink: () => Promise.resolve({ ok: true as const }),
+    })
+    function Bump() {
+      const { refresh } = useRefresh()
+      return (
+        <button type="button" onClick={refresh}>
+          Bump
+        </button>
+      )
+    }
+    render(
+      <NowProvider now={() => Date.parse('2026-10-07T03:00:00.000Z')}>
+        <RefreshProvider>
+          <MemoryRouter initialEntries={['/links/l1?range=7d']}>
+            <ClientProvider client={client}>
+              <Bump />
+              <Routes>
+                <Route path="/links/:id" element={<LinkReport />} />
+                <Route path="/links" element={<h1>the list</h1>} />
+              </Routes>
+            </ClientProvider>
+          </MemoryRouter>
+        </RefreshProvider>
+      </NowProvider>,
+    )
+    const user = userEvent.setup()
+    expect(
+      await screen.findByRole('heading', { level: 1, name: 'Spring offer' }),
+    ).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Bump' }))
+    expect(
+      await screen.findByRole('heading', { level: 1, name: 'No such link' }),
+    ).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Bump' }))
+    expect(
+      screen.queryByRole('heading', { level: 1, name: 'Spring offer' }),
+    ).not.toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: 'Edit' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Delete' })).not.toBeInTheDocument()
+    resolveThird?.(LINK)
+    expect(
+      await screen.findByRole('heading', { level: 1, name: 'Spring offer' }),
+    ).toBeInTheDocument()
+  })
+
   it('falls back to a plain title beside a non-404 error when nothing is known about the link yet', async () => {
     show(() => Promise.reject(new ApiError(500, 'server_error', 'the service is down')))
     expect(await screen.findByRole('heading', { level: 1, name: 'Link' })).toBeInTheDocument()

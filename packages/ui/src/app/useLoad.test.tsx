@@ -79,6 +79,32 @@ describe('loading', () => {
     expect(screen.getByTestId('error')).toHaveTextContent('')
   })
 
+  // The last success is not "the data" any more once the service has since
+  // refused: a reload after a failure must not bring the old answer back
+  // while the new attempt is still in flight — a screen that renders on
+  // `data` alone (rather than on `state`) would show it as current again.
+  it('clears the previous data once a new load starts after a failure', async () => {
+    let n = 0
+    let resolveThird: (v: string) => void = () => {}
+    const load = vi.fn(() => {
+      n += 1
+      if (n === 1) return Promise.resolve('load 1')
+      if (n === 2) return Promise.reject(new ApiError(404, 'not_found', 'no such thing'))
+      return new Promise<string>((r) => {
+        resolveThird = r
+      })
+    })
+    render(<Show load={load} />)
+    expect(await screen.findByText('load 1')).toBeInTheDocument()
+    await act(async () => screen.getByRole('button', { name: 'again' }).click())
+    expect(await screen.findByText('not_found')).toBeInTheDocument()
+    await act(async () => screen.getByRole('button', { name: 'again' }).click())
+    expect(screen.getByTestId('state')).toHaveTextContent('loading')
+    expect(screen.getByTestId('data')).toHaveTextContent('')
+    expect(screen.getByTestId('error')).toHaveTextContent('')
+    await act(async () => resolveThird('load 3'))
+  })
+
   it('loads again when asked, staying in loading with the old data until the new answer arrives', async () => {
     let n = 0
     let resolveSecond: (v: string) => void = () => {}

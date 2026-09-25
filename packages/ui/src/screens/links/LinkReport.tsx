@@ -36,11 +36,12 @@ export function LinkReport() {
   const w = useWindow()
   const r = useLoad((signal) => client.link(id, { signal }), [id, round])
 
-  // `useLoad` keeps the previous answer on screen while a new one loads or a
-  // reload fails — right for a refresh, wrong for a navigation from one link
-  // to another: the id the address names is the only one this page may show.
-  // A link that answers after the address has moved on to a different one is
-  // treated as not yet loaded, exactly like a link still in flight.
+  // `useLoad` keeps the previous answer on screen while a refresh after a
+  // success is in flight — right here, since the link named by the address
+  // has not changed. It keeps nothing once a refresh has failed (there is no
+  // "previous answer" left to trust), and this page adds its own rule on top:
+  // an answer for a different id, because the address moved to another link
+  // while this one was still in flight, is treated as not yet loaded too.
   const link: Link | undefined = r.data?.id === id ? r.data : undefined
 
   if (r.error?.status === 404) {

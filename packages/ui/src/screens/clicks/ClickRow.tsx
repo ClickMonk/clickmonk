@@ -5,40 +5,58 @@ import { Button } from '@/components/ui/button'
 import { TableCell, TableRow } from '@/components/ui/table'
 import { Fragment, useState } from 'react'
 
-/** Every field of a click, labelled, in the order the service returns them. */
-const FIELDS: [keyof Click, string][] = [
-  ['clickId', 'Click ID'],
-  ['at', 'Time (UTC)'],
-  ['host', 'Host'],
-  ['path', 'Path'],
-  ['outcome', 'Outcome'],
-  ['step', 'Decided at'],
-  ['status', 'Status'],
-  ['destination', 'Sent to'],
-  ['targetId', 'Target (rotation)'],
-  ['linkId', 'Link ID'],
-  ['domainId', 'Domain ID'],
-  ['visitorId', 'Visitor'],
-  ['returning', 'Returning'],
-  ['country', 'Country'],
-  ['region', 'Region'],
-  ['city', 'City'],
-  ['geoSource', 'Location source'],
-  ['device', 'Device'],
-  ['os', 'Operating system'],
-  ['browser', 'Browser'],
-  ['asn', 'Network (ASN)'],
-  ['class', 'Class'],
-  ['signals', 'Signals'],
-  ['action', 'Action'],
-  ['referrer', 'Referrer'],
-  ['userAgent', 'User agent'],
-  ['network', 'Address (network)'],
-  ['capUnchecked', 'Cap not checked'],
-]
+/**
+ * Every field's label, in the order the service returns them. Written as a
+ * record — rather than the array it is turned into below — so that
+ * `satisfies` fails the build the moment `Click` gains or loses a field and
+ * this list has not been kept in step: a field missing here would otherwise
+ * be a silently missing row in the dump, not a typecheck error.
+ */
+const FIELD_LABELS = {
+  clickId: 'Click ID',
+  at: 'Time (UTC)',
+  host: 'Host',
+  path: 'Path',
+  outcome: 'Outcome',
+  step: 'Decided at',
+  status: 'Status',
+  destination: 'Sent to',
+  targetId: 'Target (rotation)',
+  linkId: 'Link ID',
+  domainId: 'Domain ID',
+  visitorId: 'Visitor',
+  returning: 'Returning',
+  country: 'Country',
+  region: 'Region',
+  city: 'City',
+  geoSource: 'Location source',
+  device: 'Device',
+  os: 'Operating system',
+  browser: 'Browser',
+  asn: 'Network (ASN)',
+  class: 'Class',
+  signals: 'Signals',
+  action: 'Action',
+  referrer: 'Referrer',
+  userAgent: 'User agent',
+  network: 'Address (network)',
+  capUnchecked: 'Cap not checked',
+} satisfies Record<keyof Click, string>
+
+const FIELDS = Object.entries(FIELD_LABELS) as [keyof Click, string][]
 
 const text = (v: unknown): string =>
-  v === null || v === '' ? '—' : Array.isArray(v) ? (v.length ? v.join(', ') : '—') : String(v)
+  v === null || v === ''
+    ? '—'
+    : typeof v === 'boolean'
+      ? v
+        ? 'Yes'
+        : 'No'
+      : Array.isArray(v)
+        ? v.length
+          ? v.join(', ')
+          : '—'
+        : String(v)
 
 export function ClickRow({ c, zone }: { c: Click; zone: string }) {
   const [open, setOpen] = useState(false)

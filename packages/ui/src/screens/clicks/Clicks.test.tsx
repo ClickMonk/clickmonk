@@ -44,49 +44,44 @@ const click = (id: string, over: Partial<Click> = {}): Click => ({
   ...over,
 })
 
+/**
+ * Renders the screen. Either builds a client from the common fixtures
+ * (`pages`, `count`), or — for a scenario those can't express (a lookup that
+ * fails, a page held on a deferred promise, per-call routing) — takes a
+ * caller-built one directly via `client`, which then ignores `pages`/`count`.
+ */
 function show(
   o: {
+    client?: ReturnType<typeof fakeClient>
     pages?: (cursor?: string) => ClickPage
     count?: ClickCount
     at?: string
   } = {},
 ) {
-  const client = fakeClient({
-    clicks: ((_f: unknown, page: { cursor?: string }) =>
-      Promise.resolve(
-        o.pages
-          ? o.pages(page.cursor)
-          : { window: W, link: null, clicks: [click('c1')], nextCursor: null },
-      )) as never,
-    clickCount: () =>
-      Promise.resolve(
-        o.count ?? { window: W, link: null, count: 3, cap: 1_000_000, truncated: false },
-      ),
-    link: () =>
-      Promise.resolve({
-        id: '00000000-0000-4000-8000-0000000000a1',
-        host: 'go.example.test',
-        slug: 'spring',
-        name: 'Spring offer',
-      } as never),
-  })
+  const client =
+    o.client ??
+    fakeClient({
+      clicks: ((_f: unknown, page: { cursor?: string }) =>
+        Promise.resolve(
+          o.pages
+            ? o.pages(page.cursor)
+            : { window: W, link: null, clicks: [click('c1')], nextCursor: null },
+        )) as never,
+      clickCount: () =>
+        Promise.resolve(
+          o.count ?? { window: W, link: null, count: 3, cap: 1_000_000, truncated: false },
+        ),
+      link: () =>
+        Promise.resolve({
+          id: '00000000-0000-4000-8000-0000000000a1',
+          host: 'go.example.test',
+          slug: 'spring',
+          name: 'Spring offer',
+        } as never),
+    })
   render(
     <NowProvider now={NOW}>
       <MemoryRouter initialEntries={[o.at ?? '/clicks?range=today']}>
-        <ClientProvider client={client}>
-          <Clicks />
-        </ClientProvider>
-      </MemoryRouter>
-    </NowProvider>,
-  )
-  return { client, user: userEvent.setup() }
-}
-
-/** `showWith` renders with a caller-built client, for a scenario `show()` can't express. */
-function showWith(client: ReturnType<typeof fakeClient>, at = '/clicks?range=today') {
-  render(
-    <NowProvider now={NOW}>
-      <MemoryRouter initialEntries={[at]}>
         <ClientProvider client={client}>
           <Clicks />
         </ClientProvider>
@@ -103,6 +98,15 @@ describe('the click log', () => {
   it('is titled as a screen', () => {
     show()
     expect(screen.getByRole('heading', { level: 1, name: 'Clicks' })).toBeInTheDocument()
+  })
+
+  it('says exactly why the log and the reports can disagree', () => {
+    show()
+    expect(
+      screen.getByText(
+        'Every click, newest first. The log counts the window to the millisecond; the reports count whole hours, so the two can differ by the clicks in a partial hour.',
+      ),
+    ).toBeInTheDocument()
   })
 
   it('asks for the exact window and fifty clicks', async () => {
@@ -162,6 +166,100 @@ describe('the click log', () => {
     })
   })
 
+  // A lookup that fails, is slow, or simply hasn't answered yet must not
+  // leave the log silently filtered with nothing on screen saying so, and
+  // must not strand the operator without a way to clear it.
+  it('still offers to clear the link filter when the link lookup fails', async () => {
+    const client = fakeClient({
+      clicks: () =>
+        Promise.resolve({
+          window: W,
+          link: null,
+          clicks: [click('c1')],
+          nextCursor: null,
+        } as never),
+      clickCount: () =>
+        Promise.resolve({ window: W, link: null, count: 3, cap: 1_000_000, truncated: false }),
+      link: () => Promise.reject(new ApiError(500, 'server_error', 'the service is down')),
+    })
+    const { client: c, user } = show({
+      client,
+      at: '/clicks?range=today&link=00000000-0000-4000-8000-0000000000a1',
+    })
+    expect(await screen.findByText('Link filter applied')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Clear the link filter' }))
+    expect(clickCalls(c).at(-1)?.[0]).toEqual(W)
+  })
+
+  it('clears the link filter from a link that did resolve, and asks again without it', async () => {
+    const { client, user } = show({
+      at: '/clicks?range=today&link=00000000-0000-4000-8000-0000000000a1',
+    })
+    await screen.findByText('Link: go.example.test/spring — Spring offer')
+    await user.click(screen.getByRole('button', { name: 'Clear the link filter' }))
+    expect(
+      screen.queryByText('Link: go.example.test/spring — Spring offer'),
+    ).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Clear the link filter' })).not.toBeInTheDocument()
+    expect(clickCalls(client).at(-1)?.[0]).toEqual(W)
+  })
+
+  it('filters by outcome, keeps the filter in the address, and starts again from the first page', async () => {
+    const { client, user } = show()
+    await screen.findByText('Germany')
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Outcome' }), 'blocked')
+    await screen.findByText('Germany')
+    expect(clickCalls(client).at(-1)).toEqual([{ ...W, outcome: 'blocked' }, { limit: 50 }])
+  })
+
+  it('upper-cases a typed country and applies it on blur', async () => {
+    const { client, user } = show()
+    await screen.findByText('Germany')
+    await user.type(screen.getByLabelText('Country'), 'de')
+    await user.tab()
+    expect(clickCalls(client).at(-1)).toEqual([{ ...W, country: 'DE' }, { limit: 50 }])
+    expect(screen.getByLabelText('Country')).toHaveValue('DE')
+  })
+
+  // The country field is checked locally, the way the window's own custom
+  // range is: a value the service would refuse is never written to the
+  // address at all, and the field says why beside itself instead.
+  it('refuses a country that is not two letters, without writing it to the address', async () => {
+    const { client, user } = show()
+    await screen.findByText('Germany')
+    const input = screen.getByLabelText('Country')
+    await user.type(input, 'D')
+    await user.tab()
+    expect(input).toHaveAttribute('aria-invalid', 'true')
+    expect(screen.getByText('A country is two letters.')).toBeInTheDocument()
+    expect(clickCalls(client)).toEqual([[W, { limit: 50 }]])
+  })
+
+  it('says a filter in the address could not be used', () => {
+    show({ at: '/clicks?range=today&class=robot' })
+    expect(
+      screen.getByText('A filter in this address could not be used and was left out.'),
+    ).toBeInTheDocument()
+  })
+
+  it('shows a boolean field as Yes or No, not true or false', async () => {
+    const { user } = show({
+      pages: () => ({
+        window: W,
+        link: null,
+        clicks: [click('c1', { returning: true, capUnchecked: false })],
+        nextCursor: null,
+      }),
+    })
+    await user.click(await screen.findByRole('button', { name: 'Show every field of this click' }))
+    const returning = screen.getByText('Returning').nextElementSibling
+    const capUnchecked = screen.getByText('Cap not checked').nextElementSibling
+    expect(returning).toHaveTextContent('Yes')
+    expect(capUnchecked).toHaveTextContent('No')
+    expect(screen.queryByText('true')).not.toBeInTheDocument()
+    expect(screen.queryByText('false')).not.toBeInTheDocument()
+  })
+
   it('loads the next page after the one shown', async () => {
     const { client, user } = show({
       pages: (cursor) =>
@@ -196,7 +294,7 @@ describe('the click log', () => {
         Promise.resolve({ window: W, link: null, count: 3, cap: 1_000_000, truncated: false }),
       link: () => Promise.resolve(null as never),
     })
-    const { user } = showWith(client)
+    const { user } = show({ client })
     const row = (await screen.findByText('Germany')).closest('tr') as HTMLElement
     await user.selectOptions(screen.getByRole('combobox', { name: 'Traffic class' }), 'bot')
     const busy = row.closest('[aria-busy]')
@@ -219,7 +317,7 @@ describe('the click log', () => {
         Promise.resolve({ window: W, link: null, count: 3, cap: 1_000_000, truncated: false }),
       link: () => Promise.resolve(null as never),
     })
-    const { user } = showWith(client)
+    const { user } = show({ client })
     await screen.findByText('Germany')
     await user.selectOptions(screen.getByRole('combobox', { name: 'Traffic class' }), 'bot')
     expect(await screen.findByRole('alert')).toBeInTheDocument()
@@ -267,7 +365,7 @@ describe('the click log', () => {
         Promise.resolve({ window: W, link: null, count: 3, cap: 1_000_000, truncated: false }),
       link: () => Promise.resolve(null as never),
     })
-    const { user } = showWith(client)
+    const { user } = show({ client })
     await user.click(await screen.findByRole('button', { name: 'Load more' }))
     await user.selectOptions(screen.getByRole('combobox', { name: 'Traffic class' }), 'bot')
     await screen.findByText('Germany')
@@ -304,7 +402,7 @@ describe('the click log', () => {
         Promise.resolve({ window: W, link: null, count: 3, cap: 1_000_000, truncated: false }),
       link: () => Promise.resolve(null as never),
     })
-    const { user } = showWith(client)
+    const { user } = show({ client })
     const button = await screen.findByRole('button', { name: 'Load more' })
     await user.click(button)
     await user.click(button)
@@ -340,7 +438,7 @@ describe('the click log', () => {
         Promise.resolve({ window: W, link: null, count: 3, cap: 1_000_000, truncated: false }),
       link: () => Promise.resolve(null as never),
     })
-    const { user } = showWith(client)
+    const { user } = show({ client })
     const button = await screen.findByRole('button', { name: 'Load more' })
     await user.click(button)
     expect(button).toBeDisabled()
@@ -378,6 +476,17 @@ describe('the export', () => {
     expect(screen.getByRole('link', { name: 'Download the first 1,000,000' })).toBeInTheDocument()
   })
 
+  it('says there is nothing to export, and offers no link, when the count is zero', async () => {
+    const { user } = show({
+      count: { window: W, link: null, count: 0, cap: 1_000_000, truncated: false },
+    })
+    await user.click(await screen.findByRole('button', { name: 'Export as CSV' }))
+    expect(
+      await screen.findByText('There are no clicks to export in this window.'),
+    ).toBeInTheDocument()
+    expect(screen.queryByRole('link')).not.toBeInTheDocument()
+  })
+
   it('clears the count and the link when a filter changes after counting', async () => {
     const { user } = show({ at: '/clicks?range=today&class=bot' })
     await user.click(await screen.findByRole('button', { name: 'Export as CSV' }))
@@ -407,7 +516,7 @@ describe('the export', () => {
       }) as never,
       link: () => Promise.resolve(null as never),
     })
-    const { user } = showWith(client, '/clicks?range=today&class=bot')
+    const { user } = show({ client, at: '/clicks?range=today&class=bot' })
     await user.click(await screen.findByRole('button', { name: 'Export as CSV' }))
     await user.selectOptions(screen.getByRole('combobox', { name: 'Traffic class' }), 'human')
     resolveCount?.({ window: W, link: null, count: 3, cap: 1_000_000, truncated: false })
