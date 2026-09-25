@@ -33,6 +33,16 @@ describe('the built stylesheet', () => {
   it('gives every element a border colour from the brand role, not currentColor', () => {
     expect(css).toContain('border-color:var(--color-border)')
   })
+
+  // The CSP is `font-src 'self'`: a font the browser is told to fetch from
+  // the page's own origin. A font inlined as a data: URI would still render,
+  // silently bypassing that policy rather than being caught by it.
+  it('references the shipped fonts by URL, never inlines one as data', () => {
+    const woff2Refs = css.match(/url\([^)]*\.woff2[^)]*\)/g) ?? []
+    expect(woff2Refs.length).toBeGreaterThan(0)
+    expect(woff2Refs.every((ref) => !ref.includes('data:'))).toBe(true)
+    expect(css).not.toMatch(/data:font\//)
+  })
 })
 
 describe('the built page', () => {
