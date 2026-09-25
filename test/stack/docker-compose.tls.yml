@@ -32,6 +32,9 @@ services:
           # A link domain the reporting suite clicks through, added with the
           # CLI's escape hatch rather than through a published DNS token.
           - rep.example.test
+          # The browser suite's link domain: the browser clicks a link on it
+          # and watches the click arrive in the interface.
+          - ui.example.test
 
   worker:
     environment:

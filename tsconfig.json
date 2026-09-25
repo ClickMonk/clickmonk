@@ -8,6 +8,7 @@
     { "path": "packages/ipdata" },
     { "path": "packages/redirect" },
     { "path": "packages/ui" },
+    { "path": "packages/ui/tsconfig.e2e.json" },
     { "path": "packages/worker" },
     { "path": "test" }
   ]

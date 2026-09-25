@@ -1,13 +1,30 @@
 import { defineConfig } from '@playwright/test'
 
-// Placeholder until the browser suite is written: an empty test directory so
-// `playwright test` has a valid config to run against from day one, rather
-// than every later task inventing its own.
+const out = process.env.CLICKMONK_E2E_OUT ?? 'test-results'
+
+/**
+ * The browser suite. Run only by the stack suite in test/stack/ui.test.ts,
+ * inside Playwright's own image, against the shipped stack.
+ *
+ * `ignoreHTTPSErrors` because the stack's certificates come from an authority
+ * that exists only inside the stack; nothing here ever reaches another host.
+ * One worker, no retries: the suite drives one install in order, and a retry
+ * would hide the flake the run exists to show.
+ *
+ * `timezoneId` puts the browser in a zone half an hour off the hour, with
+ * daylight saving, where time logic that is right only in UTC shows itself.
+ */
 export default defineConfig({
   testDir: './e2e',
-  timeout: 30_000,
+  workers: 1,
+  retries: 0,
+  timeout: 120_000,
+  outputDir: `${out}/results`,
+  reporter: [['list'], ['html', { open: 'never', outputFolder: `${out}/report` }]],
   use: {
-    baseURL: process.env.CSP_SERVER_URL ?? 'http://127.0.0.1:8788',
+    baseURL: process.env.CLICKMONK_E2E_URL,
+    ignoreHTTPSErrors: true,
+    trace: 'retain-on-failure',
+    timezoneId: 'Australia/Adelaide',
   },
-  reporter: [['list']],
 })
