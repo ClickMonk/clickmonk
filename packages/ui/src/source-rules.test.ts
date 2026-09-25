@@ -274,17 +274,46 @@ describe('the source', () => {
     ).toEqual([])
   })
 
-  it('never dims a screen with opacity-50 while content reloads', () => {
+  it('never dims a screen with an opacity utility while content reloads', () => {
     // A screen marks the region that is reloading with aria-busy and keeps it
     // at full contrast; the visible cue belongs on the Refresh button
     // ("Refreshing…"), not on the content behind it. opacity-50 dropped
     // muted text to about 2.2:1 and body text to about 3.5:1 in the light
-    // theme for as long as the reload took.
+    // theme for as long as the reload took, and nothing under screens/ has a
+    // legitimate reason to fade with opacity, so any weight is refused
+    // rather than just the one value that was found in use.
     const screens = shipped.filter((p) => /[\\/]screens[\\/]/.test(p))
-    const found = find(screens, /opacity-50\b/)
+    const found = find(screens, /\bopacity-\d+\b/)
     expect(
       found,
       'Dimming a busy region drops it under 3:1. Mark it aria-busy and leave its opacity alone.',
+    ).toEqual([])
+  })
+
+  it('never dims a busy region by swapping in text-muted-foreground either', () => {
+    // The same dimming can be reached without opacity: a conditional class
+    // that reads for muted colour only while a loading/stale/busy flag is
+    // set composites text under the same 3:1 risk the opacity check refuses.
+    // This is a narrower net than the opacity check — it only catches a
+    // muted-colour class and a loading-shaped identifier on the same
+    // line — so a legitimate, unconditional text-muted-foreground (a caption,
+    // a hint, a footer) never matches.
+    const screens = shipped.filter((p) => /[\\/]screens[\\/]/.test(p))
+    const found = screens.flatMap((p) =>
+      readFileSync(p, 'utf8')
+        .split('\n')
+        .flatMap((line, i) => {
+          const muted = /\btext-muted-foreground\b/.test(line)
+          const loadingShaped = /\b(stale|loading|busy)\b/i.test(line)
+          const conditional = /\?/.test(line)
+          return muted && loadingShaped && conditional
+            ? [`${relative(SRC, p)}:${i + 1}: ${line.trim()}`]
+            : []
+        }),
+    )
+    expect(
+      found,
+      'A muted colour swapped in while a load is stale/loading/busy dims it the same way opacity-50 did. Keep the busy region at full contrast; mark it aria-busy instead.',
     ).toEqual([])
   })
 
