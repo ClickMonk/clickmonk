@@ -65,6 +65,9 @@ describe('the shell', () => {
       'href',
       'https://creativecommons.org/licenses/by/4.0/',
     )
+    expect(credit).toHaveTextContent(
+      'IP geolocation by DB-IP, licensed under CC BY 4.0. ClickMonk converts it to its own lookup format.',
+    )
   })
 
   it('reloads what is on screen when Refresh is pressed', async () => {

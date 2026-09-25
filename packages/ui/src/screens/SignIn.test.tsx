@@ -140,4 +140,16 @@ describe('the sign-in screen', () => {
     )
     expect(screen.getByRole('status')).toHaveTextContent('Your session ended. Sign in again.')
   })
+
+  it('says a session was not kept, distinct from one that ended, when that is why it is here', () => {
+    render(
+      <ClientProvider client={fakeClient()}>
+        <SignIn onSignedIn={() => {}} ended={false} notKept />
+      </ClientProvider>,
+    )
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Signed in, but this browser did not keep the session. ClickMonk has to be opened over https.',
+    )
+    expect(screen.queryByText('Your session ended. Sign in again.')).not.toBeInTheDocument()
+  })
 })

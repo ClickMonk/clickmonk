@@ -18,7 +18,11 @@ import { type FormEvent, useRef, useState } from 'react'
  * rather than the disabled state, because a second click can land before the
  * render that disables the button.
  */
-export function SignIn({ onSignedIn, ended }: { onSignedIn: () => void; ended: boolean }) {
+export function SignIn({
+  onSignedIn,
+  ended,
+  notKept = false,
+}: { onSignedIn: () => void; ended: boolean; notKept?: boolean }) {
   const client = useClient()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -64,6 +68,17 @@ export function SignIn({ onSignedIn, ended }: { onSignedIn: () => void; ended: b
       {ended && (
         <output className="block text-sm text-muted-foreground">
           Your session ended. Sign in again.
+        </output>
+      )}
+      {/* The service accepted the password, but the browser handed back no
+          cookie on the check that followed — the sign in the operator just
+          did did not stick. Distinct from a session that ended: nothing here
+          had ever been signed in. The usual cause is an `https`-only cookie
+          on a page opened over plain `http`. */}
+      {!ended && notKept && (
+        <output className="block text-sm text-muted-foreground">
+          Signed in, but this browser did not keep the session. ClickMonk has to be opened over
+          https.
         </output>
       )}
       <form className="grid gap-4" onSubmit={submit}>

@@ -14,7 +14,7 @@ type Phase =
   | { name: 'checking' }
   | { name: 'unavailable'; error: ApiError }
   | { name: 'no_admin' }
-  | { name: 'anonymous'; ended: boolean }
+  | { name: 'anonymous'; ended: boolean; notKept: boolean }
   | { name: 'authenticated'; me: Me }
 
 export const BOOT_TIMEOUT_MS = 8000
@@ -31,23 +31,40 @@ export function App({
 }: { makeClient?: (onUnauthorized: () => void) => ApiClient; bootTimeoutMs?: number }) {
   const [phase, setPhase] = useState<Phase>({ name: 'checking' })
   const ended = useCallback(() => {
-    setPhase((p) => (p.name === 'authenticated' ? { name: 'anonymous', ended: true } : p))
+    setPhase((p) =>
+      p.name === 'authenticated' ? { name: 'anonymous', ended: true, notKept: false } : p,
+    )
   }, [])
   // biome-ignore lint/correctness/useExhaustiveDependencies: one client for the life of the page
   const client = useMemo(() => makeClient(ended), [])
 
-  const check = useCallback(async () => {
-    setPhase({ name: 'checking' })
-    try {
-      const me = await client.me({ signal: AbortSignal.timeout(bootTimeoutMs) })
-      setPhase({ name: 'authenticated', me })
-    } catch (err) {
-      if (!(err instanceof ApiError)) throw err
-      if (err.status === 401) setPhase({ name: 'anonymous', ended: false })
-      else if (err.status === 503 && err.code === 'no_admin') setPhase({ name: 'no_admin' })
-      else setPhase({ name: 'unavailable', error: err })
-    }
-  }, [client, bootTimeoutMs])
+  // The same request, run at boot and again right after a sign-in. Only the
+  // second case can mean the browser refused to keep the session cookie (an
+  // `https`-only cookie handed to a plain `http` page): the boot case, and a
+  // retry from Unavailable, get no special wording because nothing was just
+  // signed in for the session to have failed to keep.
+  const runCheck = useCallback(
+    async (unauthenticatedNotice: 'none' | 'not_kept') => {
+      setPhase({ name: 'checking' })
+      try {
+        const me = await client.me({ signal: AbortSignal.timeout(bootTimeoutMs) })
+        setPhase({ name: 'authenticated', me })
+      } catch (err) {
+        if (!(err instanceof ApiError)) throw err
+        if (err.status === 401)
+          setPhase({
+            name: 'anonymous',
+            ended: false,
+            notKept: unauthenticatedNotice === 'not_kept',
+          })
+        else if (err.status === 503 && err.code === 'no_admin') setPhase({ name: 'no_admin' })
+        else setPhase({ name: 'unavailable', error: err })
+      }
+    },
+    [client, bootTimeoutMs],
+  )
+  const check = useCallback(() => runCheck('none'), [runCheck])
+  const afterSignIn = useCallback(() => runCheck('not_kept'), [runCheck])
 
   useEffect(() => {
     void check()
@@ -59,7 +76,7 @@ export function App({
     } catch {
       // Signed out either way: a session the service already ended is not a reason to stay.
     }
-    setPhase({ name: 'anonymous', ended: false })
+    setPhase({ name: 'anonymous', ended: false, notKept: false })
   }, [client])
 
   return (
@@ -67,7 +84,9 @@ export function App({
       {phase.name === 'checking' && <div className="min-h-dvh bg-background" />}
       {phase.name === 'unavailable' && <Unavailable error={phase.error} onRetry={check} />}
       {phase.name === 'no_admin' && <NoAdmin />}
-      {phase.name === 'anonymous' && <SignIn ended={phase.ended} onSignedIn={check} />}
+      {phase.name === 'anonymous' && (
+        <SignIn ended={phase.ended} notKept={phase.notKept} onSignedIn={afterSignIn} />
+      )}
       {phase.name === 'authenticated' && (
         <RefreshProvider>
           <Shell email={phase.me.email} onSignOut={signOut}>

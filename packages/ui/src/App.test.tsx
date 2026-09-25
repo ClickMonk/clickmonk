@@ -189,6 +189,55 @@ describe('signing in and out', () => {
     expect(s.calls).toContain('DELETE /api/session')
     expect(screen.queryByText('Your session ended. Sign in again.')).not.toBeInTheDocument()
   })
+
+  // The check that follows a successful sign-in reuses the same "checking"
+  // phase as the boot check, which unmounts the sign-in screen (and the
+  // password sitting in its state) for as long as that check is in flight.
+  it('leaves the sign-in screen while the check after signing in is pending', async () => {
+    let meCalls = 0
+    let resolveSecondMe: ((r: Response) => void) | undefined
+    const s = server({
+      'GET /api/me': () => {
+        meCalls += 1
+        if (meCalls === 1) return json(401, { error: 'unauthenticated', message: 'sign in' })
+        return new Promise<Response>((resolve) => {
+          resolveSecondMe = resolve
+        })
+      },
+      'POST /api/session': () => json(200, { ok: true, expiresAt: '2026-10-24T00:00:00.000Z' }),
+    })
+    show(s.makeClient)
+    const user = userEvent.setup()
+    await user.type(await screen.findByLabelText('Email'), 'admin@example.com')
+    await user.type(screen.getByLabelText('Password'), 'a decent admin password')
+    await user.click(screen.getByRole('button', { name: 'Sign in' }))
+    await waitFor(() => expect(screen.queryByLabelText('Password')).not.toBeInTheDocument())
+    resolveSecondMe?.(json(200, ME))
+    expect(await screen.findByRole('heading', { level: 1, name: 'Overview' })).toBeInTheDocument()
+  })
+})
+
+describe('a session that does not stick after signing in', () => {
+  // The service accepted the password (the POST answers 200), but the check
+  // that follows still gets a 401: the browser refused the cookie, not the
+  // credentials. Distinct wording from "Your session ended" — nothing here
+  // had ever been signed in for a session to end.
+  it('says the browser did not keep the session, distinct from one ending', async () => {
+    const s = server({
+      'GET /api/me': () => json(401, { error: 'unauthenticated', message: 'sign in' }),
+      'POST /api/session': () => json(200, { ok: true, expiresAt: '2026-10-24T00:00:00.000Z' }),
+    })
+    show(s.makeClient)
+    const user = userEvent.setup()
+    await user.type(await screen.findByLabelText('Email'), 'admin@example.com')
+    await user.type(screen.getByLabelText('Password'), 'a decent admin password')
+    await user.click(screen.getByRole('button', { name: 'Sign in' }))
+    expect(await screen.findByRole('heading', { level: 1, name: 'Sign in' })).toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Signed in, but this browser did not keep the session. ClickMonk has to be opened over https.',
+    )
+    expect(screen.queryByText('Your session ended. Sign in again.')).not.toBeInTheDocument()
+  })
 })
 
 describe('an address with nothing at it', () => {

@@ -77,7 +77,22 @@ describe('how fresh the numbers are', () => {
     expect(await screen.findByText('The IP data could not be read.')).toBeInTheDocument()
   })
 
-  it('links to the domains that need attention, and says nothing when none do', async () => {
+  it('says nothing when no domain needs attention', async () => {
+    show({ ...base, alerts: 0 })
+    // Wait for the status to have rendered before asserting an absence, so
+    // this cannot pass merely because nothing has loaded yet.
+    await screen.findByText('No clicks have reached the reports yet.')
+    expect(screen.queryByRole('link')).not.toBeInTheDocument()
+  })
+
+  it('names one domain in the singular', async () => {
+    show({ ...base, alerts: 1 })
+    expect(
+      await screen.findByRole('link', { name: '1 domain needs attention' }),
+    ).toBeInTheDocument()
+  })
+
+  it('links to the domains that need attention', async () => {
     show({ ...base, alerts: 2 })
     const link = await screen.findByRole('link', { name: '2 domains need attention' })
     expect(link).toHaveAttribute('href', '/domains')
