@@ -31,7 +31,7 @@ export function Shell({
     <div className="grid min-h-dvh grid-rows-[auto_1fr_auto] md:grid-cols-[13rem_1fr] md:grid-rows-[1fr_auto]">
       <nav
         aria-label="Main"
-        className="border-b border-border bg-muted md:row-span-1 md:border-r md:border-b-0"
+        className="min-w-0 border-b border-border bg-muted md:row-span-1 md:border-r md:border-b-0"
       >
         <p className="px-4 pt-4 font-serif text-lg font-semibold text-foreground">ClickMonk</p>
         <ul className="flex gap-1 overflow-x-auto p-2 md:grid md:overflow-visible">
