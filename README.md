@@ -440,14 +440,15 @@ answers the API — visit the admin host in a browser and sign in. Each screen:
 - **Overview** — every link on every domain, as one report.
 - **Links** — the link list, searchable, and where a link is created, edited, or opened for its
   own report.
-- **Clicks** — the click log, filtered by link, traffic class, outcome and country, with the CSV
-  export.
-- **Domains** — adding a domain and watching it become verified.
+- **Clicks** — the click log, filtered by link (from a link's own page), traffic class, outcome
+  and country, with the CSV export.
+- **Domains** — adding a domain and checking its record until it verifies.
 - **Settings** — the traffic action for each non-human class, the safe URL, the abuser
   threshold, and how long this install keeps clicks and their addresses.
 - **Account** — the password, two-factor authentication, the sessions signed in, and API keys.
 
-**Every time on screen is in the browser's own zone, never the server's.** A day chart's days
+**Every time on screen is in the browser's own zone, never the server's, except a click's raw
+fields, which are labelled UTC.** A day chart's days
 still begin on a whole hour of UTC, because that is the grain the hourly rollups are kept at.
 So a zone that is not a whole number of hours from UTC — India Standard Time, UTC+5:30, is one
 — has its days begin off midnight, at 23:30 or 00:30 rather than 00:00, and the screen says so
@@ -463,9 +464,9 @@ back to the tab after a minute away; there is no timer running in the background
 service for anything.
 
 **Nothing the interface does is unavailable to a script.** Every screen is built on the same
-admin API documented in this section and the ones above it — see
-["The admin API"](#the-admin-api) — so anything the interface can do, a `curl` command or the
-CLI can do too.
+admin API documented in ["The admin API"](#the-admin-api) and
+["Reading the clicks back out"](#reading-the-clicks-back-out) — so anything the interface can
+do, a `curl` command or the CLI can do too.
 
 **What it does not do yet:** there is no time zone setting for the install itself, only the
 browser's own zone; no bulk operations — one link, one domain, one setting at a time, the same
@@ -752,7 +753,8 @@ the country looked up is the CDN's.
 
 IP Geolocation by [DB-IP](https://db-ip.com), licensed under
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). ClickMonk converts it to its
-own lookup format. The same credit is in the web interface's own footer, on every screen.
+own lookup format. The same credit is in the web interface's own footer, on every signed-in
+screen.
 
 A download replaces the list in use only when it parses whole and holds at least a
 minimum number of entries (about a fifth of a current edition; for country, half the

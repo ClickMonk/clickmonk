@@ -50,7 +50,7 @@ pass), the admin
 API (one account, sessions, TOTP with recovery codes, API keys, domain/link/settings
 CRUD, answering on `CLICKMONK_ADMIN_HOST` alone — unset, every route but `/health` is a
 503 and links serve exactly as before), reporting over that API (a summary, a chart by
-hour or day, a breakdown over nine dimensions, the raw click log and a streamed CSV of it,
+hour or day, a breakdown over ten dimensions, the raw click log and a streamed CSV of it,
 all reading hourly rollups except the log and its export), the web interface (a React app
 the admin service serves from that same host, behind the same host guard — every screen
 built on the admin API and nothing it can reach that a script cannot), retention (two
@@ -86,19 +86,19 @@ What does not exist yet, and must not be implied by any documentation:
 - **A CSV of a report, from the API itself.** `GET /api/clicks.csv` streams the click log
   only. A summary or a breakdown is one small answer already, and turning one into a file is
   the web interface's own doing, client-side, not a route the API streams.
-- **A time zone, on the API.** Every window, bucket and retention period it takes is UTC.
-  The web interface computes a preset like "yesterday" from the browser's own zone; a caller
-  of the API directly still has to. The hourly grain leaves a whole-hour offset possible
-  without a schema change, which is what the interface's day charts use — see
-  `packages/ui/src/window/range.ts`; a half-hour zone would need one.
+- **A time zone, on the API.** Every window and retention period it takes is UTC, and so is a
+  chart's bucket size — `offset` only moves where a day bucket begins, in whole hours, and does
+  nothing for an hourly one. The web interface computes a preset like "yesterday" from the
+  browser's own zone; a caller of the API directly still has to — see
+  `packages/ui/src/window/range.ts`.
 - **Notifications of any kind.** No mail configuration exists; `GET /api/alerts` is what
   an operator reads instead.
 - **Most link settings in the CLI.** `link add` takes `--target`, `--backup`, `--cap`,
   `--expires`, `--no-passthrough` and `--action` only, and no command changes a link
   after `link add`. `settings set` sets the install-wide traffic actions, the safe URL,
   the abuser threshold and the two retention periods. Device URLs, a returning URL,
-  country rules, a name, a password and the disabled state are the admin API's, or
-  hand-written SQL without it.
+  country rules, a name, a password and the disabled state are the admin API's and the web
+  interface's, or hand-written SQL without it.
   A returning URL also needs HTTPS to do anything: its cookie is marked `Secure`, so a
   browser drops it over plain HTTP.
 - **Proxy/VPN detection beyond Tor exits, cloud providers' published ranges, and region
@@ -163,7 +163,8 @@ packages/admin/     the admin API: sessions, API keys, TOTP, domain/link/setting
 packages/ui/        the web interface: React 19, Tailwind 4, a Vite build the admin
                     service serves from its own host and dist/. No colour in source, no
                     Radix overlay primitive, no runtime import from a service package,
-                    one <h1> per screen. Every time shown is the browser's own zone.
+                    one <h1> per screen. Every time shown is the browser's own zone, except a
+                    click's raw fields, which are labelled UTC.
 packages/cli/       `clickmonk migrate | domain | link add | settings | ipdata | admin | apikey`.
                     Two commands here are deliberately not API routes: `admin create`,
                     because nothing can authenticate before the account exists, and
