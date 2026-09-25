@@ -113,6 +113,7 @@ describe('the link list', () => {
         link('spring'),
         link('off', 'go.example.test', { enabled: false }),
         link('soon', 'new.example.test'),
+        link('locked', 'go.example.test', { hasPassword: true }),
       ],
       nextCursor: null,
     }))
@@ -122,6 +123,8 @@ describe('the link list', () => {
     expect(state(1)).toHaveTextContent(/^Active$/)
     expect(state(2)).toHaveTextContent(/^Disabled: answers as an unknown slug$/)
     expect(state(3)).toHaveTextContent(/^Domain not verified: answers 404$/)
+    // A rule and no status: the rule is what the cell says, with no "Active".
+    expect(state(4)).toHaveTextContent(/^Password$/)
   })
 
   // A domain the truncated /api/domains answer left out (issue #22) is not
