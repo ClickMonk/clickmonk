@@ -169,6 +169,18 @@ describe('what the stack publishes', () => {
     }
   })
 
+  // Read-only: this service has no reason to write IP data, and a later edit
+  // that drops `:ro` is exactly the change nobody reviews.
+  it('mounts the IP data volume read-only on the admin service', () => {
+    const block = serviceBlock(cfg, 'admin')
+    // The resolved configuration expands the short `ipdata:/path:ro` form
+    // into the long one below; `read_only: true` is what this asserts, since
+    // that is the field a later edit dropping `:ro` would actually change.
+    expect(block).toMatch(
+      /\n {6}- type: volume\n {8}source: ipdata\n {8}target: \/var\/lib\/clickmonk\/ipdata\n {8}read_only: true\n/,
+    )
+  })
+
   it('tells the redirect to believe a forwarded address only from the stack’s own network', () => {
     expect(cfg).toContain('CLICKMONK_TRUSTED_PROXIES: uniquelocal,loopback')
   })

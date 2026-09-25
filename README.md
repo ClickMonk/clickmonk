@@ -123,7 +123,9 @@ What does not work yet:
   simply not arrived yet.
 - **Reports answer nothing while ClickHouse is down.** `GET /api/reports/…`,
   `GET /api/clicks`, `GET /api/clicks.csv` and `GET /api/clicks/count` answer 503; domains,
-  links and settings keep working.
+  links and settings keep working. `GET /api/status` is the exception: it still answers
+  200, with `"reporting":"unavailable"`, because it is the thing that says reporting is
+  down.
 - **An export that fails part way through ends the connection** rather than finishing the
   file, because a file that looks complete and is not is worse than a download that broke.
 - **Any notification.** Nothing is emailed, posted or pushed anywhere: there is no mail
@@ -477,6 +479,25 @@ Add `&link=<id>` to any of them for one link instead of all of them. **Nothing l
 link up**, so an id that belongs to no link is an empty answer rather than an error, on all
 six of these.
 
+**`GET /api/status`** takes no query string and answers how fresh everything is in one read:
+
+```sh
+curl -H "authorization: Bearer $KEY" "https://admin.example.com/api/status"
+# {"newestHour":"2026-09-24T11:00:00.000Z","reporting":"ok",
+#  "ipData":{"country":{"version":"2026-09","fetchedAt":"2026-09-20T03:00:00.000Z"},
+#            "asn":null,"datacenter":null,"tor":{"version":"…","fetchedAt":"…"}},
+#  "ipDataProblem":null,"alerts":2}
+```
+
+`newestHour` and `reporting` are the summary's own freshness, answered here even when
+ClickHouse cannot be reached: `reporting` is `"unavailable"` and `newestHour` is `null`
+rather than a 503, because this is the route that says reporting is down. `ipData` is each
+IP list's version and when it was fetched, `null` for a source never fetched and `null` for
+the whole field on an install with no IP data yet — `CLICKMONK_IPDATA_UPDATE=off`, or a
+fresh one. `ipDataProblem` is set, with `ipData` then `null` too, only when the manifest is
+there and could not be read; the response never says why, so check the admin service's own
+log for the reason. `alerts` is the count `GET /api/alerts` would list, capped the same way.
+
 **A report counts whole buckets; the log counts milliseconds.** Before a report is counted,
 `from` is floored and `to` raised to the next boundary, and **the boundary is the grain that
 report answers at**: the hour for the summary and the breakdown, because that is the grain
@@ -659,7 +680,9 @@ you find out.
 The worker downloads four lists to your server, and `clickmonk ipdata update` fetches
 them on demand. The redirect looks each visitor's address up in memory: no lookup
 leaves your server, and no request waits for a download. The lists take about 25 MB of
-the redirect's memory, and each has a fixed ceiling.
+the redirect's memory, and each has a fixed ceiling. The admin service also mounts this
+volume, read-only, and reads it for nothing but `GET /api/status` — to say how old each
+list is.
 
 The address looked up is the one Caddy passes on, which is the visitor's: Caddy is the
 only service with a published port, nothing outside the stack can open a connection to the

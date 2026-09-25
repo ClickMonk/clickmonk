@@ -34,6 +34,7 @@ const app = buildAdminApp(
     ch,
     adminHost: config.adminHost,
     dnsServers: config.dnsServers,
+    ipdataDir: config.ipdataDir,
   },
   { trustProxy: config.trustedProxies },
 )

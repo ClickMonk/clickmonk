@@ -21,6 +21,7 @@ import { registerLinkRoutes } from './links.js'
 import { registerReportRoutes } from './reports.js'
 import { registerSessionRoutes } from './session-routes.js'
 import { registerSettingsRoutes } from './settings-routes.js'
+import { registerStatusRoutes } from './status.js'
 
 /** Failed sign-ins from one client before it is refused, and the window. */
 export const LOGIN_ATTEMPT_LIMIT = 10
@@ -121,6 +122,13 @@ export interface AdminDeps {
    * has to read the log passes a destination stream here instead.
    */
   log?: FastifyServerOptions['logger']
+  /**
+   * Where the worker writes the IP data manifest, mounted read-only here. Read
+   * by the status route only. Absent in most tests, which then see the
+   * default directory — which does not exist on a test machine, and reads as
+   * "no IP data yet".
+   */
+  ipdataDir?: string
 }
 
 export interface AdminContext extends AdminDeps {
@@ -302,6 +310,7 @@ export function buildAdminApp(
   registerSettingsRoutes(app, ctx)
   registerReportRoutes(app, ctx)
   registerClickRoutes(app, ctx)
+  registerStatusRoutes(app, ctx)
 
   return app
 }

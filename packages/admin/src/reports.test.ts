@@ -1322,6 +1322,16 @@ describe('when ClickHouse is not there', () => {
     expect(r.statusCode).toBe(200)
   })
 
+  // Status is the one report route that does not turn an unreachable store
+  // into a 503: it is the thing that tells the operator reporting is down, so
+  // it cannot do that by being down with it.
+  it('answers status 200 and says reporting is unavailable, rather than a 503', async () => {
+    const r = await deadApp.inject({ method: 'GET', url: '/api/status', headers: read(cookie) })
+    expect(r.statusCode).toBe(200)
+    expect(r.json().reporting).toBe('unavailable')
+    expect(r.json().newestHour).toBeNull()
+  })
+
   // The answer is the same 503 as an unreachable store, so the status alone
   // pins nothing: with no guard at all the query is attempted on nothing, the
   // TypeError is caught where a ClickHouse failure is caught, and the caller

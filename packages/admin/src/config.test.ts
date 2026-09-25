@@ -25,7 +25,14 @@ describe('loadConfig', () => {
       port: 9100,
       trustedProxies: ['127.0.0.1'],
       dnsServers: [],
+      ipdataDir: '/var/lib/clickmonk/ipdata',
     })
+  })
+
+  it('takes a set IP data directory as given', () => {
+    expect(loadConfig({ ...base, CLICKMONK_IPDATA_DIR: '/mnt/ipdata' }).ipdataDir).toBe(
+      '/mnt/ipdata',
+    )
   })
 
   // All four, one row each: the comment on them claims that an install with a
