@@ -155,6 +155,24 @@ describe('a session that ends while the application is open', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
     expect(s.calls.filter((c) => c === 'GET /api/me')).toHaveLength(1)
   })
+
+  // The overview's ten report requests and the header's status, all answering
+  // 401 because the session ended a moment ago. One sign-in screen, no error.
+  it('goes to the sign-in screen once when every request on the overview is refused', async () => {
+    const refused = () => json(401, { error: 'unauthenticated', message: 'sign in' })
+    const s = server({
+      'GET /api/me': () => json(200, ME),
+      'GET /api/status': refused,
+      'GET /api/reports/summary': refused,
+      'GET /api/reports/timeseries': refused,
+      'GET /api/reports/breakdown': refused,
+    })
+    show(s.makeClient, '/overview')
+    expect(await screen.findByRole('heading', { level: 1, name: 'Sign in' })).toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent('Your session ended. Sign in again.')
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(s.calls.filter((c) => c === 'GET /api/me')).toHaveLength(1)
+  })
 })
 
 describe('signing in and out', () => {

@@ -1,4 +1,5 @@
 import { NotFound } from '@/screens/NotFound'
+import { Overview } from '@/screens/overview/Overview'
 import { Navigate, Route, Routes } from 'react-router'
 import { PageHeader } from './PageHeader'
 
@@ -11,7 +12,7 @@ export function AppRoutes() {
   return (
     <Routes>
       <Route path="/" element={<Navigate to="/overview" replace />} />
-      <Route path="/overview" element={<Placeholder title="Overview" />} />
+      <Route path="/overview" element={<Overview />} />
       <Route path="/links" element={<Placeholder title="Links" />} />
       <Route path="/links/new" element={<Placeholder title="New link" />} />
       <Route path="/links/:id" element={<Placeholder title="Link" />} />
