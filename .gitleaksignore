@@ -1,0 +1,6 @@
+# Test fixtures that look like secrets and are not: a made-up API key whose
+# secret part is base64 of "secret-secret-…", and a DNS verification token of
+# hex digits in order. Each line is gitleaks' fingerprint of the commit that
+# introduced the fixture; history is kept, so the fingerprint is the only fix.
+d0334a0c90754bdca095ee6967253ae30ca60d43:packages/ui/src/screens/account/ApiKeys.test.tsx:generic-api-key:8
+792d0fb97eafb920a7857ca969d10bea93ee45e4:packages/ui/src/screens/domains/Domains.test.tsx:generic-api-key:11
