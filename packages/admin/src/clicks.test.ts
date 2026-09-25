@@ -929,7 +929,39 @@ describe('GET /api/clicks/count', () => {
       url: `/api/clicks/count?${WINDOW}&class=bot`,
       headers: read(cookie),
     })
-    expect(r.json().count).toBe(1)
+    expect(r.statusCode).toBe(200)
+    // Whole, not just `.count`: `link` is echoed from the parsed window on
+    // every case in this block, and a body only ever asserted at its least
+    // interesting value — `null` — can be answered by a constant.
+    expect(r.json()).toEqual({
+      window: { from: '2026-09-24T00:00:00.000Z', to: '2026-09-25T00:00:00.000Z' },
+      link: null,
+      count: 1,
+      cap: 1_000_000,
+      truncated: false,
+    })
+  })
+
+  // Whole, and this is where `link` carries a value: link A is the first click
+  // and the bot click, both counted once each; link B's own click is outside
+  // this filter. Nothing in the block above exercises the link filter at all —
+  // every other case here leaves it unset — so an implementation that echoed
+  // the parsed window's `linkId` but never bound it into the probe's `WHERE`
+  // would still answer every other test in this file correctly.
+  it('counts one link when asked for one', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/clicks/count?${WINDOW}&link=${LINK_A}`,
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.json()).toEqual({
+      window: { from: '2026-09-24T00:00:00.000Z', to: '2026-09-25T00:00:00.000Z' },
+      link: LINK_A,
+      count: 2,
+      cap: 1_000_000,
+      truncated: false,
+    })
   })
 
   it('says the export would stop at the cap, and counts no further than it', async () => {
