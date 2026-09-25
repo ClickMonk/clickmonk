@@ -22,6 +22,10 @@ export function Domains() {
   const [host, setHost] = useState('')
   const [addError, setAddError] = useState<ApiError | null>(null)
   const [adding, setAdding] = useState(false)
+  // See `DomainCard`: a non-`ApiError` failure is a defect, rethrown to React
+  // rather than left as an unhandled rejection from `add`'s own async IIFE.
+  const [thrown, setThrown] = useState<unknown>(null)
+  if (thrown !== null) throw thrown
 
   const add = (e: FormEvent) => {
     e.preventDefault()
@@ -34,7 +38,7 @@ export function Domains() {
         list.reload()
       } catch (err) {
         if (err instanceof ApiError) setAddError(err)
-        else throw err
+        else setThrown(err)
       } finally {
         setAdding(false)
       }
@@ -84,7 +88,7 @@ export function Domains() {
           ))}
         </div>
       )}
-      {list.data?.truncated && (
+      {list.state !== 'error' && list.data?.truncated && (
         <p className="text-sm text-muted-foreground">
           Only the first 500 domains by name are shown; clickmonk domain list shows every one.
         </p>

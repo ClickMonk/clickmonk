@@ -11,6 +11,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { fieldErrors } from '@/screens/links/linkForm'
 import { type FormEvent, useState } from 'react'
 
 /** A check's result in words. An error is not an absent record, and is not said as one. */
@@ -26,8 +27,35 @@ export function DomainCard({ d, onChanged }: { d: Domain; onChanged: () => void 
   const [check, setCheck] = useState<DomainCheck | null>(null)
   const [note, setNote] = useState<string | null>(null)
   const [error, setError] = useState<ApiError | null>(null)
+  const [saveErrors, setSaveErrors] = useState<Record<string, string>>({})
+  // An error that is not an `ApiError` is a defect, not a refusal to show; it
+  // is rethrown to React the way `Confirm` does, rather than left to become
+  // an unhandled rejection from an async handler nothing awaits.
+  const [thrown, setThrown] = useState<unknown>(null)
+  if (thrown !== null) throw thrown
+
+  // A check just run belongs to this domain's `lastCheck` as it stood when it
+  // ran. Once a reload brings a new `lastCheck` — its own check, with its own
+  // time — the local result steps aside for the stored one, the same as the
+  // URL fields below step aside for a `d` a reload changed under them.
+  const [seenCheckedAt, setSeenCheckedAt] = useState(d.lastCheck?.checkedAt ?? null)
+  if ((d.lastCheck?.checkedAt ?? null) !== seenCheckedAt) {
+    setSeenCheckedAt(d.lastCheck?.checkedAt ?? null)
+    if (check) setCheck(null)
+  }
+
   const [rootUrl, setRootUrl] = useState(d.rootUrl ?? '')
   const [notFoundUrl, setNotFoundUrl] = useState(d.notFoundUrl ?? '')
+  const [seenRootUrl, setSeenRootUrl] = useState(d.rootUrl)
+  const [seenNotFoundUrl, setSeenNotFoundUrl] = useState(d.notFoundUrl)
+  if (d.rootUrl !== seenRootUrl) {
+    setSeenRootUrl(d.rootUrl)
+    setRootUrl(d.rootUrl ?? '')
+  }
+  if (d.notFoundUrl !== seenNotFoundUrl) {
+    setSeenNotFoundUrl(d.notFoundUrl)
+    setNotFoundUrl(d.notFoundUrl ?? '')
+  }
 
   const run = async (fn: () => Promise<void>) => {
     setError(null)
@@ -35,7 +63,7 @@ export function DomainCard({ d, onChanged }: { d: Domain; onChanged: () => void 
       await fn()
     } catch (err) {
       if (err instanceof ApiError) setError(err)
-      else throw err
+      else setThrown(err)
     }
   }
 
@@ -46,13 +74,28 @@ export function DomainCard({ d, onChanged }: { d: Domain; onChanged: () => void 
     if (notFoundUrl !== (d.notFoundUrl ?? ''))
       body.notFoundUrl = notFoundUrl === '' ? null : notFoundUrl
     if (Object.keys(body).length === 0) return
-    void run(async () => {
-      await client.updateDomain(d.id, body)
-      onChanged()
-    })
+    setSaveErrors({})
+    void (async () => {
+      try {
+        await client.updateDomain(d.id, body)
+        onChanged()
+      } catch (err) {
+        if (err instanceof ApiError) setSaveErrors(fieldErrors(err.message))
+        else setThrown(err)
+      }
+    })()
   }
 
-  const last = check ? { ...check, checkedAt: null } : d.lastCheck
+  const checkNow = () =>
+    run(async () => {
+      const r = await client.checkDomain(d.id)
+      setCheck(r)
+      // The service's writer records the result under the domain, not just in
+      // this response: a reload is what brings the stored check, its time,
+      // and — for a check that verified the domain — the badge that follows.
+      onChanged()
+    })
+
   return (
     <Card>
       <section aria-labelledby={`domain-${d.id}`}>
@@ -89,20 +132,24 @@ export function DomainCard({ d, onChanged }: { d: Domain; onChanged: () => void 
             </dl>
           </div>
           <div className="text-sm">
-            {last === null ? (
-              <p className="text-muted-foreground">Not checked yet</p>
-            ) : check ? (
-              <p>{`${CHECK_WORDS[check.status]}: ${check.detail ?? ''}`}</p>
-            ) : (
+            {check ? (
               <p>
-                <span className="font-medium">{CHECK_WORDS[last.status]}</span>
-                {last.detail && <span className="block text-muted-foreground">{last.detail}</span>}
-                {d.lastCheck && (
-                  <span className="block text-xs text-muted-foreground">
-                    {formatInstant(d.lastCheck.checkedAt, zone)}
-                  </span>
-                )}
+                {check.detail
+                  ? `${CHECK_WORDS[check.status]}: ${check.detail}`
+                  : CHECK_WORDS[check.status]}
               </p>
+            ) : d.lastCheck ? (
+              <p>
+                <span className="font-medium">{CHECK_WORDS[d.lastCheck.status]}</span>
+                {d.lastCheck.detail && (
+                  <span className="block text-muted-foreground">{d.lastCheck.detail}</span>
+                )}
+                <span className="block text-xs text-muted-foreground">
+                  {formatInstant(d.lastCheck.checkedAt, zone)}
+                </span>
+              </p>
+            ) : (
+              <p className="text-muted-foreground">Not checked yet</p>
             )}
           </div>
           <form className="grid gap-3 sm:grid-cols-[1fr_1fr_auto] sm:items-end" onSubmit={saveUrls}>
@@ -111,31 +158,46 @@ export function DomainCard({ d, onChanged }: { d: Domain; onChanged: () => void 
               <Input
                 id={`root-${d.id}`}
                 value={rootUrl}
+                aria-invalid={saveErrors.rootUrl ? true : undefined}
+                aria-describedby={saveErrors.rootUrl ? `root-${d.id}-error` : undefined}
                 onChange={(e) => setRootUrl(e.target.value)}
                 placeholder="Where https://host/ goes"
               />
+              {saveErrors.rootUrl && (
+                <p id={`root-${d.id}-error`} className="text-sm text-destructive">
+                  {saveErrors.rootUrl}
+                </p>
+              )}
             </div>
             <div className="grid gap-1">
               <Label htmlFor={`nf-${d.id}`}>Not-found URL</Label>
               <Input
                 id={`nf-${d.id}`}
                 value={notFoundUrl}
+                aria-invalid={saveErrors.notFoundUrl ? true : undefined}
+                aria-describedby={saveErrors.notFoundUrl ? `nf-${d.id}-error` : undefined}
                 onChange={(e) => setNotFoundUrl(e.target.value)}
                 placeholder="Where an unknown slug goes"
               />
+              {saveErrors.notFoundUrl && (
+                <p id={`nf-${d.id}-error`} className="text-sm text-destructive">
+                  {saveErrors.notFoundUrl}
+                </p>
+              )}
             </div>
             <Button type="submit" variant="secondary">
               Save URLs
             </Button>
           </form>
+          {saveErrors.form && (
+            <p role="alert" className="text-sm text-destructive">
+              {saveErrors.form}
+            </p>
+          )}
           {error && <ErrorNote error={error} />}
           {note && <p className="text-sm text-muted-foreground">{note}</p>}
           <div className="flex flex-wrap gap-2">
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => run(async () => setCheck(await client.checkDomain(d.id)))}
-            >
+            <Button type="button" variant="outline" onClick={checkNow}>
               Check now
             </Button>
             {d.verified && (

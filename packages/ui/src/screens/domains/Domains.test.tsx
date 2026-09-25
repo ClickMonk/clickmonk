@@ -10,6 +10,12 @@ import { Domains } from './Domains'
 
 const TOKEN = 'clickmonk-verify=0123456789abcdef0123456789abcdef'
 
+/** The service's own words (admin/src/domains.ts), verbatim. */
+const UNVERIFY_NOTE =
+  'links on this domain now answer 404 and no certificate will be renewed for it; a certificate already issued is presented until it expires'
+const CHECKED_RECENTLY = (lastStatus: string) =>
+  `this domain was checked less than 60 seconds ago; its last result was ${lastStatus}`
+
 const domain = (host: string, over: Partial<Domain> = {}): Domain => ({
   id: `d-${host}`,
   host,
@@ -29,6 +35,14 @@ function show(list: Domain[], over: Parameters<typeof fakeClient>[0] = {}, trunc
       const d = domain(body.host)
       current = [...current, d]
       return Promise.resolve(d)
+    }) as never,
+    deleteDomain: ((id: string) => {
+      current = current.filter((d) => d.id !== id)
+      return Promise.resolve({ ok: true as const })
+    }) as never,
+    unverifyDomain: ((id: string) => {
+      current = current.map((d) => (d.id === id ? { ...d, verified: false } : d))
+      return Promise.resolve({ ok: true as const, note: UNVERIFY_NOTE })
     }) as never,
     ...over,
   })
@@ -133,9 +147,8 @@ describe('the domain list', () => {
     const heading = await screen.findByRole('heading', { level: 2, name: 'go.example.test' })
     await user.type(screen.getByLabelText('Host name'), 'added.example.test')
     await user.click(screen.getByRole('button', { name: 'Add domain' }))
-    const busy = heading.closest('[aria-busy]')
-    expect(busy).toHaveAttribute('aria-busy', 'true')
-    expect(busy).toHaveClass('opacity-50')
+    await waitFor(() => expect(heading.closest('[aria-busy]')).toHaveAttribute('aria-busy', 'true'))
+    expect(heading.closest('[aria-busy]')).toHaveClass('opacity-50')
     resolveSecond?.({
       domains: [domain('go.example.test'), domain('added.example.test')],
       truncated: false,
@@ -164,15 +177,102 @@ describe('the domain list', () => {
       screen.queryByRole('heading', { level: 2, name: 'go.example.test' }),
     ).not.toBeInTheDocument()
   })
+
+  it('hides the truncation notice too, once a reload fails', async () => {
+    let calls = 0
+    const { user } = show([], {
+      domains: (() => {
+        calls += 1
+        if (calls === 1)
+          return Promise.resolve({ domains: [domain('go.example.test')], truncated: true })
+        return Promise.reject(new ApiError(500, 'server_error', 'the service is down'))
+      }) as never,
+      addDomain: () => Promise.resolve(domain('added.example.test')),
+    })
+    await screen.findByText(/Only the first 500 domains by name are shown/)
+    await user.type(screen.getByLabelText('Host name'), 'added.example.test')
+    await user.click(screen.getByRole('button', { name: 'Add domain' }))
+    expect(await screen.findByRole('alert')).toBeInTheDocument()
+    expect(
+      screen.queryByText(/Only the first 500 domains by name are shown/),
+    ).not.toBeInTheDocument()
+  })
+
+  it('resyncs a card’s URL inputs when a reload changes the domain from elsewhere', async () => {
+    let calls = 0
+    const { user } = show([], {
+      domains: (() => {
+        calls += 1
+        if (calls === 1)
+          return Promise.resolve({
+            domains: [domain('go.example.test', { rootUrl: 'https://example.com/old' })],
+            truncated: false,
+          })
+        return Promise.resolve({
+          domains: [domain('go.example.test', { rootUrl: 'https://example.com/new' })],
+          truncated: false,
+        })
+      }) as never,
+      addDomain: () => Promise.resolve(domain('second.example.test')),
+    })
+    const c = await card('go.example.test')
+    expect(within(c).getByLabelText('Root URL')).toHaveValue('https://example.com/old')
+    await user.type(screen.getByLabelText('Host name'), 'second.example.test')
+    await user.click(screen.getByRole('button', { name: 'Add domain' }))
+    await waitFor(async () => {
+      expect(within(await card('go.example.test')).getByLabelText('Root URL')).toHaveValue(
+        'https://example.com/new',
+      )
+    })
+  })
+
+  it('reloads after a check, so the stored result — with its time — replaces the local one', async () => {
+    let calls = 0
+    const { user } = show([domain('go.example.test')], {
+      domains: (() => {
+        calls += 1
+        if (calls === 1)
+          return Promise.resolve({ domains: [domain('go.example.test')], truncated: false })
+        return Promise.resolve({
+          domains: [
+            domain('go.example.test', {
+              verified: true,
+              lastCheck: {
+                status: 'verified',
+                detail: null,
+                checkedAt: '2026-10-07T03:00:00.000Z',
+              },
+            }),
+          ],
+          truncated: false,
+        })
+      }) as never,
+      checkDomain: () => Promise.resolve({ status: 'verified', detail: 'dns ok' }),
+    })
+    const c = await card('go.example.test')
+    await user.click(within(c).getByRole('button', { name: 'Check now' }))
+    await waitFor(async () => {
+      expect(within(await card('go.example.test')).getByText('Verified')).toBeInTheDocument()
+    })
+    const c2 = await card('go.example.test')
+    // The fresh local result (with its own detail, no time) has stepped
+    // aside for the stored one (no detail here, but its own checked-at time)
+    // — not stayed forever, which is what a check that never reloads would do.
+    expect(within(c2).queryByText('Found the record: dns ok')).not.toBeInTheDocument()
+    expect(within(c2).getByText('Found the record')).toBeInTheDocument()
+    expect(within(c2).getByText(/13:30/)).toBeInTheDocument()
+    expect(within(c2).getByRole('button', { name: 'Stop serving' })).toBeInTheDocument()
+  })
 })
 
 describe('adding a domain', () => {
-  it('sends the host and nothing else, and shows the new domain with its record', async () => {
+  it('sends the host and nothing else, shows the new domain, and clears the field', async () => {
     const { client, user } = show([])
     await user.type(screen.getByLabelText('Host name'), 'go.example.test')
     await user.click(screen.getByRole('button', { name: 'Add domain' }))
     expect(await card('go.example.test')).toBeInTheDocument()
     expect(calls(client, 'addDomain')).toEqual([[{ host: 'go.example.test' }]])
+    expect(screen.getByLabelText('Host name')).toHaveValue('')
   })
 
   it.each([
@@ -182,7 +282,7 @@ describe('adding a domain', () => {
       'that is the host name this API answers on, so links on it would never resolve',
     ],
     ['invalid_host', 'not a valid host name'],
-  ])('says %s beside the host name', async (code, message) => {
+  ])('says %s beside the host name, and keeps what was typed', async (code, message) => {
     const { user } = show([], {
       addDomain: () =>
         Promise.reject(new ApiError(code === 'invalid_host' ? 400 : 409, code, message)),
@@ -191,6 +291,22 @@ describe('adding a domain', () => {
     await user.click(screen.getByRole('button', { name: 'Add domain' }))
     expect(await screen.findByText(message)).toBeInTheDocument()
     expect(screen.getByLabelText('Host name')).toHaveAccessibleDescription(message)
+    expect(screen.getByLabelText('Host name')).toHaveValue('go.example.test')
+  })
+
+  it('does not clear the host field before the add answers', async () => {
+    let resolveAdd: ((d: Domain) => void) | undefined
+    const { user } = show([], {
+      addDomain: () =>
+        new Promise<Domain>((resolve) => {
+          resolveAdd = resolve
+        }),
+    })
+    await user.type(screen.getByLabelText('Host name'), 'go.example.test')
+    await user.click(screen.getByRole('button', { name: 'Add domain' }))
+    expect(screen.getByLabelText('Host name')).toHaveValue('go.example.test')
+    resolveAdd?.(domain('go.example.test'))
+    await waitFor(() => expect(screen.getByLabelText('Host name')).toHaveValue(''))
   })
 })
 
@@ -216,20 +332,13 @@ describe('a domain’s actions', () => {
     const { user } = show([domain('go.example.test')], {
       checkDomain: () =>
         Promise.reject(
-          new ApiError(
-            429,
-            'checked_recently',
-            'this domain was checked less than a minute ago; its last result was missing_token',
-            42,
-          ),
+          new ApiError(429, 'checked_recently', CHECKED_RECENTLY('missing_token'), 42),
         ),
     })
     await user.click(
       within(await card('go.example.test')).getByRole('button', { name: 'Check now' }),
     )
-    expect(await screen.findByRole('alert')).toHaveTextContent(
-      'this domain was checked less than a minute ago',
-    )
+    expect(await screen.findByRole('alert')).toHaveTextContent(CHECKED_RECENTLY('missing_token'))
   })
 
   it('changes a root URL and sends only that, and clears one with null', async () => {
@@ -266,14 +375,46 @@ describe('a domain’s actions', () => {
     ])
   })
 
-  it('stops serving a verified domain after saying what that does and does not do', async () => {
-    const { client, user } = show([domain('go.example.test', { verified: true })], {
-      unverifyDomain: () =>
-        Promise.resolve({
-          ok: true as const,
-          note: 'links on this domain now answer 404 and no certificate will be renewed for it',
-        }),
+  it('sends only the not-found URL when only it changed', async () => {
+    const { client, user } = show(
+      [domain('go.example.test', { verified: true, notFoundUrl: 'https://example.com/old' })],
+      {
+        updateDomain: ((_id: string, body: object) =>
+          Promise.resolve(domain('go.example.test', body))) as never,
+      },
+    )
+    const c = await card('go.example.test')
+    await user.clear(within(c).getByLabelText('Not-found URL'))
+    await user.type(within(c).getByLabelText('Not-found URL'), 'https://example.com/new')
+    await user.click(within(c).getByRole('button', { name: 'Save URLs' }))
+    expect(calls(client, 'updateDomain')).toEqual([
+      ['d-go.example.test', { notFoundUrl: 'https://example.com/new' }],
+    ])
+  })
+
+  it('splits a Save URLs refusal per field, keeping what was typed', async () => {
+    const { user } = show([domain('go.example.test', { verified: true })], {
+      updateDomain: () =>
+        Promise.reject(
+          new ApiError(
+            400,
+            'invalid_body',
+            'rootUrl: must be an absolute http(s) URL of printable ASCII with no token',
+          ),
+        ),
     })
+    const c = await card('go.example.test')
+    await user.type(within(c).getByLabelText('Root URL'), 'not a url')
+    await user.click(within(c).getByRole('button', { name: 'Save URLs' }))
+    const message = 'must be an absolute http(s) URL of printable ASCII with no token'
+    expect(await within(c).findByText(message)).toBeInTheDocument()
+    expect(within(c).getByLabelText('Root URL')).toHaveAccessibleDescription(message)
+    expect(within(c).getByLabelText('Root URL')).toHaveValue('not a url')
+    expect(within(c).getByLabelText('Not-found URL')).toHaveValue('')
+  })
+
+  it('stops serving a verified domain after saying what that does and does not do, and the badge follows the reload', async () => {
+    const { client, user } = show([domain('go.example.test', { verified: true })])
     await user.click(
       within(await card('go.example.test')).getByRole('button', { name: 'Stop serving' }),
     )
@@ -281,12 +422,11 @@ describe('a domain’s actions', () => {
       'A certificate already issued is presented until it expires',
     )
     await user.click(screen.getByRole('button', { name: 'Stop serving go.example.test' }))
-    expect(
-      await screen.findByText(
-        'links on this domain now answer 404 and no certificate will be renewed for it',
-      ),
-    ).toBeInTheDocument()
+    expect(await screen.findByText(UNVERIFY_NOTE)).toBeInTheDocument()
     expect(calls(client, 'unverifyDomain')).toEqual([['d-go.example.test']])
+    const c = await card('go.example.test')
+    expect(within(c).getByText('Not verified: its links answer 404')).toBeInTheDocument()
+    expect(within(c).getByText(UNVERIFY_NOTE)).toBeInTheDocument()
   })
 
   it('offers no way to stop serving a domain that is not verified', async () => {
@@ -296,13 +436,55 @@ describe('a domain’s actions', () => {
     ).not.toBeInTheDocument()
   })
 
-  it('deletes a domain after saying its links go with it', async () => {
-    const { client, user } = show([domain('go.example.test')], {
-      deleteDomain: () => Promise.resolve({ ok: true as const }),
-    })
+  it('deletes a domain after saying its links go with it, and drops its card on reload', async () => {
+    const { client, user } = show([domain('go.example.test')])
     await user.click(within(await card('go.example.test')).getByRole('button', { name: 'Delete' }))
     expect(screen.getByRole('alertdialog')).toHaveTextContent('Every link on it goes with it')
     await user.click(screen.getByRole('button', { name: 'Delete go.example.test' }))
     expect(calls(client, 'deleteDomain')).toEqual([['d-go.example.test']])
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('heading', { level: 2, name: 'go.example.test' }),
+      ).not.toBeInTheDocument(),
+    )
+  })
+
+  it('keeps the second card’s own inputs after the first is deleted', async () => {
+    const { user } = show([
+      domain('a.example.test', { rootUrl: 'https://example.com/a' }),
+      domain('b.example.test', { rootUrl: 'https://example.com/b' }),
+    ])
+    const b = await card('b.example.test')
+    expect(within(b).getByLabelText('Root URL')).toHaveValue('https://example.com/b')
+    await user.click(within(await card('a.example.test')).getByRole('button', { name: 'Delete' }))
+    await user.click(screen.getByRole('button', { name: 'Delete a.example.test' }))
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('heading', { level: 2, name: 'a.example.test' }),
+      ).not.toBeInTheDocument(),
+    )
+    const b2 = await card('b.example.test')
+    expect(within(b2).getByLabelText('Root URL')).toHaveValue('https://example.com/b')
+  })
+
+  it('does not leak the first card’s own note onto the second after the first is deleted', async () => {
+    const { user } = show([
+      domain('a.example.test', { verified: true }),
+      domain('b.example.test', { verified: true }),
+    ])
+    await user.click(
+      within(await card('a.example.test')).getByRole('button', { name: 'Stop serving' }),
+    )
+    await user.click(screen.getByRole('button', { name: 'Stop serving a.example.test' }))
+    expect(await within(await card('a.example.test')).findByText(UNVERIFY_NOTE)).toBeInTheDocument()
+    await user.click(within(await card('a.example.test')).getByRole('button', { name: 'Delete' }))
+    await user.click(screen.getByRole('button', { name: 'Delete a.example.test' }))
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('heading', { level: 2, name: 'a.example.test' }),
+      ).not.toBeInTheDocument(),
+    )
+    const b = await card('b.example.test')
+    expect(within(b).queryByText(UNVERIFY_NOTE)).not.toBeInTheDocument()
   })
 })
