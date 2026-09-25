@@ -107,6 +107,23 @@ describe('the link list', () => {
     ).not.toBeInTheDocument()
   })
 
+  it('says a plain link is active, and says nothing of the kind beside a badge', async () => {
+    show(() => ({
+      items: [
+        link('spring'),
+        link('off', 'go.example.test', { enabled: false }),
+        link('soon', 'new.example.test'),
+      ],
+      nextCursor: null,
+    }))
+    const rows = await screen.findAllByRole('row')
+    const state = (i: number) =>
+      within(rows[i] as HTMLElement).getAllByRole('cell')[2] as HTMLElement
+    expect(state(1)).toHaveTextContent(/^Active$/)
+    expect(state(2)).toHaveTextContent(/^Disabled: answers as an unknown slug$/)
+    expect(state(3)).toHaveTextContent(/^Domain not verified: answers 404$/)
+  })
+
   // A domain the truncated /api/domains answer left out (issue #22) is not
   // known to be unverified, so the list must not guess: no badge rather than
   // a wrong one.

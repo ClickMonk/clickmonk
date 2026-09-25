@@ -212,6 +212,11 @@ export function Links() {
                             {f}
                           </Badge>
                         ))}
+                        {/* A link with nothing to say about it is serving:
+                            said, so the cell does not read as missing data. */}
+                        {!unverified && facts.status.length + facts.rules.length === 0 && (
+                          <span className="text-sm text-muted-foreground">Active</span>
+                        )}
                       </div>
                     </TableCell>
                     <TableCell className="text-sm text-muted-foreground">
