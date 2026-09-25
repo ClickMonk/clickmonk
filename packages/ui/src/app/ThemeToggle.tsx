@@ -1,5 +1,5 @@
 import { Moon, Sun } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useSyncExternalStore } from 'react'
 
 /** Read by `public/theme.js` before first paint as well; the two must agree on this key. */
 export const THEME_KEY = 'cm-theme'
@@ -15,7 +15,20 @@ function stored(): Choice {
   }
 }
 
-const systemDark = () => window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? false
+const DARK_QUERY = '(prefers-color-scheme: dark)'
+
+const systemDark = () => window.matchMedia?.(DARK_QUERY).matches ?? false
+
+/**
+ * Follows the system's scheme while the page is open. Read once at render, a
+ * change of the system scheme would leave the button naming and drawing the
+ * theme the page already shows, and pressing it would change nothing.
+ */
+const subscribeToSystem = (onChange: () => void): (() => void) => {
+  const q = window.matchMedia?.(DARK_QUERY)
+  q?.addEventListener('change', onChange)
+  return () => q?.removeEventListener('change', onChange)
+}
 
 /**
  * Light or dark. The button names the theme it switches to, because an icon for
@@ -25,6 +38,7 @@ const systemDark = () => window.matchMedia?.('(prefers-color-scheme: dark)').mat
  */
 export function ThemeToggle() {
   const [choice, setChoice] = useState<Choice>(stored)
+  const dark = useSyncExternalStore(subscribeToSystem, systemDark)
   useEffect(() => {
     const root = document.documentElement
     if (choice === 'system') root.removeAttribute('data-theme')
@@ -36,7 +50,7 @@ export function ThemeToggle() {
       // A browser that refuses storage keeps the choice for this page only.
     }
   }, [choice])
-  const applied = choice === 'system' ? (systemDark() ? 'dark' : 'light') : choice
+  const applied = choice === 'system' ? (dark ? 'dark' : 'light') : choice
   const target = applied === 'dark' ? 'light' : 'dark'
   return (
     <button
