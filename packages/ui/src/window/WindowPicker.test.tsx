@@ -2,7 +2,7 @@ import { NowProvider } from '@/app/clock'
 import { RefreshProvider, useRefresh } from '@/app/refresh'
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { MemoryRouter, useLocation } from 'react-router'
+import { MemoryRouter, useLocation, useNavigate } from 'react-router'
 import { describe, expect, it } from 'vitest'
 import { WindowPicker } from './WindowPicker'
 import { useWindow } from './useWindow'
@@ -35,7 +35,7 @@ describe('the window picker', () => {
   it('writes a preset to the address and keeps the rest of it', async () => {
     const user = setup('/clicks?class=bot')
     await user.selectOptions(screen.getByRole('combobox', { name: 'Time range' }), 'today')
-    expect(screen.getByLabelText('address')).toHaveTextContent('/clicks?class=bot&range=today')
+    expect(screen.getByLabelText('address').textContent).toBe('/clicks?class=bot&range=today')
   })
 
   // The address is compared whole: a `from` left behind beside `range` would
@@ -52,7 +52,7 @@ describe('the window picker', () => {
     await user.type(screen.getByLabelText('From'), '2026-10-01')
     await user.type(screen.getByLabelText('To'), '2026-10-04')
     await user.click(screen.getByRole('button', { name: 'Apply' }))
-    expect(screen.getByLabelText('address')).toHaveTextContent(
+    expect(screen.getByLabelText('address').textContent).toBe(
       '/overview?from=2026-10-01&to=2026-10-04',
     )
   })
@@ -64,7 +64,7 @@ describe('the window picker', () => {
     await user.type(screen.getByLabelText('To'), '2026-10-01')
     await user.click(screen.getByRole('button', { name: 'Apply' }))
     expect(screen.getByRole('alert')).toHaveTextContent('The end date is before the start date.')
-    expect(screen.getByLabelText('address')).toHaveTextContent('/overview?range=7d')
+    expect(screen.getByLabelText('address').textContent).toBe('/overview?range=7d')
   })
 
   it('refuses a custom range longer than 366 days, and leaves the address alone', async () => {
@@ -127,5 +127,136 @@ describe('the window picker', () => {
     expect(said[0]).toHaveTextContent(
       'That time range could not be used, so this shows the last 7 days.',
     )
+  })
+
+  // The window a preset names ends at "now", and choosing a preset is a moment
+  // the operator asked for the numbers, so it reads now afresh.
+  it('reads now afresh when the choice changes', async () => {
+    let now = Date.parse('2026-10-07T03:00:00.000Z')
+    function End() {
+      const w = useWindow()
+      return <output aria-label="end">{new Date(w.span.toMs).toISOString()}</output>
+    }
+    render(
+      <NowProvider now={() => now}>
+        <MemoryRouter initialEntries={['/overview?range=today']}>
+          <WindowPicker />
+          <End />
+        </MemoryRouter>
+      </NowProvider>,
+    )
+    expect(screen.getByLabelText('end').textContent).toBe('2026-10-07T03:00:00.000Z')
+    now = Date.parse('2026-10-07T03:20:00.000Z')
+    await userEvent
+      .setup()
+      .selectOptions(screen.getByRole('combobox', { name: 'Time range' }), '7d')
+    expect(screen.getByLabelText('end').textContent).toBe('2026-10-07T03:20:00.000Z')
+  })
+
+  it('clears a refusal when a corrected range is applied', async () => {
+    const user = setup('/overview?range=7d')
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Time range' }), 'custom')
+    await user.type(screen.getByLabelText('From'), '2026-10-04')
+    await user.type(screen.getByLabelText('To'), '2026-10-01')
+    await user.click(screen.getByRole('button', { name: 'Apply' }))
+    expect(screen.getByRole('alert')).toHaveTextContent('The end date is before the start date.')
+    await user.clear(screen.getByLabelText('To'))
+    await user.type(screen.getByLabelText('To'), '2026-10-05')
+    await user.click(screen.getByRole('button', { name: 'Apply' }))
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByLabelText('address').textContent).toBe(
+      '/overview?from=2026-10-04&to=2026-10-05',
+    )
+  })
+
+  // The preset is the one the address already names, so the address does not
+  // change and only the choice itself can clear the refusal.
+  it('clears a refusal when a preset is chosen instead', async () => {
+    const user = setup('/overview?range=7d')
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Time range' }), 'custom')
+    await user.type(screen.getByLabelText('From'), '2026-10-04')
+    await user.type(screen.getByLabelText('To'), '2026-10-01')
+    await user.click(screen.getByRole('button', { name: 'Apply' }))
+    expect(screen.getByRole('alert')).toHaveTextContent('The end date is before the start date.')
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Time range' }), '7d')
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByLabelText('address').textContent).toBe('/overview?range=7d')
+  })
+
+  it('clears a refusal once either date is changed', async () => {
+    const user = setup('/overview?range=7d')
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Time range' }), 'custom')
+    await user.type(screen.getByLabelText('From'), '2026-10-04')
+    await user.type(screen.getByLabelText('To'), '2026-10-01')
+    await user.click(screen.getByRole('button', { name: 'Apply' }))
+    await user.clear(screen.getByLabelText('From'))
+    expect(screen.queryByRole('alert')).toBeNull()
+    await user.type(screen.getByLabelText('From'), '2026-10-04')
+    await user.click(screen.getByRole('button', { name: 'Apply' }))
+    expect(screen.getByRole('alert')).toHaveTextContent('The end date is before the start date.')
+    await user.clear(screen.getByLabelText('To'))
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('follows the address back from a custom range to a preset', async () => {
+    function Back() {
+      const navigate = useNavigate()
+      return (
+        <button type="button" onClick={() => navigate(-1)}>
+          Back
+        </button>
+      )
+    }
+    render(
+      <NowProvider now={NOW}>
+        <MemoryRouter
+          initialEntries={['/overview?range=30d', '/overview?from=2026-10-01&to=2026-10-04']}
+          initialIndex={1}
+        >
+          <WindowPicker />
+          <Back />
+        </MemoryRouter>
+      </NowProvider>,
+    )
+    const select = screen.getByRole('combobox', { name: 'Time range' })
+    expect(select).toHaveValue('custom')
+    expect(screen.getByLabelText('From')).toHaveValue('2026-10-01')
+    const user = userEvent.setup()
+    await user.clear(screen.getByLabelText('From'))
+    await user.click(screen.getByRole('button', { name: 'Apply' }))
+    expect(screen.getByRole('alert')).toHaveTextContent('Choose both dates.')
+    await user.click(screen.getByRole('button', { name: 'Back' }))
+    expect(select).toHaveValue('30d')
+    expect(screen.queryByLabelText('From')).toBeNull()
+    // The refusal was of a range the address no longer names.
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('follows the address back from one custom range to another', async () => {
+    function Back() {
+      const navigate = useNavigate()
+      return (
+        <button type="button" onClick={() => navigate(-1)}>
+          Back
+        </button>
+      )
+    }
+    render(
+      <NowProvider now={NOW}>
+        <MemoryRouter
+          initialEntries={[
+            '/overview?from=2026-09-01&to=2026-09-03',
+            '/overview?from=2026-10-01&to=2026-10-04',
+          ]}
+          initialIndex={1}
+        >
+          <WindowPicker />
+          <Back />
+        </MemoryRouter>
+      </NowProvider>,
+    )
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Back' }))
+    expect(screen.getByLabelText('From')).toHaveValue('2026-09-01')
+    expect(screen.getByLabelText('To')).toHaveValue('2026-09-03')
   })
 })

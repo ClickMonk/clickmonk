@@ -177,23 +177,35 @@ const dayMonth = (atMs: number, timeZone: string): string =>
 /**
  * A sentence for a day chart whose days do not all begin at local midnight,
  * or null when they do. Read from the window the service counted, a day at a
- * time, so it describes the bars actually drawn rather than a rule about them.
+ * time, so it describes the bars actually drawn rather than a rule about them,
+ * and names every change of where days begin, in order: a year crosses two.
  */
 export function dayStartNote(counted: Span, timeZone: string): string | null {
-  const starts: { at: number; time: string }[] = []
-  for (let t = counted.fromMs; t < counted.toMs; t += DAY)
-    starts.push({ at: t, time: hhmm(t, timeZone) })
-  const first = starts[0]
+  const changes: { at: number; time: string }[] = []
+  for (let t = counted.fromMs; t < counted.toMs; t += DAY) {
+    const time = hhmm(t, timeZone)
+    if (changes.at(-1)?.time !== time) changes.push({ at: t, time })
+  }
+  const [first, ...later] = changes
   if (!first) return null
-  const change = starts.find((s) => s.time !== first.time)
-  if (first.time === '00:00' && !change) return null
+  if (first.time === '00:00' && later.length === 0) return null
+  const name = (time: string): string => (time === '00:00' ? 'midnight' : time)
   const lead =
     first.time === '00:00'
       ? 'Days are counted from midnight'
       : `Days are counted from ${first.time} rather than midnight`
-  const after = change
-    ? `, and from ${change.time} from ${dayMonth(change.at + 12 * HOUR, timeZone)} on, after the clocks changed`
-    : ''
+  const seen = new Set([first.time])
+  const clauses = later.map((c) => {
+    const again = seen.has(c.time) ? ' again' : ''
+    seen.add(c.time)
+    return `from ${name(c.time)}${again} from ${dayMonth(c.at + 12 * HOUR, timeZone)} on`
+  })
+  const after =
+    clauses.length === 0
+      ? ''
+      : clauses.length === 1
+        ? `, and ${clauses[0]}, after the clocks changed`
+        : `, ${clauses.slice(0, -1).join(', ')}, and ${clauses.at(-1)}, after the clocks changed`
   return `${lead}${after}. Reports are kept by the hour, so a day can only begin on a whole hour of UTC.`
 }
 
@@ -220,8 +232,15 @@ export function describeSpan(s: Span, timeZone: string): string {
   return `${f.format(new Date(s.fromMs))} – ${f.format(new Date(s.toMs))}`
 }
 
+/**
+ * A real calendar date whose next day is also one. The round trip through
+ * `addDays(v, 0)` refuses a date that does not exist (`2026-02-30` comes back
+ * as `2026-03-02`), and the next day must still be four-digit, because a custom
+ * range ends where the day after its last date begins: `9999-12-31` would end
+ * in year 10000, which is not a date this module can write.
+ */
 const isDate = (v: string | null): v is string =>
-  v !== null && DATE_RE.test(v) && addDays(v, 0) === v
+  v !== null && DATE_RE.test(v) && addDays(v, 0) === v && DATE_RE.test(addDays(v, 1))
 
 /** The choice a URL names, or the default and a sentence saying why. */
 export function parseChoice(params: URLSearchParams): { choice: Choice; problem: string | null } {

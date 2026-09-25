@@ -20,12 +20,26 @@ export function WindowPicker() {
   const [to, setTo] = useState(custom ? choice.to : '')
   const [error, setError] = useState<string | null>(null)
 
+  // The address can change under the picker (Back, a link), so what it shows
+  // follows the address's choice whenever that changes, and a refusal of an
+  // earlier range goes with it.
+  const key = JSON.stringify(choice)
+  const [lastKey, setLastKey] = useState(key)
+  if (key !== lastKey) {
+    setLastKey(key)
+    setEditing(custom)
+    setFrom(custom ? choice.from : '')
+    setTo(custom ? choice.to : '')
+    setError(null)
+  }
+
   const apply = () => {
     if (from === '' || to === '') return setError('Choose both dates.')
     if (to < from) return setError('The end date is before the start date.')
     const checked = parseChoice(new URLSearchParams({ from, to }))
     if (checked.problem !== null) return setError('A custom range is at most 366 days.')
-    setError(null)
+    // No refusal is showing here: the dates were changed since the last one,
+    // and changing either clears it.
     setChoice({ from, to })
   }
 
@@ -40,6 +54,7 @@ export function WindowPicker() {
             const v = e.target.value
             if (v === 'custom') return setEditing(true)
             setEditing(false)
+            setError(null)
             setChoice({ preset: v as PresetId })
           }}
         >
@@ -59,12 +74,23 @@ export function WindowPicker() {
               id="window-from"
               type="date"
               value={from}
-              onChange={(e) => setFrom(e.target.value)}
+              onChange={(e) => {
+                setFrom(e.target.value)
+                setError(null)
+              }}
             />
           </div>
           <div className="grid gap-1">
             <Label htmlFor="window-to">To</Label>
-            <Input id="window-to" type="date" value={to} onChange={(e) => setTo(e.target.value)} />
+            <Input
+              id="window-to"
+              type="date"
+              value={to}
+              onChange={(e) => {
+                setTo(e.target.value)
+                setError(null)
+              }}
+            />
           </div>
           <Button type="button" variant="secondary" onClick={apply}>
             Apply

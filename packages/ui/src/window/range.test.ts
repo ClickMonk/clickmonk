@@ -149,6 +149,20 @@ describe('what a day chart counted', () => {
       'Days are counted from midnight, and from 23:00 from 2 November on, after the clocks changed. Reports are kept by the hour, so a day can only begin on a whole hour of UTC.',
     )
   })
+
+  // A year crosses both of New York's clock changes: days begin at midnight,
+  // at 23:00 from the day after the clocks go back (2 November 2025), and at
+  // midnight again from the day after they go forward (8 March 2026).
+  it('names every change in a year, in order', () => {
+    expect(
+      dayStartNote(
+        { fromMs: at('2025-10-08T04:00:00Z'), toMs: at('2026-10-08T04:00:00Z') },
+        'America/New_York',
+      ),
+    ).toBe(
+      'Days are counted from midnight, from 23:00 from 3 November on, and from midnight again from 9 March on, after the clocks changed. Reports are kept by the hour, so a day can only begin on a whole hour of UTC.',
+    )
+  })
 })
 
 describe('labels', () => {
@@ -183,6 +197,8 @@ describe('the choice in the address', () => {
     ['an end before its start', 'from=2026-10-04&to=2026-10-01'],
     ['more than 366 days', 'from=2025-01-01&to=2026-01-02'],
     ['a start and no end', 'from=2026-10-01'],
+    ['a last day whose next day is past year 9999', 'from=9999-12-31&to=9999-12-31'],
+    ['an end whose next day is past year 9999', 'from=9999-01-01&to=9999-12-31'],
   ])('falls back to the last seven days for %s, and says so', (_label, query) => {
     expect(parseChoice(new URLSearchParams(query))).toEqual({
       choice: { preset: '7d' },
