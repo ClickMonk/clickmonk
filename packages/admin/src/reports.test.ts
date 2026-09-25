@@ -130,6 +130,20 @@ beforeAll(async () => {
   // must change none of them — the invariant the whole rollup design rests on,
   // and one no fixture of distinct ids can see.
   await insert([click()])
+  // Link rows for the breakdown by link, which labels each id it counts. The
+  // ids are the ones the clicks above carry; a third link exists and has no
+  // clicks, and must not appear. No row is written for the zero id.
+  await pool.query(
+    `INSERT INTO domains (id, host, verified) VALUES ($1, 'go.example.test', true)`,
+    [DOMAIN],
+  )
+  await pool.query(
+    `INSERT INTO links (id, domain_id, slug, name) VALUES
+       ($1, $3, 'spring', 'Spring offer'),
+       ($2, $3, 'autumn', NULL),
+       ('00000000-0000-4000-8000-0000000000a9', $3, 'unused', NULL)`,
+    [LINK_A, LINK_B, DOMAIN],
+  )
 })
 
 beforeEach(async () => {
@@ -413,6 +427,83 @@ describe('GET /api/reports/timeseries', () => {
     })
   })
 
+  // Days from noon UTC, which is midnight at UTC-12. The four clicks at ten
+  // and the one at half past eleven on the 24th are in the day that began at
+  // noon on the 23rd; the one at half past midnight on the 25th is in the day
+  // that began at noon on the 24th. At offset zero the same request is three
+  // UTC days, which is what the second assertion is for.
+  it('counts days from where the offset puts midnight', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/reports/timeseries?from=2026-09-23T12:00:00.000Z&to=2026-09-25T12:00:00.000Z&bucket=day&offset=-12',
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.json()).toEqual({
+      window: { from: '2026-09-23T12:00:00.000Z', to: '2026-09-25T12:00:00.000Z' },
+      link: null,
+      bucket: 'day',
+      buckets: [
+        { at: '2026-09-23T12:00:00.000Z', clicks: 5, visitors: 2 },
+        { at: '2026-09-24T12:00:00.000Z', clicks: 1, visitors: 1 },
+      ],
+      newestHour: '2026-09-25T00:00:00.000Z',
+    })
+    const utc = await app.inject({
+      method: 'GET',
+      url: '/api/reports/timeseries?from=2026-09-23T12:00:00.000Z&to=2026-09-25T12:00:00.000Z&bucket=day',
+      headers: read(cookie),
+    })
+    expect(utc.json().buckets).toHaveLength(3)
+  })
+
+  it('aligns a ragged window to the offset’s days, and says so', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/reports/timeseries?from=2026-09-24T10:30:00.000Z&to=2026-09-24T11:30:00.000Z&bucket=day&offset=3',
+      headers: read(cookie),
+    })
+    expect(r.json().window).toEqual({
+      from: '2026-09-23T21:00:00.000Z',
+      to: '2026-09-24T21:00:00.000Z',
+    })
+    expect(r.json().buckets).toEqual([{ at: '2026-09-23T21:00:00.000Z', clicks: 5, visitors: 2 }])
+  })
+
+  it('leaves an hour chart as it was, whatever the offset', async () => {
+    const q = 'from=2026-09-24T10:00:00.000Z&to=2026-09-24T12:00:00.000Z&bucket=hour'
+    const plain = await app.inject({
+      method: 'GET',
+      url: `/api/reports/timeseries?${q}`,
+      headers: read(cookie),
+    })
+    const moved = await app.inject({
+      method: 'GET',
+      url: `/api/reports/timeseries?${q}&offset=5`,
+      headers: read(cookie),
+    })
+    expect(moved.json()).toEqual(plain.json())
+    expect(plain.json().buckets).toEqual([
+      { at: '2026-09-24T10:00:00.000Z', clicks: 4, visitors: 2 },
+      { at: '2026-09-24T11:00:00.000Z', clicks: 1, visitors: 1 },
+    ])
+  })
+
+  it.each([
+    ['an offset west of every zone', 'offset=-13'],
+    ['an offset east of every zone', 'offset=15'],
+    ['half an hour', 'offset=5.5'],
+    ['something that is not a number', 'offset=east'],
+  ])('refuses %s', async (_label, extra) => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/reports/timeseries?${WINDOW}&bucket=day&${extra}`,
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(400)
+    expect(r.json().error).toBe('invalid_query')
+  })
+
   it('refuses more buckets than one response carries, and says to ask for days', async () => {
     const r = await app.inject({
       method: 'GET',
@@ -596,6 +687,53 @@ describe('GET /api/reports/breakdown', () => {
         { value: 'bot', clicks: 1, visitors: 1 },
       ],
     })
+  })
+
+  // Link A carries the first click, the second visitor's, the blocked bot's
+  // and the one at half past eleven; link B the same visitor's click on it. The
+  // unused link has no clicks and is not a row.
+  it('breaks a window down by link, and names each link', async () => {
+    const r = await breakdown('dimension=link')
+    expect(r.statusCode).toBe(200)
+    expect(r.json()).toEqual({
+      window: COUNTED,
+      link: null,
+      dimension: 'link',
+      truncated: false,
+      rows: [
+        {
+          value: LINK_A,
+          clicks: 4,
+          visitors: 2,
+          link: { slug: 'spring', host: 'go.example.test', name: 'Spring offer' },
+        },
+        {
+          value: LINK_B,
+          clicks: 1,
+          visitors: 1,
+          link: { slug: 'autumn', host: 'go.example.test', name: null },
+        },
+      ],
+    })
+  })
+
+  it('says a link it counted no longer exists, rather than dropping the row', async () => {
+    await pool.query('DELETE FROM links WHERE id = $1', [LINK_B])
+    try {
+      const r = await breakdown('dimension=link')
+      expect(r.json().rows[1]).toEqual({ value: LINK_B, clicks: 1, visitors: 1, link: null })
+    } finally {
+      await pool.query(
+        `INSERT INTO links (id, domain_id, slug, name) VALUES ($1, $2, 'autumn', NULL)`,
+        [LINK_B, DOMAIN],
+      )
+    }
+  })
+
+  it('carries no link field on any other dimension', async () => {
+    const r = await breakdown('dimension=country')
+    for (const row of r.json().rows)
+      expect(Object.keys(row).sort()).toEqual(['clicks', 'value', 'visitors'])
   })
 
   it.each<[string, { value: string; clicks: number; visitors: number }[]]>([
@@ -994,6 +1132,18 @@ describe('parseWindow', () => {
     expect((thrown as HttpError).status).toBe(400)
     expect((thrown as HttpError).code).toBe('invalid_query')
   })
+
+  it('aligns the start to the offset’s day even when UTC’s day has turned', () => {
+    // 22:30 UTC on the 24th is 01:30 on the 25th at UTC+3, whose day began at
+    // 21:00 UTC on the 24th. Floored without the offset it would be 21:00 UTC
+    // on the 23rd.
+    const w = parseWindow(
+      { from: '2026-09-24T22:30:00.000Z', to: '2026-09-24T23:00:00.000Z' },
+      { alignMs: 86_400_000, offsetMs: 3 * 3_600_000 },
+    )
+    expect(new Date(w.fromMs).toISOString()).toBe('2026-09-24T21:00:00.000Z')
+    expect(new Date(w.toMs).toISOString()).toBe('2026-09-25T21:00:00.000Z')
+  })
 })
 
 describe('the newest hour the install holds', () => {
@@ -1170,6 +1320,16 @@ describe('when ClickHouse is not there', () => {
   it('still answers everything that does not read it', async () => {
     const r = await deadApp.inject({ method: 'GET', url: '/api/links', headers: read(cookie) })
     expect(r.statusCode).toBe(200)
+  })
+
+  // Status is the one report route that does not turn an unreachable store
+  // into a 503: it is the thing that tells the operator reporting is down, so
+  // it cannot do that by being down with it.
+  it('answers status 200 and says reporting is unavailable, rather than a 503', async () => {
+    const r = await deadApp.inject({ method: 'GET', url: '/api/status', headers: read(cookie) })
+    expect(r.statusCode).toBe(200)
+    expect(r.json().reporting).toBe('unavailable')
+    expect(r.json().newestHour).toBeNull()
   })
 
   // The answer is the same 503 as an unreachable store, so the status alone

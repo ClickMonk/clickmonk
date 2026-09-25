@@ -904,6 +904,149 @@ describe('GET /api/clicks.csv', () => {
   })
 })
 
+describe('GET /api/clicks/count', () => {
+  // The window holds three distinct clicks — the first one twice, which FINAL
+  // makes one — and the export's cap is a million.
+  it('says how many clicks an export of the window would write', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/clicks/count?${WINDOW}`,
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.json()).toEqual({
+      window: { from: '2026-09-24T00:00:00.000Z', to: '2026-09-25T00:00:00.000Z' },
+      link: null,
+      count: 3,
+      cap: 1_000_000,
+      truncated: false,
+    })
+  })
+
+  it('applies the log’s filters', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/clicks/count?${WINDOW}&class=bot`,
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(200)
+    // Whole, not just `.count`: `link` is echoed from the parsed window on
+    // every case in this block, and a body only ever asserted at its least
+    // interesting value — `null` — can be answered by a constant.
+    expect(r.json()).toEqual({
+      window: { from: '2026-09-24T00:00:00.000Z', to: '2026-09-25T00:00:00.000Z' },
+      link: null,
+      count: 1,
+      cap: 1_000_000,
+      truncated: false,
+    })
+  })
+
+  // Whole, and this is where `link` carries a value: link A is the first click
+  // and the bot click, both counted once each; link B's own click is outside
+  // this filter. Nothing in the block above exercises the link filter at all —
+  // every other case here leaves it unset — so an implementation that echoed
+  // the parsed window's `linkId` but never bound it into the probe's `WHERE`
+  // would still answer every other test in this file correctly.
+  it('counts one link when asked for one', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/clicks/count?${WINDOW}&link=${LINK_A}`,
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.json()).toEqual({
+      window: { from: '2026-09-24T00:00:00.000Z', to: '2026-09-25T00:00:00.000Z' },
+      link: LINK_A,
+      count: 2,
+      cap: 1_000_000,
+      truncated: false,
+    })
+  })
+
+  it('says the export would stop at the cap, and counts no further than it', async () => {
+    const capped = testApp(pool, clock, { ch, exportRowCap: 2 })
+    try {
+      const r = await capped.inject({
+        method: 'GET',
+        url: `/api/clicks/count?${WINDOW}`,
+        headers: read(cookie),
+      })
+      expect(r.json()).toEqual({
+        window: { from: '2026-09-24T00:00:00.000Z', to: '2026-09-25T00:00:00.000Z' },
+        link: null,
+        count: 2,
+        cap: 2,
+        truncated: true,
+      })
+    } finally {
+      await capped.close()
+    }
+  })
+
+  it('does not claim the cap when the window holds exactly the cap', async () => {
+    const capped = testApp(pool, clock, { ch, exportRowCap: 3 })
+    try {
+      const r = await capped.inject({
+        method: 'GET',
+        url: `/api/clicks/count?${WINDOW}`,
+        headers: read(cookie),
+      })
+      expect(r.json().count).toBe(3)
+      expect(r.json().truncated).toBe(false)
+    } finally {
+      await capped.close()
+    }
+  })
+
+  it.each([
+    ['a page size', 'limit=10'],
+    ['a cursor', 'cursor=1.00000000-0000-4000-8000-000000000001'],
+    ['a field nobody knows', 'sort=time'],
+  ])('refuses %s, which mean nothing to a count', async (_label, extra) => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/clicks/count?${WINDOW}&${extra}`,
+      headers: read(cookie),
+    })
+    expect(r.statusCode).toBe(400)
+    expect(r.json().error).toBe('invalid_query')
+  })
+
+  it('needs a credential', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/clicks/count?${WINDOW}`,
+      headers: { host: ADMIN_HOST },
+    })
+    expect(r.statusCode).toBe(401)
+  })
+
+  it('takes a report slot, not the export’s', async () => {
+    const noExports = testApp(pool, clock, { ch, exportGate: new ConcurrencyGate(0) })
+    const noReports = testApp(pool, clock, { ch, reportGate: new ConcurrencyGate(0) })
+    try {
+      const a = await noExports.inject({
+        method: 'GET',
+        url: `/api/clicks/count?${WINDOW}`,
+        headers: read(cookie),
+      })
+      expect(a.statusCode).toBe(200)
+      const b = await noReports.inject({
+        method: 'GET',
+        url: `/api/clicks/count?${WINDOW}`,
+        headers: read(cookie),
+      })
+      expect(b.statusCode).toBe(429)
+      expect(b.json().error).toBe('too_many_reports')
+      expect(b.headers['retry-after']).toBe('1')
+    } finally {
+      await noExports.close()
+      await noReports.close()
+    }
+  })
+})
+
 /**
  * A gate that counts the slots it handed out and the times they were given back.
  *

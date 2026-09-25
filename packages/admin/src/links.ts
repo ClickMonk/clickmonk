@@ -69,14 +69,32 @@ const LinkFields = {
 
 const CreateBody = z.object({ host: z.string().min(1).max(253), ...LinkFields }).strict()
 const PatchBody = z.object(LinkFields).strict()
+
+/**
+ * A page boundary: the last link's creation time in microseconds since the
+ * epoch, and its id. Microseconds because the column holds them — a boundary
+ * rounded to milliseconds skips or repeats a link created in the same
+ * millisecond as the one before it. Opaque to a caller, and parsed strictly.
+ */
+const LINK_CURSOR_RE =
+  /^(\d{1,17})\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/
+
+/** The longest search a caller may send. Longer than any slug; nobody types more. */
+export const MAX_LINK_SEARCH = 100
+
 const ListQuery = z
   .object({
     domain: z.string().max(253).optional(),
+    q: z.string().min(1).max(MAX_LINK_SEARCH).optional(),
     limit: z.coerce.number().int().min(1).max(MAX_LINK_PAGE).default(DEFAULT_LINK_PAGE),
-    /** The last id of the previous page. The order is by id: stable, arbitrary. */
-    cursor: z.string().uuid().optional(),
+    cursor: z.string().regex(LINK_CURSOR_RE, 'not a cursor from a previous page').optional(),
   })
   .strict()
+
+/** `%`, `_` and `\` as themselves in an `ILIKE … ESCAPE '\'` pattern. */
+export function likeLiteral(text: string): string {
+  return text.replace(/[\\%_]/g, (c) => `\\${c}`)
+}
 
 interface LinkRow {
   id: string
@@ -94,17 +112,25 @@ interface LinkRow {
   passthrough: boolean
   traffic_actions: Record<string, string>
   password_hash: string | null
+  created_at: Date
+  created_us: string
+  cap_used: string | null
   targets: { id: string; url: string; weight: number }[] | null
 }
 
 const SELECT_LINKS = `SELECT l.id, l.domain_id, d.host, l.slug, l.name, l.enabled, l.backup_url,
                              l.device_urls, l.returning_url, l.countries, l.click_cap,
                              l.expires_at, l.passthrough, l.traffic_actions, l.password_hash,
+                             l.created_at,
+                             (extract(epoch from l.created_at) * 1000000)::bigint AS created_us,
+                             CASE WHEN l.click_cap IS NULL THEN NULL
+                                  ELSE coalesce(c.clicks, 0) END AS cap_used,
                              json_agg(json_build_object('id', t.id, 'url', t.url, 'weight', t.weight)
                                       ORDER BY t.position)
                                FILTER (WHERE t.id IS NOT NULL) AS targets
                         FROM links l
                         JOIN domains d ON d.id = l.domain_id
+                        LEFT JOIN link_counters c ON c.link_id = l.id
                         LEFT JOIN link_targets t ON t.link_id = l.id`
 
 /** What a link looks like over the API. The password appears only as a boolean. */
@@ -127,6 +153,8 @@ function asLink(l: LinkRow): Record<string, unknown> {
     passthrough: l.passthrough,
     trafficActions: l.traffic_actions,
     hasPassword: l.password_hash !== null,
+    createdAt: l.created_at.toISOString(),
+    capUsed: l.cap_used === null ? null : Number(l.cap_used),
   }
 }
 
@@ -150,7 +178,10 @@ function asInput(l: LinkRow): Record<string, unknown> {
 
 async function linkById(pg: Pool, id: string): Promise<LinkRow> {
   if (!z.string().uuid().safeParse(id).success) fail(404, 'not_found', 'no such link')
-  const r = await pg.query<LinkRow>(`${SELECT_LINKS} WHERE l.id = $1 GROUP BY l.id, d.host`, [id])
+  const r = await pg.query<LinkRow>(
+    `${SELECT_LINKS} WHERE l.id = $1 GROUP BY l.id, d.host, c.clicks`,
+    [id],
+  )
   const row = r.rows[0]
   if (!row) fail(404, 'not_found', 'no such link')
   return row as LinkRow
@@ -257,28 +288,40 @@ export function registerLinkRoutes(app: FastifyInstance, ctx: AdminContext): voi
   app.get('/api/links', async (req) => {
     requireCredential(req)
     const q = readBody(ListQuery, ownFields(req.query))
-    // `written`, not `q.domain` and `q.cursor`: both are optional, so a caller
-    // who sent neither has nothing of their own under either name, and a plain
-    // read is answered by the prototype — a filter nobody asked for, or a
-    // cursor that is not an id reaching the query as one.
+    // `written`, not `q.domain`, `q.q` and `q.cursor`: all three are optional,
+    // so a caller who sent none has nothing of their own under any of those
+    // names, and a plain read is answered by the prototype — a filter nobody
+    // asked for, or a cursor that is not a cursor reaching the query as one.
     const domain = written(q, 'domain')
+    const search = written(q, 'q')
     const cursor = written(q, 'cursor')
     const host = domain === undefined ? null : normaliseHost(domain)
-    if (domain !== undefined && host === null) fail(400, 'invalid_host', 'not a valid host name')
+    if (domain !== undefined && host === null)
+      return fail(400, 'invalid_host', 'not a valid host name')
+    const boundary = cursor === undefined ? null : LINK_CURSOR_RE.exec(cursor)
     const r = await ctx.pg.query<LinkRow>(
       `${SELECT_LINKS}
         WHERE ($1::text IS NULL OR d.host = $1)
-          AND ($2::uuid IS NULL OR l.id > $2)
-        GROUP BY l.id, d.host
-        ORDER BY l.id
-        LIMIT $3`,
-      [host, cursor ?? null, q.limit],
+          AND ($2::text IS NULL OR l.slug ILIKE $2 ESCAPE '\\' OR l.name ILIKE $2 ESCAPE '\\')
+          AND ($3::bigint IS NULL
+               OR (l.created_at, l.id) < (timestamptz 'epoch' + $3 * interval '1 microsecond', $4::uuid))
+        GROUP BY l.id, d.host, c.clicks
+        ORDER BY l.created_at DESC, l.id DESC
+        LIMIT $5`,
+      [
+        host,
+        search === undefined ? null : `%${likeLiteral(search)}%`,
+        boundary?.[1] ?? null,
+        boundary?.[2] ?? null,
+        q.limit,
+      ],
     )
+    const last = r.rows[r.rows.length - 1]
     return {
       links: r.rows.map(asLink),
       // Present only when a further page may exist, so a caller stops rather
       // than asking forever.
-      nextCursor: r.rows.length === q.limit ? (r.rows[r.rows.length - 1]?.id ?? null) : null,
+      nextCursor: r.rows.length === q.limit && last ? `${last.created_us}.${last.id}` : null,
     }
   })
 

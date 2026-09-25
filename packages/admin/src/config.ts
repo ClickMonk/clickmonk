@@ -1,5 +1,6 @@
 import { AdminHostSchema, TrustedProxiesSchema, formatConfigError } from '@clickmonk/core'
 import type { ChConfig } from '@clickmonk/db'
+import { DEFAULT_IPDATA_DIR } from '@clickmonk/ipdata'
 import { isResolverAddress } from '@clickmonk/worker/domains'
 import { z } from 'zod'
 
@@ -46,6 +47,10 @@ const Schema = z.object({
   // Used only by the on-demand domain check, which asks the same resolvers
   // the worker's scheduled pass does.
   CLICKMONK_DNS_SERVERS: DnsServers,
+  // Where the worker writes the IP data manifest. Mounted read-only into this
+  // service's container; the default is the same path the worker and the
+  // redirect use, from the one place that path is written down.
+  CLICKMONK_IPDATA_DIR: z.string().min(1).default(DEFAULT_IPDATA_DIR),
 })
 
 export interface AdminConfig {
@@ -56,6 +61,7 @@ export interface AdminConfig {
   port: number
   trustedProxies: string[]
   dnsServers: string[]
+  ipdataDir: string
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv): AdminConfig {
@@ -74,5 +80,6 @@ export function loadConfig(env: NodeJS.ProcessEnv): AdminConfig {
     port: e.CLICKMONK_ADMIN_PORT,
     trustedProxies: e.CLICKMONK_TRUSTED_PROXIES,
     dnsServers: e.CLICKMONK_DNS_SERVERS,
+    ipdataDir: e.CLICKMONK_IPDATA_DIR,
   }
 }

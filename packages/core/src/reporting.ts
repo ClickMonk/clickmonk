@@ -10,9 +10,10 @@
  * nothing here knows what "today" means. That is deliberate. A preset like
  * "last 7 days" needs a timezone; this install has no opinion about the
  * operator's, and a timezone parameter on five endpoints is five places to get
- * it wrong. A caller computes a preset into a pair of instants. The hourly
- * grain is what leaves a whole-hour offset possible later without a schema
- * change; a half-hour zone would need one.
+ * it wrong. A caller computes a preset into a pair of instants. A chart by day
+ * takes one more thing, a whole-hour offset for where its days begin, which the
+ * hourly grain makes possible without a schema change; a half-hour zone is
+ * counted from the nearest whole hour.
  */
 
 /** The two bucket sizes a chart is drawn at. */
@@ -46,12 +47,16 @@ export const ROLLUP_DIMENSIONS = [
 export type RollupDimension = (typeof ROLLUP_DIMENSIONS)[number]
 
 /**
- * Dimensions that are keys of the hourly rollup itself. All three are closed
- * lists whose values cannot grow without a new click record version, so keying
- * by them costs a bounded number of rows per hour and per link, and a summary
- * can be answered from one table.
+ * Dimensions that are columns of the hourly rollup's own key, so a breakdown
+ * by one of them is a `GROUP BY` on that table and no second table is read.
+ *
+ * Three of them are closed lists whose values cannot grow without a new click
+ * record version. The fourth, `link`, is not closed — it grows with the links
+ * an operator creates — and is here because the link id was a key column from
+ * the start: every report can be asked for one link, and that filter needed it
+ * in the key. What the four share is the table, not the size of their lists.
  */
-export const KEYED_DIMENSIONS = ['class', 'action', 'outcome'] as const
+export const KEYED_DIMENSIONS = ['class', 'action', 'outcome', 'link'] as const
 export type KeyedDimension = (typeof KEYED_DIMENSIONS)[number]
 
 export const REPORT_DIMENSIONS = [...ROLLUP_DIMENSIONS, ...KEYED_DIMENSIONS] as const
@@ -70,6 +75,15 @@ export const MAX_REPORT_WINDOW_MS = MAX_REPORT_WINDOW_DAYS * 86_400_000
 export const MAX_REPORT_BUCKETS = 2000
 
 /**
+ * Where a day bucket may begin, in whole hours from UTC midnight. Every zone
+ * in use lies inside this range. Whole hours only: the rollups are hourly, so
+ * a half-hour zone's days can only be counted from the nearest whole hour —
+ * the interface says so rather than pretending otherwise.
+ */
+export const MIN_DAY_OFFSET_HOURS = -12
+export const MAX_DAY_OFFSET_HOURS = 14
+
+/**
  * How many buckets the half-open window [fromMs, toMs) touches.
  *
  * Counted from aligned boundaries rather than from elapsed time: twenty
@@ -77,9 +91,18 @@ export const MAX_REPORT_BUCKETS = 2000
  * two bars on a chart, and a ceiling computed the other way would let a
  * response through that is one bar bigger than the ceiling. Unix time carries
  * no leap seconds, so a day boundary is exact arithmetic on the epoch.
+ *
+ * `offsetMs` moves the boundaries: a day at UTC+3 begins at 21:00 UTC, so the
+ * count is taken on the shifted epoch. Zero for an hour bucket changes nothing,
+ * and a whole-hour offset on an hour bucket changes nothing either.
  */
-export function bucketCount(fromMs: number, toMs: number, bucket: ReportBucket): number {
+export function bucketCount(
+  fromMs: number,
+  toMs: number,
+  bucket: ReportBucket,
+  offsetMs = 0,
+): number {
   if (toMs <= fromMs) return 0
   const ms = BUCKET_MS[bucket]
-  return Math.floor((toMs - 1) / ms) - Math.floor(fromMs / ms) + 1
+  return Math.floor((toMs - 1 + offsetMs) / ms) - Math.floor((fromMs + offsetMs) / ms) + 1
 }

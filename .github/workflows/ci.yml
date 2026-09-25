@@ -88,9 +88,10 @@ jobs:
   # `durability` both call `down -v`.
   stack:
     runs-on: ubuntu-latest
-    # Six suites now, each bringing the stack up for itself, one of them
-    # obtaining certificates from a local authority. Three and a half minutes
-    # with warm images locally; a cold runner builds the image first.
+    # Seven suites now, each bringing the stack up for itself, one of them
+    # obtaining certificates from a local authority and one driving a browser
+    # from Playwright's image. Four minutes with warm images locally; a cold
+    # runner builds the image first and pulls the browser's (about 1 GB).
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7

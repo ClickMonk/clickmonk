@@ -44,6 +44,14 @@ import { fail, readBody } from './http.js'
 export const MAX_DOMAINS_LISTED = 500
 
 /**
+ * Which domains need attention: every one whose last check did not find the
+ * token, and every one no check has reached yet. One spelling, read by the
+ * listing below and by the count `GET /api/status` answers, so "which domains
+ * need attention" is never asked two ways that could answer differently.
+ */
+export const ALERT_CONDITION = `(c.status IS NULL OR c.status <> 'verified')`
+
+/**
  * How long after a check the same domain may be checked again over the API,
  * and how many checks this process runs at once. The worker's scheduled pass
  * has its own interval; these are the bounds on the endpoint an authenticated
@@ -272,7 +280,7 @@ export function registerDomainRoutes(app: FastifyInstance, ctx: AdminContext): v
     requireCredential(req)
     const r = await ctx.pg.query<DomainRow>(
       `${SELECT_DOMAINS}
-        WHERE c.status IS NULL OR c.status <> 'verified'
+        WHERE ${ALERT_CONDITION}
         ORDER BY d.host LIMIT ${MAX_DOMAINS_LISTED + 1}`,
     )
     return {

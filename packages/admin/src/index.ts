@@ -1,3 +1,4 @@
+import { join } from 'node:path'
 import { createChClient, createPgPool } from '@clickmonk/db'
 import { buildAdminApp } from './app.js'
 import { loadConfig } from './config.js'
@@ -34,6 +35,8 @@ const app = buildAdminApp(
     ch,
     adminHost: config.adminHost,
     dnsServers: config.dnsServers,
+    ipdataDir: config.ipdataDir,
+    uiDir: join(import.meta.dirname, '..', '..', 'ui', 'dist'),
   },
   { trustProxy: config.trustedProxies },
 )

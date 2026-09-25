@@ -3,6 +3,10 @@ WORKDIR /app
 RUN corepack enable
 COPY pnpm-workspace.yaml package.json pnpm-lock.yaml tsconfig.base.json tsconfig.json ./
 COPY packages ./packages
+# The interface's stylesheet imports the brand's tokens from brand/, outside
+# packages/. Only the build stage reads it: Vite writes everything it takes from
+# there into packages/ui/dist, and nothing at runtime reads brand/ again.
+COPY brand ./brand
 # build:image compiles each package without its tests or the database test
 # helpers, which exist only to run the test suite.
 RUN pnpm install --frozen-lockfile && pnpm build:image
@@ -35,6 +39,9 @@ COPY --from=build /app/packages/db/dist packages/db/dist
 COPY --from=build /app/packages/ipdata/dist packages/ipdata/dist
 COPY --from=build /app/packages/redirect/dist packages/redirect/dist
 COPY --from=build /app/packages/admin/dist packages/admin/dist
+# No package.json for the interface: it has no runtime dependencies, only the
+# files the admin service serves, built in the stage above.
+COPY --from=build /app/packages/ui/dist packages/ui/dist
 COPY --from=build /app/packages/worker/dist packages/worker/dist
 COPY --from=build /app/packages/cli/dist packages/cli/dist
 USER clickmonk

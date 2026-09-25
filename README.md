@@ -37,6 +37,8 @@ on your own infrastructure, and your click data stays yours.
   install-wide settings and everything under "Reading the clicks back out"
   below. It answers on one host name of its own — set
   `CLICKMONK_ADMIN_HOST` — and Caddy gets it a certificate the first time you visit it.
+- **A web interface**, served on that same host name, over HTTPS, alongside the API — see
+  ["The web interface"](#the-web-interface) below.
 - **Password-protected links.** Set a password on a link and visitors are asked for it on
   a ClickMonk page on your own domain before they are sent on. Attempts are counted per
   client per link — an IPv4 address, or a whole IPv6 /64, since one client usually holds
@@ -54,7 +56,8 @@ on your own infrastructure, and your click data stays yours.
 - **Country rules** use the country looked up from the visitor's address.
 - **Reports over the admin API.** Clicks come back out: a summary of a window, a chart by
   hour or by day, and a breakdown by country, device, operating system, browser, referring
-  host, the target rotation chose, the traffic class, the action taken or the outcome. They
+  host, the target rotation chose, the traffic class, the action taken, the outcome, or the
+  link. They
   read hourly rollups written as the clicks arrive rather than the clicks themselves, so a
   window of a year is read as hours and not as every click inside it, and every number
   counts a click once even if the worker shipped its spool segment twice. **A report counts
@@ -92,24 +95,21 @@ on your own infrastructure, and your click data stays yours.
 
 What does not work yet:
 
-- **A web interface.** There is an admin API but no pages to drive it: a browser can sign
-  in, and there is nothing to click. Driving it means `curl` or the CLI for now. Enrolling
-  an authenticator app hands you the secret and an `otpauth:` URI to paste into it, because
-  nothing here draws a QR code.
 - **More than one admin account.** There is exactly one, and it is the whole of the access
   control: no second person, no roles, no record of which of you did something, and no way
   to let someone in and then out again except by changing the one password, which signs
   every browser out. An API key is the only credential you can hand over and revoke on its
   own, and a key is not a person — it cannot sign in, and nothing it does is attributed to
   anyone. The admin API also cannot be tried without a real domain name: see that section.
-- **Anything drawn.** The reports are JSON; nothing plots them. There is no dashboard, so
-  how fresh the numbers are is a field in the answer — `newestHour`, on the summary and the
-  chart — rather than something on a screen.
-- **A CSV of a report.** The export is the click log. A summary or a breakdown is already one
-  small answer, and turning it into a file is a job for the web interface rather than
-  something this API streams.
-- **A time zone.** Every window, bucket and retention period is UTC. A preset like
-  "yesterday" is for whoever is asking to work out.
+- **A CSV of a report, from the API itself.** `GET /api/clicks.csv` streams the click log
+  only; a summary, a chart or a breakdown is already one small answer, and turning one of
+  those into a file is the web interface's own doing, in the browser, not a route this API
+  streams.
+- **A time zone, on the API.** Every window and retention period it takes is UTC, and so is
+  a chart's bucket size — `offset` only moves where a day bucket begins, in whole hours, and
+  does nothing for an hourly one. A preset like "yesterday" is for whoever is asking to work
+  out — the web interface does that from the browser's own zone; a script calling the API
+  directly still has to.
 - **A breakdown by two things at once.** One dimension per request: clicks by country, or
   clicks by browser, never clicks by country by browser.
 - **A report of a window older than this install's rollups.** They are written as the clicks
@@ -120,8 +120,10 @@ What does not work yet:
   The redirect keeps answering and keeps spooling throughout, so nothing is lost — it has
   simply not arrived yet.
 - **Reports answer nothing while ClickHouse is down.** `GET /api/reports/…`,
-  `GET /api/clicks` and `GET /api/clicks.csv` answer 503; domains, links and settings keep
-  working.
+  `GET /api/clicks`, `GET /api/clicks.csv` and `GET /api/clicks/count` answer 503; domains,
+  links and settings keep working. `GET /api/status` is the exception: it still answers
+  200, with `"reporting":"unavailable"`, because it is the thing that says reporting is
+  down.
 - **An export that fails part way through ends the connection** rather than finishing the
   file, because a file that looks complete and is not is worse than a download that broke.
 - **Any notification.** Nothing is emailed, posted or pushed anywhere: there is no mail
@@ -366,7 +368,11 @@ not whether the install is configured, and not whether the account exists. That 
 `GET /api/domains` returns at most 500 entries and `GET /api/keys` at most 200, each
 setting `"truncated": true` when there were more. `clickmonk domain list` has no such cap;
 `clickmonk apikey list` has the same one and says when it hit it. `GET /api/links` pages
-properly, with `limit` and `cursor`.
+properly, with `limit` and an opaque `cursor` from the previous answer — newest links
+first. `q` searches the slug and the name, case-insensitively, as a substring; it reads
+every link on the install, so it is fine for what an operator has and not a plan for a
+much larger one. Each link in the response carries `createdAt` and, for a link with a
+click cap, `capUsed` — `null` for a link with none.
 
 The install-wide settings are `GET /api/settings` and `PUT /api/settings` — the same
 things `clickmonk settings set` covers, in two halves: `traffic` and `retention`. The
@@ -426,6 +432,47 @@ install query DNS in a loop.
 stack starts, Caddy routes every name to the redirect exactly as it did before, the admin
 service answers `503` on every route but `/health`, and the CLI is the only way in.
 
+## The web interface
+
+Served on `CLICKMONK_ADMIN_HOST` and nowhere else, over HTTPS, by the same admin service that
+answers the API — visit the admin host in a browser and sign in. Each screen:
+
+- **Overview** — every link on every domain, as one report.
+- **Links** — the link list, searchable, and where a link is created, edited, or opened for its
+  own report.
+- **Clicks** — the click log, filtered by link (from a link's own page), traffic class, outcome
+  and country, with the CSV export.
+- **Domains** — adding a domain and checking its record until it verifies.
+- **Settings** — the traffic action for each non-human class, the safe URL, the abuser
+  threshold, and how long this install keeps clicks and their addresses.
+- **Account** — the password, two-factor authentication, the sessions signed in, and API keys.
+
+**Every time on screen is in the browser's own zone, never the server's, except a click's raw
+fields, which are labelled UTC.** A day chart's days
+still begin on a whole hour of UTC, because that is the grain the hourly rollups are kept at.
+So a zone that is not a whole number of hours from UTC — India Standard Time, UTC+5:30, is one
+— has its days begin off midnight, at 23:30 or 00:30 rather than 00:00, and the screen says so
+when it does.
+
+**Unique visitors counts what a cookie sees**, the same as the API: a client that keeps no
+cookie is a new visitor on every click. **The CSV export states the row count and whether it
+will hit the cap before the download starts**, and only one export runs at a time — the same
+limit ["Reading the clicks back out"](#reading-the-clicks-back-out) describes for the API.
+
+**Nothing here polls.** The numbers on screen are as fresh as the last "Refresh", or as coming
+back to the tab after a minute away; there is no timer running in the background asking the
+service for anything.
+
+**Nothing the interface does is unavailable to a script.** Every screen is built on the same
+admin API documented in ["The admin API"](#the-admin-api) and
+["Reading the clicks back out"](#reading-the-clicks-back-out) — so anything the interface can
+do, a `curl` command or the CLI can do too.
+
+**What it does not do yet:** there is no time zone setting for the install itself, only the
+browser's own zone; no bulk operations — one link, one domain, one setting at a time, the same
+as the CLI; and no local development mode, so trying it needs a real admin host set up, the
+same as the API does. See [#23](../../issues/23).
+
 ## Reading the clicks back out
 
 Every one of these is a read, so an API key reaches all of them and no `Origin` header is
@@ -437,17 +484,30 @@ needed. Windows are UTC, `from` is included and `to` is not, and a window may be
 curl -H "authorization: Bearer $KEY" \
   "https://admin.example.com/api/reports/summary?from=2026-09-23T00:00:00Z&to=2026-09-24T00:00:00Z"
 
-# A chart: bucket=hour or bucket=day, at most 2000 buckets in one answer
+# A chart: bucket=hour or bucket=day, at most 2000 buckets in one answer.
+# offset moves where a day begins: a whole number of hours from UTC midnight,
+# -12 to 14, default 0. offset=3 counts days from 21:00 UTC — midnight at
+# UTC+3. It changes nothing on an hourly chart, since a whole-hour offset
+# moves no hour boundary, and a half-hour zone is counted from the nearest
+# whole hour.
 curl -H "authorization: Bearer $KEY" \
-  "https://admin.example.com/api/reports/timeseries?from=2026-09-01T00:00:00Z&to=2026-09-24T00:00:00Z&bucket=day"
+  "https://admin.example.com/api/reports/timeseries?from=2026-09-01T00:00:00Z&to=2026-09-24T00:00:00Z&bucket=day&offset=3"
 
-# One dimension: country, device, os, browser, referrer, target, class, action, outcome
+# One dimension: country, device, os, browser, referrer, target, class, action,
+# outcome, link. A breakdown by link carries a link object — slug, host and
+# name — on each row, read from the link table rather than the rollup; null
+# when the id names no link any more.
 curl -H "authorization: Bearer $KEY" \
   "https://admin.example.com/api/reports/breakdown?from=2026-09-23T00:00:00Z&to=2026-09-24T00:00:00Z&dimension=country&limit=20"
 
 # The log itself, newest first, paged with the cursor the previous answer gave
 curl -H "authorization: Bearer $KEY" \
   "https://admin.example.com/api/clicks?from=2026-09-23T00:00:00Z&to=2026-09-24T00:00:00Z&class=bot&limit=100"
+
+# How many rows an export of the same filters would write, before asking for
+# the file: {"window":{...},"link":null,"count":1234,"cap":1000000,"truncated":false}
+curl -H "authorization: Bearer $KEY" \
+  "https://admin.example.com/api/clicks/count?from=2026-09-01T00:00:00Z&to=2026-09-24T00:00:00Z"
 
 # And as a file
 curl -H "authorization: Bearer $KEY" -OJ \
@@ -456,18 +516,38 @@ curl -H "authorization: Bearer $KEY" -OJ \
 
 Add `&link=<id>` to any of them for one link instead of all of them. **Nothing looks the
 link up**, so an id that belongs to no link is an empty answer rather than an error, on all
-five of these.
+six of these.
+
+**`GET /api/status`** takes no query string and answers how fresh everything is in one read:
+
+```sh
+curl -H "authorization: Bearer $KEY" "https://admin.example.com/api/status"
+# {"newestHour":"2026-09-24T11:00:00.000Z","reporting":"ok",
+#  "ipData":{"country":{"version":"2026-09","fetchedAt":"2026-09-20T03:00:00.000Z"},
+#            "asn":null,"datacenter":null,"tor":{"version":"…","fetchedAt":"…"}},
+#  "ipDataProblem":null,"alerts":2}
+```
+
+`newestHour` and `reporting` are the summary's own freshness, answered here even when
+ClickHouse cannot be reached: `reporting` is `"unavailable"` and `newestHour` is `null`
+rather than a 503, because this is the route that says reporting is down. `ipData` is each
+IP list's version and when it was fetched, `null` for a source never fetched and `null` for
+the whole field on an install with no IP data yet — `CLICKMONK_IPDATA_UPDATE=off`, or a
+fresh one. `ipDataProblem` is set, with `ipData` then `null` too, only when the manifest is
+there and could not be read; the response never says why, so check the admin service's own
+log for the reason. `alerts` is the count `GET /api/alerts` would list, capped the same way.
 
 **A report counts whole buckets; the log counts milliseconds.** Before a report is counted,
 `from` is floored and `to` raised to the next boundary, and **the boundary is the grain that
 report answers at**: the hour for the summary and the breakdown, because that is the grain
 the rollups hold, and the bucket you asked for on the chart — so `bucket=day` counts whole
-days. The log and the export use the two instants exactly as they were sent. So the same
+days, from where `offset` puts midnight. The log, the export and the count use the two
+instants exactly as they were sent. So the same
 window can answer differently through these surfaces and none of them is broken: ask
 `from=2026-09-24T10:30:00Z&to=2026-09-24T10:50:00Z` and the summary, the hourly chart and the
 breakdown all count 10:00 to 11:00, a chart by day counts the whole of the 24th, and the log
 counts the twenty minutes you named — three different numbers from one request. Every one of
-these five answers repeats the window it actually counted, in its own `window` field. Read
+these six answers repeats the window it actually counted, in its own `window` field. Read
 that before comparing two numbers.
 
 **What the numbers mean.** `clicks` counts distinct clicks and `visitors` distinct visitor
@@ -515,6 +595,14 @@ body — which is why a probe query runs in front of the export rather than a tr
 appended, since the clients an operator actually uses do not show trailers. Narrow the
 window and ask again; nothing is lost. The cap can be built as high as 10,000,000, and
 there is no environment variable for it yet.
+
+**`GET /api/clicks/count`** answers the same question ahead of the download: it takes the
+log's own filters and runs the same bounded probe, so `{"count":1234,"cap":1000000,
+"truncated":false}` tells you how many rows the export would write and whether it would
+stop at the cap, before you ask for the file. It is a query rather than a body, so it takes
+a report slot and not the export's — asking it does not compete with a download already
+running. The window can gain clicks between this answer and the export; the export's own
+header stays the authority on the file it actually wrote.
 
 **A cell that would otherwise look like a formula is prefixed with an apostrophe.** A
 spreadsheet runs a cell beginning `=`, `+`, `-` or `@`, or with whitespace in front of one,
@@ -631,7 +719,9 @@ you find out.
 The worker downloads four lists to your server, and `clickmonk ipdata update` fetches
 them on demand. The redirect looks each visitor's address up in memory: no lookup
 leaves your server, and no request waits for a download. The lists take about 25 MB of
-the redirect's memory, and each has a fixed ceiling.
+the redirect's memory, and each has a fixed ceiling. The admin service also mounts this
+volume, read-only, and reads it for nothing but `GET /api/status` — to say how old each
+list is.
 
 The address looked up is the one Caddy passes on, which is the visitor's: Caddy is the
 only service with a published port, nothing outside the stack can open a connection to the
@@ -663,7 +753,8 @@ the country looked up is the CDN's.
 
 IP Geolocation by [DB-IP](https://db-ip.com), licensed under
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). ClickMonk converts it to its
-own lookup format.
+own lookup format. The same credit is in the web interface's own footer, on every signed-in
+screen.
 
 A download replaces the list in use only when it parses whole and holds at least a
 minimum number of entries (about a fifth of a current edition; for country, half the

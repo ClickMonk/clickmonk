@@ -7,7 +7,7 @@
   "scripts": {
     "build": "pnpm -r build",
     "build:image": "pnpm -r build:image",
-    "test": "vitest run",
+    "test": "vitest run && pnpm --filter @clickmonk/ui test",
     "test:watch": "vitest",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",

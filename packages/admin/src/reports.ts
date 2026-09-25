@@ -26,16 +26,18 @@ import {
   BUCKET_MS,
   type ConcurrencyGate,
   type KeyedDimension,
+  MAX_DAY_OFFSET_HOURS,
   MAX_REPORT_BUCKETS,
   MAX_REPORT_WINDOW_DAYS,
   MAX_REPORT_WINDOW_MS,
+  MIN_DAY_OFFSET_HOURS,
   REPORT_BUCKETS,
   REPORT_DIMENSIONS,
   type ReportBucket,
   bucketCount,
   isKeyedDimension,
 } from '@clickmonk/core'
-import type { ClickHouseClient } from '@clickmonk/db'
+import type { ClickHouseClient, Pool } from '@clickmonk/db'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 import { z } from 'zod'
 import type { AdminContext } from './app.js'
@@ -122,16 +124,23 @@ const chTime = (ms: number): string => new Date(ms).toISOString().replace('T', '
  * is 9,600 of them against a ceiling of 2,000, and the ceiling bites first
  * from about 84 days on. Whatever asks for buckets checks its own count; what
  * this function owes it is a window made of numbers.
+ *
+ * `offsetMs` moves the grid a day is aligned to; the chart passes it and
+ * nothing else does.
  */
 export function parseWindow(
   q: { from: string; to: string; link?: string },
-  o: { alignMs: number | null },
+  o: { alignMs: number | null; offsetMs?: number },
 ): ReportWindow {
   const rawFrom = Date.parse(q.from)
   const rawTo = Date.parse(q.to)
   const align = o.alignMs
-  const fromMs = align === null ? rawFrom : Math.floor(rawFrom / align) * align
-  const toMs = align === null ? rawTo : Math.ceil(rawTo / align) * align
+  // The offset moves the grid the window is aligned to: a day at UTC+3 begins
+  // at 21:00 UTC. Added before the floor and taken off after it, so the result
+  // is still an instant in UTC.
+  const off = o.offsetMs ?? 0
+  const fromMs = align === null ? rawFrom : Math.floor((rawFrom + off) / align) * align - off
+  const toMs = align === null ? rawTo : Math.ceil((rawTo + off) / align) * align - off
   // `!(toMs > fromMs)` and not `toMs <= fromMs`: every comparison with NaN is
   // false, so the second form lets an unparseable date through, and NaN then
   // survives the alignment, the length check and the bucket ceiling — each of
@@ -293,14 +302,25 @@ const SummaryQuery = z.object({ ...WINDOW_FIELDS }).strict()
 /**
  * How each bucket size is grouped. A module constant per bucket rather than
  * anything built from the request: the value that reaches the query text is
- * one of exactly two strings written here.
+ * one of exactly two strings written here, and the offset is a bound
+ * parameter inside the second.
+ *
+ * The day's expression moves each hour by the offset, takes the start of that
+ * day, and moves it back, so a day at UTC+3 is grouped from 21:00 UTC. At an
+ * offset of zero it is `toStartOfDay(hour)`.
  */
 const BUCKET_EXPR: Record<ReportBucket, string> = {
   hour: 'hour',
-  day: 'toStartOfDay(hour)',
+  day: 'addHours(toStartOfDay(addHours(hour, {offset:Int8})), negate({offset:Int8}))',
 }
 
-const TimeseriesQuery = z.object({ ...WINDOW_FIELDS, bucket: z.enum(REPORT_BUCKETS) }).strict()
+const TimeseriesQuery = z
+  .object({
+    ...WINDOW_FIELDS,
+    bucket: z.enum(REPORT_BUCKETS),
+    offset: z.coerce.number().int().min(MIN_DAY_OFFSET_HOURS).max(MAX_DAY_OFFSET_HOURS).default(0),
+  })
+  .strict()
 
 /** Values in one breakdown, and the ceiling a caller may ask for. */
 export const DEFAULT_BREAKDOWN_ROWS = 100
@@ -316,6 +336,7 @@ const KEYED_COLUMN: Record<KeyedDimension, string> = {
   class: 'traffic_class',
   action: 'action',
   outcome: 'outcome',
+  link: 'link_id',
 }
 
 const BreakdownQuery = z
@@ -325,6 +346,27 @@ const BreakdownQuery = z
     limit: z.coerce.number().int().min(1).max(MAX_BREAKDOWN_ROWS).default(DEFAULT_BREAKDOWN_ROWS),
   })
   .strict()
+
+/**
+ * The slug, host and name of each link id given, for the rows a breakdown by
+ * link shows. Ids with no row are absent from the map. One query, bound as an
+ * array, over at most the 500 ids a breakdown returns.
+ */
+async function linkLabels(
+  pg: Pool,
+  ids: string[],
+): Promise<Map<string, { slug: string; host: string; name: string | null }>> {
+  const out = new Map<string, { slug: string; host: string; name: string | null }>()
+  if (ids.length === 0) return out
+  const r = await pg.query<{ id: string; slug: string; host: string; name: string | null }>(
+    `SELECT l.id, l.slug, d.host, l.name
+       FROM links l JOIN domains d ON d.id = l.domain_id
+      WHERE l.id = ANY($1::uuid[])`,
+    [ids],
+  )
+  for (const row of r.rows) out.set(row.id, { slug: row.slug, host: row.host, name: row.name })
+  return out
+}
 
 export function registerReportRoutes(app: FastifyInstance, ctx: AdminContext): void {
   /**
@@ -438,8 +480,9 @@ export function registerReportRoutes(app: FastifyInstance, ctx: AdminContext): v
     requireCredential(req)
     const q = readQuery(TimeseriesQuery, req.query)
     const step = BUCKET_MS[q.bucket]
-    const w = parseWindow(q, { alignMs: step })
-    const buckets = bucketCount(w.fromMs, w.toMs, q.bucket)
+    const offsetMs = q.offset * HOUR_MS
+    const w = parseWindow(q, { alignMs: step, offsetMs })
+    const buckets = bucketCount(w.fromMs, w.toMs, q.bucket, offsetMs)
     if (buckets > MAX_REPORT_BUCKETS) {
       // `return fail(…)` rather than a bare call, for the reason `requireCh`
       // spells out: `fail` is a const arrow, so TypeScript does not treat a
@@ -466,7 +509,7 @@ export function registerReportRoutes(app: FastifyInstance, ctx: AdminContext): v
                          uniqExactMerge(visitors_state) AS visitors
                     FROM clicks_hourly WHERE ${windowClause(w)}
                    GROUP BY at ORDER BY at`,
-          params: windowParams(w),
+          params: { ...windowParams(w), ...(q.bucket === 'day' ? { offset: q.offset } : {}) },
         })
         // The same freshness the summary answers with, and a chart needs it
         // more than a number does. Every bucket the rollup has no row for is
@@ -513,12 +556,15 @@ export function registerReportRoutes(app: FastifyInstance, ctx: AdminContext): v
   /**
    * The top values of one dimension over the window.
    *
-   * Two tables answer it. The six open dimensions are rows of the per-dimension
-   * rollup, keyed by the dimension name; the three closed ones are keys of the
-   * hourly rollup, so they are read from there and grouped by their own column.
-   * Nothing in the query text comes from the request: the dimension chooses
-   * between two statements written here, and the only interpolated value is a
-   * row count the schema has already bounded to 1–500.
+   * The choice is between the per-dimension rollup and a keyed column of the
+   * hourly one. The six open dimensions are rows of the per-dimension rollup,
+   * keyed by the dimension name; the four keyed ones are columns of the hourly
+   * rollup's own key, so they are read from there and grouped by their own
+   * column. Nothing in the query text comes from the request: the dimension
+   * chooses between two statements written here, and the only interpolated
+   * value is a row count the schema has already bounded to 1–500. A breakdown
+   * by link adds one Postgres query for its labels, over exactly the ids the
+   * response shows.
    *
    * Ordered by clicks descending and then by value ascending, because a tie
    * broken by nothing at all is broken by whatever order the parts were read
@@ -576,15 +622,29 @@ export function registerReportRoutes(app: FastifyInstance, ctx: AdminContext): v
                    LIMIT ${q.limit + 1}`,
           params: { ...windowParams(w), ...(keyed ? {} : { dimension }) },
         })
+        const shown = rows.slice(0, q.limit)
+        // The labels for a breakdown by link, from Postgres, in one query over
+        // exactly the ids shown. A link deleted since its clicks were counted,
+        // and the zero id every click on no link carries, have no row and are
+        // answered with null rather than left out, so the rows still add up to
+        // the total beside them.
+        const labels =
+          dimension === 'link'
+            ? await linkLabels(
+                ctx.pg,
+                shown.map((r) => r.value),
+              )
+            : null
         return {
           window: { from: new Date(w.fromMs).toISOString(), to: new Date(w.toMs).toISOString() },
           link: w.linkId,
           dimension,
           truncated: rows.length > q.limit,
-          rows: rows.slice(0, q.limit).map((row) => ({
+          rows: shown.map((row) => ({
             value: row.value,
             clicks: count(row.clicks),
             visitors: count(row.visitors),
+            ...(labels === null ? {} : { link: labels.get(row.value) ?? null }),
           })),
         }
       },

@@ -14,6 +14,7 @@
   PASS   6.24:1  (min 4.5)  accent text on surface               #006A61 on #F8FBFB
   PASS   6.49:1  (min 4.5)  accent text on raised                #006A61 on #FFFFFF
   PASS   5.87:1  (min 4.5)  accent text on accent tint           #006A61 on #EAF6F4
+  PASS   5.91:1  (min 4.5)  link text on sunken (hovered row)    #006A61 on #F1F5F5
   PASS   6.24:1  (min 4.5)  label on accent fill                 #F8FBFB on #006A61
   PASS   7.16:1  (min 4.5)  label on destructive fill            #F8FBFB on #A12623
   PASS   7.16:1  (min 4.5)  blocked / error text on surface      #A12623 on #F8FBFB
@@ -24,6 +25,8 @@
   PASS   4.24:1  (min 3.0)  control border on raised             #737D7D on #FFFFFF
   PASS   6.24:1  (min 3.0)  accent as graphic (the mark)         #006A61 on #F8FBFB
   PASS   5.91:1  (min 3.0)  focus ring / bar fill on sunken      #006A61 on #F1F5F5
+  PASS   6.24:1  (min 3.0)  focus ring on surface                #006A61 on #F8FBFB
+  PASS   6.49:1  (min 3.0)  focus ring / chart column on raised  #006A61 on #FFFFFF
   PASS  18.18:1  (min 3.0)  ink as graphic (the mark)            #101111 on #F8FBFB
   -- status colours on #F8FBFB --
   PASS   6.29:1  (min 4.5)  success                              #36692A
@@ -48,6 +51,7 @@
   PASS   8.81:1  (min 4.5)  accent text on surface               #6EBFB5 on #101111
   PASS   8.08:1  (min 4.5)  accent text on raised                #6EBFB5 on #181B1B
   PASS   7.58:1  (min 4.5)  accent text on accent tint           #6EBFB5 on #0D2421
+  PASS   9.23:1  (min 4.5)  link text on sunken (hovered row)    #6EBFB5 on #090A0A
   PASS   8.81:1  (min 4.5)  label on accent fill                 #101111 on #6EBFB5
   PASS   9.04:1  (min 4.5)  label on destructive fill            #101111 on #F69B94
   PASS   9.04:1  (min 4.5)  blocked / error text on surface      #F69B94 on #101111
@@ -58,6 +62,8 @@
   PASS   4.09:1  (min 3.0)  control border on raised             #737D7D on #181B1B
   PASS   8.81:1  (min 3.0)  accent as graphic (the mark)         #6EBFB5 on #101111
   PASS   9.23:1  (min 3.0)  focus ring / bar fill on sunken      #6EBFB5 on #090A0A
+  PASS   8.81:1  (min 3.0)  focus ring on surface                #6EBFB5 on #101111
+  PASS   8.08:1  (min 3.0)  focus ring / chart column on raised  #6EBFB5 on #181B1B
   PASS  16.62:1  (min 3.0)  ink as graphic (the mark)            #EDF1F1 on #101111
   -- status colours on #101111 --
   PASS  10.56:1  (min 4.5)  success                              #94D186

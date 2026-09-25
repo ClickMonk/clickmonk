@@ -2,7 +2,7 @@
  * The highest migration version this build understands. Every migration bumps
  * it; `migrate()` refuses to run against a database whose ledger is newer.
  */
-export const SCHEMA_VERSION = 8
+export const SCHEMA_VERSION = 9
 
 export * from './admin-host.js'
 export * from './attempts.js'

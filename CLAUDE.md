@@ -50,10 +50,12 @@ pass), the admin
 API (one account, sessions, TOTP with recovery codes, API keys, domain/link/settings
 CRUD, answering on `CLICKMONK_ADMIN_HOST` alone — unset, every route but `/health` is a
 503 and links serve exactly as before), reporting over that API (a summary, a chart by
-hour or day, a breakdown over nine dimensions, the raw click log and a streamed CSV of it,
-all reading hourly rollups except the log and its export), retention (two periods on the
-settings row, enforced hourly by the worker, dropping raw clicks a partition at a time and
-blanking the address on a click in place), the CLI (`migrate`,
+hour or day, a breakdown over ten dimensions, the raw click log and a streamed CSV of it,
+all reading hourly rollups except the log and its export), the web interface (a React app
+the admin service serves from that same host, behind the same host guard — every screen
+built on the admin API and nothing it can reach that a script cannot), retention (two
+periods on the settings row, enforced hourly by the worker, dropping raw clicks a partition
+at a time and blanking the address on a click in place), the CLI (`migrate`,
 `domain add|list|verify`, `link add`, `settings show|set`, `ipdata status|update`,
 `admin create|passwd`, `admin totp disable`, `apikey create|list|revoke`), `install.sh`, a
 Compose stack, and the restart durability and stack test suites.
@@ -75,31 +77,28 @@ mistyped host name is not a reason to take every link on the install down.
 
 What does not exist yet, and must not be implied by any documentation:
 
-- **A web UI.** There is an admin API; nothing draws it yet, and it cannot be reached over
-  plain HTTP at all — the admin host answers 308, and the session cookie is `Secure` with
-  the `__Host-` prefix — so unlike a link domain it cannot be tried on a laptop.
 - **More than one admin account.** One account is the whole of the access control: no
   roles, no second person, no attribution of who did what. An API key is the only
   credential that can be handed out and revoked on its own, and it is not a person.
 - **A way back in over the API when both factors are lost.** Removing the second factor
   there requires the second factor. `clickmonk admin totp disable` is the answer, and it is
   a command on the server for that reason.
-- **Anything drawn.** The reports are JSON and nothing plots them. There is no dashboard,
-  so how fresh the numbers are is `newestHour` in the summary and the chart rather than
-  something on a screen.
-- **A CSV of a report.** The export is the click log. A summary or a breakdown is one small
-  answer already, and turning it into a file belongs to the web interface.
-- **A time zone.** Every window, bucket and retention period is UTC, and a preset like
-  "yesterday" is the caller's to compute. The hourly grain leaves a whole-hour offset
-  possible later without a schema change; a half-hour zone would need one.
+- **A CSV of a report, from the API itself.** `GET /api/clicks.csv` streams the click log
+  only. A summary or a breakdown is one small answer already, and turning one into a file is
+  the web interface's own doing, client-side, not a route the API streams.
+- **A time zone, on the API.** Every window and retention period it takes is UTC, and so is a
+  chart's bucket size — `offset` only moves where a day bucket begins, in whole hours, and does
+  nothing for an hourly one. The web interface computes a preset like "yesterday" from the
+  browser's own zone; a caller of the API directly still has to — see
+  `packages/ui/src/window/range.ts`.
 - **Notifications of any kind.** No mail configuration exists; `GET /api/alerts` is what
   an operator reads instead.
 - **Most link settings in the CLI.** `link add` takes `--target`, `--backup`, `--cap`,
   `--expires`, `--no-passthrough` and `--action` only, and no command changes a link
   after `link add`. `settings set` sets the install-wide traffic actions, the safe URL,
   the abuser threshold and the two retention periods. Device URLs, a returning URL,
-  country rules, a name, a password and the disabled state are the admin API's, or
-  hand-written SQL without it.
+  country rules, a name, a password and the disabled state are the admin API's and the web
+  interface's, or hand-written SQL without it.
   A returning URL also needs HTTPS to do anything: its cookie is marked `Secure`, so a
   browser drops it over plain HTTP.
 - **Proxy/VPN detection beyond Tor exits, cloud providers' published ranges, and region
@@ -161,6 +160,11 @@ packages/worker/    ships the spool into ClickHouse; runs migrations on boot;
                     writer of the settings row that the CLI and the admin API share.
 packages/admin/     the admin API: sessions, API keys, TOTP, domain/link/settings CRUD,
                     the reports, the click log and its CSV export.
+packages/ui/        the web interface: React 19, Tailwind 4, a Vite build the admin
+                    service serves from its own host and dist/. No colour in source, no
+                    Radix overlay primitive, no runtime import from a service package,
+                    one <h1> per screen. Every time shown is the browser's own zone, except a
+                    click's raw fields, which are labelled UTC.
 packages/cli/       `clickmonk migrate | domain | link add | settings | ipdata | admin | apikey`.
                     Two commands here are deliberately not API routes: `admin create`,
                     because nothing can authenticate before the account exists, and
@@ -178,7 +182,9 @@ test/stack/         brings the whole stack up against a local certificate author
                     certificate, a sign-in over HTTPS, a password-protected link
                     answered end to end, a click driven through the whole stack and
                     read back as a report, a log page and a CSV, and a retention
-                    period lowered and then enforced.
+                    period lowered and then enforced. `ui.test.ts` drives the web
+                    interface itself in a real browser, on that same stack, and fails
+                    on any content security policy violation on any screen.
 ```
 
 Three properties of the product shape every change:
@@ -199,6 +205,12 @@ docker compose -f docker-compose.test.yml up -d --wait   # Postgres + ClickHouse
 pnpm build        # required before the first `pnpm test`
 pnpm test
 ```
+
+**`pnpm test` is two suites, run one after the other: the service packages' own Vitest run,
+then `packages/ui`'s** (`vitest run && pnpm --filter @clickmonk/ui test`). The interface's
+suite has its own config and runs in `Australia/Adelaide`; see `packages/ui/vitest.config.ts`
+and CONTRIBUTING.md. Neither talks to the browser suite in `test/stack/`, which is part of
+the stack suites below.
 
 **Build before the first test run, and after changing `core`, `db`, `ipdata`, `worker` or
 `admin`.**
@@ -288,6 +300,13 @@ These hold from the first line of code, whatever the stack turns out to be:
   migration changes fresh installs only. Fix it forward in a new one.
 - **A redirect never waits on reporting.** Recording a click is not allowed to add
   latency to, or a failure mode to, sending the visitor on.
+- **`packages/ui/src` writes no colour of its own.** A colour bypasses the measured brand
+  roles; use a semantic class or `var(--color-…)`.
+- **`packages/ui` ships no Radix overlay primitive, no inline script or style, and no
+  runtime import from a service package.** The first two the content security policy
+  refuses outright; the third throws at load in a browser that has no Node behind it.
+- **Every screen in `packages/ui` has exactly one `<h1>`**, asserted by heading level, not
+  by its text.
 
 ## Writing tests here
 

@@ -61,6 +61,11 @@ services:
       CLICKMONK_ADMIN_HOST: ${CLICKMONK_ADMIN_HOST:-}
       CLICKMONK_TRUSTED_PROXIES: ${CLICKMONK_TRUSTED_PROXIES:-uniquelocal,loopback}
       CLICKMONK_DNS_SERVERS: ${CLICKMONK_DNS_SERVERS:-}
+    volumes:
+      # The IP data the worker writes, read here only to say how old it is.
+      # Read-only: this service has no reason to write it, and a mount it
+      # cannot write through is how that is enforced rather than promised.
+      - ipdata:/var/lib/clickmonk/ipdata:ro
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9100/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 5s

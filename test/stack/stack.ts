@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** The repository root: every compose path below is relative to it. */
@@ -10,6 +10,24 @@ export const TMP = join(ROOT, 'test', 'stack', 'tmp')
 export const NETWORK = 'clickmonk-tls_default'
 export const CURL_IMAGE = 'curlimages/curl:8.11.1'
 export const PEBBLE_IMAGE = 'ghcr.io/letsencrypt/pebble:2.10.1'
+
+/**
+ * Playwright's own image, which carries the browsers, at the version of the
+ * library the interface installed. Read from the installed package rather than
+ * written out, because the two must match exactly and a constant here would be
+ * a second place to bump. A function, read when the browser suite asks, so
+ * that every other suite importing this module runs without the interface's
+ * dependencies installed.
+ */
+export function playwrightImage(): string {
+  const { version } = JSON.parse(
+    readFileSync(
+      join(ROOT, 'packages', 'ui', 'node_modules', '@playwright', 'test', 'package.json'),
+      'utf8',
+    ),
+  ) as { version: string }
+  return `mcr.microsoft.com/playwright:v${version}-noble`
+}
 
 const FILES = ['-f', 'docker-compose.yml', '-f', 'test/stack/docker-compose.tls.yml']
 
