@@ -37,6 +37,8 @@ on your own infrastructure, and your click data stays yours.
   install-wide settings and everything under "Reading the clicks back out"
   below. It answers on one host name of its own — set
   `CLICKMONK_ADMIN_HOST` — and Caddy gets it a certificate the first time you visit it.
+- **A web interface**, served on that same host name, over HTTPS, alongside the API — see
+  ["The web interface"](#the-web-interface) below.
 - **Password-protected links.** Set a password on a link and visitors are asked for it on
   a ClickMonk page on your own domain before they are sent on. Attempts are counted per
   client per link — an IPv4 address, or a whole IPv6 /64, since one client usually holds
@@ -93,25 +95,21 @@ on your own infrastructure, and your click data stays yours.
 
 What does not work yet:
 
-- **A web interface.** There is an admin API but no pages to drive it: a browser can sign
-  in, and there is nothing to click. Driving it means `curl` or the CLI for now. Enrolling
-  an authenticator app hands you the secret and an `otpauth:` URI to paste into it, because
-  nothing here draws a QR code.
 - **More than one admin account.** There is exactly one, and it is the whole of the access
   control: no second person, no roles, no record of which of you did something, and no way
   to let someone in and then out again except by changing the one password, which signs
   every browser out. An API key is the only credential you can hand over and revoke on its
   own, and a key is not a person — it cannot sign in, and nothing it does is attributed to
   anyone. The admin API also cannot be tried without a real domain name: see that section.
-- **Anything drawn.** The reports are JSON; nothing plots them. There is no dashboard, so
-  how fresh the numbers are is a field in the answer — `newestHour`, on the summary and the
-  chart — rather than something on a screen.
-- **A CSV of a report.** The export is the click log. A summary or a breakdown is already one
-  small answer, and turning it into a file is a job for the web interface rather than
-  something this API streams.
-- **A time zone.** Every window and retention period is UTC, and so is a chart's bucket
-  size — `offset` only moves where a day bucket begins, in whole hours, and does nothing
-  for an hourly one. A preset like "yesterday" is for whoever is asking to work out.
+- **A CSV of a report, from the API itself.** `GET /api/clicks.csv` streams the click log
+  only; a summary, a chart or a breakdown is already one small answer, and turning one of
+  those into a file is the web interface's own doing, in the browser, not a route this API
+  streams.
+- **A time zone, on the API.** Every window and retention period it takes is UTC, and so is
+  a chart's bucket size — `offset` only moves where a day bucket begins, in whole hours, and
+  does nothing for an hourly one. A preset like "yesterday" is for whoever is asking to work
+  out — the web interface does that from the browser's own zone; a script calling the API
+  directly still has to.
 - **A breakdown by two things at once.** One dimension per request: clicks by country, or
   clicks by browser, never clicks by country by browser.
 - **A report of a window older than this install's rollups.** They are written as the clicks
@@ -434,6 +432,46 @@ install query DNS in a loop.
 stack starts, Caddy routes every name to the redirect exactly as it did before, the admin
 service answers `503` on every route but `/health`, and the CLI is the only way in.
 
+## The web interface
+
+Served on `CLICKMONK_ADMIN_HOST` and nowhere else, over HTTPS, by the same admin service that
+answers the API — visit the admin host in a browser and sign in. Each screen:
+
+- **Overview** — every link on every domain, as one report.
+- **Links** — the link list, searchable, and where a link is created, edited, or opened for its
+  own report.
+- **Clicks** — the click log, filtered by link, traffic class, outcome and country, with the CSV
+  export.
+- **Domains** — adding a domain and watching it become verified.
+- **Settings** — the traffic action for each non-human class, the safe URL, the abuser
+  threshold, and how long this install keeps clicks and their addresses.
+- **Account** — the password, two-factor authentication, the sessions signed in, and API keys.
+
+**Every time on screen is in the browser's own zone, never the server's.** A day chart's days
+still begin on a whole hour of UTC, because that is the grain the hourly rollups are kept at.
+So a zone that is not a whole number of hours from UTC — India Standard Time, UTC+5:30, is one
+— has its days begin off midnight, at 23:30 or 00:30 rather than 00:00, and the screen says so
+when it does.
+
+**Unique visitors counts what a cookie sees**, the same as the API: a client that keeps no
+cookie is a new visitor on every click. **The CSV export states the row count and whether it
+will hit the cap before the download starts**, and only one export runs at a time — the same
+limit ["Reading the clicks back out"](#reading-the-clicks-back-out) describes for the API.
+
+**Nothing here polls.** The numbers on screen are as fresh as the last "Refresh", or as coming
+back to the tab after a minute away; there is no timer running in the background asking the
+service for anything.
+
+**Nothing the interface does is unavailable to a script.** Every screen is built on the same
+admin API documented in this section and the ones above it — see
+["The admin API"](#the-admin-api) — so anything the interface can do, a `curl` command or the
+CLI can do too.
+
+**What it does not do yet:** there is no time zone setting for the install itself, only the
+browser's own zone; no bulk operations — one link, one domain, one setting at a time, the same
+as the CLI; and no local development mode, so trying it needs a real admin host set up, the
+same as the API does. See [#23](../../issues/23).
+
 ## Reading the clicks back out
 
 Every one of these is a read, so an API key reaches all of them and no `Origin` header is
@@ -714,7 +752,7 @@ the country looked up is the CDN's.
 
 IP Geolocation by [DB-IP](https://db-ip.com), licensed under
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). ClickMonk converts it to its
-own lookup format.
+own lookup format. The same credit is in the web interface's own footer, on every screen.
 
 A download replaces the list in use only when it parses whole and holds at least a
 minimum number of entries (about a fifth of a current edition; for country, half the

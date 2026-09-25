@@ -31,6 +31,40 @@ You need Node 22, Docker with Compose v2, and `corepack` (it ships with Node). T
 
 `CLAUDE.md` explains why the build comes before the tests, and the order CI runs checks in.
 
+### Working on the web interface
+
+`packages/ui` is a React app the admin service serves. From the repo root:
+
+    pnpm --filter @clickmonk/ui test    # unit suite
+    pnpm --filter @clickmonk/ui build   # tsc -b, then the production build
+
+The unit suite runs in `Australia/Adelaide` on purpose — a zone that is not a whole number of
+hours from UTC and observes daylight saving — so time logic that is only right in UTC fails
+here. It runs as part of the root `pnpm test` too.
+
+The browser suite drives a real browser against the shipped stack over HTTPS, so it goes
+through the stack suites (see "The stack suites" above), not `pnpm --filter @clickmonk/ui
+test`. Set `CLICKMONK_SHOTS=1` to have that run also write a screenshot of every screen, in
+both themes and at two widths, to `test/stack/tmp/e2e/shots/`.
+
+Rules the source-rule tests enforce, each with its own reason:
+
+- **No colour in `packages/ui/src`** — no hex, `rgb()`/`hsl()`/`oklch()`, named colour, or
+  Tailwind palette class. A colour that bypasses the measured brand roles can pass contrast in
+  one theme and fail in the other. Use a semantic class (`bg-primary`, `text-destructive`…) or,
+  in SVG, `var(--color-…)`.
+- **No Radix overlay primitive** (`Dialog`, `Select`, `Popover`…) — they inject a `<style>`
+  element at runtime, which the content security policy refuses. Use the native `<dialog>` in
+  `components/ui/modal.tsx`, or a native `<select>`.
+- **No inline script or style in the built output** — the same policy has no exception for one,
+  so it would be silently blocked rather than shown.
+- **No runtime import from `@clickmonk/core`** (`import type` only) — a service package pulls in
+  Node modules that throw when a browser bundle evaluates them, which is a blank page. Restate
+  the value in `api/vocabulary.ts`, whose test checks it against the service's own.
+- **Every screen has exactly one `<h1>`**, through `PageHeader`; a card or section title is an
+  `<h2>`. Tests assert this by heading level, not by text, so a change that demotes a page's
+  only heading is caught.
+
 ## Code of conduct
 
 All participation is governed by our [Code of Conduct](CODE_OF_CONDUCT.md).
