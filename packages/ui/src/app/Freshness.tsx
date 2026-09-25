@@ -48,7 +48,7 @@ export function Freshness() {
   const { round } = useRefresh()
   const now = useNowMs()
   const r = useLoad((signal) => client.status(signal), [round])
-  if (!r.data) return null
+  if (r.state === 'error' || !r.data) return null
   const s = r.data
   const alerts = s.alerts > 500 ? '500+' : formatNumber(s.alerts)
   return (

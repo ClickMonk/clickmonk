@@ -1,8 +1,11 @@
 import { ClientProvider } from '@/api/context'
+import { ApiError } from '@/api/errors'
 import { fakeClient } from '@/api/fake'
 import type { Status } from '@/api/types'
 import { NowProvider } from '@/app/clock'
-import { render, screen } from '@testing-library/react'
+import { RefreshProvider, useRefresh } from '@/app/refresh'
+import { render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router'
 import { describe, expect, it } from 'vitest'
 import { Freshness } from './Freshness'
@@ -26,6 +29,31 @@ function show(status: Status) {
       </MemoryRouter>
     </NowProvider>,
   )
+}
+
+function RefreshButton() {
+  const { refresh } = useRefresh()
+  return (
+    <button type="button" onClick={refresh}>
+      Refresh
+    </button>
+  )
+}
+
+function showWithRefresh(status: () => Promise<Status>) {
+  render(
+    <NowProvider now={NOW}>
+      <MemoryRouter>
+        <ClientProvider client={fakeClient({ status })}>
+          <RefreshProvider now={NOW}>
+            <RefreshButton />
+            <Freshness />
+          </RefreshProvider>
+        </ClientProvider>
+      </MemoryRouter>
+    </NowProvider>,
+  )
+  return { user: userEvent.setup() }
 }
 
 describe('how fresh the numbers are', () => {
@@ -110,5 +138,35 @@ describe('how fresh the numbers are', () => {
     expect(
       await screen.findByRole('link', { name: '500 domains need attention' }),
     ).toBeInTheDocument()
+  })
+
+  // A refresh that fails must not leave the previous success's numbers on
+  // screen looking current: `useLoad` keeps them beside `state: 'error'`, so
+  // this line has to check the state, not just whether `data` is set.
+  it('goes silent, rather than keeping stale numbers on screen, once a reload fails', async () => {
+    let calls = 0
+    const { user } = showWithRefresh(() => {
+      calls += 1
+      if (calls === 1)
+        return Promise.resolve({
+          ...base,
+          newestHour: '2026-10-07T02:00:00.000Z',
+          alerts: 2,
+        })
+      return Promise.reject(new ApiError(500, 'server_error', 'the service is down'))
+    })
+    expect(
+      await screen.findByText('Reports include clicks up to 7 Oct 2026, 12:30–13:30.'),
+    ).toBeInTheDocument()
+    expect(
+      await screen.findByRole('link', { name: '2 domains need attention' }),
+    ).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Refresh' }))
+    await waitFor(() =>
+      expect(
+        screen.queryByText('Reports include clicks up to 7 Oct 2026, 12:30–13:30.'),
+      ).not.toBeInTheDocument(),
+    )
+    expect(screen.queryByRole('link', { name: '2 domains need attention' })).not.toBeInTheDocument()
   })
 })
