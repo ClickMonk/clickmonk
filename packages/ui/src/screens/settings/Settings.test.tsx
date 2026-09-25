@@ -2,10 +2,21 @@ import { ClientProvider } from '@/api/context'
 import { ApiError } from '@/api/errors'
 import { fakeClient } from '@/api/fake'
 import type { Settings as S } from '@/api/types'
-import { render, screen } from '@testing-library/react'
+import { RefreshProvider, useRefresh } from '@/app/refresh'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it } from 'vitest'
 import { Settings } from './Settings'
+
+/** A stand-in for the header's Refresh button, so a test can start a round without Shell. */
+function RefreshButton() {
+  const { refresh } = useRefresh()
+  return (
+    <button type="button" onClick={refresh}>
+      go
+    </button>
+  )
+}
 
 const SETTINGS: S = {
   traffic: {
@@ -212,5 +223,35 @@ describe('the settings screen', () => {
     )
     await user.click(await screen.findByRole('button', { name: 'Save settings' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('most likely the retention pass')
+  })
+
+  it('marks the body busy while a reload is in flight, without losing the fields', async () => {
+    let resolveSecond: ((s: S) => void) | undefined
+    let calls = 0
+    const client = fakeClient({
+      settings: (() => {
+        calls += 1
+        if (calls === 1) return Promise.resolve(SETTINGS)
+        return new Promise<S>((resolve) => {
+          resolveSecond = resolve
+        })
+      }) as never,
+    })
+    render(
+      <ClientProvider client={client}>
+        <RefreshProvider>
+          <RefreshButton />
+          <Settings />
+        </RefreshProvider>
+      </ClientProvider>,
+    )
+    const threshold = await screen.findByLabelText('Abuser threshold')
+    const region = threshold.closest('[aria-busy]') as HTMLElement
+    expect(region).toHaveAttribute('aria-busy', 'false')
+    await userEvent.setup().click(screen.getByRole('button', { name: 'go' }))
+    expect(region).toHaveAttribute('aria-busy', 'true')
+    expect(screen.getByLabelText('Abuser threshold')).toHaveValue('60')
+    resolveSecond?.(SETTINGS)
+    await waitFor(() => expect(region).toHaveAttribute('aria-busy', 'false'))
   })
 })

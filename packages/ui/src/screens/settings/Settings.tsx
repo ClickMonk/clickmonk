@@ -4,6 +4,7 @@ import type { NonHumanClass, Settings as SettingsData, SettingsInput } from '@/a
 import { ACTION_LABELS, NON_HUMAN_CLASSES, TRAFFIC_ACTIONS } from '@/api/vocabulary'
 import { ErrorNote } from '@/app/ErrorNote'
 import { PageHeader } from '@/app/PageHeader'
+import { useRefresh } from '@/app/refresh'
 import { useLoad } from '@/app/useLoad'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -35,14 +36,15 @@ const PLURAL: Record<NonHumanClass, string> = {
  */
 export function Settings() {
   const client = useClient()
-  const load = useLoad(() => client.settings(), [])
+  const { round } = useRefresh()
+  const load = useLoad(() => client.settings(), [round])
   return (
     <div className="grid gap-6">
       <PageHeader title="Settings" />
       {load.state === 'error' && load.error && <ErrorNote error={load.error} />}
       {load.state !== 'error' && load.data && (
         <div aria-busy={load.state === 'loading'} className="grid gap-6">
-          <SettingsBody settings={load.data} />
+          <SettingsBody key={round} settings={load.data} />
         </div>
       )}
     </div>
