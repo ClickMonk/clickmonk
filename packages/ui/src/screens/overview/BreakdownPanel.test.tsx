@@ -199,6 +199,7 @@ describe('a breakdown panel', () => {
     expect(await screen.findByText('Germany')).toBeInTheDocument()
     const region = screen.getByText('Germany').closest('[aria-busy]') as HTMLElement
     expect(region).toHaveAttribute('aria-busy', 'false')
+    expect(screen.getByTestId('rows')).not.toHaveClass('opacity-50')
     rerender(
       <ClientProvider client={client}>
         <BreakdownPanel query={W2} dimension="country" total={20} round={0} />
@@ -206,8 +207,84 @@ describe('a breakdown panel', () => {
     )
     expect(region).toHaveAttribute('aria-busy', 'true')
     expect(screen.getByText('Germany')).toBeInTheDocument()
+    expect(screen.getByTestId('rows')).toHaveClass('opacity-50')
     resolveSecond?.(answer([{ value: 'FR', clicks: 5, visitors: 2 }]))
     expect(await screen.findByText('France')).toBeInTheDocument()
     expect(region).toHaveAttribute('aria-busy', 'false')
+    expect(screen.getByTestId('rows')).not.toHaveClass('opacity-50')
+  })
+
+  // The CSV a panel offers while stale would write the previous window's
+  // rows under the new window's file name; simplest is to offer no CSV at
+  // all until this panel's own answer has landed.
+  it('hides the CSV button while a reload is in flight', async () => {
+    let resolveSecond: ((b: Breakdown) => void) | undefined
+    let calls = 0
+    const client = fakeClient({
+      breakdown: (() => {
+        calls += 1
+        if (calls === 1) return Promise.resolve(answer([{ value: 'DE', clicks: 7, visitors: 3 }]))
+        return new Promise<Breakdown>((resolve) => {
+          resolveSecond = resolve
+        })
+      }) as never,
+    })
+    const { rerender } = render(
+      <ClientProvider client={client}>
+        <BreakdownPanel query={W} dimension="country" total={20} round={0} />
+      </ClientProvider>,
+    )
+    expect(
+      await screen.findByRole('button', { name: 'Download countries as CSV' }),
+    ).toBeInTheDocument()
+    rerender(
+      <ClientProvider client={client}>
+        <BreakdownPanel query={W2} dimension="country" total={20} round={0} />
+      </ClientProvider>,
+    )
+    expect(
+      screen.queryByRole('button', { name: 'Download countries as CSV' }),
+    ).not.toBeInTheDocument()
+    resolveSecond?.(answer([{ value: 'FR', clicks: 5, visitors: 2 }]))
+    expect(
+      await screen.findByRole('button', { name: 'Download countries as CSV' }),
+    ).toBeInTheDocument()
+  })
+
+  // Reproduces the exact numbers a re-render with a pending new query and a
+  // new total once showed: the old row (7 clicks) briefly read "7 · 14%"
+  // (against the *new* total of 50) before this panel's own answer for that
+  // window had come back. The share must not appear until it does.
+  it('shows a share only once its own answer matches the total it is shown against', async () => {
+    let resolveSecond: ((b: Breakdown) => void) | undefined
+    let calls = 0
+    const client = fakeClient({
+      breakdown: (() => {
+        calls += 1
+        if (calls === 1) return Promise.resolve(answer([{ value: 'DE', clicks: 7, visitors: 3 }]))
+        return new Promise<Breakdown>((resolve) => {
+          resolveSecond = resolve
+        })
+      }) as never,
+    })
+    const { rerender } = render(
+      <ClientProvider client={client}>
+        <BreakdownPanel query={W} dimension="country" total={20} round={0} />
+      </ClientProvider>,
+    )
+    expect(await screen.findByText('7 · 35%')).toBeInTheDocument()
+    rerender(
+      <ClientProvider client={client}>
+        <BreakdownPanel query={W2} dimension="country" total={50} round={0} />
+      </ClientProvider>,
+    )
+    // Still the old (dimmed) row, but no share computed against the new
+    // total while this panel's own load has not caught up with it.
+    expect(screen.getByText('Germany')).toBeInTheDocument()
+    expect(screen.queryByText('7 · 35%')).not.toBeInTheDocument()
+    expect(screen.queryByText('7 · 14%')).not.toBeInTheDocument()
+    expect(screen.getByText('7')).toBeInTheDocument()
+    resolveSecond?.(answer([{ value: 'DE', clicks: 7, visitors: 3 }]))
+    expect(await screen.findByText('7 · 14%')).toBeInTheDocument()
   })
 })

@@ -1,8 +1,9 @@
 import { ClientProvider } from '@/api/context'
+import { ApiError } from '@/api/errors'
 import { fakeClient } from '@/api/fake'
 import type { Breakdown, Summary, Timeseries } from '@/api/types'
 import { NowProvider } from '@/app/clock'
-import { render, screen } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router'
 import { describe, expect, it, vi } from 'vitest'
@@ -54,6 +55,19 @@ function show() {
     </NowProvider>,
   )
   return client
+}
+
+/** `showWith` renders with a caller-built client, for a scenario `show()` can't express. */
+function showWith(client: ReturnType<typeof fakeClient>) {
+  render(
+    <NowProvider now={NOW}>
+      <MemoryRouter initialEntries={['/overview?range=7d']}>
+        <ClientProvider client={client}>
+          <Overview />
+        </ClientProvider>
+      </MemoryRouter>
+    </NowProvider>,
+  )
 }
 
 describe('the overview', () => {
@@ -166,5 +180,148 @@ describe('the overview', () => {
       breakdownCalls.slice(-8).map((c) => (c.args[0] as { from: string }).from),
     )
     expect([...newFroms]).toEqual(['2026-09-07T14:30:00.000Z'])
+  })
+
+  // Nothing checks that Report actually calls the day-labeller rather than
+  // labelling each bucket plainly: a 7-day range's own bucket is 'day', so
+  // the response saying 'hour' (which happens; the two are independent) is
+  // also what proves the card title follows the answer, not the request.
+  it('carries the day on every hour label once the chart spans more than one local date, and titles the card by the response’s own bucket', async () => {
+    const hourly: Timeseries = {
+      window: W,
+      link: null,
+      bucket: 'hour',
+      buckets: Array.from({ length: 30 }, (_, i) => ({
+        at: new Date(Date.parse('2026-10-07T00:00:00.000Z') + i * 3_600_000).toISOString(),
+        clicks: i,
+        visitors: i,
+      })),
+      newestHour: '2026-10-07T02:00:00.000Z',
+    }
+    showWith(
+      fakeClient({
+        summary: () => Promise.resolve(summary),
+        timeseries: () => Promise.resolve(hourly),
+        breakdown: ((_w: unknown, d: string) => Promise.resolve(empty(d))) as never,
+      }),
+    )
+    await screen.findByText('1,200')
+    expect(screen.getByText('By hour')).toBeInTheDocument()
+    expect(screen.queryByText('By day')).not.toBeInTheDocument()
+    await userEvent.setup().click(screen.getByText('Show the numbers'))
+    const table = within(screen.getByRole('table'))
+    expect(table.getByText('Wed 7 Oct, 10:30')).toBeInTheDocument()
+    expect(table.getByText('Thu 8 Oct, 10:30')).toBeInTheDocument()
+  })
+
+  // The summary answering before the breakdowns is common, but the reverse
+  // can happen too: a breakdown's own request lands while the summary it
+  // shares a total with is still on the window before. The share must wait
+  // for both, not just its own panel's load.
+  it('shows a breakdown’s share only once the summary for the same window has answered too', async () => {
+    let resolveSecondSummary: ((s: Summary) => void) | undefined
+    let summaryCalls = 0
+    const countryAnswer: Breakdown = {
+      window: W,
+      link: null,
+      dimension: 'country',
+      truncated: false,
+      rows: [{ value: 'DE', clicks: 7, visitors: 3 }],
+    }
+    showWith(
+      fakeClient({
+        summary: () => {
+          summaryCalls += 1
+          if (summaryCalls === 1) return Promise.resolve(summary)
+          return new Promise<Summary>((resolve) => {
+            resolveSecondSummary = resolve
+          })
+        },
+        timeseries: () => Promise.resolve(series),
+        breakdown: ((_w: unknown, d: string) =>
+          Promise.resolve(d === 'country' ? countryAnswer : empty(d))) as never,
+      }),
+    )
+    expect(await screen.findByText('7 · <1%')).toBeInTheDocument()
+    await userEvent.setup().selectOptions(screen.getByLabelText('Time range'), '30d')
+    await new Promise((r) => setTimeout(r, 0))
+    // The country panel's own breakdown has already answered for the new
+    // window (it resolves at once), but the summary has not: no share.
+    expect(screen.getByText('Germany')).toBeInTheDocument()
+    expect(screen.queryByText(/7 · /)).not.toBeInTheDocument()
+    resolveSecondSummary?.({ ...summary, clicks: 20 })
+    expect(await screen.findByText('7 · 35%')).toBeInTheDocument()
+  })
+
+  it('hides the old summary numbers when a new window’s summary request fails', async () => {
+    let summaryCalls = 0
+    showWith(
+      fakeClient({
+        summary: () => {
+          summaryCalls += 1
+          if (summaryCalls === 1) return Promise.resolve(summary)
+          return Promise.reject(
+            new ApiError(503, 'reporting_unavailable', 'reporting is not available'),
+          )
+        },
+        timeseries: () => Promise.resolve(series),
+        breakdown: ((_w: unknown, d: string) => Promise.resolve(empty(d))) as never,
+      }),
+    )
+    expect(await screen.findByText('1,200')).toBeInTheDocument()
+    await userEvent.setup().selectOptions(screen.getByLabelText('Time range'), '30d')
+    expect(await screen.findByRole('alert')).toBeInTheDocument()
+    expect(screen.queryByText('1,200')).not.toBeInTheDocument()
+  })
+
+  it('hides the old chart when a new window’s timeseries request fails', async () => {
+    let seriesCalls = 0
+    showWith(
+      fakeClient({
+        summary: () => Promise.resolve(summary),
+        timeseries: () => {
+          seriesCalls += 1
+          if (seriesCalls === 1) return Promise.resolve(series)
+          return Promise.reject(
+            new ApiError(503, 'reporting_unavailable', 'reporting is not available'),
+          )
+        },
+        breakdown: ((_w: unknown, d: string) => Promise.resolve(empty(d))) as never,
+      }),
+    )
+    await screen.findByText('1,200')
+    expect(screen.getByRole('img')).toBeInTheDocument()
+    await userEvent.setup().selectOptions(screen.getByLabelText('Time range'), '30d')
+    expect(await screen.findByRole('alert')).toBeInTheDocument()
+    expect(screen.queryByRole('img')).not.toBeInTheDocument()
+  })
+
+  it('hides the chart’s CSV button while a reload is in flight', async () => {
+    let resolveSecondSeries: ((t: Timeseries) => void) | undefined
+    let seriesCalls = 0
+    showWith(
+      fakeClient({
+        summary: () => Promise.resolve(summary),
+        timeseries: () => {
+          seriesCalls += 1
+          if (seriesCalls === 1) return Promise.resolve(series)
+          return new Promise<Timeseries>((resolve) => {
+            resolveSecondSeries = resolve
+          })
+        },
+        breakdown: ((_w: unknown, d: string) => Promise.resolve(empty(d))) as never,
+      }),
+    )
+    expect(
+      await screen.findByRole('button', { name: 'Download the chart as CSV' }),
+    ).toBeInTheDocument()
+    await userEvent.setup().selectOptions(screen.getByLabelText('Time range'), '30d')
+    expect(
+      screen.queryByRole('button', { name: 'Download the chart as CSV' }),
+    ).not.toBeInTheDocument()
+    resolveSecondSeries?.(series)
+    expect(
+      await screen.findByRole('button', { name: 'Download the chart as CSV' }),
+    ).toBeInTheDocument()
   })
 })

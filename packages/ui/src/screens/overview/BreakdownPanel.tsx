@@ -80,6 +80,13 @@ export function BreakdownPanel(props: {
   // window's rows sitting next to a new window's error — reads as still
   // current. A loading reload keeps them, dimmed, so a fast reload does not
   // blank the panel.
+  // A share divides these rows by `total`, and the two only ever answer the
+  // same request when this panel's own load has finished ('ok') *and* a total
+  // was given — `total` is undefined whenever the summary it comes from is
+  // itself not `'ok'` for the current window (see Report.tsx). Without this,
+  // a still-loading panel's dimmed, previous-window rows would show a share
+  // against whatever total the *new* window's summary just answered with.
+  const shareKnown = r.state === 'ok' && props.total !== undefined
   const rows =
     r.state === 'error'
       ? []
@@ -87,7 +94,9 @@ export function BreakdownPanel(props: {
           key: row.value,
           label: rowLabel(props.dimension, row, { targets: props.targets }),
           value: row.clicks,
-          secondary: `${formatNumber(row.clicks)} · ${formatShare(row.clicks, props.total ?? 0)}`,
+          secondary: shareKnown
+            ? `${formatNumber(row.clicks)} · ${formatShare(row.clicks, props.total as number)}`
+            : formatNumber(row.clicks),
           row,
         }))
   const stale = r.state === 'loading'
@@ -121,7 +130,7 @@ export function BreakdownPanel(props: {
           <p className="text-sm text-muted-foreground">Nothing in this window.</p>
         )}
         {rows.length > 0 && (
-          <div className={stale ? 'opacity-50' : undefined}>
+          <div data-testid="rows" className={stale ? 'opacity-50' : undefined}>
             <Bars rows={rows} />
           </div>
         )}

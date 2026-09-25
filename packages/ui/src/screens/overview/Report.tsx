@@ -58,15 +58,25 @@ export function Report({ link, panels }: { link?: string; panels: Panel[] }) {
   // come from the same, finished request: `total` is only ever the current
   // query's own answer, never a stale one left over from the window before.
   const total = summary.state === 'ok' ? summary.data?.clicks : undefined
+  // The same rule as a breakdown panel, for the two blocks below: an error
+  // drops what it was showing (the old window's numbers beside its own
+  // request's error read as still current), and a reload in flight keeps the
+  // old numbers up, marked busy and dimmed, rather than blanking on every
+  // window change or refresh.
+  const summaryStale = summary.state === 'loading'
+  const seriesStale = series.state === 'loading'
 
   return (
     <div className="grid gap-6">
       {summary.error && <ErrorNote error={summary.error} />}
-      {summary.data && (
-        <>
+      {summary.data && summary.state !== 'error' && (
+        <div
+          aria-busy={summaryStale}
+          className={summaryStale ? 'grid gap-6 opacity-50' : 'grid gap-6'}
+        >
           <CountedWindow counted={summary.data.window} />
           <SummaryCards s={summary.data} />
-        </>
+        </div>
       )}
       <Card>
         <CardHeader className="flex flex-row flex-wrap items-center justify-between gap-2">
@@ -84,7 +94,7 @@ export function Report({ link, panels }: { link?: string; panels: Panel[] }) {
                 {m === 'clicks' ? 'Clicks' : 'Visitors'}
               </Button>
             ))}
-            {buckets.length > 0 && (
+            {buckets.length > 0 && series.state === 'ok' && (
               <Button
                 type="button"
                 size="sm"
@@ -104,8 +114,11 @@ export function Report({ link, panels }: { link?: string; panels: Panel[] }) {
         </CardHeader>
         <CardContent className="grid gap-2">
           {series.error && <ErrorNote error={series.error} />}
-          {series.data && (
-            <>
+          {series.data && series.state !== 'error' && (
+            <div
+              aria-busy={seriesStale}
+              className={seriesStale ? 'grid gap-2 opacity-50' : 'grid gap-2'}
+            >
               <Columns
                 buckets={buckets}
                 unit={metric}
@@ -119,7 +132,7 @@ export function Report({ link, panels }: { link?: string; panels: Panel[] }) {
                 </p>
               )}
               <CountedWindow counted={series.data.window} bucket={series.data.bucket} />
-            </>
+            </div>
           )}
         </CardContent>
       </Card>
