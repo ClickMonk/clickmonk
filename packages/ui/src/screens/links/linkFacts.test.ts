@@ -48,6 +48,15 @@ describe('what a link says about itself', () => {
     ])
   })
 
+  // A cap of zero is a link switched off by its cap rather than one with no
+  // cap at all (that is `clickCap: null`, tested above): `0 >= 0` is already
+  // reached, on the very first click.
+  it('says a cap of zero is already reached', () => {
+    expect(linkFacts(link({ clickCap: 0, capUsed: 0 }), NOW, ADL).status).toEqual([
+      'Cap reached: 0 of 0 clicks',
+    ])
+  })
+
   it('says when it expires, and when it expired, in local time', () => {
     expect(linkFacts(link({ expiresAt: '2026-11-11T13:30:00.000Z' }), NOW, ADL).status).toEqual([
       'Expires 12 Nov 2026, 00:00',
@@ -63,6 +72,28 @@ describe('what a link says about itself', () => {
   it('says a link expiring at exactly this moment has already expired', () => {
     expect(linkFacts(link({ expiresAt: '2026-10-07T03:00:00.000Z' }), NOW, ADL).status).toEqual([
       'Expired 7 Oct 2026, 13:30',
+    ])
+  })
+
+  // Three status facts at once, in the order the code checks them — disabled,
+  // then the cap, then the expiry — so a reorder is a visible change here even
+  // though every individual fact is already covered above.
+  it('lists disabled, capped and expired together in that order', () => {
+    expect(
+      linkFacts(
+        link({
+          enabled: false,
+          clickCap: 100,
+          capUsed: 100,
+          expiresAt: '2026-10-02T23:30:00.000Z',
+        }),
+        NOW,
+        ADL,
+      ).status,
+    ).toEqual([
+      'Disabled: answers as an unknown slug',
+      'Cap reached: 100 of 100 clicks',
+      'Expired 3 Oct 2026, 09:00',
     ])
   })
 
