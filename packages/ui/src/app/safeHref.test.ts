@@ -2,8 +2,9 @@ import { describe, expect, it } from 'vitest'
 import { safeHref } from './safeHref'
 
 describe('a link from a response', () => {
-  it.each(['https://example.com/offer?a=1', 'http://example.com/'])('keeps %s', (url) =>
-    expect(safeHref(url)).toBe(url),
+  it.each(['https://example.com/offer?a=1', 'http://example.com/', 'HTTPS://example.com/'])(
+    'keeps %s',
+    (url) => expect(safeHref(url)).toBe(url),
   )
 
   it.each([

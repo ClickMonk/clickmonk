@@ -21,6 +21,12 @@ export function Confirm(props: {
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<ApiError | null>(null)
+  // An error that is not an `ApiError` is a defect, not a refusal to show. It
+  // is rethrown to React the way `useLoad` does: an async event handler's own
+  // returned promise is never awaited by anything, so throwing straight from
+  // `catch` here would only be an unhandled rejection, never seen.
+  const [thrown, setThrown] = useState<unknown>(null)
+  if (thrown !== null) throw thrown
   const confirm = async () => {
     setBusy(true)
     setError(null)
@@ -29,14 +35,19 @@ export function Confirm(props: {
       setOpen(false)
     } catch (err) {
       if (err instanceof ApiError) setError(err)
-      else throw err
+      else setThrown(err)
     } finally {
       setBusy(false)
     }
   }
   return (
     <>
-      {cloneElement(props.trigger, { onClick: () => setOpen(true) })}
+      {cloneElement(props.trigger, {
+        onClick: () => {
+          setError(null)
+          setOpen(true)
+        },
+      })}
       <Modal
         open={open}
         onClose={() => setOpen(false)}

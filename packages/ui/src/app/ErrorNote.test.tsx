@@ -37,4 +37,12 @@ describe('an error, said', () => {
     render(<ErrorNote error={error} />)
     expect(screen.getByRole('alert')).toHaveTextContent(text)
   })
+
+  // `toHaveTextContent` above is a substring match, which "no such key.."
+  // would also satisfy — jest-dom has no exact option for it — so the
+  // double-full-stop guard needs a direct comparison of the whole text.
+  it('collapses a message that already ends in a full stop, rather than doubling it', () => {
+    render(<ErrorNote error={new ApiError(404, 'not_found', 'no such key.')} />)
+    expect(screen.getByRole('alert').textContent).toBe('no such key.')
+  })
 })

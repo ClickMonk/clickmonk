@@ -5,6 +5,7 @@ import { beforeAll, describe, expect, it } from 'vitest'
 const DIST = join(import.meta.dirname, '..', 'dist')
 
 let html = ''
+let css = ''
 
 beforeAll(() => {
   if (!existsSync(join(DIST, 'index.html')))
@@ -12,11 +13,26 @@ beforeAll(() => {
       'run `pnpm --filter @clickmonk/ui build` first: this test reads the built output',
     )
   html = readFileSync(join(DIST, 'index.html'), 'utf8')
-  const js = readdirSync(join(DIST, 'assets')).filter((f) => f.endsWith('.js'))
+  const assets = readdirSync(join(DIST, 'assets'))
+  const js = assets.filter((f) => f.endsWith('.js'))
   expect(
     js,
     'one chunk: nothing is lazy-loaded, so an upgrade cannot leave a page asking for a chunk that is gone',
   ).toHaveLength(1)
+  const cssFile = assets.find((f) => f.endsWith('.css'))
+  if (!cssFile) throw new Error('no built CSS file in dist/assets')
+  css = readFileSync(join(DIST, 'assets', cssFile), 'utf8')
+})
+
+describe('the built stylesheet', () => {
+  // Tailwind's preflight resets `border` to `0 solid`, which leaves the
+  // colour at its default, currentColor. Without a base rule pointing every
+  // border at the brand's role, a bare `border` class (the card, the
+  // outline button, the table's rules) draws in whatever text colour is
+  // inherited, not a border.
+  it('gives every element a border colour from the brand role, not currentColor', () => {
+    expect(css).toContain('border-color:var(--color-border)')
+  })
 })
 
 describe('the built page', () => {

@@ -104,3 +104,24 @@ body {
   font-family: var(--cm-font-sans);
   font-variant-numeric: tabular-nums;
 }
+
+/* Tailwind 4's preflight resets `border` to `0 solid`, which leaves an
+ * element's border colour at its default, currentColor — the text colour,
+ * not the brand's border role. shadcn's own base stylesheet (from `init`,
+ * never run here) carries this same rule; without it, a bare `border` class
+ * (the card, the outline button, the table's rules) draws in whatever text
+ * colour happens to be inherited, not a border. */
+@layer base {
+  *,
+  ::before,
+  ::after {
+    border-color: var(--color-border);
+  }
+}
+
+/* Tailwind 4's preflight resets `border` to `0 solid`, which leaves an
+ * element's border colour at its default, currentColor — the text colour,
+ * not the brand's border role. shadcn's own base stylesheet (from `init`,
+ * never run here) carries this same rule; without it, a bare `border` class
+ * (the card, the outline button, the table's rules) draws in whatever text
+ * colour happens to be inherited, not a border. */

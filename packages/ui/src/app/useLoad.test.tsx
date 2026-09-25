@@ -62,11 +62,23 @@ describe('loading', () => {
     expect(screen.getByTestId('error')).toHaveTextContent('')
   })
 
-  it('loads again when asked', async () => {
+  it('loads again when asked, staying in loading with the old data until the new answer arrives', async () => {
     let n = 0
-    render(<Show load={() => Promise.resolve(`load ${++n}`)} />)
+    let resolveSecond: (v: string) => void = () => {}
+    const load = vi.fn(() => {
+      n += 1
+      if (n === 1) return Promise.resolve('load 1')
+      return new Promise<string>((r) => {
+        resolveSecond = r
+      })
+    })
+    render(<Show load={load} />)
     expect(await screen.findByText('load 1')).toBeInTheDocument()
     await act(async () => screen.getByRole('button', { name: 'again' }).click())
-    expect(await screen.findByText('load 2')).toBeInTheDocument()
+    expect(screen.getByTestId('state')).toHaveTextContent('loading')
+    expect(screen.getByTestId('data')).toHaveTextContent('load 1')
+    await act(async () => resolveSecond('load 2'))
+    expect(screen.getByTestId('state')).toHaveTextContent('ok')
+    expect(screen.getByTestId('data')).toHaveTextContent('load 2')
   })
 })
