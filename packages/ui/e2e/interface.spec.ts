@@ -360,6 +360,23 @@ test('exports the click as a file of one header and one row', async () => {
   expect(lines[1]).toContain(`"${LINK_HOST}","/${SLUG}"`)
 })
 
+// The anchor's `download` attribute is what stops a refused second request —
+// the export gate has one slot — from replacing the whole application with
+// the service's raw JSON. Two clicks in quick succession, not one followed by
+// a wait, so the second reaches the anchor before the first's response has
+// had time to answer.
+test('clicking Download the CSV twice in a row leaves the interface on the Clicks screen', async () => {
+  await page.getByRole('button', { name: 'Export as CSV' }).click()
+  await expect(page.getByText('1 click will be in the file.', { exact: true })).toBeVisible()
+  const link = page.getByRole('link', { name: 'Download the CSV' })
+  const oneDownload = page.waitForEvent('download')
+  await link.click()
+  await link.click()
+  await oneDownload
+  await h1('Clicks')
+  expect(await page.locator('body').innerText()).not.toContain('"error"')
+})
+
 test('the overview counts the click and names its link', async () => {
   await page
     .getByRole('navigation', { name: 'Main' })
