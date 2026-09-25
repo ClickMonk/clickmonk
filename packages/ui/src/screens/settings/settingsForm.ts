@@ -5,7 +5,8 @@ import type {
   SettingsInput,
   TrafficAction,
 } from '@/api/types'
-import { NON_HUMAN_CLASSES } from '@/api/vocabulary'
+import { MAX_ABUSER_THRESHOLD, MAX_RETENTION_DAYS, NON_HUMAN_CLASSES } from '@/api/vocabulary'
+import { formatNumber } from '@/app/format'
 
 export interface SettingsFormState {
   actions: Record<NonHumanClass, TrafficAction>
@@ -53,14 +54,14 @@ const WHOLE = /^\d+$/
 export function settingsProblems(f: SettingsFormState): Record<string, string> {
   const out: Record<string, string> = {}
   const t = Number(f.abuserThreshold)
-  if (!WHOLE.test(f.abuserThreshold) || t < 1 || t > 100_000)
-    out.abuserThreshold = 'A whole number from 1 to 100,000.'
+  if (!WHOLE.test(f.abuserThreshold) || t < 1 || t > MAX_ABUSER_THRESHOLD)
+    out.abuserThreshold = `A whole number from 1 to ${formatNumber(MAX_ABUSER_THRESHOLD)}.`
   for (const k of ['raw', 'ip'] as const) {
     const p = f[k]
     if (p.forever) continue
     if (p.days === '') out[k] = 'Choose a number of days, or for ever.'
-    else if (!WHOLE.test(p.days) || Number(p.days) < 1 || Number(p.days) > 3650)
-      out[k] = 'A whole number of days from 1 to 3,650.'
+    else if (!WHOLE.test(p.days) || Number(p.days) < 1 || Number(p.days) > MAX_RETENTION_DAYS)
+      out[k] = `A whole number of days from 1 to ${formatNumber(MAX_RETENTION_DAYS)}.`
   }
   if (f.safeUrl === '' && NON_HUMAN_CLASSES.some((c) => f.actions[c] === 'safe'))
     out.safeUrl = 'The safe action needs a safe URL.'

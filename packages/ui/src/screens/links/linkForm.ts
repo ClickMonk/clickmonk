@@ -1,5 +1,5 @@
 import type { Link, LinkInput, LinkPatch, NonHumanClass, TrafficAction } from '@/api/types'
-import { NON_HUMAN_CLASSES } from '@/api/vocabulary'
+import { MIN_LINK_PASSWORD_LENGTH, NON_HUMAN_CLASSES } from '@/api/vocabulary'
 import { zoneOffsetMinutes } from '@/window/range'
 
 /**
@@ -225,8 +225,8 @@ export function problemsOf(s: LinkFormState): Record<string, string> {
     if (list.length === 0) out.countries = 'Name at least one country.'
     else if (bad) out.countries = `“${bad}” is not a two-letter country code.`
   }
-  if (s.password.mode === 'set' && s.password.value.length < 6) {
-    out.password = 'A link password is at least 6 characters.'
+  if (s.password.mode === 'set' && s.password.value.length < MIN_LINK_PASSWORD_LENGTH) {
+    out.password = `A link password is at least ${MIN_LINK_PASSWORD_LENGTH} characters.`
   }
   return out
 }

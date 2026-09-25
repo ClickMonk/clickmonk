@@ -23,6 +23,11 @@ import { type FormEvent, useState } from 'react'
 
 const DAYS_RE = /^\d+$/
 
+// Both bounds below are `admin`'s own (`packages/admin/src/keys.ts`,
+// `MAX_KEY_NAME_LENGTH` and `MAX_KEY_DAYS`), restated rather than imported —
+// the interface imports nothing from a service package at runtime. A drift
+// here is not caught by a test the way `core`'s bounds are in
+// `vocabulary.test.ts`; keep this comment in step with that file by hand.
 function nameProblem(name: string): string | undefined {
   if (name.length < 1 || name.length > 100) return 'A name is 1 to 100 characters.'
   return undefined

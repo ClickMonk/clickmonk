@@ -41,6 +41,17 @@ export const REPORT_DIMENSIONS = [
 export const DEVICES = ['ios', 'android', 'desktop'] as const
 export const IP_SOURCES = ['country', 'asn', 'datacenter', 'tor'] as const
 
+/**
+ * Numeric bounds a form checks locally before asking the service, restated
+ * from `core` for the same reason the lists above are: the test beside this
+ * file fails the moment one drifts from the number `core` actually enforces,
+ * rather than a form silently refusing a value the service would accept.
+ */
+export const MIN_ADMIN_PASSWORD_LENGTH = 12
+export const MIN_LINK_PASSWORD_LENGTH = 6
+export const MAX_ABUSER_THRESHOLD = 100_000
+export const MAX_RETENTION_DAYS = 3650
+
 export const CLASS_LABELS: Record<(typeof TRAFFIC_CLASSES)[number], string> = {
   bot: 'Bot',
   abuser: 'Abuser',

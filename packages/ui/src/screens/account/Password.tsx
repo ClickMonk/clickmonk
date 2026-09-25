@@ -1,12 +1,11 @@
 import { useClient } from '@/api/context'
 import { ApiError } from '@/api/errors'
+import { MIN_ADMIN_PASSWORD_LENGTH } from '@/api/vocabulary'
 import { ErrorNote } from '@/app/ErrorNote'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { type FormEvent, useState } from 'react'
-
-const MIN_LENGTH = 12
 
 /** "1 other session was" against "2 other sessions were" — the count is never off by the word around it. */
 function signedOutSentence(count: number): string {
@@ -42,8 +41,8 @@ export function Password({ onChanged = () => {} }: { onChanged?: () => void } = 
     setStatus(null)
     setFailure(null)
     setCurrentPasswordError(null)
-    if (newPassword.length < MIN_LENGTH) {
-      setProblem('A password is at least 12 characters.')
+    if (newPassword.length < MIN_ADMIN_PASSWORD_LENGTH) {
+      setProblem(`A password is at least ${MIN_ADMIN_PASSWORD_LENGTH} characters.`)
       return
     }
     if (newPassword !== again) {

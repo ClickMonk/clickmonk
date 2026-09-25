@@ -129,6 +129,9 @@ export function Links() {
         <form className="flex items-end gap-2" onSubmit={search}>
           <div className="grid gap-1">
             <Label htmlFor="link-search">Search links</Label>
+            {/* 100 is admin's own MAX_LINK_SEARCH (packages/admin/src/links.ts),
+                restated rather than imported — the interface imports nothing
+                from a service package at runtime. */}
             <Input
               id="link-search"
               type="search"
