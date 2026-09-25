@@ -360,21 +360,26 @@ test('exports the click as a file of one header and one row', async () => {
   expect(lines[1]).toContain(`"${LINK_HOST}","/${SLUG}"`)
 })
 
-// The anchor's `download` attribute is what stops a refused second request —
-// the export gate has one slot — from replacing the whole application with
-// the service's raw JSON. Two clicks in quick succession, not one followed by
-// a wait, so the second reaches the anchor before the first's response has
-// had time to answer.
-test('clicking Download the CSV twice in a row leaves the interface on the Clicks screen', async () => {
+// The anchor's `download` attribute is what stops a refused request — the
+// export gate has one slot, a session can end, ClickHouse can be down — from
+// replacing the whole application with the service's raw JSON. The export
+// here holds one row and answers in milliseconds, so nothing short of a
+// forced refusal ever exercises that path: a plain second click always gets
+// its own slot and a 200. The route below makes the refusal deterministic.
+test('a refused download leaves the interface on the Clicks screen, not raw JSON', async () => {
   await page.getByRole('button', { name: 'Export as CSV' }).click()
   await expect(page.getByText('1 click will be in the file.', { exact: true })).toBeVisible()
-  const link = page.getByRole('link', { name: 'Download the CSV' })
-  const oneDownload = page.waitForEvent('download')
-  await link.click()
-  await link.click()
-  await oneDownload
+  await page.route('**/api/clicks.csv*', (route) =>
+    route.fulfill({
+      status: 429,
+      contentType: 'application/json',
+      body: '{"error":"too_many_exports","message":"an export is already running; try again"}',
+    }),
+  )
+  await page.getByRole('link', { name: 'Download the CSV' }).click()
   await h1('Clicks')
   expect(await page.locator('body').innerText()).not.toContain('"error"')
+  await page.unroute('**/api/clicks.csv*')
 })
 
 test('the overview counts the click and names its link', async () => {
