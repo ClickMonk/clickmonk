@@ -368,7 +368,11 @@ not whether the install is configured, and not whether the account exists. That 
 `GET /api/domains` returns at most 500 entries and `GET /api/keys` at most 200, each
 setting `"truncated": true` when there were more. `clickmonk domain list` has no such cap;
 `clickmonk apikey list` has the same one and says when it hit it. `GET /api/links` pages
-properly, with `limit` and `cursor`.
+properly, with `limit` and an opaque `cursor` from the previous answer — newest links
+first. `q` searches the slug and the name, case-insensitively, as a substring; it reads
+every link on the install, so it is fine for what an operator has and not a plan for a
+much larger one. Each link in the response carries `createdAt` and, for a link with a
+click cap, `capUsed` — `null` for a link with none.
 
 The install-wide settings are `GET /api/settings` and `PUT /api/settings` — the same
 things `clickmonk settings set` covers, in two halves: `traffic` and `retention`. The

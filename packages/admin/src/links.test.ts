@@ -3,7 +3,7 @@ import { createPgPool } from '@clickmonk/db'
 import { TEST_PG_URL, resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import type { FastifyInstance, LightMyRequestResponse } from 'fastify'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { MAX_LINK_PAGE, ownFields } from './links.js'
+import { ownFields } from './links.js'
 import { clockFrom, read, signedIn, testApp, write } from './testing.js'
 
 const pg = testPg()
@@ -442,55 +442,126 @@ describe('changing a link', () => {
   })
 })
 
+/** Sets a link's creation time, so an order can be asserted without the database's clock. */
+const createdAt = (slug: string, iso: string) =>
+  pg.query('UPDATE links SET created_at = $2 WHERE slug = $1', [slug, iso])
+
+const slugs = (r: LightMyRequestResponse): string[] =>
+  r.json().links.map((l: { slug: string }) => l.slug)
+
 describe('listing links', () => {
-  it('pages, bounded, and stops rather than offering a cursor forever', async () => {
-    for (let i = 0; i < 5; i++) await create({ slug: `link-${i}`, targets: [target] })
-    const first = await app.inject({
-      method: 'GET',
-      url: '/api/links?limit=2',
-      headers: read(cookie),
-    })
-    expect(first.json().links).toHaveLength(2)
-    const second = await app.inject({
-      method: 'GET',
-      url: `/api/links?limit=2&cursor=${first.json().nextCursor}`,
-      headers: read(cookie),
-    })
-    expect(second.json().links).toHaveLength(2)
-    const seen = [...first.json().links, ...second.json().links].map(
-      (l: { slug: string }) => l.slug,
-    )
-    expect(new Set(seen).size).toBe(4)
-    const last = await app.inject({
-      method: 'GET',
-      url: `/api/links?limit=2&cursor=${second.json().nextCursor}`,
-      headers: read(cookie),
-    })
-    expect(last.json().links).toHaveLength(1)
-    expect(last.json().nextCursor).toBeNull()
+  it('lists the newest first', async () => {
+    for (const slug of ['old', 'middle', 'new']) await create({ slug, targets: [target] })
+    await createdAt('old', '2026-09-01T00:00:00.000Z')
+    await createdAt('middle', '2026-09-10T00:00:00.000Z')
+    await createdAt('new', '2026-09-20T00:00:00.000Z')
+    const r = await app.inject({ method: 'GET', url: '/api/links', headers: read(cookie) })
+    expect(slugs(r)).toEqual(['new', 'middle', 'old'])
   })
 
-  it('refuses a page larger than the bound, and a cursor that is not an id', async () => {
-    const tooBig = await app.inject({
+  // Five links created in one instant, paged two at a time: every link exactly
+  // once, in id order within the instant, and no cursor after the last. A
+  // boundary that compared the time alone would skip the rest of the instant;
+  // one that compared it with `<=` would repeat it.
+  it('pages through links created in the same instant, each exactly once', async () => {
+    for (let i = 0; i < 5; i++) await create({ slug: `tie-${i}`, targets: [target] })
+    await pg.query(`UPDATE links SET created_at = '2026-09-15T12:00:00.123456Z'`)
+    const ids = (await pg.query<{ id: string }>('SELECT id FROM links ORDER BY id DESC')).rows.map(
+      (row) => row.id,
+    )
+    const seen: string[] = []
+    let cursor: string | null = null
+    let pages = 0
+    do {
+      const r: LightMyRequestResponse = await app.inject({
+        method: 'GET',
+        url: `/api/links?limit=2${cursor ? `&cursor=${cursor}` : ''}`,
+        headers: read(cookie),
+      })
+      seen.push(...r.json().links.map((l: { id: string }) => l.id))
+      cursor = r.json().nextCursor
+      pages += 1
+    } while (cursor !== null && pages < 10)
+    expect(seen).toEqual(ids)
+    expect(pages).toBe(3)
+  })
+
+  // Two links a microsecond apart, paged one at a time. A cursor that carried
+  // milliseconds would round both to the same instant and the second page
+  // would repeat the first link or skip the second.
+  it('keeps the microseconds in the cursor', async () => {
+    await create({ slug: 'first', targets: [target] })
+    await create({ slug: 'second', targets: [target] })
+    await createdAt('first', '2026-09-15T12:00:00.000001Z')
+    await createdAt('second', '2026-09-15T12:00:00.000002Z')
+    const one = await app.inject({
       method: 'GET',
-      url: `/api/links?limit=${MAX_LINK_PAGE + 1}`,
+      url: '/api/links?limit=1',
       headers: read(cookie),
     })
-    expect(tooBig.statusCode).toBe(400)
-    // The code and the whole body, because the interesting failure is a 500:
-    // a bound the schema no longer applies sends the value on to Postgres,
-    // which raises, and the route answers 500 — a refusal of a kind, and not
-    // this one. A test that read only "it did not work" would accept it.
-    expect(tooBig.json().error).toBe('invalid_body')
-    expect(Object.keys(tooBig.json()).sort()).toEqual(['error', 'message'])
-    const badCursor = await app.inject({
+    expect(slugs(one)).toEqual(['second'])
+    const two = await app.inject({
       method: 'GET',
-      url: '/api/links?cursor=not-a-uuid',
+      url: `/api/links?limit=1&cursor=${one.json().nextCursor}`,
       headers: read(cookie),
     })
-    expect(badCursor.statusCode).toBe(400)
-    expect(badCursor.json().error).toBe('invalid_body')
-    expect(Object.keys(badCursor.json()).sort()).toEqual(['error', 'message'])
+    expect(slugs(two)).toEqual(['first'])
+  })
+
+  it('stops rather than offering a cursor forever', async () => {
+    await create({ slug: 'only', targets: [target] })
+    const r = await app.inject({ method: 'GET', url: '/api/links?limit=2', headers: read(cookie) })
+    expect(r.json().nextCursor).toBeNull()
+  })
+
+  it.each([
+    ['a page larger than the bound', `limit=${201}`],
+    ['a cursor that is not a cursor', 'cursor=not-a-cursor'],
+    ['a cursor with an id that is not an id', 'cursor=1758000000000000.nope'],
+    ['a cursor in the old shape, a bare id', 'cursor=00000000-0000-4000-8000-000000000001'],
+    ['an empty search', 'q='],
+    ['a search longer than the bound', `q=${'x'.repeat(101)}`],
+  ])('refuses %s', async (_label, query) => {
+    const r = await app.inject({ method: 'GET', url: `/api/links?${query}`, headers: read(cookie) })
+    expect(r.statusCode).toBe(400)
+    expect(r.json().error).toBe('invalid_body')
+    expect(Object.keys(r.json()).sort()).toEqual(['error', 'message'])
+  })
+
+  it('finds a link by part of its slug or its name, ignoring case', async () => {
+    await create({ slug: 'spring-sale', targets: [target] })
+    await create({ slug: 'autumn', name: 'Big SPRING push', targets: [target] })
+    await create({ slug: 'winter', targets: [target] })
+    await createdAt('spring-sale', '2026-09-01T00:00:00.000Z')
+    await createdAt('autumn', '2026-09-02T00:00:00.000Z')
+    const r = await app.inject({ method: 'GET', url: '/api/links?q=Spring', headers: read(cookie) })
+    expect(slugs(r)).toEqual(['autumn', 'spring-sale'])
+  })
+
+  it('searches for a percent sign and an underscore as themselves', async () => {
+    await create({ slug: 'half', name: '50% off', targets: [target] })
+    await create({ slug: 'plain', name: '500 off', targets: [target] })
+    await create({ slug: 'a_b', targets: [target] })
+    await create({ slug: 'axb', targets: [target] })
+    const percent = await app.inject({
+      method: 'GET',
+      url: '/api/links?q=50%25',
+      headers: read(cookie),
+    })
+    expect(slugs(percent)).toEqual(['half'])
+    const underscore = await app.inject({
+      method: 'GET',
+      url: '/api/links?q=a_',
+      headers: read(cookie),
+    })
+    expect(slugs(underscore)).toEqual(['a_b'])
+  })
+
+  it('searches for a backslash as itself', async () => {
+    await create({ slug: 'slash', name: 'back\\slash', targets: [target] })
+    await create({ slug: 'other', name: 'backslash', targets: [target] })
+    const r = await app.inject({ method: 'GET', url: '/api/links?q=k%5Cs', headers: read(cookie) })
+    expect(slugs(r)).toEqual(['slash'])
   })
 
   it('filters by domain', async () => {
@@ -513,6 +584,65 @@ describe('listing links', () => {
       headers: read(cookie),
     })
     expect(r.json().links.map((l: { slug: string }) => l.slug)).toEqual(['two'])
+  })
+
+  it('combines a search with a domain', async () => {
+    await app.inject({
+      method: 'POST',
+      url: '/api/domains',
+      headers: write(cookie),
+      payload: { host: 'two.example.test' },
+    })
+    await create({ slug: 'sale', targets: [target] })
+    await app.inject({
+      method: 'POST',
+      url: '/api/links',
+      headers: write(cookie),
+      payload: { host: 'two.example.test', slug: 'sale', targets: [target] },
+    })
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/links?q=sale&domain=two.example.test',
+      headers: read(cookie),
+    })
+    expect(r.json().links.map((l: { host: string }) => l.host)).toEqual(['two.example.test'])
+  })
+})
+
+describe('what a link says about itself', () => {
+  it('says when it was created', async () => {
+    const id = (await create({ slug: 'dated', targets: [target] })).json().id
+    await createdAt('dated', '2026-09-15T12:00:00.123Z')
+    const r = await app.inject({ method: 'GET', url: `/api/links/${id}`, headers: read(cookie) })
+    expect(r.json().createdAt).toBe('2026-09-15T12:00:00.123Z')
+  })
+
+  it('says how much of its cap is used, and nothing when it has no cap', async () => {
+    const capped = (await create({ slug: 'capped', clickCap: 1000, targets: [target] })).json()
+    const open = (await create({ slug: 'open', targets: [target] })).json()
+    // Created, never clicked: no counter row yet, and the answer is zero.
+    expect(capped.capUsed).toBe(0)
+    expect(open.capUsed).toBeNull()
+    await pg.query('INSERT INTO link_counters (link_id, clicks) VALUES ($1, 312)', [capped.id])
+    const listed = await app.inject({ method: 'GET', url: '/api/links', headers: read(cookie) })
+    const byslug = Object.fromEntries(
+      listed.json().links.map((l: { slug: string; capUsed: number | null }) => [l.slug, l.capUsed]),
+    )
+    expect(byslug).toEqual({ capped: 312, open: null })
+  })
+
+  // A counter left behind by a cap that has since been removed is not a cap in
+  // use: the link has no cap, so the answer is null whatever the row says.
+  it('says nothing about a cap it no longer has', async () => {
+    const link = (await create({ slug: 'was-capped', clickCap: 10, targets: [target] })).json()
+    await pg.query('INSERT INTO link_counters (link_id, clicks) VALUES ($1, 7)', [link.id])
+    const r = await app.inject({
+      method: 'PATCH',
+      url: `/api/links/${link.id}`,
+      headers: write(cookie),
+      payload: { clickCap: null },
+    })
+    expect(r.json().capUsed).toBeNull()
   })
 })
 
