@@ -40,6 +40,10 @@ describe('the built page', () => {
   })
 
   it('leaves the attribute off when nothing is stored, or something unknown is', () => {
+    // Nothing stored: test-setup's beforeEach already cleared localStorage.
+    new Function(readFileSync(join(DIST, 'theme.js'), 'utf8'))()
+    expect(document.documentElement.hasAttribute('data-theme')).toBe(false)
+
     localStorage.setItem('cm-theme', 'purple')
     new Function(readFileSync(join(DIST, 'theme.js'), 'utf8'))()
     expect(document.documentElement.hasAttribute('data-theme')).toBe(false)
