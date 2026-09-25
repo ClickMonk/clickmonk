@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <title>ClickMonk</title>
+    <!-- Applies a stored light or dark choice before first paint. A file and
+         not an inline script: the content security policy allows no inline
+         script at all. It must stay a classic script here, before the bundle. -->
+    <script src="/theme.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -7,6 +7,7 @@
     { "path": "packages/db" },
     { "path": "packages/ipdata" },
     { "path": "packages/redirect" },
+    { "path": "packages/ui" },
     { "path": "packages/worker" },
     { "path": "test" }
   ]

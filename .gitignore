@@ -46,3 +46,8 @@ docker-compose.override.yml
 # The TLS suite writes the local certificate authority root and the test DNS
 # zone here before it starts the stack.
 test/stack/tmp/
+
+# tsc -b's own incremental build output for the interface package. Vite owns
+# dist/ (already ignored above); this is a separate directory so the two
+# builds never delete each other's output, and nothing reads it.
+packages/ui/dist-ts/
