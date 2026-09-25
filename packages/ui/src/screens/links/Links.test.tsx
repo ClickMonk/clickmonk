@@ -286,6 +286,28 @@ describe('the link list', () => {
     )
   })
 
+  // The disabled attribute must already be set the instant the click handler
+  // runs — a test that waits first would pass even if only the handler's own
+  // guard, not the attribute, stopped the second request.
+  it('disables Load more the instant it is clicked', async () => {
+    let resolveMore: ((p: Page<Link>) => void) | undefined
+    const client = fakeClient({
+      links: ((q: Record<string, unknown>) => {
+        if (q.cursor === undefined)
+          return Promise.resolve({ items: [link('b'), link('a')], nextCursor: '5.l-a' })
+        return new Promise<Page<Link>>((resolve) => {
+          resolveMore = resolve
+        })
+      }) as never,
+      domains,
+    })
+    const { user } = showWith(client)
+    const button = await screen.findByRole('button', { name: 'Load more' })
+    await user.click(button)
+    expect(button).toBeDisabled()
+    resolveMore?.({ items: [], nextCursor: null })
+  })
+
   it('hides the list when a reload fails, rather than leaving stale rows on screen', async () => {
     let calls = 0
     const client = fakeClient({
