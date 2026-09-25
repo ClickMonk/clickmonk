@@ -409,7 +409,7 @@ const SCREENS: [name: string, path: () => string][] = [
   ['account', () => '/account'],
 ]
 
-test('a stored dark theme is applied before the bundle runs', async () => {
+test('a stored theme is applied before the bundle runs, and native controls follow it', async () => {
   await page.getByRole('banner').getByRole('button', { name: 'Switch to dark theme' }).click()
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
   await page.reload()
