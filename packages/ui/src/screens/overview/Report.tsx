@@ -7,11 +7,12 @@ import { Columns } from '@/charts/Columns'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { CountedWindow } from '@/window/CountedWindow'
-import { bucketLabel, toQuery } from '@/window/range'
+import { toQuery, windowDatesSlug } from '@/window/range'
 import { useWindow } from '@/window/useWindow'
 import { useState } from 'react'
 import { BreakdownPanel } from './BreakdownPanel'
 import { SummaryCards } from './SummaryCards'
+import { chartBucketLabels } from './chartLabels'
 import type { Dimension } from './labels'
 
 export type Panel = { dimension: Dimension; title?: string; targets?: Map<string, string> }
@@ -44,13 +45,19 @@ export function Report({ link, panels }: { link?: string; panels: Panel[] }) {
     [...deps, w.bucket, w.offset],
   )
   const [metric, setMetric] = useState<'clicks' | 'visitors'>('clicks')
-  const buckets = (series.data?.buckets ?? []).map((b) => ({
-    label: bucketLabel(Date.parse(b.at), series.data?.bucket ?? w.bucket, w.timeZone),
+  const bucket = series.data?.bucket ?? w.bucket
+  const labels = chartBucketLabels(series.data?.buckets ?? [], bucket, w.timeZone)
+  const buckets = (series.data?.buckets ?? []).map((b, i) => ({
+    label: labels[i] ?? '',
     value: b[metric],
     at: b.at,
     clicks: b.clicks,
     visitors: b.visitors,
   }))
+  // A share divides one window's rows by another window's total unless both
+  // come from the same, finished request: `total` is only ever the current
+  // query's own answer, never a stale one left over from the window before.
+  const total = summary.state === 'ok' ? summary.data?.clicks : undefined
 
   return (
     <div className="grid gap-6">
@@ -63,7 +70,7 @@ export function Report({ link, panels }: { link?: string; panels: Panel[] }) {
       )}
       <Card>
         <CardHeader className="flex flex-row flex-wrap items-center justify-between gap-2">
-          <CardTitle className="text-base">{w.bucket === 'hour' ? 'By hour' : 'By day'}</CardTitle>
+          <CardTitle className="text-base">{bucket === 'hour' ? 'By hour' : 'By day'}</CardTitle>
           <div className="flex gap-1">
             {(['clicks', 'visitors'] as const).map((m) => (
               <Button
@@ -84,7 +91,7 @@ export function Report({ link, panels }: { link?: string; panels: Panel[] }) {
                 variant="ghost"
                 aria-label="Download the chart as CSV"
                 onClick={() =>
-                  downloadCsv('chart.csv', [
+                  downloadCsv(`chart-${windowDatesSlug(query, w.timeZone)}.csv`, [
                     ['Bucket start (UTC)', 'Label', 'Clicks', 'Visitors'],
                     ...buckets.map((b) => [b.at, b.label, b.clicks, b.visitors]),
                   ])
@@ -102,8 +109,8 @@ export function Report({ link, panels }: { link?: string; panels: Panel[] }) {
               <Columns
                 buckets={buckets}
                 unit={metric}
-                span={series.data.bucket}
-                label={`${metric === 'clicks' ? 'Clicks' : 'Visitors'} by ${series.data.bucket}`}
+                span={bucket}
+                label={`${metric === 'clicks' ? 'Clicks' : 'Visitors'} by ${bucket}`}
               />
               {metric === 'visitors' && (
                 <p className="text-xs text-muted-foreground">
@@ -124,7 +131,7 @@ export function Report({ link, panels }: { link?: string; panels: Panel[] }) {
             dimension={p.dimension}
             title={p.title}
             targets={p.targets}
-            total={summary.data?.clicks}
+            total={total}
             round={round}
           />
         ))}

@@ -9,6 +9,7 @@ import {
   parseChoice,
   spanOf,
   startOfDate,
+  windowDatesSlug,
   zoneOffsetMinutes,
 } from './range'
 
@@ -178,6 +179,18 @@ describe('labels', () => {
     expect(
       describeSpan({ fromMs: at('2026-09-30T14:00:00Z'), toMs: at('2026-10-07T14:00:00Z') }, ADL),
     ).toBe('30 Sept, 23:30 – 8 Oct, 00:30')
+  })
+
+  it('names a window by its local dates for a filename, the end one before the exclusive boundary', () => {
+    expect(
+      windowDatesSlug({ from: '2026-09-30T14:30:00.000Z', to: '2026-10-07T03:00:00.000Z' }, ADL),
+    ).toBe('2026-10-01-to-2026-10-07')
+  })
+
+  it('can name the same local date at both ends, for a window under a day', () => {
+    expect(
+      windowDatesSlug({ from: '2026-10-07T00:00:00.000Z', to: '2026-10-07T03:00:00.000Z' }, ADL),
+    ).toBe('2026-10-07-to-2026-10-07')
   })
 })
 

@@ -33,7 +33,15 @@ export function Columns({
     null,
   )
   const most = top && top.value > 0 ? `, the most ${formatNumber(top.value)} on ${top.label}` : ''
-  const sentence = `${label}: ${formatNumber(total)} ${unit} over ${buckets.length} ${span}${buckets.length === 1 ? '' : 's'}${most}`
+  const spans = `over ${buckets.length} ${span}${buckets.length === 1 ? '' : 's'}`
+  // Visitors are counted per bar (a returning visitor is one visitor in each
+  // bar they appear in), so a total across bars would be wrong in the same
+  // way the caveat under the chart warns against — the sentence names the
+  // buckets and the peak, never a sum, when the metric is visitors.
+  const sentence =
+    unit === 'visitors'
+      ? `${label}, ${spans}${most}`
+      : `${label}: ${formatNumber(total)} ${unit} ${spans}${most}`
   const Unit = unit === 'clicks' ? 'Clicks' : 'Visitors'
   return (
     <figure className="grid gap-2">
@@ -93,8 +101,9 @@ export function Columns({
             </tr>
           </thead>
           <tbody>
-            {buckets.map((b) => (
-              <tr key={b.label}>
+            {buckets.map((b, i) => (
+              // biome-ignore lint/suspicious/noArrayIndexKey: buckets are positional and never reorder; two buckets can share a label (a clock change), and the label is not a stable identity.
+              <tr key={i}>
                 <td>{b.label}</td>
                 <td className="tabular-nums">{formatNumber(b.value)}</td>
               </tr>

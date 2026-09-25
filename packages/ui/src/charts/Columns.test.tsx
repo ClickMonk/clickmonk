@@ -1,6 +1,6 @@
 import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { Columns } from './Columns'
 
 const buckets = [
@@ -15,6 +15,18 @@ describe('the column chart', () => {
     expect(
       screen.getByRole('img', {
         name: 'Clicks by day: 49 clicks over 3 days, the most 37 on Wed 7 Oct',
+      }),
+    ).toBeInTheDocument()
+  })
+
+  // Visitors are counted per bar, so their total across bars is not a real
+  // number: the sentence names the buckets and the peak, never a sum, and
+  // says nothing where the clicks sentence would have said "49 visitors".
+  it('never sums the buckets for visitors: the sentence names the peak, not a total', () => {
+    render(<Columns buckets={buckets} unit="visitors" span="day" label="Visitors by day" />)
+    expect(
+      screen.getByRole('img', {
+        name: 'Visitors by day, over 3 days, the most 37 on Wed 7 Oct',
       }),
     ).toBeInTheDocument()
   })
@@ -52,5 +64,21 @@ describe('the column chart', () => {
       .getAllByRole('row')
       .map((r) => r.textContent)
     expect(rows).toEqual(['WhenClicks', 'Mon 5 Oct12', 'Tue 6 Oct0', 'Wed 7 Oct37'])
+  })
+
+  // Two buckets can share a label (an hour chart's clock-change "again"), so
+  // the table's rows are keyed by position, not by the label: React warns to
+  // the console on a duplicate key, and this asserts it never does.
+  it('never warns of a duplicate key when two buckets share a label', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const same = [
+      { label: '01:00', value: 3 },
+      { label: '01:00', value: 5 },
+    ]
+    render(<Columns buckets={same} unit="clicks" span="hour" label="Clicks by hour" />)
+    await userEvent.setup().click(screen.getByText('Show the numbers'))
+    expect(within(screen.getByRole('table')).getAllByRole('row')).toHaveLength(3)
+    expect(error).not.toHaveBeenCalled()
+    error.mockRestore()
   })
 })

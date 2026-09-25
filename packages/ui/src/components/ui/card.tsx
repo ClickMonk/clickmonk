@@ -27,13 +27,11 @@ function CardHeader({ className, ...props }: React.ComponentProps<'div'>) {
   )
 }
 
-function CardTitle({ className, ...props }: React.ComponentProps<'div'>) {
+// A heading, not a div: a card titles a section of the page, and a card
+// grid is how an operator navigates it. It is never the page's own <h1>.
+function CardTitle({ className, ...props }: React.ComponentProps<'h2'>) {
   return (
-    <div
-      data-slot="card-title"
-      className={cn('leading-none font-semibold', className)}
-      {...props}
-    />
+    <h2 data-slot="card-title" className={cn('leading-none font-semibold', className)} {...props} />
   )
 }
 

@@ -156,8 +156,10 @@ describe('a session that ends while the application is open', () => {
     expect(s.calls.filter((c) => c === 'GET /api/me')).toHaveLength(1)
   })
 
-  // The overview's ten report requests and the header's status, all answering
-  // 401 because the session ended a moment ago. One sign-in screen, no error.
+  // The header's own status check alone is 401 here, which already ends the
+  // session (as the case above shows) before the overview's own ten report
+  // requests could possibly matter; naming all four refused routes is a
+  // shield against a mount order change, not proof that all four fired.
   it('goes to the sign-in screen once when every request on the overview is refused', async () => {
     const refused = () => json(401, { error: 'unauthenticated', message: 'sign in' })
     const s = server({

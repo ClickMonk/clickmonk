@@ -272,3 +272,15 @@ export function choiceParams(choice: Choice): Record<string, string> {
 export function toQuery(span: Span): { from: string; to: string } {
   return { from: new Date(span.fromMs).toISOString(), to: new Date(span.toMs).toISOString() }
 }
+
+/**
+ * A window's local dates, for a filename: "2026-10-01-to-2026-10-07". `to` is
+ * exclusive, so the date shown for it is a millisecond before the boundary —
+ * the last local date actually in the window, which can equal the start date
+ * for a window under a day.
+ */
+export function windowDatesSlug(query: { from: string; to: string }, timeZone: string): string {
+  const from = localDate(Date.parse(query.from), timeZone)
+  const to = localDate(Date.parse(query.to) - 1, timeZone)
+  return `${from}-to-${to}`
+}

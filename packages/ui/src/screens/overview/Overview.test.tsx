@@ -5,7 +5,7 @@ import { NowProvider } from '@/app/clock'
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { Overview } from './Overview'
 
 const NOW = () => Date.parse('2026-10-07T03:00:00.000Z')
@@ -57,9 +57,12 @@ function show() {
 }
 
 describe('the overview', () => {
-  it('is titled as a screen', () => {
+  it('is titled as a screen, its cards headings under it rather than a second h1', async () => {
     show()
     expect(screen.getByRole('heading', { level: 1, name: 'Overview' })).toBeInTheDocument()
+    await screen.findByText('1,200')
+    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1)
+    expect(screen.getAllByRole('heading', { level: 2 }).length).toBeGreaterThan(0)
   })
 
   it('shows the five numbers, and says what unique visitors count', async () => {
@@ -117,14 +120,51 @@ describe('the overview', () => {
     ).toHaveLength(2)
   })
 
-  it('says visitors are counted per bar when the chart shows visitors', async () => {
+  it('plots the visitors themselves once switched, having said nothing of the caution under clicks', async () => {
     show()
     await screen.findByText('1,200')
+    // Absent under clicks, first: the caution is about the visitors metric
+    // only, and must not already be on screen before it is switched to.
+    expect(screen.queryByText(/Visitors are counted per bar/)).not.toBeInTheDocument()
     await userEvent.setup().click(screen.getByRole('button', { name: 'Visitors' }))
     expect(
       await screen.findByText(
         'Visitors are counted per bar; adding bars together counts a returning visitor more than once.',
       ),
     ).toBeInTheDocument()
+    await userEvent.setup().click(screen.getByText('Show the numbers'))
+    expect(screen.getByText('820')).toBeInTheDocument()
+    expect(screen.queryByText('1,190')).not.toBeInTheDocument()
+  })
+
+  it('writes the chart’s own numbers to a CSV', async () => {
+    const created: Blob[] = []
+    vi.spyOn(URL, 'createObjectURL').mockImplementation((b) => {
+      created.push(b as Blob)
+      return 'blob:x'
+    })
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    show()
+    await screen.findByText('1,200')
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Download the chart as CSV' }))
+    expect(await created[0]?.text()).toBe(
+      '"Bucket start (UTC)","Label","Clicks","Visitors"\r\n"2026-09-30T14:00:00.000Z","Thu 1 Oct","1190","820"\r\n',
+    )
+  })
+
+  it('asks again, with the new window’s dates, when the range changes', async () => {
+    const client = show()
+    await screen.findByText('1,200')
+    await new Promise((r) => setTimeout(r, 0))
+    const before = client.calls.filter((c) => c.method === 'breakdown').length
+    await userEvent.setup().selectOptions(screen.getByLabelText('Time range'), '30d')
+    await new Promise((r) => setTimeout(r, 0))
+    const breakdownCalls = client.calls.filter((c) => c.method === 'breakdown')
+    expect(breakdownCalls.length).toBe(before + 8)
+    const newFroms = new Set(
+      breakdownCalls.slice(-8).map((c) => (c.args[0] as { from: string }).from),
+    )
+    expect([...newFroms]).toEqual(['2026-09-07T14:30:00.000Z'])
   })
 })
