@@ -261,6 +261,40 @@ describe('a session that does not stick after signing in', () => {
 })
 
 describe('refreshing the account after a change', () => {
+  // `refreshMe` exists to show what the service now says, not what it said
+  // at boot — so a mutation that calls `GET /api/me` and never stores the
+  // answer must fail here. The second response differs from the first
+  // (`totpEnabled: true`, a fresh `recoveryCodesLeft`), so the assertion can
+  // only pass if that second response is the one the screen shows.
+  it("shows the second me response's state after confirming two-factor, not the first", async () => {
+    let meCalls = 0
+    const s = server({
+      'GET /api/me': () => {
+        meCalls += 1
+        return meCalls === 1
+          ? json(200, ME)
+          : json(200, { ...ME, totpEnabled: true, recoveryCodesLeft: 10 })
+      },
+      'GET /api/status': () => json(200, STATUS),
+      'GET /api/sessions': () => json(200, { sessions: [] }),
+      'GET /api/keys': () => json(200, { keys: [], truncated: false }),
+      'POST /api/totp': () =>
+        json(200, { secret: 'JBSWY3DPEHPK3PXP', uri: 'otpauth://totp/x?secret=JBSWY3DPEHPK3PXP' }),
+      'POST /api/totp/confirm': () => json(200, { ok: true, recoveryCodes: ['ABCDE-FGHJK'] }),
+    })
+    show(s.makeClient, '/account')
+    const user = userEvent.setup()
+    await user.click(await screen.findByRole('button', { name: 'Set up an authenticator app' }))
+    await user.type(screen.getByLabelText('Your password'), 'a decent admin password')
+    await user.click(screen.getByRole('button', { name: 'Continue' }))
+    await user.type(await screen.findByLabelText('Code from the app'), '123456')
+    await user.click(screen.getByRole('button', { name: 'Turn on two-factor' }))
+    expect(await screen.findByText('On. 10 recovery codes left.')).toBeInTheDocument()
+    expect(
+      screen.queryByRole('button', { name: 'Set up an authenticator app' }),
+    ).not.toBeInTheDocument()
+  })
+
   // The account screen calls its refresh without awaiting it
   // (`onChanged()`, not `await onChanged()`), so a rejection this refresh
   // does not catch would be an unhandled one. Here the refresh's own

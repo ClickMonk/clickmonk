@@ -172,6 +172,17 @@ describe('once two-factor is on', () => {
     expect(client.calls.filter((c) => c.method === 'disableTotp')).toHaveLength(0)
   })
 
+  it('clears a client-side refusal once the dialog closes, rather than showing it again on reopen', async () => {
+    const { user } = show(true)
+    await user.click(screen.getByRole('button', { name: 'Turn off two-factor' }))
+    await user.type(screen.getByLabelText('Your password'), 'pw')
+    await user.click(screen.getByRole('button', { name: 'Turn it off' }))
+    expect(screen.getByText('Enter the code from the app.')).toBeInTheDocument()
+    act(() => openDialog().close())
+    await user.click(screen.getByRole('button', { name: 'Turn off two-factor' }))
+    expect(screen.queryByText('Enter the code from the app.')).not.toBeInTheDocument()
+  })
+
   it('shows the service refusal when turning it off fails', async () => {
     const { user } = show(true, {
       // confirmSecondFactor answers a wrong code with 403 (session-routes.ts).

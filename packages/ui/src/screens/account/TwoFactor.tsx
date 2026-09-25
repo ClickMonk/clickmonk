@@ -157,9 +157,11 @@ export function TwoFactor({
   // own `onClose` and by "I have saved them" alike.
   const closeCodes = () => setCodes(null)
 
+  // `clientProblem` is not reset here: `closeFlow` is the one place that
+  // clears it, next to the secret-clearing invariant above, so there is no
+  // second reset to fall out of step with the first.
   const open = (f: 'setup' | 'disable' | 'recovery') => {
     setError(null)
-    setClientProblem(null)
     setFlow(f)
   }
 
