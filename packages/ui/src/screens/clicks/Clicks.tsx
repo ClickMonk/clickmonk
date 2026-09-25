@@ -317,6 +317,7 @@ export function Clicks() {
               </p>
               <a
                 href={client.exportUrl(exported.query)}
+                download
                 className="text-sm font-medium text-primary underline-offset-2 hover:underline"
               >
                 {`Download the first ${formatNumber(exported.count.cap)}`}
@@ -329,6 +330,7 @@ export function Clicks() {
               </p>
               <a
                 href={client.exportUrl(exported.query)}
+                download
                 className="text-sm font-medium text-primary underline-offset-2 hover:underline"
               >
                 Download the CSV

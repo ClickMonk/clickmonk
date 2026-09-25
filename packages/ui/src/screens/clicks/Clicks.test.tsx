@@ -5,7 +5,7 @@ import type { Click, ClickCount, ClickPage } from '@/api/types'
 import { NowProvider } from '@/app/clock'
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { MemoryRouter } from 'react-router'
+import { MemoryRouter, Link as RouterLink } from 'react-router'
 import { describe, expect, it } from 'vitest'
 import { Clicks } from './Clicks'
 
@@ -202,6 +202,55 @@ describe('the click log', () => {
     ).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Clear the link filter' })).not.toBeInTheDocument()
     expect(clickCalls(client).at(-1)?.[0]).toEqual(W)
+  })
+
+  // The name shown beside the filter must be the link the address names right
+  // now, never a previous link's name held over while the new one is still
+  // loading — `useLoad` keeps the old success's data visible during a reload,
+  // so the id has to be checked, not just whether `linkName.data` is set.
+  it('shows nothing of the old link once the address names a different one still loading', async () => {
+    const A = '00000000-0000-4000-8000-0000000000a1'
+    const B = '00000000-0000-4000-8000-0000000000b2'
+    let resolveB:
+      | ((l: { id: string; host: string; slug: string; name: string | null }) => void)
+      | undefined
+    const client = fakeClient({
+      clicks: () =>
+        Promise.resolve({ window: W, link: null, clicks: [click('c1')], nextCursor: null }),
+      clickCount: () =>
+        Promise.resolve({ window: W, link: null, count: 3, cap: 1_000_000, truncated: false }),
+      link: ((linkId: string) =>
+        linkId === A
+          ? Promise.resolve({
+              id: A,
+              host: 'go.example.test',
+              slug: 'spring',
+              name: 'Spring offer',
+            })
+          : new Promise((resolve) => {
+              resolveB = resolve
+            })) as never,
+    })
+    render(
+      <NowProvider now={NOW}>
+        <MemoryRouter initialEntries={[`/clicks?range=today&link=${A}`]}>
+          <ClientProvider client={client}>
+            <RouterLink to={`/clicks?range=today&link=${B}`}>jump</RouterLink>
+            <Clicks />
+          </ClientProvider>
+        </MemoryRouter>
+      </NowProvider>,
+    )
+    expect(
+      await screen.findByText('Link: go.example.test/spring — Spring offer'),
+    ).toBeInTheDocument()
+    await userEvent.setup().click(screen.getByRole('link', { name: 'jump' }))
+    expect(await screen.findByText('Link filter applied')).toBeInTheDocument()
+    expect(
+      screen.queryByText('Link: go.example.test/spring — Spring offer'),
+    ).not.toBeInTheDocument()
+    resolveB?.({ id: B, host: 'new.example.test', slug: 'promo', name: null })
+    expect(await screen.findByText('Link: new.example.test/promo')).toBeInTheDocument()
   })
 
   it('filters by outcome, keeps the filter in the address, and starts again from the first page', async () => {
@@ -455,10 +504,14 @@ describe('the export', () => {
       ...W,
       class: 'bot',
     })
-    expect(screen.getByRole('link', { name: 'Download the CSV' })).toHaveAttribute(
+    const download = screen.getByRole('link', { name: 'Download the CSV' })
+    expect(download).toHaveAttribute(
       'href',
       '/api/clicks.csv?from=2026-10-06T13%3A30%3A00.000Z&to=2026-10-07T03%3A00%3A00.000Z&class=bot',
     )
+    // A refused download must end as a failed browser download, not a
+    // navigation that replaces the whole application with raw JSON.
+    expect(download).toHaveAttribute('download')
   })
 
   // A window holding more than the cap. The operator reads where the file will
@@ -473,7 +526,9 @@ describe('the export', () => {
         'This window holds more than 1,000,000 clicks. The file stops at 1,000,000, newest first; choose a shorter window for the rest.',
       ),
     ).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: 'Download the first 1,000,000' })).toBeInTheDocument()
+    const download = screen.getByRole('link', { name: 'Download the first 1,000,000' })
+    expect(download).toBeInTheDocument()
+    expect(download).toHaveAttribute('download')
   })
 
   it('says there is nothing to export, and offers no link, when the count is zero', async () => {
