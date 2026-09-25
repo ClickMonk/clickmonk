@@ -208,8 +208,10 @@ export function buildAdminApp(
     logger: deps.log ?? true,
     bodyLimit: MAX_BODY_BYTES,
     requestTimeout: 20_000,
-    // Nothing here answers a HEAD usefully, and a generated HEAD route on a
-    // write would be one more way to reach it.
+    // Stops Fastify auto-generating a HEAD for every route this service
+    // defines directly, so a write gains no extra way in. The interface's own
+    // files are the one exception: the static plugin registers its own HEAD
+    // route for each file it serves, which is a plain, harmless read.
     exposeHeadRoutes: false,
   })
 

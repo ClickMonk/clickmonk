@@ -59,12 +59,24 @@ describe('the interface', () => {
 
   it('is the page at a client route', async () => {
     const r = await get('/links/00000000-0000-4000-8000-0000000000a1/edit')
+    expect(r.statusCode).toBe(200)
     expect(r.body).toBe(INDEX)
     expect(r.headers['content-security-policy']).toBe(UI_POLICY)
+    expect(r.headers['cache-control']).toBe('no-store')
   })
 
   it('serves a hashed file for a year', async () => {
     const r = await get('/assets/index-abc123.js')
+    expect(r.statusCode).toBe(200)
+    expect(r.headers['cache-control']).toBe('public, max-age=31536000, immutable')
+    expect(r.headers['content-security-policy']).toBe(UI_POLICY)
+  })
+
+  it("keys the hashed cache rule off the route that matched, not the request's raw spelling", async () => {
+    // Percent-encoded but the same file: Fastify still routes it to the
+    // static plugin's own /assets/index-abc123.js route. A header decision
+    // keyed off the raw URL string would miss this and answer uncached.
+    const r = await get('/%61ssets/index-abc123.js')
     expect(r.statusCode).toBe(200)
     expect(r.headers['cache-control']).toBe('public, max-age=31536000, immutable')
     expect(r.headers['content-security-policy']).toBe(UI_POLICY)
@@ -81,6 +93,18 @@ describe('the interface', () => {
     expect(r.statusCode).toBe(404)
     expect(r.json()).toEqual({ error: 'not_found', message: 'no such route' })
     expect(r.headers['content-security-policy']).toBe(API_POLICY)
+  })
+
+  it('refuses everything under /assets/ that is not a real file, not with the page', async () => {
+    // No dot in the last segment, so a plain "looks like a file" check would
+    // miss this — nothing under /assets/ is ever a client route, whatever its
+    // last segment looks like, because a hashed year-long cache is the wrong
+    // answer for a page.
+    const r = await get('/assets/foo')
+    expect(r.statusCode).toBe(404)
+    expect(r.json()).toEqual({ error: 'not_found', message: 'no such route' })
+    expect(r.headers['content-security-policy']).toBe(API_POLICY)
+    expect(r.headers['cache-control']).toBe('no-store')
   })
 
   it('keeps every other security header on the page', async () => {
@@ -108,6 +132,30 @@ describe('the API, unchanged', () => {
     expect(r.headers['content-security-policy']).toBe(API_POLICY)
   })
 
+  it('excludes an API 200 from the interface policy, not just every non-200', async () => {
+    // Every other API test here is a refusal or a 404, so a check that only
+    // excludes API paths from non-200 statuses would still pass them all. A
+    // route with nothing to refuse is the only way to see a real API 200.
+    app.get('/api/probe', async () => ({ ok: true }))
+    const r = await get('/api/probe')
+    expect(r.statusCode).toBe(200)
+    expect(r.json()).toEqual({ ok: true })
+    expect(r.headers['content-security-policy']).toBe(API_POLICY)
+    expect(r.headers['cache-control']).toBe('no-store')
+  })
+
+  it("keys that exclusion off the route that matched, not the request's raw spelling", async () => {
+    // Percent-encoded but the same route: Fastify still dispatches it to
+    // /api/probe. A header decision keyed off the raw URL string would miss
+    // this and hand the interface's policy to an API response.
+    app.get('/api/probe', async () => ({ ok: true }))
+    const r = await get('/%61pi/probe')
+    expect(r.statusCode).toBe(200)
+    expect(r.json()).toEqual({ ok: true })
+    expect(r.headers['content-security-policy']).toBe(API_POLICY)
+    expect(r.headers['cache-control']).toBe('no-store')
+  })
+
   it('does not serve the page for a write, which the cross-site check refuses first without an origin', async () => {
     const bare = await app.inject({ method: 'POST', url: '/links', headers: { host: ADMIN_HOST } })
     expect(bare.statusCode).toBe(403)
@@ -123,8 +171,7 @@ describe('the API, unchanged', () => {
   it('does not serve the page on another host name', async () => {
     const r = await app.inject({ method: 'GET', url: '/', headers: { host: 'go.example.test' } })
     expect(r.statusCode).toBe(404)
-    expect(r.json().error).toBe('not_found')
-    expect(r.body).not.toContain('<!doctype html>')
+    expect(r.json()).toEqual({ error: 'not_found', message: 'no such host on this service' })
   })
 
   it('answers health as it always has', async () => {
@@ -134,9 +181,9 @@ describe('the API, unchanged', () => {
       headers: { host: '127.0.0.1:9100' },
     })
     expect(r.json()).toEqual({ status: 'ok' })
-    // A 200 under /health, the one API path a plain status check alone would
-    // let through: this is what pins the onSend hook's own exclusion of API
-    // paths, separately from its exclusion of every non-200 status.
+    // Every 200 from an API path is excluded the same way, pinned above by
+    // the probe route; /health is the one that needs no database, so it is
+    // worth its own check alongside the body it has always answered.
     expect(r.headers['content-security-policy']).toBe(API_POLICY)
   })
 })
