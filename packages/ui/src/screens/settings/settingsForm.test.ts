@@ -1,12 +1,6 @@
 import type { Settings } from '@/api/types'
 import { describe, expect, it } from 'vitest'
-import {
-  deletesData,
-  deletion,
-  settingsFormOf,
-  settingsInputOf,
-  settingsProblems,
-} from './settingsForm'
+import { deletion, settingsFormOf, settingsInputOf, settingsProblems } from './settingsForm'
 
 const S: Settings = {
   traffic: {
@@ -83,26 +77,30 @@ describe('the settings form', () => {
   })
 })
 
-describe('whether a save deletes data', () => {
+describe('whether a save deletes data, and the button that confirms it', () => {
   const now = { rawRetentionDays: 90, ipRetentionDays: 30 }
   const forever = { rawRetentionDays: null, ipRetentionDays: null }
   const both =
     'Clicks older than 90 days will be deleted within the hour, when the worker next runs. Addresses older than 30 days will be blanked within the hour, when the worker next runs. This cannot be undone.'
 
-  it('says a shorter click period deletes clicks', () => {
-    expect(deletesData(now, { rawRetentionDays: 30, ipRetentionDays: 30 })).toBe(
-      'Clicks older than 30 days will be deleted within the hour, when the worker next runs. This cannot be undone.',
-    )
+  it('says a shorter click period deletes clicks, and names the button after it', () => {
+    expect(deletion(now, { rawRetentionDays: 30, ipRetentionDays: 30 })).toEqual({
+      sentence:
+        'Clicks older than 30 days will be deleted within the hour, when the worker next runs. This cannot be undone.',
+      action: 'Delete older clicks and save',
+    })
   })
 
-  it('says a shorter address period blanks addresses', () => {
-    expect(deletesData(now, { rawRetentionDays: 90, ipRetentionDays: 7 })).toBe(
-      'Addresses older than 7 days will be blanked within the hour, when the worker next runs. This cannot be undone.',
-    )
+  it('says a shorter address period blanks addresses, and names the button after it', () => {
+    expect(deletion(now, { rawRetentionDays: 90, ipRetentionDays: 7 })).toEqual({
+      sentence:
+        'Addresses older than 7 days will be blanked within the hour, when the worker next runs. This cannot be undone.',
+      action: 'Blank older addresses and save',
+    })
   })
 
-  it('says a period where there was for ever deletes, for both', () => {
-    expect(deletesData(forever, now)).toBe(both)
+  it('says a period where there was for ever deletes, for both, and names the button after both', () => {
+    expect(deletion(forever, now)).toEqual({ sentence: both, action: 'Delete older data and save' })
   })
 
   it.each([
@@ -110,31 +108,10 @@ describe('whether a save deletes data', () => {
     ['for ever', forever],
     ['the same periods again', now],
   ])('says %s deletes nothing', (_label, after) => {
-    expect(deletesData(now, after)).toBeNull()
+    expect(deletion(now, after)).toBeNull()
   })
 
   it('treats settings it could not read as keeping everything, and asks', () => {
-    expect(deletesData(null, now)).toBe(both)
-  })
-})
-
-describe('the button that confirms a deletion', () => {
-  const now = { rawRetentionDays: 90, ipRetentionDays: 30 }
-  const forever = { rawRetentionDays: null, ipRetentionDays: null }
-
-  it('names clicks when only clicks are shorter', () => {
-    expect(deletion(now, { rawRetentionDays: 30, ipRetentionDays: 30 })?.action).toBe(
-      'Delete older clicks and save',
-    )
-  })
-
-  it('names addresses when only addresses are shorter', () => {
-    expect(deletion(now, { rawRetentionDays: 90, ipRetentionDays: 7 })?.action).toBe(
-      'Blank older addresses and save',
-    )
-  })
-
-  it('names both when both are shorter', () => {
-    expect(deletion(forever, now)?.action).toBe('Delete older data and save')
+    expect(deletion(null, now)).toEqual({ sentence: both, action: 'Delete older data and save' })
   })
 })

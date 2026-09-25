@@ -103,14 +103,3 @@ export function deletion(
         : 'Blank older addresses and save'
   return { sentence: `${parts.join(' ')} This cannot be undone.`, action }
 }
-
-/**
- * The sentence to confirm before a save that deletes data, or null when the
- * save deletes nothing.
- */
-export function deletesData(
-  before: RetentionSettings | null,
-  after: RetentionSettings,
-): string | null {
-  return deletion(before, after)?.sentence ?? null
-}

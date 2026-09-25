@@ -403,13 +403,6 @@ const ROWS: Record<Exclude<keyof ApiClient, 'exportUrl'>, Row> = {
     answer: { ok: true, note: 'links on this domain now answer 404' },
     result: { ok: true, note: 'links on this domain now answer 404' },
   },
-  alerts: {
-    call: (c) => c.alerts(),
-    url: '/api/alerts',
-    init: READ,
-    answer: { domains: [{ id: DOMAIN, status: 'never_checked' }], truncated: false },
-    result: { domains: [{ id: DOMAIN, status: 'never_checked' }], truncated: false },
-  },
   links: {
     call: (c) => c.links({ domain: 'go.example.com', q: 'spring', limit: 20, cursor: '5.b' }),
     url: '/api/links?domain=go.example.com&q=spring&limit=20&cursor=5.b',

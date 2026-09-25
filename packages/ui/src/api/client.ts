@@ -20,7 +20,6 @@
 import { ApiError } from './errors'
 import { type Scheduler, createScheduler } from './scheduler'
 import type {
-  Alert,
   ApiKey,
   Breakdown,
   ClickCount,
@@ -174,7 +173,6 @@ export function createClient(
       call<DomainCheck>('POST', `/api/domains/${id(domainId)}/check`),
     unverifyDomain: (domainId: string) =>
       call<{ ok: true; note: string }>('POST', `/api/domains/${id(domainId)}/unverify`),
-    alerts: () => call<{ domains: Alert[]; truncated: boolean }>('GET', '/api/alerts'),
 
     // Links.
     links: async (q: { domain?: string; q?: string; limit?: number; cursor?: string }): Promise<

@@ -70,15 +70,6 @@ export interface DomainCheck {
   detail: string | null
 }
 
-export interface Alert {
-  id: string
-  host: string
-  verified: boolean
-  status: DomainStatus | 'never_checked'
-  detail: string | null
-  checkedAt: Instant | null
-}
-
 export type TrafficAction = 'nothing' | 'flag' | 'block' | 'safe'
 export type NonHumanClass = 'bot' | 'abuser' | 'anonymous' | 'datacenter'
 
