@@ -17,15 +17,15 @@ function Round() {
 }
 
 function Refreshing() {
-  const { refreshing, setRefreshing } = useRefresh()
+  const { refreshing, beginLoad, endLoad } = useRefresh()
   return (
     <>
       <p>{refreshing ? 'refreshing' : 'idle'}</p>
-      <button type="button" onClick={() => setRefreshing(true)}>
-        start
+      <button type="button" onClick={beginLoad}>
+        begin
       </button>
-      <button type="button" onClick={() => setRefreshing(false)}>
-        stop
+      <button type="button" onClick={endLoad}>
+        end
       </button>
     </>
   )
@@ -80,16 +80,36 @@ describe('refreshing', () => {
     expect(screen.getByRole('button')).toHaveTextContent('round 0')
   })
 
-  it('starts idle, and carries whatever a reporter sets until the next report', async () => {
+  it('starts idle, and goes busy once something begins loading', async () => {
     render(
       <RefreshProvider>
         <Refreshing />
       </RefreshProvider>,
     )
     expect(screen.getByText('idle')).toBeInTheDocument()
-    await act(async () => screen.getByRole('button', { name: 'start' }).click())
+    await act(async () => screen.getByRole('button', { name: 'begin' }).click())
     expect(screen.getByText('refreshing')).toBeInTheDocument()
-    await act(async () => screen.getByRole('button', { name: 'stop' }).click())
+    await act(async () => screen.getByRole('button', { name: 'end' }).click())
+    expect(screen.getByText('idle')).toBeInTheDocument()
+  })
+
+  // The count, not a single flag: a second load still outstanding must keep
+  // the flag up once the first of the two ends, the way one screen's several
+  // loads share one Refresh button.
+  it('stays busy while a second load is still outstanding after the first ends', async () => {
+    render(
+      <RefreshProvider>
+        <Refreshing />
+      </RefreshProvider>,
+    )
+    const begin = screen.getByRole('button', { name: 'begin' })
+    const end = screen.getByRole('button', { name: 'end' })
+    await act(async () => begin.click())
+    await act(async () => begin.click())
+    expect(screen.getByText('refreshing')).toBeInTheDocument()
+    await act(async () => end.click())
+    expect(screen.getByText('refreshing')).toBeInTheDocument()
+    await act(async () => end.click())
     expect(screen.getByText('idle')).toBeInTheDocument()
   })
 

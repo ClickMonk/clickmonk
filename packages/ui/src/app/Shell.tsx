@@ -65,6 +65,11 @@ export function Shell({
               size="sm"
               onClick={refresh}
               disabled={refreshing}
+              // The cue that replaced the dimmed content must not itself be
+              // dimmed: the button base fades every disabled control to
+              // disabled:opacity-50, so this overrides it back to full
+              // contrast while "Refreshing…" is the reason it is disabled.
+              className="disabled:opacity-100"
             >
               {refreshing ? 'Refreshing…' : 'Refresh'}
             </Button>

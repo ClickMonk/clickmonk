@@ -1,6 +1,7 @@
 import { ApiError } from '@/api/errors'
 import { act, render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
+import { RefreshProvider, useRefresh } from './refresh'
 import { useLoad } from './useLoad'
 
 function Show({ load, dep = 0 }: { load: (s: AbortSignal) => Promise<string>; dep?: number }) {
@@ -15,6 +16,12 @@ function Show({ load, dep = 0 }: { load: (s: AbortSignal) => Promise<string>; de
       </button>
     </div>
   )
+}
+
+/** Reads the shared `refreshing` flag beside a `Show`, both under one `RefreshProvider`. */
+function Busy() {
+  const { refreshing } = useRefresh()
+  return <p data-testid="busy">{refreshing ? 'busy' : 'idle'}</p>
 }
 
 describe('loading', () => {
@@ -123,5 +130,78 @@ describe('loading', () => {
     await act(async () => resolveSecond('load 2'))
     expect(screen.getByTestId('state')).toHaveTextContent('ok')
     expect(screen.getByTestId('data')).toHaveTextContent('load 2')
+  })
+
+  it('marks the refresh context busy while loading, and clears it once it answers', async () => {
+    let resolve: (v: string) => void = () => {}
+    render(
+      <RefreshProvider>
+        <Show
+          load={() =>
+            new Promise<string>((r) => {
+              resolve = r
+            })
+          }
+        />
+        <Busy />
+      </RefreshProvider>,
+    )
+    expect(screen.getByTestId('busy')).toHaveTextContent('busy')
+    await act(async () => resolve('done'))
+    expect(screen.getByTestId('busy')).toHaveTextContent('idle')
+  })
+
+  // A refusal is still the load settling: the flag must not read this
+  // screen as loading forever after one request the service turned down.
+  it('clears the refresh context’s busy flag on a failed load too', async () => {
+    let reject: (e: ApiError) => void = () => {}
+    render(
+      <RefreshProvider>
+        <Show
+          load={() =>
+            new Promise<string>((_resolve, r) => {
+              reject = r
+            })
+          }
+        />
+        <Busy />
+      </RefreshProvider>,
+    )
+    expect(screen.getByTestId('busy')).toHaveTextContent('busy')
+    await act(async () => reject(new ApiError(429, 'rate_limited', 'slow down')))
+    expect(screen.getByTestId('busy')).toHaveTextContent('idle')
+  })
+
+  // Two loads sharing one context: the flag is a count, not a flag one of
+  // them can clear on the other's behalf.
+  it('stays busy while a second load is still going after the first of two settles', async () => {
+    let resolveFast: (v: string) => void = () => {}
+    let resolveSlow: (v: string) => void = () => {}
+    render(
+      <RefreshProvider>
+        <Show
+          load={() =>
+            new Promise<string>((r) => {
+              resolveFast = r
+            })
+          }
+          dep={1}
+        />
+        <Show
+          load={() =>
+            new Promise<string>((r) => {
+              resolveSlow = r
+            })
+          }
+          dep={2}
+        />
+        <Busy />
+      </RefreshProvider>,
+    )
+    expect(screen.getByTestId('busy')).toHaveTextContent('busy')
+    await act(async () => resolveFast('fast'))
+    expect(screen.getByTestId('busy')).toHaveTextContent('busy')
+    await act(async () => resolveSlow('slow'))
+    expect(screen.getByTestId('busy')).toHaveTextContent('idle')
   })
 })
