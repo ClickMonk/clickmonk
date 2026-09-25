@@ -275,7 +275,7 @@ describe('a breakdown panel', () => {
         <BreakdownPanel query={W2} dimension="country" total={50} round={0} />
       </ClientProvider>,
     )
-    // Still the old (dimmed) row, but no share computed against the new
+    // Still the old (aria-busy) row, but no share computed against the new
     // total while this panel's own load has not caught up with it.
     expect(screen.getByText('Germany')).toBeInTheDocument()
     expect(screen.queryByText('7 · 35%')).not.toBeInTheDocument()

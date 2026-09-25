@@ -327,7 +327,7 @@ describe('the click log', () => {
     expect(await screen.findByText('No clicks in this window.')).toBeInTheDocument()
   })
 
-  it('dims the table and marks it busy while a reload is in flight, rather than blanking it', async () => {
+  it('marks the table busy while a reload is in flight, without losing it', async () => {
     let resolveSecond: ((p: ClickPage) => void) | undefined
     let calls = 0
     const client = fakeClient({

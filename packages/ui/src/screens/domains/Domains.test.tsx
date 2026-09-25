@@ -137,7 +137,7 @@ describe('the domain list', () => {
     expect(within(c).getByText(TOKEN)).toBeInTheDocument()
   })
 
-  it('dims the list and marks it busy while a reload is in flight, rather than blanking it', async () => {
+  it('marks the list busy while a reload is in flight, without losing it', async () => {
     let resolveSecond: ((p: { domains: Domain[]; truncated: boolean }) => void) | undefined
     let calls = 0
     const { user } = show([], {

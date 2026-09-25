@@ -61,8 +61,8 @@ export function Report({ link, panels }: { link?: string; panels: Panel[] }) {
   // The same rule as a breakdown panel, for the two blocks below: an error
   // drops what it was showing (the old window's numbers beside its own
   // request's error read as still current), and a reload in flight keeps the
-  // old numbers up, marked busy and dimmed, rather than blanking on every
-  // window change or refresh.
+  // old numbers up, marked aria-busy at full contrast, rather than blanking
+  // on every window change or refresh.
   const summaryStale = summary.state === 'loading'
   const seriesStale = series.state === 'loading'
 
