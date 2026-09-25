@@ -1,6 +1,12 @@
 import type { Settings } from '@/api/types'
 import { describe, expect, it } from 'vitest'
-import { deletesData, settingsFormOf, settingsInputOf, settingsProblems } from './settingsForm'
+import {
+  deletesData,
+  deletion,
+  settingsFormOf,
+  settingsInputOf,
+  settingsProblems,
+} from './settingsForm'
 
 const S: Settings = {
   traffic: {
@@ -109,5 +115,26 @@ describe('whether a save deletes data', () => {
 
   it('treats settings it could not read as keeping everything, and asks', () => {
     expect(deletesData(null, now)).toBe(both)
+  })
+})
+
+describe('the button that confirms a deletion', () => {
+  const now = { rawRetentionDays: 90, ipRetentionDays: 30 }
+  const forever = { rawRetentionDays: null, ipRetentionDays: null }
+
+  it('names clicks when only clicks are shorter', () => {
+    expect(deletion(now, { rawRetentionDays: 30, ipRetentionDays: 30 })?.action).toBe(
+      'Delete older clicks and save',
+    )
+  })
+
+  it('names addresses when only addresses are shorter', () => {
+    expect(deletion(now, { rawRetentionDays: 90, ipRetentionDays: 7 })?.action).toBe(
+      'Blank older addresses and save',
+    )
+  })
+
+  it('names both when both are shorter', () => {
+    expect(deletion(forever, now)?.action).toBe('Delete older data and save')
   })
 })

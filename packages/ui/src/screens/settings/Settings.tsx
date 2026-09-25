@@ -14,7 +14,7 @@ import { NativeSelect } from '@/components/ui/native-select'
 import { type FormEvent, useState } from 'react'
 import {
   type SettingsFormState,
-  deletesData,
+  deletion,
   settingsFormOf,
   settingsInputOf,
   settingsProblems,
@@ -25,15 +25,6 @@ const PLURAL: Record<NonHumanClass, string> = {
   abuser: 'Abusers',
   anonymous: 'Anonymous visitors',
   datacenter: 'Datacenter visitors',
-}
-
-/** The button that names the action, from the sentence `deletesData` wrote. */
-function confirmAction(sentence: string): string {
-  const clicks = sentence.includes('Clicks older than')
-  const addresses = sentence.includes('Addresses older than')
-  if (clicks && addresses) return 'Delete older data and save'
-  if (clicks) return 'Delete older clicks and save'
-  return 'Blank older addresses and save'
 }
 
 /**
@@ -69,7 +60,11 @@ function SettingsBody({ settings }: { settings: SettingsData }) {
   const [status, setStatus] = useState<string | null>(null)
   const [failure, setFailure] = useState<ApiError | null>(null)
   const [busy, setBusy] = useState(false)
-  const [confirm, setConfirm] = useState<{ sentence: string; input: SettingsInput } | null>(null)
+  const [confirm, setConfirm] = useState<{
+    sentence: string
+    action: string
+    input: SettingsInput
+  } | null>(null)
   // A failure that is not an `ApiError` is a defect, not a refusal to show,
   // and is rethrown to React the way `Confirm` does.
   const [thrown, setThrown] = useState<unknown>(null)
@@ -105,8 +100,8 @@ function SettingsBody({ settings }: { settings: SettingsData }) {
     setProblems(probs)
     if (Object.keys(probs).length > 0) return
     const input = settingsInputOf(form)
-    const sentence = deletesData(current.retention, input.retention)
-    if (sentence) setConfirm({ sentence, input })
+    const d = deletion(current.retention, input.retention)
+    if (d) setConfirm({ ...d, input })
     else void doSave(input)
   }
 
@@ -279,7 +274,7 @@ function SettingsBody({ settings }: { settings: SettingsData }) {
             disabled={busy}
             onClick={() => confirm && void doSave(confirm.input)}
           >
-            {confirm ? confirmAction(confirm.sentence) : ''}
+            {confirm ? confirm.action : ''}
           </Button>
         </div>
       </Modal>

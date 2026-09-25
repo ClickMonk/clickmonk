@@ -72,22 +72,44 @@ const shorter = (before: number | null | undefined, after: number | null) =>
   after !== null && (before === null || before === undefined || after < before)
 
 /**
+ * What a save that deletes data must confirm: the sentence to show, and the
+ * name of the button that agrees to it — naming clicks, addresses or both,
+ * whichever the save actually shortens. Null when the save deletes nothing.
+ * Settings the service could not read count as keeping everything, which is
+ * what the service does with them.
+ */
+export function deletion(
+  before: RetentionSettings | null,
+  after: RetentionSettings,
+): { sentence: string; action: string } | null {
+  const clicks = shorter(before?.rawRetentionDays, after.rawRetentionDays)
+  const addresses = shorter(before?.ipRetentionDays, after.ipRetentionDays)
+  if (!clicks && !addresses) return null
+  const parts: string[] = []
+  if (clicks)
+    parts.push(
+      `Clicks older than ${after.rawRetentionDays} days will be deleted within the hour, when the worker next runs.`,
+    )
+  if (addresses)
+    parts.push(
+      `Addresses older than ${after.ipRetentionDays} days will be blanked within the hour, when the worker next runs.`,
+    )
+  const action =
+    clicks && addresses
+      ? 'Delete older data and save'
+      : clicks
+        ? 'Delete older clicks and save'
+        : 'Blank older addresses and save'
+  return { sentence: `${parts.join(' ')} This cannot be undone.`, action }
+}
+
+/**
  * The sentence to confirm before a save that deletes data, or null when the
- * save deletes nothing. Settings the service could not read count as keeping
- * everything, which is what the service does with them.
+ * save deletes nothing.
  */
 export function deletesData(
   before: RetentionSettings | null,
   after: RetentionSettings,
 ): string | null {
-  const parts: string[] = []
-  if (shorter(before?.rawRetentionDays, after.rawRetentionDays))
-    parts.push(
-      `Clicks older than ${after.rawRetentionDays} days will be deleted within the hour, when the worker next runs.`,
-    )
-  if (shorter(before?.ipRetentionDays, after.ipRetentionDays))
-    parts.push(
-      `Addresses older than ${after.ipRetentionDays} days will be blanked within the hour, when the worker next runs.`,
-    )
-  return parts.length === 0 ? null : `${parts.join(' ')} This cannot be undone.`
+  return deletion(before, after)?.sentence ?? null
 }
