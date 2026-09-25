@@ -49,7 +49,7 @@ export const MAX_DOMAINS_LISTED = 500
  * listing below and by the count `GET /api/status` answers, so "which domains
  * need attention" is never asked two ways that could answer differently.
  */
-export const ALERT_CONDITION = `c.status IS NULL OR c.status <> 'verified'`
+export const ALERT_CONDITION = `(c.status IS NULL OR c.status <> 'verified')`
 
 /**
  * How long after a check the same domain may be checked again over the API,

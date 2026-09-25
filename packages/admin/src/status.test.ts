@@ -2,10 +2,21 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ConcurrencyGate } from '@clickmonk/core'
+import type { ClickHouseClient } from '@clickmonk/db'
 import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import type { FastifyInstance } from 'fastify'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { ADMIN_HOST, clockFrom, read, signedIn, testApp } from './testing.js'
+
+/** A `log` option that captures each line rather than writing it, as `reports.test.ts` does. */
+const captured = (lines: string[]): { level: 'error'; stream: { write(line: string): void } } => ({
+  level: 'error',
+  stream: {
+    write(line: string) {
+      lines.push(line)
+    },
+  },
+})
 
 const pool = testPg()
 const ch = testCh()
@@ -126,11 +137,22 @@ describe('GET /api/status', () => {
 
   it('says the IP data could not be read, without saying what the error was', async () => {
     writeFileSync(join(dir, 'manifest.json'), '{"v": 2}')
-    const r = await status(app)
-    expect(r.statusCode).toBe(200)
-    expect(r.json().ipData).toBeNull()
-    expect(r.json().ipDataProblem).toBe('the IP data manifest could not be read')
-    expect(r.body).not.toContain(dir)
+    const lines: string[] = []
+    const logged = testApp(pool, clock, { ch, ipdataDir: dir, log: captured(lines) })
+    try {
+      const r = await status(logged)
+      expect(r.statusCode).toBe(200)
+      expect(r.json().ipData).toBeNull()
+      expect(r.json().ipDataProblem).toBe('the IP data manifest could not be read')
+      expect(r.body).not.toContain(dir)
+      const manifestLines = lines.filter((l) =>
+        l.includes('the ip data manifest could not be read'),
+      )
+      expect(manifestLines.length).toBe(1)
+      expect((JSON.parse(manifestLines[0] as string) as { err?: unknown }).err).toBeDefined()
+    } finally {
+      await logged.close()
+    }
   })
 
   it('treats a directory that is not there as no IP data', async () => {
@@ -168,6 +190,28 @@ describe('GET /api/status', () => {
       expect(r.json().alerts).toBe(2)
     } finally {
       await noStore.close()
+    }
+  })
+
+  // The catch that turns `chRows`' 503 into `reporting: "unavailable"` must
+  // narrow to that failure alone. A store that hands back a row
+  // `newestHourOrNull` cannot read — not a connection failure, a bug in the
+  // row mapping — must read as the internal error it is, not as reporting
+  // being down: the two say very different things to an operator, and only
+  // one of them is about this install's ClickHouse.
+  it('does not read a bug in reading the answer as reporting being unavailable', async () => {
+    const lines: string[] = []
+    const badRow: ClickHouseClient = {
+      query: async () => ({ json: async () => [{ newest: 5 }] }),
+    } as unknown as ClickHouseClient
+    const broken = testApp(pool, clock, { ch: badRow, ipdataDir: dir, log: captured(lines) })
+    try {
+      const r = await status(broken)
+      expect(r.statusCode).toBe(500)
+      expect(r.json()).toEqual({ error: 'internal', message: 'something went wrong' })
+      expect(lines.filter((l) => l.includes('admin request failed')).length).toBe(1)
+    } finally {
+      await broken.close()
     }
   })
 
