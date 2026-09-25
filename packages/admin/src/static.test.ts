@@ -82,6 +82,24 @@ describe('the interface', () => {
     expect(r.headers['content-security-policy']).toBe(UI_POLICY)
   })
 
+  it('refuses a Range request: an asset answers 200 with the whole body under its own headers', async () => {
+    const r = await get('/assets/index-abc123.js', { range: 'bytes=0-3' })
+    expect(r.statusCode).toBe(200)
+    expect(r.body).toBe('console.log(1)')
+    expect(r.headers['accept-ranges']).toBeUndefined()
+    expect(r.headers['content-security-policy']).toBe(UI_POLICY)
+    expect(r.headers['cache-control']).toBe('public, max-age=31536000, immutable')
+  })
+
+  it('refuses a Range request on the page too', async () => {
+    const r = await get('/', { range: 'bytes=0-3' })
+    expect(r.statusCode).toBe(200)
+    expect(r.body).toBe(INDEX)
+    expect(r.headers['accept-ranges']).toBeUndefined()
+    expect(r.headers['content-security-policy']).toBe(UI_POLICY)
+    expect(r.headers['cache-control']).toBe('no-store')
+  })
+
   it('serves the theme script uncached', async () => {
     const r = await get('/theme.js')
     expect(r.statusCode).toBe(200)

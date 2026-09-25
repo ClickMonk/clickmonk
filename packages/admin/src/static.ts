@@ -25,10 +25,15 @@
  *
  * **One cache rule.** A file under /assets/ is named by its content and never
  * changes, so it is cached for a year; everything else — the page, the theme
- * script, the icon — is never cached, so an upgrade is one reload away.
- * `etag` and `lastModified` are off on the static plugin: this scheme has no
- * cache rule for a `304` or a partial `206`, and turning them off is what
- * stops the plugin ever answering with one.
+ * script, the icon — is never cached, so an upgrade is one reload away. This
+ * scheme has no cache rule for a partial `206`, so `acceptRanges` is off:
+ * without it, a `Range` request gets the whole body under the interface's own
+ * headers, the same as any other request for that file, rather than a slice
+ * of it under the wrong cache-control. `etag` and `lastModified` are off too,
+ * so nothing here issues a validator — but Fastify's own freshness check
+ * still runs ahead of that, so a conditional request (`If-None-Match: *`, or
+ * a future `If-Modified-Since`) can still get a `304`. No browser sends one
+ * here, because nothing on this path ever hands one out.
  *
  * **A narrow fallback.** A client route (a GET, outside the API and outside
  * /assets/, whose last segment has no dot) is answered with the page. Nothing
@@ -79,6 +84,7 @@ export function registerUiStatic(app: FastifyInstance, uiDir: string): boolean {
     index: false,
     etag: false,
     lastModified: false,
+    acceptRanges: false,
   })
 
   app.addHook('onSend', async (req, reply, payload) => {
