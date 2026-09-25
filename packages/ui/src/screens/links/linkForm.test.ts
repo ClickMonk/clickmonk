@@ -325,6 +325,21 @@ describe('the service’s refusal, field by field', () => {
     })
   })
 
+  // `body` is the service's name for the request as a whole, not a field.
+  it('puts a refusal of the whole body under the form', () => {
+    expect(fieldErrors("body: Unrecognized key(s) in object: 'x'")).toEqual({
+      form: "Unrecognized key(s) in object: 'x'",
+    })
+  })
+
+  // A weight has an input of its own, so its refusal is kept apart from the URL's.
+  it('keeps a target’s weight apart from its URL', () => {
+    expect(fieldErrors('targets.1.weight: Expected number; targets.1.url: Required')).toEqual({
+      'targets.1.weight': 'Expected number',
+      'targets.1': 'Required',
+    })
+  })
+
   it('keeps a part with no path for the form as a whole', () => {
     expect(fieldErrors('something went wrong')).toEqual({ form: 'something went wrong' })
   })

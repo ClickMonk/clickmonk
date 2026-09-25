@@ -233,13 +233,14 @@ export function problemsOf(s: LinkFormState): Record<string, string> {
 
 /**
  * The service's `invalid_link` message, field by field: `targets.1.url: text`
- * lands under `targets.1`, `backupUrl: text` under `backupUrl`, and a part with
- * no path under `form`.
+ * lands under `targets.1`, `targets.1.weight: text` under `targets.1.weight`
+ * (a target's weight has an input of its own), `backupUrl: text` under
+ * `backupUrl`, and a part with no path under `form`.
  */
 export function fieldErrors(message: string): Record<string, string> {
   const out: Record<string, string> = {}
   for (const part of message.split('; ')) {
-    const m = /^([A-Za-z]+(?:\.\d+)?)[.\w]*: (.*)$/.exec(part)
+    const m = /^([A-Za-z]+(?:\.\d+(?:\.weight\b)?)?)[.\w]*: (.*)$/.exec(part)
     // `link` and `body` are the service's names for a refusal of the whole
     // link or the whole body — weights that do not add up, a body it could not
     // read — and belong to the form, not to a field named after them.

@@ -39,9 +39,21 @@ const PLURAL: Record<NonHumanClass, string> = {
 
 const lowerFirst = (s: string): string => s.charAt(0).toLowerCase() + s.slice(1)
 
-/** The ids of the `<p>`s that describe a control: its error first, then its hint. */
-const describedBy = (id: string, error?: string, hint?: string): string | undefined =>
-  [error ? `${id}-error` : null, hint ? `${id}-hint` : null].filter(Boolean).join(' ') || undefined
+/** A list of ids for `aria-describedby`, without the ones that are absent. */
+const ids = (...list: (string | false | null | undefined)[]): string | undefined =>
+  list.filter(Boolean).join(' ') || undefined
+
+/**
+ * The ids of the `<p>`s that describe a control: its error first, then its
+ * hint, then any paragraph it shares with its neighbours (an error or a hint
+ * about a group of fields, shown once under the group).
+ */
+const describedBy = (
+  id: string,
+  error?: string,
+  hint?: string,
+  also: (string | false | undefined)[] = [],
+): string | undefined => ids(error && `${id}-error`, hint && `${id}-hint`, ...also)
 
 function Notes({ id, error, hint }: { id: string; error?: string; hint?: ReactNode }) {
   return (
@@ -71,6 +83,7 @@ function Field(props: {
   type?: string
   inputMode?: 'numeric' | 'url' | 'text'
   autoComplete?: string
+  also?: (string | false | undefined)[]
 }) {
   return (
     <div className="grid gap-1">
@@ -82,7 +95,7 @@ function Field(props: {
         autoComplete={props.autoComplete}
         value={props.value}
         aria-invalid={props.error ? true : undefined}
-        aria-describedby={describedBy(props.id, props.error, props.hint)}
+        aria-describedby={describedBy(props.id, props.error, props.hint, props.also)}
         onChange={(e) => props.onChange(e.target.value)}
       />
       <Notes id={props.id} error={props.error} hint={props.hint} />
@@ -96,6 +109,7 @@ function CheckField(props: {
   checked: boolean
   onChange: (v: boolean) => void
   hint?: string
+  also?: (string | false | undefined)[]
 }) {
   return (
     <div className="grid gap-1">
@@ -103,7 +117,7 @@ function CheckField(props: {
         <Checkbox
           id={props.id}
           checked={props.checked}
-          aria-describedby={describedBy(props.id, undefined, props.hint)}
+          aria-describedby={describedBy(props.id, undefined, props.hint, props.also)}
           onCheckedChange={(v) => props.onChange(v === true)}
         />
         <Label htmlFor={props.id}>{props.label}</Label>
@@ -231,13 +245,15 @@ function FormBody(props: {
   const named = countryCodes(s.countryList).filter((c) => /^[A-Z]{2}$/.test(c))
 
   // Every key an error can land under that has a place of its own in the form.
-  // A refusal under any other key (the domain, in an edit) is shown with the
-  // form's own, so no message the service sent is dropped.
+  // A refusal under any other key (the domain in an edit, the two checkboxes)
+  // is shown with the form's own, so no message the service sent is dropped.
   const placed = new Set([
     'slug',
     'name',
     'targets',
     ...s.targets.map((_, i) => `targets.${i}`),
+    // A weight has an input only when there are several targets.
+    ...(several ? s.targets.map((_, i) => `targets.${i}.weight`) : []),
     'backupUrl',
     'deviceUrls',
     'returningUrl',
@@ -246,14 +262,14 @@ function FormBody(props: {
     'expiresAt',
     'password',
     'trafficActions',
-    'passthrough',
-    'enabled',
     ...(mode === 'create' ? ['host'] : []),
   ])
   const unplaced = Object.entries(errors)
     .filter(([k]) => k !== 'form' && !placed.has(k))
     .map(([k, v]) => `${k}: ${v}`)
   const formError = [errors.form, ...unplaced].filter(Boolean).join('; ')
+
+  const deviceNotes = [errors.deviceUrls && 'device-error', 'device-hint']
 
   const save = async (e: FormEvent) => {
     e.preventDefault()
@@ -290,12 +306,18 @@ function FormBody(props: {
     }
   }
 
+  // A password refusal while no password input is shown (the service's, after
+  // the operator chose to keep or remove) is described to the choice itself.
+  const passwordModeNote =
+    s.password.mode !== 'set' && errors.password ? 'password-mode-error' : undefined
+
   const passwordBox = (
     <CheckField
       id="password-ask"
       label="Ask visitors for a password"
       checked={s.password.mode === 'set'}
       onChange={(on) => set({ password: { mode: on ? 'set' : 'keep', value: '' } })}
+      also={[passwordModeNote]}
     />
   )
 
@@ -369,6 +391,7 @@ function FormBody(props: {
                 onChange={(url) => setTarget(i, { url })}
                 error={errors[`targets.${i}`]}
                 hint={i === 0 ? TOKENS : undefined}
+                also={[errors.targets && 'targets-error']}
               />
               {several && (
                 <div className="flex flex-wrap items-end gap-2">
@@ -379,6 +402,8 @@ function FormBody(props: {
                       inputMode="numeric"
                       value={t.weight}
                       onChange={(weight) => setTarget(i, { weight })}
+                      error={errors[`targets.${i}.weight`]}
+                      also={[errors.targets && 'targets-error']}
                     />
                   </div>
                   <Button
@@ -406,7 +431,11 @@ function FormBody(props: {
         {several && weightSum !== null && (
           <output className="block text-sm text-muted-foreground">{`Weights add up to ${weightSum}.`}</output>
         )}
-        {errors.targets && <p className="text-sm text-destructive">{errors.targets}</p>}
+        {errors.targets && (
+          <p id="targets-error" className="text-sm text-destructive">
+            {errors.targets}
+          </p>
+        )}
       </Section>
 
       <Section legend="When a visitor is turned away">
@@ -428,6 +457,7 @@ function FormBody(props: {
           inputMode="url"
           value={s.deviceUrls.ios}
           onChange={(ios) => set({ deviceUrls: { ...s.deviceUrls, ios } })}
+          also={deviceNotes}
         />
         <Field
           id="device-android"
@@ -435,6 +465,7 @@ function FormBody(props: {
           inputMode="url"
           value={s.deviceUrls.android}
           onChange={(android) => set({ deviceUrls: { ...s.deviceUrls, android } })}
+          also={deviceNotes}
         />
         <Field
           id="device-desktop"
@@ -442,6 +473,7 @@ function FormBody(props: {
           inputMode="url"
           value={s.deviceUrls.desktop}
           onChange={(desktop) => set({ deviceUrls: { ...s.deviceUrls, desktop } })}
+          also={deviceNotes}
         />
         <Notes
           id="device"
@@ -468,6 +500,9 @@ function FormBody(props: {
           <NativeSelect
             id="country-mode"
             value={s.countryMode}
+            aria-describedby={
+              s.countryMode === 'all' && errors.countries ? 'country-mode-error' : undefined
+            }
             onChange={(e) => set({ countryMode: e.target.value as LinkFormState['countryMode'] })}
           >
             <option value="all">Allow every country</option>
@@ -491,7 +526,9 @@ function FormBody(props: {
           </div>
         )}
         {s.countryMode === 'all' && errors.countries && (
-          <p className="text-sm text-destructive">{errors.countries}</p>
+          <p id="country-mode-error" className="text-sm text-destructive">
+            {errors.countries}
+          </p>
         )}
       </Section>
 
@@ -533,6 +570,7 @@ function FormBody(props: {
                   name="password-mode"
                   className="accent-primary"
                   checked={s.password.mode === value}
+                  aria-describedby={passwordModeNote}
                   onChange={() => set({ password: { mode: value, value: '' } })}
                 />
                 <Label htmlFor={`password-${value}`}>{label}</Label>
@@ -553,8 +591,10 @@ function FormBody(props: {
             error={errors.password}
           />
         )}
-        {s.password.mode !== 'set' && errors.password && (
-          <p className="text-sm text-destructive">{errors.password}</p>
+        {passwordModeNote && (
+          <p id="password-mode-error" className="text-sm text-destructive">
+            {errors.password}
+          </p>
         )}
       </Section>
 
@@ -571,7 +611,10 @@ function FormBody(props: {
               <NativeSelect
                 id={`traffic-${c}`}
                 value={s.trafficActions[c]}
-                aria-describedby={noSafe ? `traffic-${c}-hint` : undefined}
+                aria-describedby={ids(
+                  noSafe && `traffic-${c}-hint`,
+                  errors.trafficActions && 'traffic-error',
+                )}
                 onChange={(e) =>
                   set({
                     trafficActions: {
@@ -604,7 +647,9 @@ function FormBody(props: {
           )
         })}
         {errors.trafficActions && (
-          <p className="text-sm text-destructive">{errors.trafficActions}</p>
+          <p id="traffic-error" className="text-sm text-destructive">
+            {errors.trafficActions}
+          </p>
         )}
       </Section>
 
