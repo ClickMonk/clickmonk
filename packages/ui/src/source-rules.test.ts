@@ -234,6 +234,19 @@ describe('the source', () => {
     ).toEqual([])
   })
 
+  it('draws every focus ring at full opacity, never with a translucent modifier', () => {
+    // A translucent ring composites the accent or danger colour under the
+    // surface behind it, which can fall well under 3:1 — the one state a
+    // keyboard user relies on to find the control at all. `aria-invalid`'s
+    // ring is a decoration beside an already-opaque border and is not this
+    // rule's concern; only `focus-visible`'s own ring is.
+    const found = find(shipped, /focus-visible:ring-[a-z-]+\/\d+/)
+    expect(
+      found,
+      'A translucent focus ring can composite under 3:1. Use the ring colour at full opacity (ring-ring, …).',
+    ).toEqual([])
+  })
+
   it('puts no HTML from a string into the page, and evaluates no string', () => {
     const found = find(shipped, /dangerouslySetInnerHTML|\beval\(|new Function\(/)
     expect(

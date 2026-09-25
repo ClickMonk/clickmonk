@@ -43,7 +43,7 @@ export function Shell({
                   cn(
                     'block rounded-md px-3 py-2 text-sm whitespace-nowrap',
                     isActive
-                      ? 'bg-accent text-accent-foreground'
+                      ? 'bg-primary text-primary-foreground'
                       : 'text-muted-foreground hover:text-foreground',
                   )
                 }

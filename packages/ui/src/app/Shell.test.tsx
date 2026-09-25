@@ -49,6 +49,17 @@ describe('the shell', () => {
     expect(within(nav).getByRole('link', { name: 'Links' })).toHaveAttribute('aria-current', 'page')
   })
 
+  // The active item's fill against the nav's own sunken background is the
+  // only visual cue that it is current — aria-current reaches assistive
+  // technology alone — so it has to be the strong accent fill, not the pale
+  // accent-surface tint that barely differs from the nav behind it.
+  it('marks the open screen with the strong accent fill, not a pale tint', () => {
+    show('/links')
+    const active = screen.getByRole('link', { name: 'Links' })
+    expect(active).toHaveClass('bg-primary', 'text-primary-foreground')
+    expect(active).not.toHaveClass('bg-accent', 'text-accent-foreground')
+  })
+
   it('names the zone times are shown in', () => {
     show()
     expect(screen.getByText('Times in Australia/Adelaide')).toBeInTheDocument()

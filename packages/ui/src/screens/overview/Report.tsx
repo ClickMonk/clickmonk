@@ -87,7 +87,7 @@ export function Report({ link, panels }: { link?: string; panels: Panel[] }) {
                 key={m}
                 type="button"
                 size="sm"
-                variant={metric === m ? 'secondary' : 'ghost'}
+                variant={metric === m ? 'default' : 'ghost'}
                 aria-pressed={metric === m}
                 onClick={() => setMetric(m)}
               >

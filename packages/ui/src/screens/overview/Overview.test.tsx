@@ -151,6 +151,20 @@ describe('the overview', () => {
     expect(screen.queryByText('1,190')).not.toBeInTheDocument()
   })
 
+  // The pressed toggle's own fill, not the label alone, is the state cue —
+  // `secondary` (surface-inset) barely differs from the card behind it.
+  it('shows the pressed metric with the strong accent fill, not the pale secondary one', async () => {
+    show()
+    await screen.findByText('1,200')
+    const clicksButton = screen.getByRole('button', { name: 'Clicks' })
+    const visitorsButton = screen.getByRole('button', { name: 'Visitors' })
+    expect(clicksButton).toHaveAttribute('data-variant', 'default')
+    expect(visitorsButton).toHaveAttribute('data-variant', 'ghost')
+    await userEvent.setup().click(visitorsButton)
+    expect(visitorsButton).toHaveAttribute('data-variant', 'default')
+    expect(clicksButton).toHaveAttribute('data-variant', 'ghost')
+  })
+
   it('writes the chart’s own numbers to a CSV', async () => {
     const created: Blob[] = []
     vi.spyOn(URL, 'createObjectURL').mockImplementation((b) => {
