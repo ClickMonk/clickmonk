@@ -5,6 +5,7 @@ import { ApiError } from './api/errors'
 import type { Me } from './api/types'
 import { AppRoutes } from './app/Router'
 import { Shell } from './app/Shell'
+import { MeProvider } from './app/me'
 import { RefreshProvider } from './app/refresh'
 import { NoAdmin } from './screens/NoAdmin'
 import { SignIn } from './screens/SignIn'
@@ -79,6 +80,13 @@ export function App({
     setPhase({ name: 'anonymous', ended: false, notKept: false })
   }, [client])
 
+  // Re-reads the account after a change on the account screen (enrolling or
+  // turning off two-factor, replacing recovery codes) so that screen shows
+  // what the service now says, not what it said at boot.
+  const refreshMe = useCallback(async () => {
+    setPhase({ name: 'authenticated', me: await client.me() })
+  }, [client])
+
   return (
     <ClientProvider client={client}>
       {phase.name === 'checking' && <div className="min-h-dvh bg-background" />}
@@ -89,9 +97,11 @@ export function App({
       )}
       {phase.name === 'authenticated' && (
         <RefreshProvider>
-          <Shell email={phase.me.email} onSignOut={signOut}>
-            <AppRoutes />
-          </Shell>
+          <MeProvider me={phase.me} refreshMe={refreshMe}>
+            <Shell email={phase.me.email} onSignOut={signOut}>
+              <AppRoutes />
+            </Shell>
+          </MeProvider>
         </RefreshProvider>
       )}
     </ClientProvider>

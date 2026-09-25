@@ -1,4 +1,5 @@
 import { NotFound } from '@/screens/NotFound'
+import { Account } from '@/screens/account/Account'
 import { Clicks } from '@/screens/clicks/Clicks'
 import { Domains } from '@/screens/domains/Domains'
 import { LinkForm } from '@/screens/links/LinkForm'
@@ -7,11 +8,12 @@ import { Links } from '@/screens/links/Links'
 import { Overview } from '@/screens/overview/Overview'
 import { Settings } from '@/screens/settings/Settings'
 import { Navigate, Route, Routes } from 'react-router'
-import { PageHeader } from './PageHeader'
+import { useMe } from './me'
 
-/** A screen not built yet. Each screen's own task replaces its line below, and nothing else. */
-function Placeholder({ title }: { title: string }) {
-  return <PageHeader title={title} />
+/** The account screen, reading who is signed in from the context `App` set up. */
+function AccountRoute() {
+  const { me, refreshMe } = useMe()
+  return <Account me={me} onAccountChanged={refreshMe} />
 }
 
 export function AppRoutes() {
@@ -26,7 +28,7 @@ export function AppRoutes() {
       <Route path="/clicks" element={<Clicks />} />
       <Route path="/domains" element={<Domains />} />
       <Route path="/settings" element={<Settings />} />
-      <Route path="/account" element={<Placeholder title="Account" />} />
+      <Route path="/account" element={<AccountRoute />} />
       <Route path="*" element={<NotFound />} />
     </Routes>
   )
