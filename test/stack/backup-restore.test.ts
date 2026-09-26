@@ -549,15 +549,18 @@ describe('backup.sh', () => {
   it(
     'leaves a worker it did not stop stopped, and still takes the backup',
     () => {
-      compose('stop', 'worker')
+      // The redirect too, so that no container can say which release this is.
+      compose('stop', 'worker', 'redirect')
       try {
         const r = runScript('backup.sh', [join(BACKUPS, 'worker-stopped')])
         expect(r.status, r.out).toBe(0)
         expect(r.out).toContain('The worker is not running; it is left that way.')
+        expect(r.out).toContain('Neither the redirect nor the worker is running')
         expect(running()).not.toContain('worker')
-        onlyBackupIn(join(BACKUPS, 'worker-stopped'))
+        const m = manifest(onlyBackupIn(join(BACKUPS, 'worker-stopped')))
+        expect(m.clickmonk_version).toBe('unknown')
       } finally {
-        compose('start', 'worker')
+        compose('start', 'redirect', 'worker')
       }
     },
     LONG,
@@ -667,11 +670,17 @@ describe('backup.sh', () => {
       } finally {
         stub.remove()
       }
-      expect(r.status, r.out).not.toBe(0)
-      expect(running()).toEqual(ALL_SERVICES)
-      expect(readdirSync(dest)).toEqual([])
-      expect(backupsDisk()).toBe('')
-      expect(existsSync(LOCK)).toBe(false)
+      try {
+        expect(r.status, r.out).not.toBe(0)
+        expect(running()).toEqual(ALL_SERVICES)
+        expect(readdirSync(dest)).toEqual([])
+        expect(backupsDisk()).toBe('')
+        expect(existsSync(LOCK)).toBe(false)
+      } finally {
+        // A trap killed before its end leaves the lock; every later test
+        // would then fail on it rather than on what it tests.
+        rmSync(LOCK, { recursive: true, force: true })
+      }
     },
     LONG,
   )
@@ -801,6 +810,96 @@ describe('backup.sh', () => {
     LONG,
   )
 
+  // A worker that will not start again: the backup is kept and the run fails
+  // saying so, and the lock is released, or every later run would refuse.
+  it(
+    'releases the lock when it cannot start the worker again',
+    () => {
+      const stub = stubDocker('    start) exit 1 ;;')
+      let r: ScriptResult
+      try {
+        r = runScript('backup.sh', [join(BACKUPS, 'no-restart')], { env: { PATH: stub.path } })
+      } finally {
+        stub.remove()
+        compose('start', 'worker')
+      }
+      expect(r.status, r.out).toBe(1)
+      expect(r.out).toContain('the worker is stopped and this script could not start it again')
+      onlyBackupIn(join(BACKUPS, 'no-restart'))
+      expect(existsSync(LOCK)).toBe(false)
+    },
+    LONG,
+  )
+
+  // A BACKUP or RESTORE whose client was killed runs on in the server. Its
+  // archive is what the sweep would delete, so the backup waits for it.
+  it(
+    'refuses while ClickHouse is still running an earlier backup or restore, before stopping anything',
+    () => {
+      const stub = stubDocker(
+        `    *"FROM system.backups"*) echo "RESTORING Disk('backups', 'clickmonk-restore-2026-10-01T041500Z.zip')"; exit 0 ;;`,
+      )
+      const dest = join(BACKUPS, 'in-progress')
+      const workerBefore = startedAt('worker')
+      compose(
+        'exec',
+        '-T',
+        'clickhouse',
+        'touch',
+        '/var/lib/clickhouse/backups/clickmonk-restore-2026-10-01T041500Z.zip',
+      )
+      let r: ScriptResult
+      try {
+        r = runScript('backup.sh', [dest], { env: { PATH: stub.path } })
+        expect(r.status, r.out).toBe(1)
+        expect(r.out).toContain(
+          "ClickHouse is still running an earlier backup or restore: RESTORING Disk('backups', 'clickmonk-restore-2026-10-01T041500Z.zip').",
+        )
+        expect(r.out).toContain('Wait for it to finish')
+        expect(r.out).toContain('the backup failed during the validation step')
+        // Its archive is left for it.
+        expect(backupsDisk()).toBe('clickmonk-restore-2026-10-01T041500Z.zip')
+        expect(readdirSync(BACKUPS)).not.toContain('in-progress')
+        expect(startedAt('worker')).toBe(workerBefore)
+      } finally {
+        stub.remove()
+        compose(
+          'exec',
+          '-T',
+          'clickhouse',
+          'rm',
+          '-f',
+          '/var/lib/clickhouse/backups/clickmonk-restore-2026-10-01T041500Z.zip',
+        )
+      }
+    },
+    LONG,
+  )
+
+  // Not knowing is not the same as nothing running: the sweep waits for an answer.
+  it(
+    'refuses when ClickHouse cannot say whether a backup or restore is running',
+    () => {
+      const stub = stubDocker('    *"FROM system.backups"*) exit 1 ;;')
+      const workerBefore = startedAt('worker')
+      let r: ScriptResult
+      try {
+        r = runScript('backup.sh', [join(BACKUPS, 'unknown-progress')], {
+          env: { PATH: stub.path },
+        })
+      } finally {
+        stub.remove()
+      }
+      expect(r.status, r.out).toBe(1)
+      expect(r.out).toContain(
+        'Could not ask ClickHouse whether a backup or restore is still running.',
+      )
+      expect(readdirSync(BACKUPS)).not.toContain('unknown-progress')
+      expect(startedAt('worker')).toBe(workerBefore)
+    },
+    LONG,
+  )
+
   // Compose itself fails on an env file it cannot find, so a check of the
   // services first would blame a store that is running.
   it(
@@ -828,8 +927,11 @@ describe('backup.sh', () => {
       const release = join(TMP, 'lock-release')
       rmSync(reached, { force: true })
       rmSync(release, { force: true })
+      // The holder's BACKUP runs for real and it pauses after it, with its
+      // archive on the backups disk: a refused run must not sweep it away.
+      const real = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim()
       const stub = stubDocker(
-        `    *"BACKUP DATABASE"*) touch ${reached}; while [ ! -e ${release} ]; do sleep 0.2; done ;;`,
+        `    *"BACKUP DATABASE"*) ${real} "$@"; rc=$?; touch ${reached}; while [ ! -e ${release} ]; do sleep 0.2; done; exit $rc ;;`,
       )
       const first = join(BACKUPS, 'holder')
       let out = ''
@@ -860,6 +962,7 @@ describe('backup.sh', () => {
         // The first run's lock, and its stopped worker, are as it left them.
         expect(readFileSync(join(LOCK, 'pid'), 'utf8').trim()).toBe(holderPid)
         expect(running()).not.toContain('worker')
+        expect(backupsDisk()).toMatch(/^clickmonk-.*\.zip$/m)
       } finally {
         writeFileSync(release, '')
       }
