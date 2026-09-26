@@ -273,11 +273,15 @@ BACKUPS_DISK="$(ch_query "SELECT name FROM system.disks WHERE name = 'backups'" 
 ZIP_BYTES="$(wc -c <"$SRC/clickhouse.zip" | tr -d ' ')" || ZIP_BYTES=''
 CH_FREE="$(ch_query "SELECT free_space FROM system.disks WHERE name = 'backups'" default)" || CH_FREE=''
 CH_BYTES="$(ch_query "SELECT sum(bytes_on_disk) FROM system.parts WHERE active AND database = '$CH_DATABASE'" default)" || CH_BYTES=''
-case "$ZIP_BYTES$CH_FREE$CH_BYTES" in
-  '' | *[!0-9]*)
-    refuse "Could not read the archive's size and ClickHouse's size and free space: '${ZIP_BYTES:-nothing}', '${CH_BYTES:-nothing}', '${CH_FREE:-nothing}'."
-    ;;
-esac
+# Each on its own: an empty one inside a concatenation would still read as a
+# number, and as zero in the sum below.
+for value in "$ZIP_BYTES" "$CH_FREE" "$CH_BYTES"; do
+  case "$value" in
+    '' | *[!0-9]*)
+      refuse "Could not read the archive's size and ClickHouse's size and free space: '${ZIP_BYTES:-nothing}', '${CH_BYTES:-nothing}', '${CH_FREE:-nothing}'."
+      ;;
+  esac
+done
 CH_NEED=$((ZIP_BYTES * 5 / 2))
 [ $((CH_FREE + CH_BYTES)) -ge "$CH_NEED" ] ||
   refuse "The ClickHouse volume has $((CH_FREE / 1048576)) MiB free, and $((CH_BYTES / 1048576)) MiB more once its database is dropped; this restore needs about $((CH_NEED / 1048576)) MiB." \
