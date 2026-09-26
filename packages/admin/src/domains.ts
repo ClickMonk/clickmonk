@@ -281,9 +281,11 @@ export function registerDomainRoutes(app: FastifyInstance, ctx: AdminContext): v
 
   /**
    * What the operator has to know: every domain whose last check did not find
-   * the token, and every domain no check has reached yet. Verification is
-   * never revoked automatically, so a domain here may still be serving — that
-   * is the point of showing it.
+   * the token, and every domain no check has reached yet — except a domain
+   * verified by hand that has never once passed a check, which is not shown
+   * here until it does (`ALERT_CONDITION`). Verification is never revoked
+   * automatically, so a domain here may still be serving — that is the point
+   * of showing it.
    *
    * Capped and counted exactly as the listing is: an operator shown a prefix
    * of what is wrong, with no sign that it was a prefix, is worse off than

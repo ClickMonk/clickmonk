@@ -651,11 +651,25 @@ describe('what the operator has to know', () => {
     // 'untested' has no domain_dns_checks row at all: verified by hand, never checked.
 
     const alerts = await app.inject({ method: 'GET', url: '/api/alerts', headers: read(cookie) })
-    const hosts = (alerts.json().domains as { host: string }[]).map((d) => d.host)
+    const rows = alerts.json().domains as {
+      host: string
+      passedAt: string | null
+      handVerified: boolean
+    }[]
+    const hosts = rows.map((d) => d.host)
     expect(hosts).not.toContain('untested.example.test')
     expect(hosts).not.toContain('stillbare.example.test')
     expect(hosts).toContain('regressed.example.test')
     expect(hosts).toContain('awaiting.example.test')
+    // handVerified is always false here — ALERT_CONDITION already excludes
+    // every domain it would be true for — but passedAt still carries real
+    // information: it is what makes 'regressed' an alert at all.
+    const regressed = rows.find((d) => d.host === 'regressed.example.test')
+    expect(regressed?.passedAt).toBe('2026-09-01T00:00:00.000Z')
+    expect(regressed?.handVerified).toBe(false)
+    const awaiting = rows.find((d) => d.host === 'awaiting.example.test')
+    expect(awaiting?.passedAt).toBeNull()
+    expect(awaiting?.handVerified).toBe(false)
 
     const status = await app.inject({ method: 'GET', url: '/api/status', headers: read(cookie) })
     expect(status.json().alerts).toBe(2)
