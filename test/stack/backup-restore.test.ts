@@ -270,6 +270,7 @@ beforeAll(async () => {
   // A lock or marker a failed earlier run of this suite left would refuse every backup.
   rmSync(LOCK, { recursive: true, force: true })
   rmSync(MARKER, { force: true })
+  rmSync(`${MARKER}.partial`, { recursive: true, force: true })
   mkdirSync(BACKUPS, { recursive: true })
   // The stack's own values, in the file the scripts copy as this install's
   // .env. Compose reads it too, through COMPOSE_ENV_FILES, and agrees with
@@ -320,6 +321,7 @@ afterAll(() => {
     rmSync(BACKUPS, { recursive: true, force: true })
     rmSync(LOCK, { recursive: true, force: true })
     rmSync(MARKER, { force: true })
+    rmSync(`${MARKER}.partial`, { recursive: true, force: true })
     rmSync(ENV_FILE, { force: true })
   }
 }, 300_000)
@@ -1596,6 +1598,32 @@ describe('restore.sh refuses, after an interrupted restore or on a full disk', (
     LONG,
   )
 
+  // The restore needs the archive and the restored database side by side:
+  // two and a half times the archive, less what the DROP frees. Twice is short.
+  it(
+    'refuses a volume with room for exactly twice the archive',
+    () => {
+      const twice = 2 * statSync(join(firstBackup, 'clickhouse.zip')).size
+      const stub = stubDocker(
+        [
+          `    *"free_space FROM system.disks"*) echo ${twice}; exit 0 ;;`,
+          '    *"FROM system.parts"*) echo 0; exit 0 ;;',
+        ].join('\n'),
+      )
+      const b = unchanged()
+      try {
+        const r = runScript('restore.sh', [firstBackup], { env: { PATH: stub.path } })
+        expect(r.status, r.out).toBe(1)
+        expect(r.out).toContain('this restore needs about')
+        expect(r.out).toContain('Nothing was changed, and nothing was stopped.')
+      } finally {
+        stub.remove()
+      }
+      expect(unchanged()).toEqual(b)
+    },
+    LONG,
+  )
+
   // One size ClickHouse cannot give: it must not count as zero bytes to free.
   it(
     'refuses when ClickHouse cannot say how much its database holds',
@@ -1770,6 +1798,69 @@ describe('restore.sh, interrupted after it has changed a store', () => {
         expectLeftStopped(r, 'ClickHouse was being dropped and may be gone')
         expectFinishedByRerun()
       } finally {
+        rmSync(LOCK, { recursive: true, force: true })
+      }
+    },
+    LONG,
+  )
+
+  // A rerun after an interruption finds the earlier run's marker. If it cannot
+  // write its own, the earlier one still describes the stores and must stay.
+  it(
+    'leaves an earlier marker as it was when it cannot write its own',
+    () => {
+      writeFileSync(MARKER, '/srv/backups/2026-10-01T041500Z\n')
+      // A directory where the new marker is written first: the write fails for real.
+      mkdirSync(`${MARKER}.partial`)
+      try {
+        const r = runScript('restore.sh', [firstBackup], { input: `${stamp()}\n` })
+        expect(r.status, r.out).toBe(1)
+        expect(r.out).toContain(`Could not write ${MARKER}. Nothing has been changed yet.`)
+        expect(r.out).not.toContain('stopped part way')
+        expect(readFileSync(MARKER, 'utf8')).toBe('/srv/backups/2026-10-01T041500Z\n')
+        expect(running()).toEqual(ALL_SERVICES)
+        expect(existsSync(LOCK)).toBe(false)
+      } finally {
+        rmSync(`${MARKER}.partial`, { recursive: true, force: true })
+        rmSync(MARKER, { force: true })
+        rmSync(LOCK, { recursive: true, force: true })
+      }
+    },
+    LONG,
+  )
+
+  // Every store was restored and does not match the manifest: the stores are
+  // not the backup's, so the marker stays and backups stay refused.
+  it(
+    'keeps the marker, and backups refused, when the restored stores do not match the manifest',
+    () => {
+      const dir = join(BACKUPS, 'copies', 'wrong-count')
+      rmSync(dir, { recursive: true, force: true })
+      cpSync(firstBackup, dir, { recursive: true })
+      const path = join(dir, 'MANIFEST')
+      const edited = readFileSync(path, 'utf8').replace(
+        /^rows\.clickhouse\.clicks=\d+$/m,
+        'rows.clickhouse.clicks=99',
+      )
+      expect(edited).not.toBe(readFileSync(path, 'utf8'))
+      writeFileSync(path, edited)
+      try {
+        const r = runScript('restore.sh', [dir], { input: `${manifest(dir).timestamp}\n` })
+        expect(r.status, r.out).toBe(1)
+        expect(r.out).toContain('the restore failed during the verification step')
+        expect(r.out).toContain('clicks: the backup recorded 99 rows')
+        expect(readFileSync(MARKER, 'utf8')).toBe(`${dir}\n`)
+        for (const s of APPS) expect(running(), s).not.toContain(s)
+
+        const b = runScript('backup.sh', [join(BACKUPS, 'after-mismatch')])
+        expect(b.status, b.out).toBe(1)
+        expect(b.out).toContain(`A restore of ${dir} did not finish`)
+        expect(readdirSync(BACKUPS)).not.toContain('after-mismatch')
+
+        rmSync(MARKER, { force: true })
+        expectFinishedByRerun()
+      } finally {
+        rmSync(MARKER, { force: true })
         rmSync(LOCK, { recursive: true, force: true })
       }
     },
