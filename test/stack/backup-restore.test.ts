@@ -12,6 +12,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs'
+import { constants } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import {
@@ -68,6 +69,8 @@ const BACKUPS = join(TMP, 'backups')
 const ENV_FILE = join(TMP, 'backup.env')
 /** The lock backup.sh and restore.sh share, in the checkout. */
 const LOCK = join(ROOT, '.backup-restore.lock')
+/** What restore.sh leaves while the stores may be half restored, in the checkout. */
+const MARKER = join(ROOT, '.restore-incomplete')
 const SCRIPT_ENV: Record<string, string | undefined> = {
   ...ENV,
   COMPOSE_FILE: 'docker-compose.yml:test/stack/docker-compose.tls.yml',
@@ -100,7 +103,9 @@ function runScript(
     timeout: 600_000,
   })
   if (r.error) throw new Error(`could not run ${script}: ${r.error.message}`)
-  return { status: r.status ?? -1, out: `${r.stdout ?? ''}${r.stderr ?? ''}` }
+  // A run ended by a signal has no status; a shell reports it as 128 + its number.
+  const status = r.status ?? (r.signal ? 128 + constants.signals[r.signal] : -1)
+  return { status, out: `${r.stdout ?? ''}${r.stderr ?? ''}` }
 }
 
 /** The services running now, sorted. */
@@ -262,8 +267,9 @@ afterEach((ctx) => {
 beforeAll(async () => {
   compose('down', '-v')
   rmSync(BACKUPS, { recursive: true, force: true })
-  // A lock a failed earlier run of this suite left would refuse every backup.
+  // A lock or marker a failed earlier run of this suite left would refuse every backup.
   rmSync(LOCK, { recursive: true, force: true })
+  rmSync(MARKER, { force: true })
   mkdirSync(BACKUPS, { recursive: true })
   // The stack's own values, in the file the scripts copy as this install's
   // .env. Compose reads it too, through COMPOSE_ENV_FILES, and agrees with
@@ -313,6 +319,7 @@ afterAll(() => {
     compose('down', '-v')
     rmSync(BACKUPS, { recursive: true, force: true })
     rmSync(LOCK, { recursive: true, force: true })
+    rmSync(MARKER, { force: true })
     rmSync(ENV_FILE, { force: true })
   }
 }, 300_000)
@@ -1012,6 +1019,31 @@ describe('backup.sh', () => {
     LONG,
   )
 
+  // A restore interrupted part way leaves stores from two moments; a backup
+  // of them would be complete, checksummed and of a state that never existed.
+  it(
+    'refuses while a restore has not finished, and names the backup to finish it with',
+    () => {
+      writeFileSync(MARKER, '/srv/backups/2026-10-01T041500Z\n')
+      const workerBefore = startedAt('worker')
+      try {
+        const r = runScript('backup.sh', [join(BACKUPS, 'half-restored')])
+        expect(r.status, r.out).toBe(1)
+        expect(r.out).toContain(
+          'A restore of /srv/backups/2026-10-01T041500Z did not finish, so the stores may be half restored.',
+        )
+        expect(r.out).toContain('restore.sh /srv/backups/2026-10-01T041500Z')
+        expect(r.out).toContain('the backup failed during the validation step')
+        expect(readdirSync(BACKUPS)).not.toContain('half-restored')
+        expect(startedAt('worker')).toBe(workerBefore)
+        expect(existsSync(MARKER)).toBe(true)
+      } finally {
+        rmSync(MARKER, { force: true })
+      }
+    },
+    LONG,
+  )
+
   it(
     'parses, and prints its usage, under bash 3.2',
     () => {
@@ -1076,6 +1108,7 @@ describe('restore.sh refuses, before it stops or changes anything', () => {
     expect(r.status, r.out).toBe(1)
     expect(r.out).toContain(reason)
     expect(r.out).toContain('Nothing was changed, and nothing was stopped.')
+    expect(r.out).not.toContain('Stopped before anything was changed.')
     expect(world()).toEqual(before)
   }
 
@@ -1485,6 +1518,83 @@ describe('restore.sh refuses, before it stops or changes anything', () => {
   )
 })
 
+describe('restore.sh refuses, after an interrupted restore or on a full disk', () => {
+  const unchanged = (): { running: string[]; redirect: string; locked: boolean } => ({
+    running: running(),
+    redirect: startedAt('redirect'),
+    locked: existsSync(LOCK),
+  })
+
+  // Between a DROP and its RESTORE the clickmonk database does not exist, and
+  // naming it is itself an error. A rerun must still get as far as asking.
+  it(
+    'asks nothing of the clickmonk database before the prompt',
+    () => {
+      const stub = stubDocker(
+        '    clickmonk) echo "Database clickmonk does not exist" >&2; exit 1 ;;',
+      )
+      const b = unchanged()
+      try {
+        const r = runScript('restore.sh', [firstBackup], { env: { PATH: stub.path } })
+        expect(r.status, r.out).toBe(1)
+        expect(r.out).toContain('That is not the backup’s timestamp')
+        expect(r.out).toContain('Nothing was changed, and nothing was stopped.')
+      } finally {
+        stub.remove()
+      }
+      expect(unchanged()).toEqual(b)
+    },
+    LONG,
+  )
+
+  // The RESTORE runs after the DROP; a disk that fills there leaves ClickHouse
+  // partial with the stack stopped.
+  it(
+    'refuses a restore the ClickHouse volume has no room for',
+    () => {
+      const stub = stubDocker(
+        [
+          '    *"free_space FROM system.disks"*) echo 1; exit 0 ;;',
+          '    *"FROM system.parts"*) echo 0; exit 0 ;;',
+        ].join('\n'),
+      )
+      const b = unchanged()
+      try {
+        const r = runScript('restore.sh', [firstBackup], { env: { PATH: stub.path } })
+        expect(r.status, r.out).toBe(1)
+        expect(r.out).toContain(
+          'The ClickHouse volume has 0 MiB free, and 0 MiB more once its database is dropped',
+        )
+        expect(r.out).toContain('Nothing was changed, and nothing was stopped.')
+        expect(r.out).not.toContain('Type the backup’s timestamp')
+      } finally {
+        stub.remove()
+      }
+      expect(unchanged()).toEqual(b)
+    },
+    LONG,
+  )
+
+  // Ctrl-C during the checks: without a word the prompt would be the last thing said.
+  it(
+    'says it stopped before anything was changed when a signal arrives during the checks',
+    () => {
+      const stub = stubDocker(`    --services) kill -TERM "$(cat ${LOCK}/pid)"; sleep 1; exit 1 ;;`)
+      const b = unchanged()
+      try {
+        const r = runScript('restore.sh', [firstBackup], { env: { PATH: stub.path } })
+        expect(r.status, r.out).toBe(143)
+        expect(r.out).toContain('Stopped before anything was changed.')
+        expect(r.out).not.toContain('stopped part way')
+      } finally {
+        stub.remove()
+      }
+      expect(unchanged()).toEqual(b)
+    },
+    LONG,
+  )
+})
+
 describe('restore.sh, stopped before it changes anything', () => {
   // An operator who sends TERM while the archive is copied in, and again while
   // the services are being started: the second must not abandon the trap.
@@ -1526,6 +1636,98 @@ describe('restore.sh, stopped before it changes anything', () => {
         expect(existsSync(LOCK)).toBe(false)
       } finally {
         // A trap killed before its end leaves the lock.
+        rmSync(LOCK, { recursive: true, force: true })
+      }
+    },
+    LONG,
+  )
+})
+
+// These change the stores and restore them again, so they come last.
+describe('restore.sh, interrupted after it has changed a store', () => {
+  const APPS = ['admin', 'caddy', 'redirect', 'worker']
+  const stamp = (): string => manifest(firstBackup).timestamp ?? ''
+
+  /** TERM to restore.sh, from inside the docker call the `cases` name, once that call has run. */
+  function interruptAt(pattern: string): { path: string; remove: () => void } {
+    const real = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim()
+    return stubDocker(
+      `    ${pattern}) ${real} "$@"; kill -TERM "$(cat ${LOCK}/pid)"; sleep 2; exit 1 ;;`,
+    )
+  }
+
+  function expectLeftStopped(r: ScriptResult, state: string): void {
+    expect(r.status, r.out).toBe(143)
+    expect(r.out).toContain(`The restore stopped part way: ${state}`)
+    expect(r.out).not.toContain('Nothing was changed')
+    expect(r.out).not.toContain('Stopped before anything was changed')
+    const up = running()
+    for (const s of APPS) expect(up, s).not.toContain(s)
+    expect(readFileSync(MARKER, 'utf8')).toBe(`${firstBackup}\n`)
+    expect(existsSync(LOCK)).toBe(false)
+    expect(backupsDisk()).toBe('')
+  }
+
+  function expectFinishedByRerun(): void {
+    const r = runScript('restore.sh', [firstBackup], { input: `${stamp()}\n` })
+    expect(r.status, r.out).toBe(0)
+    expect(existsSync(MARKER)).toBe(false)
+    expect(existsSync(LOCK)).toBe(false)
+    expect(running()).toEqual(ALL_SERVICES)
+    expect(ch('SELECT count() FROM clicks FINAL')).toBe(
+      manifest(firstBackup)['rows.clickhouse.clicks'],
+    )
+  }
+
+  it(
+    'leaves the stack stopped at the spool step, refuses a backup, and finishes when run again',
+    () => {
+      const stub = interruptAt('/var/lib/clickmonk/spool')
+      let r: ScriptResult
+      try {
+        r = runScript('restore.sh', [firstBackup], {
+          input: `${stamp()}\n`,
+          env: { PATH: stub.path },
+        })
+      } finally {
+        stub.remove()
+      }
+      try {
+        expectLeftStopped(r, 'ClickHouse and Postgres are restored; the spool was being replaced')
+        expect(r.out).not.toContain('may still be finishing')
+
+        const b = runScript('backup.sh', [join(BACKUPS, 'half-restored-for-real')])
+        expect(b.status, b.out).toBe(1)
+        expect(b.out).toContain(`A restore of ${firstBackup} did not finish`)
+        expect(b.out).toContain(`restore.sh ${firstBackup}`)
+        expect(readdirSync(BACKUPS)).not.toContain('half-restored-for-real')
+
+        expectFinishedByRerun()
+      } finally {
+        rmSync(LOCK, { recursive: true, force: true })
+      }
+    },
+    LONG,
+  )
+
+  // The first destructive statement: from here on nothing may be started again.
+  it(
+    'leaves the stack stopped when interrupted right after the DROP, and finishes when run again',
+    () => {
+      const stub = interruptAt('*"DROP DATABASE"*')
+      let r: ScriptResult
+      try {
+        r = runScript('restore.sh', [firstBackup], {
+          input: `${stamp()}\n`,
+          env: { PATH: stub.path },
+        })
+      } finally {
+        stub.remove()
+      }
+      try {
+        expectLeftStopped(r, 'ClickHouse was being dropped and may be gone')
+        expectFinishedByRerun()
+      } finally {
         rmSync(LOCK, { recursive: true, force: true })
       }
     },
