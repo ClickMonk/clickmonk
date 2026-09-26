@@ -56,3 +56,4 @@ packages/ui/dist-ts/
 .backup-restore.lock/
 # The mark restore.sh leaves while the stores may be half restored.
 .restore-incomplete
+.restore-incomplete.partial

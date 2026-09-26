@@ -388,8 +388,11 @@ docker compose exec -T clickhouse sh -c \
 
 # Before the first change to any store: until every store is restored, the
 # marker makes backup.sh refuse rather than copy a mix of two moments.
-if ! printf '%s\n' "$SRC" | artefact_write "$RESTORE_MARKER"; then
-  rm -f "$RESTORE_MARKER" 2>/dev/null || true
+# Written beside it and renamed, so that a failed write never touches a marker
+# an earlier, interrupted run left: that one still describes the stores.
+if ! printf '%s\n' "$SRC" | artefact_write "$RESTORE_MARKER.partial" ||
+  ! mv -f "$RESTORE_MARKER.partial" "$RESTORE_MARKER"; then
+  rm -f "$RESTORE_MARKER.partial" 2>/dev/null || true
   abort "ClickHouse" "Could not write $RESTORE_MARKER. Nothing has been changed yet."
 fi
 DESTRUCTION_BEGUN=1
