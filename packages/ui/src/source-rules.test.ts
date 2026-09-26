@@ -282,49 +282,21 @@ describe('the source', () => {
     // theme for as long as the reload took, and nothing under screens/ has a
     // legitimate reason to fade with opacity, so any weight is refused
     // rather than just the one value that was found in use.
+    //
+    // The same dimming is reachable without opacity too — a class read for
+    // muted colour only while a loading flag is set. That was tried here as
+    // a second rule, through three revisions of the regex matching it (a
+    // line, then a className attribute, then a wider one), and each
+    // revision missed a shape the last one caught or a new one it never
+    // covered (a class hoisted into a variable, a `&&` instead of a `?`).
+    // A colour swap tied to a loading state is a review concern, not a
+    // pattern a regex over JSX can state; it stays one, rather than a fourth
+    // revision of a rule that keeps rhyming with the one before it.
     const screens = shipped.filter((p) => /[\\/]screens[\\/]/.test(p))
     const found = find(screens, /\bopacity-\d+\b/)
     expect(
       found,
       'Dimming a busy region drops it under 3:1. Mark it aria-busy and leave its opacity alone.',
-    ).toEqual([])
-  })
-
-  it('never dims a busy region by swapping in text-muted-foreground either', () => {
-    // The same dimming can be reached without opacity: a conditional class
-    // that reads for muted colour only while a loading/stale/busy flag is
-    // set composites text under the same 3:1 risk the opacity check refuses.
-    // Matched against each className={…} attribute's whole value rather than
-    // one line at a time, so a ternary Prettier has wrapped across several
-    // lines is still caught. `[^{}]*(?:\{[^{}]*\}[^{}]*)*` is a one-level
-    // brace matcher, not a parser — it is enough for a ternary or a
-    // template literal inside the attribute, which is every shape this
-    // codebase's conditional classNames take, but a second level of nested
-    // braces would close the match early. This is still a narrower net than
-    // the opacity check: a muted-colour class and a loading-shaped
-    // identifier must both appear in the same attribute, so a legitimate,
-    // unconditional text-muted-foreground (a caption, a hint, a footer)
-    // never matches.
-    const screens = shipped.filter((p) => /[\\/]screens[\\/]/.test(p))
-    const classNameValue = /className=\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}/g
-    const found = screens.flatMap((p) => {
-      const text = readFileSync(p, 'utf8')
-      const out: string[] = []
-      for (const m of text.matchAll(classNameValue)) {
-        const value = m[1] ?? ''
-        const muted = /\btext-muted-foreground\b/.test(value)
-        const loadingShaped = /\b(stale|loading|busy)\b/i.test(value)
-        const conditional = /\?/.test(value)
-        if (muted && loadingShaped && conditional) {
-          const line = text.slice(0, m.index).split('\n').length
-          out.push(`${relative(SRC, p)}:${line}: ${value.trim().replace(/\s+/g, ' ')}`)
-        }
-      }
-      return out
-    })
-    expect(
-      found,
-      'A muted colour swapped in while a load is stale/loading/busy dims it the same way opacity-50 did. Keep the busy region at full contrast; mark it aria-busy instead.',
     ).toEqual([])
   })
 
