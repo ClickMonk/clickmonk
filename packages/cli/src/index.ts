@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { formatConfigError, normaliseHost } from '@clickmonk/core'
-import { type ClickHouseClient, createChClient, createPgPool } from '@clickmonk/db'
+import { type ClickHouseClient, type Pool, createChClient, createPgPool } from '@clickmonk/db'
 import { DEFAULT_IPDATA_DIR } from '@clickmonk/ipdata'
 import { isResolverAddress } from '@clickmonk/worker/domains'
 import { z } from 'zod'
@@ -21,6 +21,32 @@ const ChEnv = z.object({
 class ConfigError extends Error {}
 
 async function main(): Promise<number> {
+  const argv = process.argv.slice(2)
+  // Answered before either environment is parsed: a backup script runs this
+  // in a one-off container to learn an image's schema version before any
+  // database is known to be reachable, and this checkout's own
+  // CLICKMONK_DNS_SERVERS may be malformed there too. Neither may stop it
+  // from answering, so `commands.ts`'s `version` branch — the only one that
+  // touches neither dependency — runs against stand-ins that throw if it
+  // ever did.
+  if (argv.length === 1 && argv[0] === 'version') {
+    const untouchable = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error('version must not touch Postgres')
+        },
+      },
+    ) as unknown as Pool
+    return runCli(argv, {
+      pg: untouchable,
+      ch: () => {
+        throw new Error('version must not touch ClickHouse')
+      },
+      out: (s) => console.log(s),
+      ipdata: { dir: process.env.CLICKMONK_IPDATA_DIR || DEFAULT_IPDATA_DIR },
+    })
+  }
   const env = PgEnv.safeParse(process.env)
   if (!env.success) throw new ConfigError(formatConfigError(env.error))
   const pg = createPgPool(env.data.CLICKMONK_POSTGRES_URL, { max: 1 })
@@ -49,7 +75,7 @@ async function main(): Promise<number> {
     return opened.ch
   }
   try {
-    return await runCli(process.argv.slice(2), {
+    return await runCli(argv, {
       pg,
       ch,
       out: (s) => console.log(s),
