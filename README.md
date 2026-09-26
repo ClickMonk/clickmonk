@@ -10,7 +10,8 @@ on your own infrastructure, and your click data stays yours.
 
 ## Status
 
-**Early, and not ready for production.** There is no release yet. What runs today:
+**0.1.0, the first release.** It has not yet carried anyone's production traffic, and the list
+below of what it does not do is part of the release. What it does:
 
 - **The redirect**, which answers links on your domains from an in-memory copy of the
   configuration: weighted rotation across destinations, click caps, expiry, backup URLs
@@ -114,7 +115,8 @@ What does not work yet:
   only; a summary, a chart or a breakdown is already one small answer, and turning one of
   those into a file is the web interface's own doing, in the browser, not a route this API
   streams.
-- **A time zone, on the API.** Every window and retention period it takes is UTC, and so is
+- **A time zone, for the install or on the API.** The install has no zone setting of its own
+  ([#43](../../issues/43)). Every window and retention period it takes is UTC, and so is
   a chart's bucket size — `offset` only moves where a day bucket begins, in whole hours, and
   does nothing for an hourly one. A preset like "yesterday" is for whoever is asking to work
   out — the web interface does that from the browser's own zone; a script calling the API
@@ -148,6 +150,8 @@ What does not work yet:
   through the admin API, or by hand in SQL without it.
   Returning-visitor routing also needs HTTPS to do anything: its cookie is marked
   `Secure`, so a browser drops it over plain HTTP.
+- **Bulk operations.** One link and one domain at a time, in the web interface as in the
+  CLI ([#39](../../issues/39)).
 - **Proxy and VPN detection beyond Tor.** The anonymous class covers Tor exit relays
   only. The well-known lists of VPN and proxy ranges publish no licence, so they are not
   used.
@@ -182,6 +186,8 @@ What does not work yet:
   meant to be run by hand, on a host that has one, before a release. A second,
   always-run test proves the address Caddy passes on is the IPv6 client's own, but only
   on the stack's unique-local subnet.
+- **A published container image.** A release is a tag, and an install builds its image from
+  the checkout: see ["Upgrading"](#upgrading).
 
 How fast a redirect is, how to back an install up, how to upgrade it and what it exposes
 each have a section below.
@@ -197,6 +203,7 @@ it), and ports 80 and 443 free.
 ```sh
 git clone https://github.com/ClickMonk/clickmonk.git
 cd clickmonk
+git checkout v0.1.0
 ./install.sh
 ```
 
@@ -525,7 +532,7 @@ admin API documented in ["The admin API"](#the-admin-api) and
 do, a `curl` command or the CLI can do too.
 
 **What it does not do yet:** there is no time zone setting for the install itself, only the
-browser's own zone; no bulk operations — one link, one domain, one setting at a time, the same
+browser's own zone; no bulk operations — one link and one domain at a time, the same
 as the CLI; and no local development mode, so trying it needs a real admin host set up, the
 same as the API does. See [#43](../../issues/43), [#39](../../issues/39) and
 [#23](../../issues/23).

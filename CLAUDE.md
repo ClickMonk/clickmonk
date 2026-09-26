@@ -41,7 +41,7 @@ run it on their own infrastructure; their click data stays theirs.
 
 ## Current status
 
-**Early, unreleased, not for production.** What exists: the redirect (in-memory snapshot,
+**Released as 0.1.0; early.** What exists: the redirect (in-memory snapshot,
 spool before response, click caps, traffic classification and actions, country rules
 from an in-memory IP lookup, the password gate on a link), Caddy in front of it with
 on-demand TLS gated on a verified domain or the configured admin host, the worker (spool
@@ -377,7 +377,14 @@ pushing a tag creates none. The whole sequence, in order:
 1. Branch `chore/release-X.Y.Z`.
 2. Bump the version in every manifest and every version constant compiled into shipped
    output, then **grep for the new version and count** rather than grepping for the old
-   one and assuming. The places are listed here once the stack exists.
+   one and assuming.
+   The places: `"version"` in the root `package.json` and in each of the eight
+   `packages/*/package.json`, and `VERSION` in `packages/core/src/version.ts` — ten in all.
+   `packages/core/src/version.test.ts` fails if any of them disagrees, and counts the
+   manifests, so a new package fails it until the count in the test is raised.
+   The README's "Installing" block checks out the release by its tag, and is bumped in the
+   same commit. The version test does not see it, so count it too:
+   `sed -n '/^## Installing/,/^## /p' README.md | grep -c 'git checkout vX.Y.Z'` prints 1.
 3. Write the `CHANGELOG.md` entry: Added / Fixed / Changed, plus what the release still
    cannot do. Before writing it, read `git log --oneline --no-merges <lasttag>..HEAD`
    against the changelog; merged work with no entry is how releases under-report.

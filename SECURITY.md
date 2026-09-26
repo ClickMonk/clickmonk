@@ -19,7 +19,7 @@ instructions for attacking them.
 
 Include, as far as you have it:
 
-- the version you are running;
+- the version you are running (see "Supported versions" below for how to find it);
 - what you did, in enough detail to reproduce;
 - what happened, and what you expected;
 - what an attacker gets out of it.
@@ -45,8 +45,16 @@ so in the first message rather than at the end of it.
 
 ## Supported versions
 
-There is no release yet. Once there is, only the latest release is supported and
-a security fix ships in the next release; this table will say so.
+| Version | Supported |
+| --- | --- |
+| the latest release | yes |
+| anything older | no |
+
+There are no backports: a security fix ships in the next release, and upgrading to it is the
+remedy. See "Upgrading" in the README. The line `clickmonk version` prints is the
+version to put in a report:
+
+    docker compose exec -T worker node packages/cli/dist/index.js version
 
 ## Scope
 
