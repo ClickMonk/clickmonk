@@ -138,6 +138,8 @@ export function DomainCard({ d, onChanged }: { d: Domain; onChanged: () => void 
                   ? `${CHECK_WORDS[check.status]}: ${check.detail}`
                   : CHECK_WORDS[check.status]}
               </p>
+            ) : d.handVerified ? (
+              <p className="text-muted-foreground">Verified by hand, no TXT record</p>
             ) : d.lastCheck ? (
               <p>
                 <span className="font-medium">{CHECK_WORDS[d.lastCheck.status]}</span>
