@@ -823,10 +823,15 @@ describe('backup.sh', () => {
         stub.remove()
         compose('start', 'worker')
       }
-      expect(r.status, r.out).toBe(1)
-      expect(r.out).toContain('the worker is stopped and this script could not start it again')
-      onlyBackupIn(join(BACKUPS, 'no-restart'))
-      expect(existsSync(LOCK)).toBe(false)
+      try {
+        expect(r.status, r.out).toBe(1)
+        expect(r.out).toContain('the worker is stopped and this script could not start it again')
+        onlyBackupIn(join(BACKUPS, 'no-restart'))
+        expect(existsSync(LOCK)).toBe(false)
+      } finally {
+        // A lock left here would fail every later test on the lock instead.
+        rmSync(LOCK, { recursive: true, force: true })
+      }
     },
     LONG,
   )
@@ -964,12 +969,15 @@ describe('backup.sh', () => {
         expect(running()).not.toContain('worker')
         expect(backupsDisk()).toMatch(/^clickmonk-.*\.zip$/m)
       } finally {
+        // Let the holder finish even when an assertion above failed, so the
+        // next test does not start beside it.
         writeFileSync(release, '')
+        await done
+        stub.remove()
+        rmSync(reached, { force: true })
+        rmSync(release, { force: true })
       }
       const status = await done
-      stub.remove()
-      rmSync(reached, { force: true })
-      rmSync(release, { force: true })
       expect(status, out).toBe(0)
       onlyBackupIn(first)
       expect(existsSync(LOCK)).toBe(false)
