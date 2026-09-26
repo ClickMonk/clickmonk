@@ -63,6 +63,10 @@ export interface Domain {
   notFoundUrl: string | null
   verificationRecord: { name: string; type: 'TXT'; value: string }
   lastCheck: { status: DomainStatus; detail: string | null; checkedAt: Instant } | null
+  /** When a check last found the token, or never has. */
+  passedAt: Instant | null
+  /** `verified && passedAt === null`: verified by hand, with no check having passed for it yet. */
+  handVerified: boolean
 }
 
 export interface DomainCheck {

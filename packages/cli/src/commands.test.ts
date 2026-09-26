@@ -746,6 +746,7 @@ describe('clickmonk domain list and verify', () => {
     )
     expect(r.rows[0]?.verified).toBe(true)
     expect(lines.join('\n')).toContain('marked verified without a DNS check')
+    expect(lines.join('\n')).toContain('not shown as needing attention until a check has passed')
   })
 
   it('verifies a domain whose token is published, and exits 0', async () => {

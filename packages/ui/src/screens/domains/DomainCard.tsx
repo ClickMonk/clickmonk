@@ -113,7 +113,9 @@ export function DomainCard({ d, onChanged }: { d: Domain; onChanged: () => void 
           {/* The record, prominent while it is still needed, and always available. */}
           <div className="grid gap-1 text-sm">
             <p className="text-muted-foreground">
-              {d.verified ? 'The record that proved it:' : 'Publish this TXT record, then check:'}
+              {d.verified && !d.handVerified
+                ? 'The record that proved it:'
+                : 'Publish this TXT record, then check:'}
             </p>
             <dl className="grid grid-cols-[max-content_1fr_auto] items-center gap-x-3 gap-y-1">
               <dt className="text-muted-foreground">Name</dt>
@@ -132,7 +134,27 @@ export function DomainCard({ d, onChanged }: { d: Domain; onChanged: () => void 
             </dl>
           </div>
           <div className="text-sm">
-            {check ? (
+            {/* Hand-verified outranks a check just run in this session: a
+                check on a hand-verified domain does not change the badge or
+                this framing, and `onChanged()` replaces `check` with the
+                reload's own `lastCheck` moments later regardless — showing
+                the raw result in between would only flash and vanish. The
+                check's own words and time are shown here too, muted, so that
+                running one still leaves something durable to see. */}
+            {d.handVerified ? (
+              <>
+                <p className="text-muted-foreground">Verified by hand, no TXT record</p>
+                {d.lastCheck && (
+                  <p className="text-muted-foreground text-xs">
+                    {d.lastCheck.detail
+                      ? `${CHECK_WORDS[d.lastCheck.status]}: ${d.lastCheck.detail}`
+                      : CHECK_WORDS[d.lastCheck.status]}
+                    {' — '}
+                    {formatInstant(d.lastCheck.checkedAt, zone)}
+                  </p>
+                )}
+              </>
+            ) : check ? (
               <p>
                 {check.detail
                   ? `${CHECK_WORDS[check.status]}: ${check.detail}`

@@ -20,6 +20,8 @@ const domain = (host: string, verified: boolean): Domain => ({
     value: 'clickmonk-verify=0123456789abcdef0123456789abcdef',
   },
   lastCheck: null,
+  passedAt: null,
+  handVerified: false,
 })
 
 const link = (slug: string, host = 'go.example.test', over: Partial<Link> = {}): Link => ({

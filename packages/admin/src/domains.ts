@@ -44,12 +44,19 @@ import { fail, readBody } from './http.js'
 export const MAX_DOMAINS_LISTED = 500
 
 /**
- * Which domains need attention: every one whose last check did not find the
- * token, and every one no check has reached yet. One spelling, read by the
- * listing below and by the count `GET /api/status` answers, so "which domains
- * need attention" is never asked two ways that could answer differently.
+ * Which domains need attention: every domain not verified at all, and every
+ * verified domain whose last check did not find the token — *unless* no
+ * check has ever passed for it, because then nothing changed: it is exactly
+ * what `domain add --verified` describes on screen, verified by hand with no
+ * TXT record, not a domain that stopped proving itself. One spelling, read by
+ * the listing below and by the count `GET /api/status` answers, so "which
+ * domains need attention" is never asked two ways that could answer
+ * differently.
  */
-export const ALERT_CONDITION = `(c.status IS NULL OR c.status <> 'verified')`
+export const ALERT_CONDITION = `(
+  (c.status IS NULL OR c.status <> 'verified')
+  AND NOT (d.verified AND c.passed_at IS NULL)
+)`
 
 /**
  * How long after a check the same domain may be checked again over the API,
@@ -90,10 +97,11 @@ interface DomainRow {
   status: DomainDnsStatus | null
   detail: string | null
   checked_at: Date | null
+  passed_at: Date | null
 }
 
 const SELECT_DOMAINS = `SELECT d.id, d.host, d.verified, d.root_url, d.not_found_url,
-                               d.verification_token, c.status, c.detail, c.checked_at
+                               d.verification_token, c.status, c.detail, c.checked_at, c.passed_at
                           FROM domains d
                           LEFT JOIN domain_dns_checks c ON c.domain_id = d.id`
 
@@ -115,6 +123,11 @@ function asDomain(d: DomainRow): Record<string, unknown> {
       d.checked_at === null
         ? null
         : { status: d.status, detail: d.detail, checkedAt: d.checked_at.toISOString() },
+    passedAt: d.passed_at === null ? null : d.passed_at.toISOString(),
+    // So the interface never re-derives the rule ALERT_CONDITION encodes: a
+    // domain shown as verified by hand, with nothing to warn about, is one
+    // that is verified and has never once passed a check.
+    handVerified: d.verified && d.passed_at === null,
   }
 }
 
@@ -268,9 +281,11 @@ export function registerDomainRoutes(app: FastifyInstance, ctx: AdminContext): v
 
   /**
    * What the operator has to know: every domain whose last check did not find
-   * the token, and every domain no check has reached yet. Verification is
-   * never revoked automatically, so a domain here may still be serving — that
-   * is the point of showing it.
+   * the token, and every domain no check has reached yet — except a domain
+   * verified by hand that has never once passed a check, which is not shown
+   * here until it does (`ALERT_CONDITION`). Verification is never revoked
+   * automatically, so a domain here may still be serving — that is the point
+   * of showing it.
    *
    * Capped and counted exactly as the listing is: an operator shown a prefix
    * of what is wrong, with no sign that it was a prefix, is worse off than
@@ -292,6 +307,12 @@ export function registerDomainRoutes(app: FastifyInstance, ctx: AdminContext): v
         status: d.status ?? 'never_checked',
         detail: d.detail,
         checkedAt: d.checked_at?.toISOString() ?? null,
+        passedAt: d.passed_at?.toISOString() ?? null,
+        // Always false here: ALERT_CONDITION already excludes a hand-verified
+        // domain that has never passed a check, so nothing this route lists
+        // ever is one. Present anyway, so every domain shape in this API
+        // carries the same fields.
+        handVerified: d.verified && d.passed_at === null,
       })),
     }
   })

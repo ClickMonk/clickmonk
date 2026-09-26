@@ -181,6 +181,7 @@ async function domainAdd(args: string[], d: CliDeps): Promise<void> {
   d.out(`domain ${host} ${created.id}`)
   if (verified) {
     d.out('marked verified without a DNS check, so it can be given a certificate at once')
+    d.out('it is not shown as needing attention until a check has passed for it once')
     return
   }
   printVerificationRecords(host, created.verificationToken, d)

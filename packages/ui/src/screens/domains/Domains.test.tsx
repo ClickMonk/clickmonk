@@ -26,6 +26,8 @@ const domain = (host: string, over: Partial<Domain> = {}): Domain => ({
   notFoundUrl: null,
   verificationRecord: { name: `_clickmonk.${host}`, type: 'TXT', value: TOKEN },
   lastCheck: null,
+  passedAt: null,
+  handVerified: false,
   ...over,
 })
 
@@ -112,6 +114,60 @@ describe('the domain list', () => {
     const c = await card('go.example.test')
     expect(within(c).getByText(words)).toBeInTheDocument()
     expect(within(c).getByText('no TXT record at _clickmonk.go.example.test')).toBeInTheDocument()
+  })
+
+  it('says a hand-verified domain has no TXT record, in place of its failing check, and still badges it Verified', async () => {
+    show([
+      domain('go.example.test', {
+        verified: true,
+        handVerified: true,
+        lastCheck: {
+          status: 'missing_token',
+          detail: 'no TXT record at _clickmonk.go.example.test',
+          checkedAt: '2026-10-07T02:00:00.000Z',
+        },
+      }),
+    ])
+    const c = await card('go.example.test')
+    expect(within(c).getByText('Verified')).toBeInTheDocument()
+    expect(within(c).getByText('Verified by hand, no TXT record')).toBeInTheDocument()
+    expect(within(c).queryByText('Record not found')).not.toBeInTheDocument()
+    // The card is not claiming DNS proved anything — the label above the
+    // record says to publish it, the same as an unverified domain's does.
+    expect(within(c).getByText('Publish this TXT record, then check:')).toBeInTheDocument()
+    expect(within(c).queryByText('The record that proved it:')).not.toBeInTheDocument()
+    // The record to publish is still there, unaffected.
+    expect(within(c).getByText('_clickmonk.go.example.test')).toBeInTheDocument()
+    // The last check's own result is not lost — shown under the hand-verified
+    // line, in that order, muted rather than framed as a problem.
+    const handVerifiedLine = within(c).getByText('Verified by hand, no TXT record')
+    const lastCheckLine = within(c).getByText(/no TXT record at _clickmonk\.go\.example\.test/)
+    expect(
+      handVerifiedLine.compareDocumentPosition(lastCheckLine) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy()
+  })
+
+  it('keeps the hand-verified framing even right after Check now finds nothing, rather than flashing the raw result', async () => {
+    const { user } = show(
+      [
+        domain('go.example.test', {
+          verified: true,
+          handVerified: true,
+          lastCheck: {
+            status: 'missing_token',
+            detail: 'no TXT record at _clickmonk.go.example.test',
+            checkedAt: '2026-10-07T02:00:00.000Z',
+          },
+        }),
+      ],
+      { checkDomain: () => Promise.resolve({ status: 'missing_token', detail: 'still nothing' }) },
+    )
+    const c = await card('go.example.test')
+    await user.click(within(c).getByRole('button', { name: 'Check now' }))
+    // Neither the un-muted, un-framed rendering `check` alone would produce
+    // nor a bare "Record not found" ever appears: hand-verified outranks it.
+    expect(within(c).getByText('Verified by hand, no TXT record')).toBeInTheDocument()
+    expect(within(c).queryByText('Record not found: still nothing')).not.toBeInTheDocument()
   })
 
   it('offers no way to mark a domain verified', async () => {

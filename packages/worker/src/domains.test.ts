@@ -222,8 +222,8 @@ async function addDomain(
 
 const checkOf = (id: string) =>
   pool
-    .query<{ status: string; detail: string; checked_at: Date }>(
-      'SELECT status, detail, checked_at FROM domain_dns_checks WHERE domain_id = $1',
+    .query<{ status: string; detail: string; checked_at: Date; passed_at: Date | null }>(
+      'SELECT status, detail, checked_at, passed_at FROM domain_dns_checks WHERE domain_id = $1',
       [id],
     )
     .then((r) => r.rows[0])
@@ -353,27 +353,111 @@ describe('recordDomainCheck', () => {
 
   it('writes the check and marks the domain verified the first time its token is found', async () => {
     const d = await addDomain('go.example.test')
+    const now = new Date()
     await recordDomainCheck(
       pool,
       { id: d.id, verified: false },
       { status: 'verified', detail: 'token found' },
-      new Date(),
+      now,
     )
     expect(await verifiedOf(d.id)).toBe(true)
     expect((await checkOf(d.id))?.status).toBe('verified')
     expect((await checkOf(d.id))?.detail).toBe('token found')
+    // A pass stamps passed_at with this check's own time.
+    expect((await checkOf(d.id))?.passed_at?.toISOString()).toBe(now.toISOString())
   })
 
-  it('records a failed check without un-verifying a domain that already was', async () => {
-    const d = await addDomain('go.example.test', true)
+  // 'error' matters here as much as 'missing_token': only 'verified' counts
+  // as a pass, so a resolver outage on a hand-verified domain must not stamp
+  // passed_at either — that would make the *next* failing check an alert,
+  // which is #47 again for a domain that never actually proved itself.
+  it.each(['missing_token', 'error'] as const)(
+    'records a failed check (%s) without un-verifying a domain that already was, and leaves passed_at null',
+    async (status) => {
+      const d = await addDomain('go.example.test', true)
+      await recordDomainCheck(
+        pool,
+        { id: d.id, verified: true },
+        { status, detail: 'no TXT record' },
+        new Date(),
+      )
+      expect(await verifiedOf(d.id)).toBe(true)
+      expect((await checkOf(d.id))?.status).toBe(status)
+      // Verified by hand, and this is its first check: nothing has ever passed.
+      expect((await checkOf(d.id))?.passed_at).toBeNull()
+    },
+  )
+
+  it.each(['missing_token', 'error'] as const)(
+    'keeps passed_at at the time of the last pass when a later check %s',
+    async (status) => {
+      const d = await addDomain('go.example.test')
+      const passedAt = new Date('2026-09-20T00:00:00.000Z')
+      await recordDomainCheck(
+        pool,
+        { id: d.id, verified: false },
+        { status: 'verified', detail: 'ok' },
+        passedAt,
+      )
+      await recordDomainCheck(
+        pool,
+        { id: d.id, verified: true },
+        { status, detail: 'record gone' },
+        new Date('2026-09-21T00:00:00.000Z'),
+      )
+      const row = await checkOf(d.id)
+      expect(row?.status).toBe(status)
+      expect(row?.passed_at?.toISOString()).toBe(passedAt.toISOString())
+    },
+  )
+
+  it('stamps passed_at on a later check that passes, updating an existing row rather than only an inserted one', async () => {
+    const d = await addDomain('go.example.test')
+    await recordDomainCheck(
+      pool,
+      { id: d.id, verified: false },
+      { status: 'missing_token', detail: 'no record yet' },
+      new Date('2026-09-20T00:00:00.000Z'),
+    )
+    expect((await checkOf(d.id))?.passed_at).toBeNull()
+    const passedAt = new Date('2026-09-21T00:00:00.000Z')
+    await recordDomainCheck(
+      pool,
+      { id: d.id, verified: false },
+      { status: 'verified', detail: 'ok' },
+      passedAt,
+    )
+    const row = await checkOf(d.id)
+    expect(row?.status).toBe('verified')
+    expect(row?.passed_at?.toISOString()).toBe(passedAt.toISOString())
+  })
+
+  // The test above restamps from null, so `COALESCE`'s argument order cannot
+  // tell "take this check's stamp" from "take the row's own" apart — either
+  // order picks the one non-null value. Only a *second* pass, after an
+  // earlier one, has both sides non-null and different, and only then does
+  // getting the order backwards show up: it would leave passed_at stuck at
+  // the first pass forever, contradicting "when a check last passed".
+  it('restamps passed_at to a later pass, not the first one', async () => {
+    const d = await addDomain('go.example.test')
+    const t1 = new Date('2026-09-20T00:00:00.000Z')
+    await recordDomainCheck(
+      pool,
+      { id: d.id, verified: false },
+      { status: 'verified', detail: 'ok' },
+      t1,
+    )
+    expect((await checkOf(d.id))?.passed_at?.toISOString()).toBe(t1.toISOString())
+    const t2 = new Date('2026-09-25T00:00:00.000Z')
     await recordDomainCheck(
       pool,
       { id: d.id, verified: true },
-      { status: 'missing_token', detail: 'no TXT record' },
-      new Date(),
+      { status: 'verified', detail: 'still ok' },
+      t2,
     )
-    expect(await verifiedOf(d.id)).toBe(true)
-    expect((await checkOf(d.id))?.status).toBe('missing_token')
+    const row = await checkOf(d.id)
+    expect(row?.status).toBe('verified')
+    expect(row?.passed_at?.toISOString()).toBe(t2.toISOString())
   })
 
   it('replaces an existing check row rather than duplicating it', async () => {

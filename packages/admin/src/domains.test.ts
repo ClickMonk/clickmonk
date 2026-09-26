@@ -226,6 +226,27 @@ describe('adding a domain', () => {
     expect(minted.rows.filter((row) => uuidShaped(row.verification_token))).not.toHaveLength(21)
   })
 
+  // The interface reads `handVerified` rather than re-deriving it, so the
+  // shape this route answers with is the whole of the contract.
+  it('answers passedAt and handVerified, computed from verified and the last check', async () => {
+    const fresh = (await add()).json()
+    expect(fresh.passedAt).toBeNull()
+    // Unverified, so not hand-verified either — there is nothing to call
+    // "verified by hand" about a domain that answers 404.
+    expect(fresh.handVerified).toBe(false)
+
+    await pg.query(
+      `INSERT INTO domains (id, host, verified, verification_token) VALUES
+       ('00000000-0000-4000-8000-0000000000f1', 'byhand.example.test', true, '${'7'.repeat(32)}')`,
+    )
+    const list = await app.inject({ method: 'GET', url: '/api/domains', headers: read(cookie) })
+    const byHand = (
+      list.json().domains as { host: string; passedAt: unknown; handVerified: unknown }[]
+    ).find((d) => d.host === 'byhand.example.test')
+    expect(byHand?.passedAt).toBeNull()
+    expect(byHand?.handVerified).toBe(true)
+  })
+
   it('refuses a body that tries to mark it verified', async () => {
     expect((await add({ host: 'go.example.test', verified: true })).statusCode).toBe(400)
     expect((await pg.query('SELECT 1 FROM domains')).rowCount).toBe(0)
@@ -413,6 +434,14 @@ describe('checking the DNS on demand', () => {
     expect(check.rows[0]?.status).toBe('verified')
     expect(check.rows[0]?.checked_at.toISOString()).toBe(clock.now().toISOString())
     expect(resolver.cancelled).toBe(1)
+    // A check that just passed for the first time: passedAt follows, and the
+    // domain is no different from one verified by DNS all along.
+    const after = await app.inject({ method: 'GET', url: '/api/domains', headers: read(cookie) })
+    const domain = (
+      after.json().domains as { id: string; passedAt: string | null; handVerified: boolean }[]
+    ).find((d) => d.id === created.id)
+    expect(domain?.passedAt).toBe(clock.now().toISOString())
+    expect(domain?.handVerified).toBe(false)
   })
 
   it('leaves a domain unverified when the token is not there, and says why', async () => {
@@ -602,5 +631,47 @@ describe('what the operator has to know', () => {
     const r = await app.inject({ method: 'GET', url: '/api/alerts', headers: read(cookie) })
     expect(r.json().domains).toHaveLength(MAX_DOMAINS_LISTED)
     expect(r.json().truncated).toBe(true)
+  })
+
+  // The four cases issue #47 draws the line between. Written directly with
+  // SQL, the way `clickmonk domain add --verified` and a worker pass both
+  // write: nothing over this API can mark a domain verified or plant a
+  // `passed_at` of its own choosing.
+  it('excludes a domain verified by hand until a check has passed for it, and re-alerts it once a passed check later fails', async () => {
+    await pg.query(`INSERT INTO domains (id, host, verified, verification_token) VALUES
+      ('00000000-0000-4000-8000-0000000000e1', 'untested.example.test', true, '${'1'.repeat(32)}'),
+      ('00000000-0000-4000-8000-0000000000e2', 'stillbare.example.test', true, '${'2'.repeat(32)}'),
+      ('00000000-0000-4000-8000-0000000000e3', 'regressed.example.test', true, '${'3'.repeat(32)}'),
+      ('00000000-0000-4000-8000-0000000000e4', 'awaiting.example.test', false, '${'4'.repeat(32)}')`)
+    await pg.query(`INSERT INTO domain_dns_checks (domain_id, status, detail, checked_at, passed_at) VALUES
+      -- Checked and failed, but never once passed: still hand-verified.
+      ('00000000-0000-4000-8000-0000000000e2', 'missing_token', 'no record', now(), NULL),
+      -- Passed once, and its most recent check failed: something changed.
+      ('00000000-0000-4000-8000-0000000000e3', 'missing_token', 'record gone', now(), '2026-09-01T00:00:00.000Z')`)
+    // 'untested' has no domain_dns_checks row at all: verified by hand, never checked.
+
+    const alerts = await app.inject({ method: 'GET', url: '/api/alerts', headers: read(cookie) })
+    const rows = alerts.json().domains as {
+      host: string
+      passedAt: string | null
+      handVerified: boolean
+    }[]
+    const hosts = rows.map((d) => d.host)
+    expect(hosts).not.toContain('untested.example.test')
+    expect(hosts).not.toContain('stillbare.example.test')
+    expect(hosts).toContain('regressed.example.test')
+    expect(hosts).toContain('awaiting.example.test')
+    // handVerified is always false here — ALERT_CONDITION already excludes
+    // every domain it would be true for — but passedAt still carries real
+    // information: it is what makes 'regressed' an alert at all.
+    const regressed = rows.find((d) => d.host === 'regressed.example.test')
+    expect(regressed?.passedAt).toBe('2026-09-01T00:00:00.000Z')
+    expect(regressed?.handVerified).toBe(false)
+    const awaiting = rows.find((d) => d.host === 'awaiting.example.test')
+    expect(awaiting?.passedAt).toBeNull()
+    expect(awaiting?.handVerified).toBe(false)
+
+    const status = await app.inject({ method: 'GET', url: '/api/status', headers: read(cookie) })
+    expect(status.json().alerts).toBe(2)
   })
 })

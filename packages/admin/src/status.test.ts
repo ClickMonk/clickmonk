@@ -82,15 +82,23 @@ beforeAll(async () => {
       },
     ],
   })
-  // Three domains: one verified by a check that found its token, one whose last
-  // check did not, and one no check has reached. The last two are alerts.
+  // Five domains, covering every case issue #47 draws the line between:
+  // d1 checked and currently passing (not an alert, as always);
+  // d2 verified by hand, no check has reached it yet (not an alert);
+  // d3 verified by hand, its one check failed, but nothing ever passed (not an alert);
+  // d4 checked, passed once, and its latest check failed — something changed (an alert);
+  // d5 not verified at all, awaiting its record (an alert).
   await pool.query(`INSERT INTO domains (id, host, verified) VALUES
     ('00000000-0000-4000-8000-0000000000d1', 'ok.example.test', true),
-    ('00000000-0000-4000-8000-0000000000d2', 'gone.example.test', true),
-    ('00000000-0000-4000-8000-0000000000d3', 'new.example.test', false)`)
-  await pool.query(`INSERT INTO domain_dns_checks (domain_id, status, detail, checked_at) VALUES
-    ('00000000-0000-4000-8000-0000000000d1', 'verified', '', '2026-09-24T11:00:00Z'),
-    ('00000000-0000-4000-8000-0000000000d2', 'missing_token', 'no TXT record', '2026-09-24T11:00:00Z')`)
+    ('00000000-0000-4000-8000-0000000000d2', 'untested.example.test', true),
+    ('00000000-0000-4000-8000-0000000000d3', 'stillbare.example.test', true),
+    ('00000000-0000-4000-8000-0000000000d4', 'regressed.example.test', true),
+    ('00000000-0000-4000-8000-0000000000d5', 'new.example.test', false)`)
+  await pool.query(`INSERT INTO domain_dns_checks (domain_id, status, detail, checked_at, passed_at) VALUES
+    ('00000000-0000-4000-8000-0000000000d1', 'verified', '', '2026-09-24T11:00:00Z', '2026-09-24T11:00:00Z'),
+    ('00000000-0000-4000-8000-0000000000d3', 'missing_token', 'no TXT record', '2026-09-24T11:00:00Z', NULL),
+    ('00000000-0000-4000-8000-0000000000d4', 'missing_token', 'record gone', '2026-09-24T11:00:00Z', '2026-09-01T00:00:00Z')`)
+  // d2 has no domain_dns_checks row at all: verified by hand, never checked.
 })
 
 beforeEach(async () => {
@@ -127,6 +135,28 @@ describe('GET /api/status', () => {
       ipDataProblem: null,
       alerts: 2,
     })
+  })
+
+  // The count alone does not say which two; this pins that it is the right
+  // two, and that a hand-verified domain's failed check joins them the moment
+  // something about it changes — a check that once passed. A domain of its
+  // own, cleaned up after, so the shared fixture the other tests in this file
+  // read is never left different from what they expect.
+  it('counts a domain verified by hand as an alert only after a check has passed for it and later failed', async () => {
+    await pool.query(`INSERT INTO domains (id, host, verified, verification_token) VALUES
+      ('00000000-0000-4000-8000-0000000000d9', 'handverified.example.test', true, '${'9'.repeat(32)}')`)
+    await pool.query(`INSERT INTO domain_dns_checks (domain_id, status, detail, checked_at) VALUES
+      ('00000000-0000-4000-8000-0000000000d9', 'missing_token', 'no record', '2026-09-24T11:00:00Z')`)
+    try {
+      expect((await status(app)).json().alerts).toBe(2)
+      await pool.query(
+        `UPDATE domain_dns_checks SET passed_at = '2026-09-01T00:00:00Z'
+          WHERE domain_id = '00000000-0000-4000-8000-0000000000d9'`,
+      )
+      expect((await status(app)).json().alerts).toBe(3)
+    } finally {
+      await pool.query(`DELETE FROM domains WHERE id = '00000000-0000-4000-8000-0000000000d9'`)
+    }
   })
 
   it('says there is no IP data yet, which is not a problem', async () => {
