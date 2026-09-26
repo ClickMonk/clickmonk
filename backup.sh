@@ -68,6 +68,7 @@ case "$DEST" in
 esac
 # docker-compose.yml and .env are found from here, so cron need not cd first.
 cd "$SCRIPT_DIR"
+set_install_paths
 
 STAMP="$(date -u +%Y-%m-%dT%H%M%SZ)"
 OUT="$DEST/$STAMP"
@@ -96,11 +97,17 @@ fail() {
   exit 1
 }
 
+# worker_up -- running, or restarting under its restart policy: either way a
+# worker that can ship clicks between the BACKUP and the counts.
+worker_up() {
+  docker compose ps --status running --status restarting --services 2>/dev/null | grep -qx worker
+}
+
 start_worker_if_we_stopped_it() {
   [ "$WORKER_STOPPED_BY_US" = 1 ] || return 0
   local attempt
   for attempt in 1 2 3; do
-    if docker compose start worker >/dev/null 2>&1 && service_running worker; then
+    if docker compose start worker >/dev/null 2>&1 && worker_up; then
       WORKER_STOPPED_BY_US=0
       return 0
     fi
@@ -130,6 +137,14 @@ remove_incomplete_output() {
 cleanup() {
   trap '' INT TERM HUP
   local restart_ok=1
+  # A signal that arrives while `docker compose stop worker` is still waiting
+  # for the worker to drain runs this at once, and that stop goes on without
+  # this script. A start now would find the worker still running and do
+  # nothing, and the stop would then finish: stopped, and nothing saying so.
+  # So the stop is finished first, and then the worker started.
+  if [ "$WORKER_STOPPED_BY_US" = 1 ]; then
+    docker compose stop worker >/dev/null 2>&1 || true
+  fi
   start_worker_if_we_stopped_it || restart_ok=0
   remove_in_container_artefact ||
     note "WARNING: could not delete $CH_BACKUP_DIR/$CH_FILE inside the clickhouse container; delete it by hand."
@@ -137,7 +152,7 @@ cleanup() {
   if [ "$restart_ok" = 0 ]; then
     note ""
     note "ERROR: the worker is stopped and this script could not start it again."
-    note "  Run: docker compose start worker"
+    note "  Run: $DC start worker"
     note "Links are still answering and their clicks are waiting in the spool,"
     note "but nothing reaches the reports until the worker is running."
     release_lock || true
@@ -161,10 +176,11 @@ acquire_lock ||
 # A restore that was interrupted leaves the stores from two moments. A backup
 # of that would be complete, checksummed and of a state that never existed.
 if [ -e "$RESTORE_MARKER" ]; then
-  RESTORING_FROM="$(cat "$RESTORE_MARKER" 2>/dev/null)" || RESTORING_FROM=''
+  RESTORING_FROM="$(file_get "$RESTORE_MARKER" backup 2>/dev/null)" || RESTORING_FROM=''
+  RESTORING_WITH="$(file_get "$RESTORE_MARKER" environment 2>/dev/null)" || RESTORING_WITH=''
   fail "validation" \
     "A restore of ${RESTORING_FROM:-an unknown backup} did not finish, so the stores may be half restored." \
-    "Finish it first: $SCRIPT_DIR/restore.sh ${RESTORING_FROM:-<backup-directory>}" \
+    "Finish it first: $RESTORING_WITH$SCRIPT_DIR/restore.sh ${RESTORING_FROM:-<backup-directory>}" \
     "If the stack is running on what that restore left, on purpose, remove $RESTORE_MARKER."
 fi
 
@@ -186,7 +202,7 @@ for service in postgres clickhouse; do
   service_running "$service" ||
     fail "validation" \
       "The '$service' service is not running." \
-      "Start it first: docker compose up -d $service"
+      "Start it first: $DC up -d $service"
 done
 
 have_sha256 ||
@@ -252,7 +268,7 @@ CH_FREE="$(ch_query "SELECT free_space FROM system.disks WHERE name = 'backups'"
   fail "validation" \
     "ClickHouse has no disk named 'backups': it was started before this checkout's" \
     "clickhouse/backup-disk.xml existed. Recreate it with the new configuration" \
-    "(links keep answering; the worker waits for it): docker compose up -d clickhouse"
+    "(links keep answering; the worker waits for it): $DC up -d clickhouse"
 # Each on its own: an empty one inside a concatenation would still read as a
 # number, and as zero bytes needed below.
 for value in "$CH_BYTES" "$CH_FREE"; do
@@ -286,7 +302,10 @@ OUT_CREATED=1
 
 # --- The spool and ClickHouse, at one instant ----------------------------
 
-if service_running worker; then
+# Restarting counts as up: Docker's restart policy could start it between the
+# BACKUP and the counts, and the manifest would then count clicks the archive
+# does not hold.
+if worker_up; then
   say "Stopping the worker while the spool and ClickHouse are copied..."
   # Set before the stop, not after: `stop` can stop the container and still
   # exit non-zero (Ctrl-C during its drain), and the trap must then know to

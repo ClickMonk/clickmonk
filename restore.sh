@@ -72,6 +72,7 @@ case "$SRC" in
   *) SRC="$PWD/$SRC" ;;
 esac
 cd "$SCRIPT_DIR"
+set_install_paths
 
 STAMP=''
 BACKUP_SCHEMA=''
@@ -89,11 +90,28 @@ CH_RESTORE_SENT=0
 # Set by refuse and abort, which say why the run ended; any other early end
 # gets one line from cleanup.
 EXPLAINED=0
+# Set once `up` has brought the stack up, the last thing the restore does.
+STACK_STARTED=0
 # What has happened to the data, in words, for the message an interrupted run
 # prints. Assigned BEFORE each destructive command, never after: a signal
 # lands while a command runs and bash acts on it before the next statement, so
 # an assignment after the command would describe the step before.
 DATA_STATE="nothing has been changed"
+# What the data is once the running step has finished, for a trap that waited
+# for it and saw it succeed.
+DATA_STATE_AFTER=''
+# The backup an earlier run was restoring when it was interrupted, read from
+# its marker: this run's "nothing was changed" is then true of this run only.
+PRIOR_RESTORE=''
+
+# prior_restore_note -- after "nothing was changed", what an earlier,
+# interrupted restore left, which this run has not changed either.
+prior_restore_note() {
+  [ -n "$PRIOR_RESTORE" ] || return 0
+  note "The stores are still as the interrupted restore of $PRIOR_RESTORE left them,"
+  note "and the stack is as it was. To finish that restore:"
+  note "  $(compose_env_prefix)$SCRIPT_DIR/restore.sh $PRIOR_RESTORE"
+}
 
 # refuse <reason> <detail...> -- a guard declining. Only ever called before
 # anything is stopped, so what it says at the end is true.
@@ -108,6 +126,7 @@ refuse() {
   done
   note ""
   note "Nothing was changed, and nothing was stopped."
+  prior_restore_note
   exit 1
 }
 
@@ -122,6 +141,7 @@ abort() {
   for line in "$@"; do
     note "  ${line}"
   done
+  [ "$DESTRUCTION_BEGUN" = 1 ] || prior_restore_note
   exit 1
 }
 
@@ -130,9 +150,15 @@ abort() {
 # start, and before the archive is deleted and the lock released. The mask
 # protects this shell, not the start: `docker compose` installs its own
 # handlers for INT and TERM, so a second Ctrl-C can cut one attempt short,
-# which is why start_services tries three times. Then the archive, and the
-# lock last: no backup may start, and sweep the backups disk, while this run's
-# archive is still there.
+# which is why start_services tries three times.
+#
+# A STEP A SIGNAL INTERRUPTED IS WAITED FOR FIRST: it is still writing to its
+# store, and its archive or the lock gone from under it would let a second run
+# start beside it. Then, before anything was changed, the services: a stop the
+# signal interrupted is finished before they are started, or the start would
+# find them still running and the stop would then leave them stopped. Then the
+# archive, and the lock last: no backup may start, and sweep the backups disk,
+# while this run's archive is still there.
 # start_services <service...> -- `docker compose start`, tried three times, and
 # a failure unless every one of them is running afterwards.
 start_services() {
@@ -155,8 +181,19 @@ start_services() {
 cleanup() {
   trap '' INT TERM HUP
   local status="$1" start_failed=0
+  wait_for_step
+  if [ "$STEP_STATUS" = 0 ] && [ -n "$DATA_STATE_AFTER" ]; then
+    DATA_STATE="$DATA_STATE_AFTER"
+  fi
+  # The RESTORE's client returned, so ClickHouse is no longer running it --
+  # unless the client itself was killed by a signal.
+  if [ -n "$STEP_STATUS" ] && [ "$STEP_STATUS" -le 128 ]; then
+    CH_RESTORE_SENT=0
+  fi
   if [ "$APPS_STOPPED" = 1 ] && [ "$DESTRUCTION_BEGUN" = 0 ] && [ -n "$RUNNING_BEFORE" ]; then
     note "Nothing was changed. Starting$RUNNING_BEFORE again..."
+    # shellcheck disable=SC2086 # a list of service names, split on purpose
+    docker compose stop $RUNNING_BEFORE >/dev/null 2>&1 || true
     # shellcheck disable=SC2086 # a list of service names, split on purpose
     start_services $RUNNING_BEFORE || start_failed=1
   fi
@@ -167,7 +204,7 @@ cleanup() {
     note "Every store was restored and does not match the manifest; the differences"
     note "are listed above. Caddy, the redirect, the admin service and the worker have"
     note "been left stopped. Restore a different backup, or start on what was restored:"
-    note "  docker compose up -d"
+    note "  $DC up -d"
     note "and then remove $RESTORE_MARKER, which makes backup.sh refuse until you do."
     status=1
   elif [ "$DESTRUCTION_BEGUN" = 1 ] && [ "$STORES_RESTORED" = 0 ]; then
@@ -176,7 +213,7 @@ cleanup() {
     note "Caddy, the redirect, the admin service and the worker have been left"
     note "stopped, so nothing serves your links. Run the restore again with the same"
     note "backup; it starts from the beginning:"
-    note "  $SCRIPT_DIR/restore.sh $SRC"
+    note "  $(compose_env_prefix)$SCRIPT_DIR/restore.sh $SRC"
     note "Until it has finished, backup.sh refuses to run."
     if [ "$CH_RESTORE_SENT" = 1 ]; then
       note "ClickHouse may still be finishing the restore this run started. Until it"
@@ -185,13 +222,20 @@ cleanup() {
     fi
     status=1
   elif [ "$start_failed" = 1 ]; then
-    note "Could not start them. Run: docker compose start$RUNNING_BEFORE"
+    note "Could not start them. Run: $DC start$RUNNING_BEFORE"
     status=1
+  elif [ "$STORES_RESTORED" = 1 ] && [ "$STACK_STARTED" = 0 ] && [ "$EXPLAINED" = 0 ]; then
+    # Interrupted while the stack was being started: the data is done.
+    note ""
+    note "Every store is restored and matches the manifest; the stack was being"
+    note "started when this stopped, and may be partly up. Start the rest with:"
+    note "  $DC up -d"
   elif [ "$APPS_STOPPED" = 0 ] && [ "$EXPLAINED" = 0 ]; then
     # Ended before anything was stopped, and not by a refusal: a signal, most
     # likely Ctrl-C at the prompt. Say so, or the prompt is the last word.
     note ""
     note "Stopped before anything was changed."
+    prior_restore_note
   fi
   release_lock || note "Could not remove $LOCK_DIR; delete it by hand before the next backup or restore."
   exit "$status"
@@ -205,6 +249,11 @@ acquire_lock ||
   refuse "Another backup or restore holds $LOCK_DIR (pid $(lock_pid))." \
     "If none is running, one was killed before it could clean up. Remove the lock," \
     "then run this again: rm -rf $LOCK_DIR"
+
+# Read under the lock, so no other run is writing it.
+if [ -e "$RESTORE_MARKER" ]; then
+  PRIOR_RESTORE="$(file_get "$RESTORE_MARKER" backup 2>/dev/null)" || PRIOR_RESTORE='an unknown backup'
+fi
 
 # --- Checks. Nothing below this line and above the confirmation changes or
 # --- stops anything.
@@ -265,7 +314,7 @@ ENV_FILE="$(env_file_path)" ||
 for service in postgres clickhouse; do
   service_running "$service" ||
     refuse "The '$service' service is not running." \
-      "Both stores must be up to restore into: docker compose up -d postgres clickhouse"
+      "Both stores must be up to restore into: $DC up -d postgres clickhouse"
 done
 
 # Asked of the `default` database, which always exists: after an interrupted
@@ -285,7 +334,7 @@ BACKUPS_DISK="$(ch_query "SELECT name FROM system.disks WHERE name = 'backups'" 
 [ "$BACKUPS_DISK" = backups ] ||
   refuse "ClickHouse has no disk named 'backups': it was started before this checkout's" \
     "clickhouse/backup-disk.xml existed. Recreate it with the new configuration" \
-    "(links keep answering): docker compose up -d clickhouse"
+    "(links keep answering): $DC up -d clickhouse"
 
 # The archive is copied onto that disk, and after the DROP the RESTORE writes
 # the restored database beside it: about four thirds of the archive's size,
@@ -318,7 +367,7 @@ IMAGE_SCHEMA="$(printf '%s\n' "$VERSION_LINE" | schema_of)"
 [ -n "$IMAGE_SCHEMA" ] ||
   refuse "Could not read the schema version this checkout's image understands." \
     "It printed: '${VERSION_LINE:-nothing}'." \
-    "Build it first: docker compose build"
+    "Build it first: $DC build"
 # A backup of an install from before `clickmonk version` records its release
 # as unknown; its schema version is still exact, and is what the advice names.
 if [ "$BACKUP_RELEASE" = unknown ]; then
@@ -339,7 +388,7 @@ WARNING: CLICKMONK_SECRET in $ENV_FILE is not the one this backup was taken with
   After the restore every returning visitor counts as new, and anyone who had
   answered a link's password is asked again. To keep them: answer anything
   but the timestamp, copy the CLICKMONK_SECRET line from $SRC/env into
-  $ENV_FILE, run docker compose up -d, and restore again."
+  $ENV_FILE, run $DC up -d, and restore again."
 fi
 BACKUP_ADMIN_HOST="$(manifest_get "$SRC" admin_host)" || BACKUP_ADMIN_HOST=''
 LIVE_ADMIN_HOST="$(env_value "$ENV_FILE" CLICKMONK_ADMIN_HOST)"
@@ -411,18 +460,20 @@ docker compose exec -T clickhouse sh -c \
 # marker makes backup.sh refuse rather than copy a mix of two moments.
 # Written beside it and renamed, so that a failed write never touches a marker
 # an earlier, interrupted run left: that one still describes the stores.
-if ! printf '%s\n' "$SRC" | artefact_write "$RESTORE_MARKER.partial" ||
+if ! printf 'backup=%s\nenvironment=%s\n' "$SRC" "$(compose_env_prefix)" | artefact_write "$RESTORE_MARKER.partial" ||
   ! mv -f "$RESTORE_MARKER.partial" "$RESTORE_MARKER"; then
   rm -f "$RESTORE_MARKER.partial" 2>/dev/null || true
   abort "ClickHouse" "Could not write $RESTORE_MARKER. Nothing has been changed yet."
 fi
 DESTRUCTION_BEGUN=1
 DATA_STATE="ClickHouse was being dropped and may be gone; Postgres, the spool and the certificates are as they were"
-ch_query "DROP DATABASE IF EXISTS $CH_DATABASE SYNC" default >/dev/null ||
+DATA_STATE_AFTER="ClickHouse was dropped and is empty; Postgres, the spool and the certificates are as they were"
+run_to_end ch_query "DROP DATABASE IF EXISTS $CH_DATABASE SYNC" default >/dev/null ||
   abort "ClickHouse" "DROP DATABASE failed; the ClickHouse error is above."
 DATA_STATE="ClickHouse was being restored and may be missing or partial; Postgres, the spool and the certificates are as they were"
+DATA_STATE_AFTER="ClickHouse is restored; Postgres, the spool and the certificates are as they were"
 CH_RESTORE_SENT=1
-if ! ch_query "RESTORE DATABASE $CH_DATABASE FROM Disk('backups', '$CH_FILE')" default >/dev/null; then
+if ! run_to_end ch_query "RESTORE DATABASE $CH_DATABASE FROM Disk('backups', '$CH_FILE')" default >/dev/null; then
   # The server answered with an error: it is not running this RESTORE.
   CH_RESTORE_SENT=0
   abort "ClickHouse" "RESTORE DATABASE failed; the ClickHouse error is above."
@@ -435,13 +486,17 @@ remove_in_container_artefact ||
 
 say "Restoring Postgres..."
 DATA_STATE="ClickHouse is restored; Postgres was being emptied and may be empty; the spool and the certificates are as they were"
-docker compose exec -T postgres sh -c \
+DATA_STATE_AFTER="ClickHouse is restored; Postgres is empty; the spool and the certificates are as they were"
+# shellcheck disable=SC2016 # expanded by the container's shell, not this one
+run_to_end docker compose exec -T postgres sh -c \
   'PGPASSWORD="$POSTGRES_PASSWORD" psql -U "$0" -d "$1" -v ON_ERROR_STOP=1 -q -c "SET client_min_messages = warning; DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public"' \
   "$PG_USER" "$PG_DATABASE" </dev/null >/dev/null ||
   abort "Postgres" "Could not empty the public schema; the Postgres error is above."
 DATA_STATE="ClickHouse is restored; Postgres was being refilled and is either empty or complete; the spool and the certificates are as they were"
+DATA_STATE_AFTER="ClickHouse and Postgres are restored; the spool and the certificates are as they were"
 # One transaction: the dump is applied whole or not at all.
-docker compose exec -T postgres sh -c \
+# shellcheck disable=SC2016 # expanded by the container's shell, not this one
+run_to_end docker compose exec -T postgres sh -c \
   'PGPASSWORD="$POSTGRES_PASSWORD" pg_restore -U "$0" -d "$1" --clean --if-exists --no-owner --single-transaction' \
   "$PG_USER" "$PG_DATABASE" <"$SRC/postgres.dump" ||
   abort "Postgres" "pg_restore failed; its error is above. Nothing of the dump was applied."
@@ -450,19 +505,24 @@ docker compose exec -T postgres sh -c \
 
 say "Restoring the spool..."
 DATA_STATE="ClickHouse and Postgres are restored; the spool was being replaced and may be partial; the certificates are as they were"
-docker compose --progress quiet run --rm --no-deps -T worker sh -c \
+DATA_STATE_AFTER="ClickHouse, Postgres and the spool are restored; the certificates are as they were"
+# shellcheck disable=SC2016 # expanded by the container's shell, not this one
+run_to_end docker compose --progress quiet run --rm --no-deps -T worker sh -c \
   'find "$0" -mindepth 1 -delete && tar -xf - -C "$0"' "$SPOOL_DIR" <"$SRC/spool.tar" ||
   abort "spool" "Could not replace the spool."
 # The redirect's copy of its configuration describes the install before the
 # restore. It reads Postgres at start and writes this again; without the file,
 # a stale configuration can never be served from it.
-docker compose --progress quiet run --rm --no-deps -T redirect sh -c \
+# shellcheck disable=SC2016 # expanded by the container's shell, not this one
+run_to_end docker compose --progress quiet run --rm --no-deps -T redirect sh -c \
   'find "$0" -mindepth 1 -delete' "$STATE_DIR" </dev/null ||
   abort "spool" "Could not empty the redirect's state directory."
 
 say "Restoring Caddy's certificates..."
 DATA_STATE="ClickHouse, Postgres and the spool are restored; Caddy's certificates were being replaced and may be partial"
-docker compose --progress quiet run --rm --no-deps -T caddy sh -c \
+DATA_STATE_AFTER="ClickHouse, Postgres, the spool and Caddy's certificates are restored, and were about to be checked against the manifest"
+# shellcheck disable=SC2016 # expanded by the container's shell, not this one
+run_to_end docker compose --progress quiet run --rm --no-deps -T caddy sh -c \
   'find "$0" -mindepth 1 -delete && tar -xf - -C "$0"' "$CADDY_DATA_DIR" <"$SRC/caddy-data.tar" ||
   abort "Caddy" "Could not replace Caddy's data."
 
@@ -470,6 +530,7 @@ docker compose --progress quiet run --rm --no-deps -T caddy sh -c \
 
 say "Checking what was restored against the manifest..."
 DATA_STATE="every store was restored, and was being checked against the manifest"
+DATA_STATE_AFTER=''
 verify_ok=1
 restored_schema="$(ledger_version)" || restored_schema=''
 if [ "$restored_schema" != "$BACKUP_SCHEMA" ]; then
@@ -504,7 +565,8 @@ say "Starting the stack..."
 docker compose up -d --wait --wait-timeout 300 ||
   abort "start" \
     "Every store is restored, but the stack did not start, or did not become healthy within five minutes." \
-    "See: docker compose ps; docker compose logs"
+    "See: $DC ps; $DC logs"
+STACK_STARTED=1
 
 say ""
 say "Restored from $SRC, taken at $STAMP."
@@ -514,4 +576,4 @@ say ""
 say "The admin account is back as it was then: its password, its two-factor"
 say "setting, its sessions and its API keys. A key revoked or a password changed"
 say "since $STAMP is as it was. Check the keys with:"
-say "  docker compose exec -T worker node packages/cli/dist/index.js apikey list"
+say "  $DC exec -T worker node packages/cli/dist/index.js apikey list"

@@ -202,9 +202,9 @@ ch_counts() {
   done
 }
 
-# manifest_get <dir> <key> -- the text after the FIRST `=` on the line for key.
+# file_get <file> <key> -- the text after the FIRST `=` on the line for key.
 # Keys never contain `=`; a value might.
-manifest_get() {
+file_get() {
   local line
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
@@ -213,8 +213,14 @@ manifest_get() {
         return 0
         ;;
     esac
-  done <"$1/MANIFEST"
+  done <"$1"
   return 1
+}
+
+# manifest_get <dir> <key>
+manifest_get() {
+  [ -f "$1/MANIFEST" ] || return 1
+  file_get "$1/MANIFEST" "$2"
 }
 
 # remove_in_container_artefact -- deletes this run's archive from the
@@ -239,17 +245,84 @@ remove_orphan_archives() {
     "$CH_BACKUP_DIR" </dev/null >/dev/null 2>&1
 }
 
-# The one lock backup.sh and restore.sh share: a directory beside this file,
+# The variables that select an install, in the order advice prints them.
+COMPOSE_SELECTORS="COMPOSE_PROJECT_NAME COMPOSE_FILE COMPOSE_ENV_FILES COMPOSE_PATH_SEPARATOR COMPOSE_PROFILES"
+
+# compose_env_prefix -- the COMPOSE_* variables set now, as `NAME=value `
+# words to put in front of a command: advice that names a command must reach
+# the same install when it is typed into another shell. Empty on an install
+# selected by nothing but its directory.
+compose_env_prefix() {
+  local name value out=''
+  for name in $COMPOSE_SELECTORS; do
+    eval "value=\${$name:-}"
+    [ -n "$value" ] || continue
+    out="$out$(printf '%s=%q ' "$name" "$value")"
+  done
+  printf '%s' "$out"
+}
+
+# compose_project -- the Compose project this install is, worked out the way
+# Compose does without asking it (asking fails when the env file is missing,
+# which is a refusal these scripts make themselves): COMPOSE_PROJECT_NAME from
+# the environment, then from the env file, then the last top-level `name:` in
+# the compose files, then the directory's name. Lower case, and only the
+# characters Compose keeps.
+compose_project() {
+  local name='' file files envf line
+  name="${COMPOSE_PROJECT_NAME:-}"
+  if [ -z "$name" ]; then
+    envf="$(env_file_path 2>/dev/null)" || envf=''
+    if [ -n "$envf" ] && [ -r "$envf" ]; then
+      name="$(env_value "$envf" COMPOSE_PROJECT_NAME)"
+    fi
+  fi
+  if [ -z "$name" ]; then
+    files="${COMPOSE_FILE:-docker-compose.yml}"
+    local IFS="${COMPOSE_PATH_SEPARATOR:-:}"
+    for file in $files; do
+      [ -r "$file" ] || continue
+      while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+          name:*)
+            line="${line#name:}"
+            line="$(printf '%s' "$line" | sed 's/#.*//; s/^[[:space:]]*//; s/[[:space:]]*$//; s/^["'\'']//; s/["'\'']$//')"
+            [ -n "$line" ] && name="$line"
+            ;;
+        esac
+      done <"$file"
+    done
+  fi
+  [ -n "$name" ] || name="$(basename "$PWD")"
+  printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-'
+}
+
+# set_install_paths -- called by both scripts once they are in their own
+# directory. One lock and one restore marker per install: two installs run
+# from one checkout under different project names never block each other.
+#
+# LOCK_DIR is the one lock backup.sh and restore.sh share, beside this file,
 # so every run against this install takes the same one whatever its
 # destination. mkdir, because it is atomic everywhere and macOS has no flock.
-LOCK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.backup-restore.lock"
-LOCK_HELD=0
-
-# RESTORE_MARKER -- a file beside the lock that restore.sh writes, holding the
-# backup it is restoring, before it changes any store, and removes once every
-# store is restored. While it exists the stores may be half restored:
+#
+# RESTORE_MARKER is written by restore.sh before it changes any store and
+# removed once every store is restored. It records the backup and the COMPOSE_*
+# variables in effect. While it exists the stores may be half restored:
 # backup.sh refuses, and restore.sh, run again, finishes the job.
-RESTORE_MARKER="$(dirname "$LOCK_DIR")/.restore-incomplete"
+#
+# DC is `docker compose` as advice prints it, with those variables in front.
+set_install_paths() {
+  local here project
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  project="$(compose_project)"
+  LOCK_DIR="$here/.backup-restore-$project.lock"
+  RESTORE_MARKER="$here/.restore-incomplete-$project"
+  DC="$(compose_env_prefix)docker compose"
+}
+LOCK_DIR=''
+RESTORE_MARKER=''
+DC='docker compose'
+LOCK_HELD=0
 
 # acquire_lock -- creates LOCK_DIR and writes this shell's pid into it, or
 # returns 1 and leaves an existing lock exactly as it is. A lock is never
@@ -275,4 +348,32 @@ release_lock() {
   [ "$LOCK_HELD" = 1 ] || return 0
   rm -rf "$LOCK_DIR" 2>/dev/null || return 1
   LOCK_HELD=0
+}
+
+# run_to_end <command...> -- a step that writes to a store, run as a child this
+# shell waits for. A signal ends the wait and runs the EXIT trap at once, but
+# not the child: an asynchronous command ignores the terminal's Ctrl-C, and a
+# TERM sent to this script alone never reaches it. The trap then waits for the
+# child (wait_for_step) before it reports or releases the lock, so no second
+# run starts while the first is still writing. `<&0` hands the child this
+# function's standard input, which a bare `&` would replace with /dev/null.
+STEP_PID=''
+STEP_STATUS=''
+run_to_end() {
+  local rc=0
+  "$@" <&0 &
+  STEP_PID=$!
+  wait "$STEP_PID" || rc=$?
+  STEP_PID=''
+  return "$rc"
+}
+
+# wait_for_step -- in the EXIT trap: waits for a step a signal interrupted, and
+# records how it ended in STEP_STATUS. Nothing when no step was running.
+wait_for_step() {
+  [ -n "$STEP_PID" ] || return 0
+  note "Waiting for the step that was running to finish..."
+  STEP_STATUS=0
+  wait "$STEP_PID" 2>/dev/null || STEP_STATUS=$?
+  STEP_PID=''
 }
