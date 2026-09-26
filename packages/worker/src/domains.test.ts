@@ -367,39 +367,49 @@ describe('recordDomainCheck', () => {
     expect((await checkOf(d.id))?.passed_at?.toISOString()).toBe(now.toISOString())
   })
 
-  it('records a failed check without un-verifying a domain that already was, and leaves passed_at null', async () => {
-    const d = await addDomain('go.example.test', true)
-    await recordDomainCheck(
-      pool,
-      { id: d.id, verified: true },
-      { status: 'missing_token', detail: 'no TXT record' },
-      new Date(),
-    )
-    expect(await verifiedOf(d.id)).toBe(true)
-    expect((await checkOf(d.id))?.status).toBe('missing_token')
-    // Verified by hand, and this is its first check: nothing has ever passed.
-    expect((await checkOf(d.id))?.passed_at).toBeNull()
-  })
+  // 'error' matters here as much as 'missing_token': only 'verified' counts
+  // as a pass, so a resolver outage on a hand-verified domain must not stamp
+  // passed_at either — that would make the *next* failing check an alert,
+  // which is #47 again for a domain that never actually proved itself.
+  it.each(['missing_token', 'error'] as const)(
+    'records a failed check (%s) without un-verifying a domain that already was, and leaves passed_at null',
+    async (status) => {
+      const d = await addDomain('go.example.test', true)
+      await recordDomainCheck(
+        pool,
+        { id: d.id, verified: true },
+        { status, detail: 'no TXT record' },
+        new Date(),
+      )
+      expect(await verifiedOf(d.id)).toBe(true)
+      expect((await checkOf(d.id))?.status).toBe(status)
+      // Verified by hand, and this is its first check: nothing has ever passed.
+      expect((await checkOf(d.id))?.passed_at).toBeNull()
+    },
+  )
 
-  it('keeps passed_at at the time of the last pass when a later check fails', async () => {
-    const d = await addDomain('go.example.test')
-    const passedAt = new Date('2026-09-20T00:00:00.000Z')
-    await recordDomainCheck(
-      pool,
-      { id: d.id, verified: false },
-      { status: 'verified', detail: 'ok' },
-      passedAt,
-    )
-    await recordDomainCheck(
-      pool,
-      { id: d.id, verified: true },
-      { status: 'missing_token', detail: 'record gone' },
-      new Date('2026-09-21T00:00:00.000Z'),
-    )
-    const row = await checkOf(d.id)
-    expect(row?.status).toBe('missing_token')
-    expect(row?.passed_at?.toISOString()).toBe(passedAt.toISOString())
-  })
+  it.each(['missing_token', 'error'] as const)(
+    'keeps passed_at at the time of the last pass when a later check %s',
+    async (status) => {
+      const d = await addDomain('go.example.test')
+      const passedAt = new Date('2026-09-20T00:00:00.000Z')
+      await recordDomainCheck(
+        pool,
+        { id: d.id, verified: false },
+        { status: 'verified', detail: 'ok' },
+        passedAt,
+      )
+      await recordDomainCheck(
+        pool,
+        { id: d.id, verified: true },
+        { status, detail: 'record gone' },
+        new Date('2026-09-21T00:00:00.000Z'),
+      )
+      const row = await checkOf(d.id)
+      expect(row?.status).toBe(status)
+      expect(row?.passed_at?.toISOString()).toBe(passedAt.toISOString())
+    },
+  )
 
   it('stamps passed_at on a later check that passes, updating an existing row rather than only an inserted one', async () => {
     const d = await addDomain('go.example.test')

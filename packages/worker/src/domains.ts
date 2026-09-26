@@ -284,14 +284,17 @@ export const DEFAULT_CHECK_LIMIT = 50
  * `passed_at` is stamped with `now` on a pass and left exactly as it was on a
  * failure — the same "never taken back" rule `verified` itself follows, and
  * for the same reason: a resolver hiccup must not turn a domain that once
- * proved itself back into one that has not. One upsert states both: the
- * value to insert is decided in JS, once, rather than repeating `result.status`
- * as a second bound parameter inside the statement — Postgres cannot always
- * agree with itself on one placeholder's type across two different positions
- * in the same query, and this sidesteps that rather than fighting it with
- * casts. The `DO UPDATE` branch either restamps `passed_at` to this check's
- * time (a pass) or keeps the row's own existing value (a failure), never the
- * `EXCLUDED` one, which would be null.
+ * proved itself back into one that has not. Whether *this* check passed is
+ * decided exactly once, in JS (`passedAt`), rather than repeating
+ * `result.status` as a second bound parameter inside the statement —
+ * Postgres cannot always agree with itself on one placeholder's type across
+ * two different positions in the same query, and this sidesteps that rather
+ * than fighting it with casts. The upsert then only has to choose between
+ * that decision and the row's own history: `COALESCE(EXCLUDED.passed_at,
+ * domain_dns_checks.passed_at)` takes this check's stamp when it passed
+ * (`EXCLUDED.passed_at` is non-null only then) and otherwise falls through to
+ * whatever the row already had — never re-deciding "did this pass" a second
+ * time in SQL.
  */
 export async function recordDomainCheck(
   pg: Pool,
@@ -307,10 +310,7 @@ export async function recordDomainCheck(
        SET status = EXCLUDED.status,
            detail = EXCLUDED.detail,
            checked_at = EXCLUDED.checked_at,
-           passed_at = CASE
-             WHEN EXCLUDED.status = 'verified' THEN EXCLUDED.checked_at
-             ELSE domain_dns_checks.passed_at
-           END`,
+           passed_at = COALESCE(EXCLUDED.passed_at, domain_dns_checks.passed_at)`,
     [row.id, result.status, result.detail, now, passedAt],
   )
   if (result.status === 'verified' && !row.verified) {
