@@ -616,8 +616,15 @@ describe('backup.sh', () => {
   it(
     'starts the worker again, and leaves nothing behind, when a step fails while it is stopped',
     () => {
+      // The lock is still held while the trap starts the worker: released
+      // first, another run could start and find the worker stopped.
+      const held = join(TMP, 'lock-held-at-start')
+      rmSync(held, { force: true })
       const stub = stubDocker(
-        '    *"BACKUP DATABASE"*) echo "simulated failure of BACKUP" >&2; exit 1 ;;',
+        [
+          '    *"BACKUP DATABASE"*) echo "simulated failure of BACKUP" >&2; exit 1 ;;',
+          `    start) [ -d ${LOCK} ] && touch ${held} ;;`,
+        ].join('\n'),
       )
       const dest = join(BACKUPS, 'failed')
       const workerBefore = startedAt('worker')
@@ -630,6 +637,9 @@ describe('backup.sh', () => {
       expect(r.status, r.out).toBe(1)
       expect(r.out).toContain('the backup failed during the ClickHouse step')
       expect(r.out).toContain('No data was changed')
+      expect(existsSync(held), 'the lock was gone when the worker was started').toBe(true)
+      rmSync(held, { force: true })
+      expect(existsSync(LOCK)).toBe(false)
       expect(readdirSync(dest)).toEqual([])
       expect(backupsDisk()).toBe('')
       expect(running()).toEqual(ALL_SERVICES)
