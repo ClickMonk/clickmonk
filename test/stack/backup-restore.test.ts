@@ -2,6 +2,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
   appendFileSync,
+  copyFileSync,
   cpSync,
   existsSync,
   mkdirSync,
@@ -1863,6 +1864,196 @@ describe('restore.sh, interrupted after it has changed a store', () => {
         rmSync(MARKER, { force: true })
         rmSync(LOCK, { recursive: true, force: true })
       }
+    },
+    LONG,
+  )
+})
+
+describe('a backup restored into an empty stack', () => {
+  const NEW_ORDER = '/order-plz'
+  const orders = (): number => compose('logs', '--no-color', 'pebble').split(NEW_ORDER).length - 1
+  const OLD_ROOT = join(TMP, 'issuing-root-before-restore.pem')
+  /** The same file as seen from a client container, which mounts TMP at /ca. */
+  const OLD_ROOT_IN_CLIENT = '/ca/issuing-root-before-restore.pem'
+
+  /**
+   * The two newest migrations, undone by hand before the backup, so that the
+   * backup is of an older schema than the image: the case of a backup taken
+   * before an upgrade and restored after it. Newest first. 009 is one index;
+   * 010 records when a domain's DNS check last passed.
+   */
+  const UNDONE = [9, 10]
+  const UNDO = [
+    // 010 adds one column and backfills it; dropping the column undoes both.
+    'ALTER TABLE domain_dns_checks DROP COLUMN passed_at',
+    // 009
+    'DROP INDEX links_created_idx',
+  ]
+  /** One row each when 009's and 010's objects exist. */
+  const EXISTS = [
+    "SELECT count(*) FROM pg_indexes WHERE indexname = 'links_created_idx'",
+    "SELECT count(*) FROM information_schema.columns WHERE table_name = 'domain_dns_checks' AND column_name = 'passed_at'",
+  ]
+
+  let base = 0
+  let oldCookie = ''
+  let restoreOut = ''
+  let imageVersion = 0
+
+  beforeAll(async () => {
+    base = reportedClicks({ cookie })
+    expect(base).toBe(2)
+    // Read while the worker runs; the CLI is executed in its container.
+    imageVersion = imageSchema()
+
+    compose('stop', 'worker')
+    for (let i = 0; i < 3; i++) click()
+    await until('three clicks in sealed segments', 60_000, () => spoolLines() === 3)
+    const shipped = segments().map((name) => ({
+      name,
+      body: compose('exec', '-T', 'redirect', 'cat', `${SPOOL}/${name}`),
+    }))
+
+    compose('start', 'worker')
+    await until(
+      'the three clicks in the reports',
+      120_000,
+      () => reportedClicks({ cookie }) === base + 3,
+    )
+    await until('the shipped segments deleted', 60_000, () => segments().length === 0)
+
+    // The state a crash between ClickHouse accepting a segment and the worker
+    // deleting it leaves: the same clicks in both places.
+    compose('stop', 'worker')
+    for (const s of shipped) {
+      compose(
+        'exec',
+        '-T',
+        '-e',
+        `CM_BODY=${s.body}`,
+        'redirect',
+        'sh',
+        '-c',
+        'printf "%s" "$CM_BODY" > "$0"',
+        `${SPOOL}/${s.name}`,
+      )
+    }
+    click()
+    click()
+    await until('five click lines in sealed segments', 60_000, () => spoolLines() === 5)
+
+    // Two migrations the backup will not have, and the image does.
+    for (const sql of UNDO) pg(sql)
+    pg(`DELETE FROM schema_migrations WHERE version IN (${UNDONE.join(', ')})`)
+    for (const sql of EXISTS) expect(pg(sql), sql).toBe('0')
+
+    const backup = runScript('backup.sh', [join(BACKUPS, 'round-trip')])
+    if (backup.status !== 0) throw new Error(`backup failed:\n${backup.out}`)
+    const dir = onlyBackupIn(join(BACKUPS, 'round-trip'))
+    expect(running()).not.toContain('worker')
+    expect(reportedClicks({ cookie })).toBe(base + 3)
+    // Older than the image: the guard's `<` case, not only its `=` one.
+    expect(Number(manifest(dir).schema_version)).toBe(imageVersion - UNDONE.length)
+
+    copyFileSync(join(TMP, 'issuing-root.pem'), OLD_ROOT)
+    oldCookie = cookie
+
+    compose('down', '-v')
+    writeAcmeRoot()
+    publishZone()
+    compose('up', '-d', '--wait', ...WAIT_TIMEOUT)
+    root = writeIssuingRoot()
+    // Empty: the worker has migrated fresh stores to the image's version, and
+    // there is no link. Waited on the ledger reaching the image's version, not
+    // on `links` existing: that table is migration 1, and ClickHouse's tables
+    // come later in the same sequence.
+    const target = String(imageVersion)
+    await until('the empty stack migrated', 120_000, () => {
+      try {
+        return pg('SELECT max(version) FROM schema_migrations') === target
+      } catch {
+        return false
+      }
+    })
+    expect(pg('SELECT count(*) FROM links')).toBe('0')
+    expect(ch('SELECT count() FROM clicks')).toBe('0')
+
+    const restored = runScript('restore.sh', [dir], { input: `${manifest(dir).timestamp}\n` })
+    restoreOut = restored.out
+    if (restored.status !== 0) throw new Error(`restore failed:\n${restored.out}`)
+  }, 1_500_000)
+
+  // The store and the spool first, the report last: a certificate that did not
+  // come back fails the report, and must not read as clicks that were lost.
+  it(
+    'counts every click once: those ClickHouse held, those only in the spool, and those in both',
+    async () => {
+      await until(
+        'the restored spool shipped',
+        120_000,
+        () => num(ch('SELECT count() FROM clicks FINAL')) === base + 5,
+      )
+      await until('the spool emptied', 60_000, () => segments().length === 0)
+      expect(num(ch('SELECT uniqExact(click_id) FROM clicks'))).toBe(base + 5)
+      expect(num(ch('SELECT uniqExactMerge(clicks_state) FROM clicks_hourly'))).toBe(base + 5)
+      expect(reportedClicks({ cookie: oldCookie, cacert: OLD_ROOT_IN_CLIENT })).toBe(base + 5)
+    },
+    LONG,
+  )
+
+  it(
+    'serves the admin host the certificate it had, and asks the new authority for none',
+    () => {
+      const r = api('GET', '/api/me', { cookie: oldCookie, cacert: OLD_ROOT_IN_CLIENT })
+      expect(r.exit, r.stderr).toBe(0)
+      expect(orders()).toBe(0)
+    },
+    LONG,
+  )
+
+  it(
+    'brings back the account, the session signed in before the backup, and the link',
+    () => {
+      expect(api('GET', '/api/me', { cookie: oldCookie, cacert: OLD_ROOT_IN_CLIENT }).status).toBe(
+        200,
+      )
+      expect(signIn(OLD_ROOT_IN_CLIENT).status).toBe(200)
+      const r = curl(['-4', '--max-time', '30', '-D', '-', `http://${LINK_HOST}/${SLUG}`])
+      expect(r.status).toBe(302)
+      expect(r.headers).toMatch(new RegExp(`^location: ${TARGET}\\r?$`, 'im'))
+    },
+    LONG,
+  )
+
+  it(
+    'applies, when the worker starts, the migrations the backup was missing',
+    async () => {
+      await until(
+        'migrations 9 and 10 applied again',
+        60_000,
+        () =>
+          pg(`SELECT count(*) FROM schema_migrations WHERE version IN (${UNDONE.join(', ')})`) ===
+          String(UNDONE.length),
+      )
+      for (const sql of EXISTS) expect(pg(sql), sql).toBe('1')
+    },
+    LONG,
+  )
+
+  it(
+    'leaves the whole stack running, and nothing on the ClickHouse backups disk',
+    () => {
+      expect(running()).toEqual(ALL_SERVICES)
+      expect(backupsDisk()).toBe('')
+    },
+    LONG,
+  )
+
+  it(
+    'tells the operator what a restore brought back that they may not want',
+    () => {
+      expect(restoreOut).toContain('A key revoked or a password changed')
+      expect(restoreOut).toContain('apikey list')
     },
     LONG,
   )
