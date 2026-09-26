@@ -150,8 +150,8 @@ What does not work yet:
   through the admin API, or by hand in SQL without it.
   Returning-visitor routing also needs HTTPS to do anything: its cookie is marked
   `Secure`, so a browser drops it over plain HTTP.
-- **Bulk operations.** One link, one domain, one setting at a time, in the web interface as
-  in the CLI ([#39](../../issues/39)).
+- **Bulk operations.** One link and one domain at a time, in the web interface as in the
+  CLI ([#39](../../issues/39)).
 - **Proxy and VPN detection beyond Tor.** The anonymous class covers Tor exit relays
   only. The well-known lists of VPN and proxy ranges publish no licence, so they are not
   used.
@@ -203,6 +203,7 @@ it), and ports 80 and 443 free.
 ```sh
 git clone https://github.com/ClickMonk/clickmonk.git
 cd clickmonk
+git checkout v0.1.0
 ./install.sh
 ```
 
@@ -531,7 +532,7 @@ admin API documented in ["The admin API"](#the-admin-api) and
 do, a `curl` command or the CLI can do too.
 
 **What it does not do yet:** there is no time zone setting for the install itself, only the
-browser's own zone; no bulk operations — one link, one domain, one setting at a time, the same
+browser's own zone; no bulk operations — one link and one domain at a time, the same
 as the CLI; and no local development mode, so trying it needs a real admin host set up, the
 same as the API does. See [#43](../../issues/43), [#39](../../issues/39) and
 [#23](../../issues/23).

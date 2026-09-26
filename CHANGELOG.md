@@ -61,7 +61,7 @@ the release, not a footnote to it.
   tried without a real host name for the admin service.
 - No time zone setting for the install. The API works in UTC; the interface uses the
   browser's zone.
-- No bulk operations: one link, one domain, one setting at a time. Most link settings are
+- No bulk operations: one link and one domain at a time. Most link settings are
   the API's and the interface's, not the CLI's, and returning-visitor routing needs HTTPS.
 - No notifications: `GET /api/alerts` is what there is instead. A domain verified by hand is
   listed only once a check has passed for it and a later one has failed.
