@@ -1,12 +1,15 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
+  appendFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { join } from 'node:path'
@@ -1012,7 +1015,7 @@ describe('backup.sh', () => {
   it(
     'parses, and prints its usage, under bash 3.2',
     () => {
-      for (const script of ['backup.sh', 'backup-lib.sh']) {
+      for (const script of ['backup.sh', 'backup-lib.sh', 'restore.sh']) {
         const parsed = spawnSync(
           'docker',
           ['run', '--rm', '-v', `${ROOT}:/src:ro`, 'bash:3.2.57', 'bash', '-n', `/src/${script}`],
@@ -1020,7 +1023,7 @@ describe('backup.sh', () => {
         )
         expect(parsed.status, `${script}: ${parsed.stderr}`).toBe(0)
       }
-      for (const script of ['backup.sh']) {
+      for (const script of ['backup.sh', 'restore.sh']) {
         const help = spawnSync(
           'docker',
           [
@@ -1037,6 +1040,493 @@ describe('backup.sh', () => {
         )
         expect(help.status, `${script}: ${help.stderr}`).toBe(0)
         expect(help.stderr).toContain(`usage: ./${script}`)
+      }
+    },
+    LONG,
+  )
+})
+
+describe('restore.sh refuses, before it stops or changes anything', () => {
+  interface World {
+    running: string[]
+    redirectStarted: string
+    links: string
+    clicks: string
+    /** A refused run releases the lock it took, and leaves one it did not take. */
+    locked: boolean
+  }
+  /** What a refusal must leave exactly as it found it. */
+  const world = (): World => ({
+    running: running(),
+    redirectStarted: startedAt('redirect'),
+    links: pg('SELECT count(*) FROM links'),
+    clicks: ch('SELECT count() FROM clicks FINAL'),
+    locked: existsSync(LOCK),
+  })
+
+  /** A copy of the first backup, to damage without damaging the original. */
+  function copyOfFirst(name: string): string {
+    const dir = join(BACKUPS, 'copies', name)
+    rmSync(dir, { recursive: true, force: true })
+    cpSync(firstBackup, dir, { recursive: true })
+    return dir
+  }
+
+  function expectRefusal(r: ScriptResult, reason: string, before: World): void {
+    expect(r.status, r.out).toBe(1)
+    expect(r.out).toContain(reason)
+    expect(r.out).toContain('Nothing was changed, and nothing was stopped.')
+    expect(world()).toEqual(before)
+  }
+
+  it(
+    'refuses a directory that is not one backup',
+    () => {
+      const before = world()
+      // The destination backup.sh was given, rather than the directory it wrote.
+      expectRefusal(
+        runScript('restore.sh', [join(BACKUPS, 'first')], { input: 'irrelevant\n' }),
+        'There is no MANIFEST in',
+        before,
+      )
+    },
+    LONG,
+  )
+
+  it(
+    'refuses a backup missing one of its files',
+    () => {
+      const dir = copyOfFirst('missing')
+      rmSync(join(dir, 'env'))
+      const before = world()
+      expectRefusal(runScript('restore.sh', [dir]), 'env is missing or empty', before)
+    },
+    LONG,
+  )
+
+  it(
+    'refuses a damaged file, by its checksum',
+    () => {
+      const dir = copyOfFirst('damaged')
+      appendFileSync(join(dir, 'postgres.dump'), 'x')
+      const before = world()
+      expectRefusal(
+        runScript('restore.sh', [dir]),
+        'postgres.dump does not match the checksum in the manifest',
+        before,
+      )
+    },
+    LONG,
+  )
+
+  it(
+    'refuses a backup newer than the image that would run it',
+    () => {
+      const dir = copyOfFirst('newer')
+      const path = join(dir, 'MANIFEST')
+      const newer = imageSchema() + 1
+      writeFileSync(
+        path,
+        readFileSync(path, 'utf8').replace(/^schema_version=\d+$/m, `schema_version=${newer}`),
+      )
+      const before = world()
+      expectRefusal(runScript('restore.sh', [dir]), 'This backup is newer than this image', before)
+    },
+    LONG,
+  )
+
+  it(
+    'refuses when the answer is not the backup’s timestamp',
+    () => {
+      const before = world()
+      const r = runScript('restore.sh', [firstBackup], { input: 'yes\n' })
+      expect(r.out).toContain('Type the backup’s timestamp to go ahead')
+      // The same secret and admin host as the backup's, so neither warning.
+      expect(r.out).not.toContain('is not the one this backup was taken with')
+      expect(r.out).not.toContain('CLICKMONK_ADMIN_HOST is')
+      expectRefusal(r, 'That is not the backup’s timestamp', before)
+    },
+    LONG,
+  )
+
+  it(
+    'refuses when nobody answers',
+    () => {
+      const before = world()
+      expectRefusal(
+        runScript('restore.sh', [firstBackup], { input: '' }),
+        'That is not the backup’s timestamp',
+        before,
+      )
+    },
+    LONG,
+  )
+
+  it(
+    'warns, before asking, when this install signs cookies with a different secret',
+    () => {
+      const other = join(TMP, 'backup-other-secret.env')
+      writeFileSync(
+        other,
+        readFileSync(ENV_FILE, 'utf8').replace(
+          /^CLICKMONK_SECRET=.*$/m,
+          `CLICKMONK_SECRET=${'o'.repeat(40)}`,
+        ),
+        { mode: 0o600 },
+      )
+      const before = world()
+      try {
+        const r = runScript('restore.sh', [firstBackup], {
+          input: 'no\n',
+          env: { COMPOSE_ENV_FILES: other },
+        })
+        expect(r.out).toContain('is not the one this backup was taken with')
+        expect(r.out.indexOf('is not the one this backup was taken with')).toBeLessThan(
+          r.out.indexOf('Type the backup’s timestamp to go ahead'),
+        )
+        expectRefusal(r, 'That is not the backup’s timestamp', before)
+      } finally {
+        rmSync(other, { force: true })
+      }
+    },
+    LONG,
+  )
+
+  it(
+    'refuses a path that is not a directory',
+    () => {
+      const before = world()
+      const missing = join(BACKUPS, 'no-such-backup')
+      expectRefusal(runScript('restore.sh', [missing]), `${missing} is not a directory`, before)
+    },
+    LONG,
+  )
+
+  // One manifest line changed or taken away at a time. Each is refused by its
+  // own guard, before anything is asked of the stack.
+  it.each([
+    {
+      what: 'a format this script does not read',
+      edit: (m: string) =>
+        m.replace(/^clickmonk_backup_version=.*$/m, 'clickmonk_backup_version=2'),
+      reason: "Its format is '2'; this script reads 1.",
+    },
+    {
+      what: 'no timestamp',
+      edit: (m: string) => m.replace(/^timestamp=.*\n/m, ''),
+      reason: 'The manifest has no timestamp.',
+    },
+    {
+      // The timestamp is part of a file name and of a ClickHouse statement.
+      what: 'a timestamp backup.sh would not write',
+      edit: (m: string) => m.replace(/^timestamp=.*$/m, "timestamp=2026-10-01T041500Z')"),
+      reason:
+        "The manifest's timestamp is '2026-10-01T041500Z')', which is not one backup.sh writes.",
+    },
+    {
+      what: 'a schema version that is not a number',
+      edit: (m: string) => m.replace(/^schema_version=.*$/m, 'schema_version=ten'),
+      reason: "The manifest's schema_version is 'ten', which is not a number.",
+    },
+    {
+      what: 'no row count for one table',
+      edit: (m: string) => m.replace(/^rows\.clickhouse\.clicks_hourly_dim=.*\n/m, ''),
+      reason: 'The manifest records no row count for clicks_hourly_dim',
+    },
+    {
+      what: 'no checksum for one file',
+      edit: (m: string) => m.replace(/^sha256\.env=.*\n/m, ''),
+      reason: 'The manifest records no checksum for env.',
+    },
+  ])(
+    'refuses a manifest with $what',
+    ({ what, edit, reason }) => {
+      const dir = copyOfFirst(`manifest-${what.replaceAll(' ', '-')}`)
+      const path = join(dir, 'MANIFEST')
+      const edited = edit(readFileSync(path, 'utf8'))
+      expect(edited).not.toBe(readFileSync(path, 'utf8'))
+      writeFileSync(path, edited)
+      const before = world()
+      expectRefusal(runScript('restore.sh', [dir]), reason, before)
+    },
+    LONG,
+  )
+
+  // A file it cannot check is not restored. Every tool on PATH but those three.
+  it(
+    'refuses on a host with no SHA-256 tool',
+    () => {
+      const bin = join(TMP, 'no-sha256')
+      rmSync(bin, { recursive: true, force: true })
+      mkdirSync(bin)
+      const linked = new Set(['sha256sum', 'shasum', 'openssl'])
+      for (const dir of (process.env.PATH ?? '').split(':')) {
+        if (dir === '' || !existsSync(dir) || !statSync(dir).isDirectory()) continue
+        for (const name of readdirSync(dir)) {
+          if (linked.has(name)) continue
+          linked.add(name)
+          symlinkSync(join(dir, name), join(bin, name))
+        }
+      }
+      const before = world()
+      try {
+        expectRefusal(
+          runScript('restore.sh', [firstBackup], { env: { PATH: bin } }),
+          'No SHA-256 tool found',
+          before,
+        )
+      } finally {
+        rmSync(bin, { recursive: true, force: true })
+      }
+    },
+    LONG,
+  )
+
+  // Compose itself fails on an env file it cannot find, so a check of the
+  // services first would blame a store that is running.
+  it(
+    'names a missing env file, rather than a store',
+    () => {
+      const missing = join(TMP, 'no-such.env')
+      const before = world()
+      const r = runScript('restore.sh', [firstBackup], { env: { COMPOSE_ENV_FILES: missing } })
+      expect(r.out).not.toContain('service is not running')
+      expectRefusal(r, `Cannot read ${missing}`, before)
+    },
+    LONG,
+  )
+
+  it(
+    'refuses when COMPOSE_ENV_FILES names more than one file',
+    () => {
+      const before = world()
+      expectRefusal(
+        runScript('restore.sh', [firstBackup], {
+          env: { COMPOSE_ENV_FILES: `${ENV_FILE},${ENV_FILE}` },
+        }),
+        'COMPOSE_ENV_FILES names more than one file',
+        before,
+      )
+    },
+    LONG,
+  )
+
+  it(
+    'refuses when a store is not running',
+    () => {
+      // Compose answers that only Postgres is running; the stack itself is untouched.
+      const stub = stubDocker('    --services) echo postgres; exit 0 ;;')
+      const before = world()
+      try {
+        expectRefusal(
+          runScript('restore.sh', [firstBackup], { env: { PATH: stub.path } }),
+          "The 'clickhouse' service is not running.",
+          before,
+        )
+      } finally {
+        stub.remove()
+      }
+    },
+    LONG,
+  )
+
+  // A second run while a backup or restore holds the lock: a backup's sweep
+  // would delete the archive a restore is reading.
+  it(
+    'refuses while another run holds the lock, and leaves the lock alone',
+    () => {
+      mkdirSync(LOCK)
+      writeFileSync(join(LOCK, 'pid'), '4242\n')
+      const before = world()
+      try {
+        const r = runScript('restore.sh', [firstBackup])
+        expect(r.out).toContain(`rm -rf ${LOCK}`)
+        expectRefusal(r, `Another backup or restore holds ${LOCK} (pid 4242)`, before)
+        expect(readFileSync(join(LOCK, 'pid'), 'utf8')).toBe('4242\n')
+      } finally {
+        rmSync(LOCK, { recursive: true, force: true })
+      }
+    },
+    LONG,
+  )
+
+  // A restore killed part way whose RESTORE the server is still running: a
+  // second one would drop the database under it.
+  it(
+    'refuses while ClickHouse is still running an earlier backup or restore',
+    () => {
+      const stub = stubDocker(
+        `    *"FROM system.backups"*) echo "RESTORING Disk('backups', 'clickmonk-restore-2026-10-01T041500Z-1.zip')"; exit 0 ;;`,
+      )
+      const before = world()
+      try {
+        const r = runScript('restore.sh', [firstBackup], { env: { PATH: stub.path } })
+        expect(r.out).toContain('Wait for it to finish')
+        expectRefusal(
+          r,
+          "ClickHouse is still running an earlier backup or restore: RESTORING Disk('backups', 'clickmonk-restore-2026-10-01T041500Z-1.zip').",
+          before,
+        )
+      } finally {
+        stub.remove()
+      }
+    },
+    LONG,
+  )
+
+  it(
+    'refuses when ClickHouse cannot say whether a backup or restore is running',
+    () => {
+      const stub = stubDocker('    *"FROM system.backups"*) exit 1 ;;')
+      const before = world()
+      try {
+        expectRefusal(
+          runScript('restore.sh', [firstBackup], { env: { PATH: stub.path } }),
+          'Could not ask ClickHouse whether a backup or restore is still running.',
+          before,
+        )
+      } finally {
+        stub.remove()
+      }
+    },
+    LONG,
+  )
+
+  // Without the disk the RESTORE fails, and it runs after the DROP: the one
+  // failure that would leave ClickHouse empty is refused before it.
+  it(
+    'refuses a ClickHouse started without the backups disk',
+    () => {
+      const stub = stubDocker('    *"FROM system.disks"*) exit 0 ;;')
+      const before = world()
+      try {
+        expectRefusal(
+          runScript('restore.sh', [firstBackup], { env: { PATH: stub.path } }),
+          "ClickHouse has no disk named 'backups'",
+          before,
+        )
+      } finally {
+        stub.remove()
+      }
+    },
+    LONG,
+  )
+
+  it(
+    'refuses when the image cannot say which schema version it understands',
+    () => {
+      const stub = stubDocker('    version) echo "usage:"; exit 1 ;;')
+      const before = world()
+      try {
+        expectRefusal(
+          runScript('restore.sh', [firstBackup], { env: { PATH: stub.path } }),
+          "Could not read the schema version this checkout's image understands.",
+          before,
+        )
+      } finally {
+        stub.remove()
+      }
+    },
+    LONG,
+  )
+
+  // Half way through an upgrade the running containers are older than the
+  // image `up` starts. Here a running container claims schema version 1, below
+  // the backup's: asked instead of the image, it would refuse the backup as newer.
+  it(
+    'reads the schema version from the image `up` would start, not a running container',
+    () => {
+      const stub = stubDocker(
+        '    version) case " $* " in *" exec "*) echo "clickmonk 0.0.0 (schema version 1)"; exit 0 ;; esac ;;',
+      )
+      const before = world()
+      try {
+        const r = runScript('restore.sh', [firstBackup], { env: { PATH: stub.path } })
+        expect(r.out).not.toContain('This backup is newer than this image')
+        expect(r.out).toContain(`This image understands schema version ${imageSchema()}`)
+        expectRefusal(r, 'That is not the backup’s timestamp', before)
+      } finally {
+        stub.remove()
+      }
+    },
+    LONG,
+  )
+
+  it(
+    'warns, before asking, when the admin host differs from the backup’s',
+    () => {
+      const other = join(TMP, 'backup-other-host.env')
+      writeFileSync(
+        other,
+        readFileSync(ENV_FILE, 'utf8').replace(
+          /^CLICKMONK_ADMIN_HOST=.*$/m,
+          'CLICKMONK_ADMIN_HOST=elsewhere.example.test',
+        ),
+        { mode: 0o600 },
+      )
+      const before = world()
+      try {
+        const r = runScript('restore.sh', [firstBackup], {
+          input: 'no\n',
+          env: { COMPOSE_ENV_FILES: other },
+        })
+        const warning = `CLICKMONK_ADMIN_HOST is 'elsewhere.example.test' here and was '${ADMIN_HOST}'`
+        expect(r.out).toContain(warning)
+        expect(r.out).not.toContain('is not the one this backup was taken with')
+        expect(r.out.indexOf(warning)).toBeLessThan(
+          r.out.indexOf('Type the backup’s timestamp to go ahead'),
+        )
+        expectRefusal(r, 'That is not the backup’s timestamp', before)
+      } finally {
+        rmSync(other, { force: true })
+      }
+    },
+    LONG,
+  )
+})
+
+describe('restore.sh, stopped before it changes anything', () => {
+  // An operator who sends TERM while the archive is copied in, and again while
+  // the services are being started: the second must not abandon the trap.
+  it(
+    'starts again what it stopped, and leaves nothing behind, when a second TERM arrives while it does',
+    () => {
+      const real = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim()
+      const stub = stubDocker(
+        [
+          `    *"cat >"*) ${real} "$@"; kill -TERM $PPID; sleep 1; exit 1 ;;`,
+          '    start) kill -TERM $PPID ;;',
+        ].join('\n'),
+      )
+      const runningBefore = running()
+      const links = pg('SELECT count(*) FROM links')
+      const clicks = ch('SELECT count() FROM clicks FINAL')
+      const redirectBefore = startedAt('redirect')
+      let r: ScriptResult
+      try {
+        r = runScript('restore.sh', [firstBackup], {
+          input: `${manifest(firstBackup).timestamp}\n`,
+          env: { PATH: stub.path },
+        })
+      } finally {
+        stub.remove()
+      }
+      try {
+        expect(r.status, r.out).not.toBe(0)
+        expect(r.out).toContain(
+          'Nothing was changed. Starting caddy redirect admin worker again...',
+        )
+        expect(r.out).not.toContain('stopped part way')
+        // Stopped and started again: nothing else about the install moved.
+        expect(startedAt('redirect')).not.toBe(redirectBefore)
+        expect(running()).toEqual(runningBefore)
+        expect(pg('SELECT count(*) FROM links')).toBe(links)
+        expect(ch('SELECT count() FROM clicks FINAL')).toBe(clicks)
+        expect(backupsDisk()).toBe('')
+        expect(existsSync(LOCK)).toBe(false)
+      } finally {
+        // A trap killed before its end leaves the lock.
+        rmSync(LOCK, { recursive: true, force: true })
       }
     },
     LONG,
