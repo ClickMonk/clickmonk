@@ -381,7 +381,10 @@ pushing a tag creates none. The whole sequence, in order:
    The places: `"version"` in the root `package.json` and in each of the eight
    `packages/*/package.json`, and `VERSION` in `packages/core/src/version.ts` — ten in all.
    `packages/core/src/version.test.ts` fails if any of them disagrees, and counts the
-   manifests, so a new package without a version fails it too.
+   manifests, so a new package fails it until the count in the test is raised.
+   The README's "Installing" block checks out the release by its tag, and is bumped in the
+   same commit. The version test does not see it, so count it too:
+   `sed -n '/^## Installing/,/^## /p' README.md | grep -c 'git checkout vX.Y.Z'` prints 1.
 3. Write the `CHANGELOG.md` entry: Added / Fixed / Changed, plus what the release still
    cannot do. Before writing it, read `git log --oneline --no-merges <lasttag>..HEAD`
    against the changelog; merged work with no entry is how releases under-report.
