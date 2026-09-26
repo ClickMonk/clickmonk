@@ -1352,9 +1352,11 @@ describe('restore.sh refuses, before it stops or changes anything', () => {
       reason: "The manifest's schema_version is 'ten', which is not a number.",
     },
     {
-      what: 'no row count for one table',
-      edit: (m: string) => m.replace(/^rows\.clickhouse\.clicks_hourly_dim=.*\n/m, ''),
-      reason: 'The manifest records no row count for clicks_hourly_dim',
+      // The rollups' counts are absent from a backup of an install without
+      // them; the raw table's never is.
+      what: 'no row count for the raw clicks table',
+      edit: (m: string) => m.replace(/^rows\.clickhouse\.clicks=.*\n/m, ''),
+      reason: 'The manifest records no row count for clicks,',
     },
     {
       what: 'no checksum for one file',
@@ -1733,6 +1735,45 @@ describe('restore.sh refuses, after an interrupted restore or on a full disk', (
 })
 
 describe('restore.sh, stopped before it changes anything', () => {
+  // docker compose handles INT and TERM itself, so one attempt at starting
+  // the services can be cut short or fail; the next one must follow.
+  it(
+    'tries starting the services again when the first attempt fails',
+    () => {
+      const once = join(TMP, 'start-failed-once')
+      rmSync(once, { force: true })
+      const stub = stubDocker(
+        [
+          '    *"cat >"*) echo "simulated copy failure" >&2; exit 1 ;;',
+          `    start) [ -e ${once} ] || { touch ${once}; exit 1; } ;;`,
+        ].join('\n'),
+      )
+      const runningBefore = running()
+      let r: ScriptResult
+      try {
+        r = runScript('restore.sh', [firstBackup], {
+          input: `${manifest(firstBackup).timestamp}\n`,
+          env: { PATH: stub.path },
+        })
+      } finally {
+        stub.remove()
+      }
+      try {
+        expect(existsSync(once), 'the first start was not attempted').toBe(true)
+        expect(r.status, r.out).toBe(1)
+        expect(r.out).toContain('Could not copy the archive into the clickhouse container')
+        expect(r.out).toContain('Could not start them (attempt 1 of 3); trying again...')
+        expect(r.out).not.toContain('Could not start them. Run:')
+        expect(running()).toEqual(runningBefore)
+        expect(existsSync(LOCK)).toBe(false)
+      } finally {
+        rmSync(once, { force: true })
+        rmSync(LOCK, { recursive: true, force: true })
+      }
+    },
+    LONG,
+  )
+
   // An operator who sends TERM while the archive is copied in, and again while
   // the services are being started: the second must not abandon the trap.
   it(
@@ -2148,6 +2189,66 @@ describe('a backup restored into an empty stack', () => {
     () => {
       expect(restoreOut).toContain('A key revoked or a password changed')
       expect(restoreOut).toContain('apikey list')
+    },
+    LONG,
+  )
+})
+
+// Every install from before the rollups existed: its ClickHouse has only the
+// raw table, which is the install the upgrade instructions tell to back up
+// first. Built here by undoing the rollups' migration on the running stack.
+describe('a backup of an install from before the ClickHouse rollups', () => {
+  const ROLLUP_VERSION = 8
+  const VIEWS = [
+    'clicks_hourly_mv',
+    'clicks_hourly_country_mv',
+    'clicks_hourly_device_mv',
+    'clicks_hourly_os_mv',
+    'clicks_hourly_browser_mv',
+    'clicks_hourly_referrer_mv',
+    'clicks_hourly_target_mv',
+  ]
+  const rollups = (): string =>
+    ch(
+      "SELECT count() FROM system.tables WHERE database = 'clickmonk' AND name IN ('clicks_hourly', 'clicks_hourly_dim')",
+    )
+
+  it(
+    'is taken with the raw table counted alone, and restored into the image that has them',
+    async () => {
+      // The worker migrates at start; stopped, it leaves the older schema be.
+      compose('stop', 'worker')
+      for (const v of VIEWS) ch(`DROP VIEW IF EXISTS ${v} SYNC`)
+      ch('DROP TABLE IF EXISTS clicks_hourly SYNC')
+      ch('DROP TABLE IF EXISTS clicks_hourly_dim SYNC')
+      pg(`DELETE FROM schema_migrations WHERE version = ${ROLLUP_VERSION}`)
+      expect(rollups()).toBe('0')
+      const clicks = ch('SELECT count() FROM clicks FINAL')
+
+      const r = runScript('backup.sh', [join(BACKUPS, 'pre-rollups')])
+      expect(r.status, r.out).toBe(0)
+      const dir = onlyBackupIn(join(BACKUPS, 'pre-rollups'))
+      const m = manifest(dir)
+      expect(m['rows.clickhouse.clicks']).toBe(clicks)
+      expect(Object.keys(m).filter((k) => k.startsWith('rows.'))).toEqual([
+        'rows.clickhouse.clicks',
+      ])
+
+      const restored = runScript('restore.sh', [dir], { input: `${m.timestamp}\n` })
+      expect(restored.status, restored.out).toBe(0)
+      // Its verification compared the restored clicks with the manifest before
+      // the worker started and shipped the spool's.
+      expect(restored.out).toContain('Checking what was restored against the manifest...')
+      expect(existsSync(MARKER)).toBe(false)
+      // Started by the restore, the worker applies the rollups' migration.
+      await until('the worker to create the rollups again', 120_000, () => rollups() === '2')
+      await until(
+        'the rollups migration in the ledger',
+        60_000,
+        () =>
+          pg(`SELECT count(*) FROM schema_migrations WHERE version = ${ROLLUP_VERSION}`) === '1',
+      )
+      expect(running()).toEqual(ALL_SERVICES)
     },
     LONG,
   )
