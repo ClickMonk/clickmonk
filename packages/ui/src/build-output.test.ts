@@ -33,6 +33,31 @@ describe('the built stylesheet', () => {
   it('gives every element a border colour from the brand role, not currentColor', () => {
     expect(css).toContain('border-color:var(--color-border)')
   })
+
+  // The CSP is `font-src 'self'`, which does not match `data:` — a font
+  // inlined as a data: URI is not a policy bypass, it is simply blocked, and
+  // the interface falls back to no font at all. Inlining is still refused:
+  // the goal is every font rendering, not merely the policy holding.
+  it('references every shipped font by URL, never inlines one as data', () => {
+    const stems = [
+      'source-sans-3-400',
+      'source-sans-3-500',
+      'source-sans-3-600',
+      'source-sans-3-700',
+      'source-serif-4-400',
+      'source-serif-4-600',
+      'source-code-pro-400',
+      'source-code-pro-500',
+    ]
+    const woff2Refs = css.match(/url\([^)]*\.woff2[^)]*\)/g) ?? []
+    for (const stem of stems)
+      expect(
+        woff2Refs.some((ref) => ref.includes(stem)),
+        `${stem} is not referenced`,
+      ).toBe(true)
+    expect(woff2Refs.every((ref) => !ref.includes('data:'))).toBe(true)
+    expect(css).not.toMatch(/data:font\//)
+  })
 })
 
 describe('the built page', () => {

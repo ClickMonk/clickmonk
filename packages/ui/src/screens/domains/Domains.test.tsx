@@ -137,7 +137,7 @@ describe('the domain list', () => {
     expect(within(c).getByText(TOKEN)).toBeInTheDocument()
   })
 
-  it('dims the list and marks it busy while a reload is in flight, rather than blanking it', async () => {
+  it('marks the list busy while a reload is in flight, without losing it', async () => {
     let resolveSecond: ((p: { domains: Domain[]; truncated: boolean }) => void) | undefined
     let calls = 0
     const { user } = show([], {
@@ -155,7 +155,6 @@ describe('the domain list', () => {
     await user.type(screen.getByLabelText('Host name'), 'added.example.test')
     await user.click(screen.getByRole('button', { name: 'Add domain' }))
     await waitFor(() => expect(heading.closest('[aria-busy]')).toHaveAttribute('aria-busy', 'true'))
-    expect(heading.closest('[aria-busy]')).toHaveClass('opacity-50')
     resolveSecond?.({
       domains: [domain('go.example.test'), domain('added.example.test')],
       truncated: false,

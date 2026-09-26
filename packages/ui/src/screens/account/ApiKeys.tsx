@@ -149,10 +149,7 @@ export function ApiKeys() {
         <p className="text-sm text-muted-foreground">No API keys yet.</p>
       )}
       {list.state !== 'error' && keys.length > 0 && (
-        <div
-          aria-busy={list.state === 'loading'}
-          className={list.state === 'loading' ? 'opacity-50' : undefined}
-        >
+        <div aria-busy={list.state === 'loading'}>
           <Table>
             <TableHeader>
               <TableRow>

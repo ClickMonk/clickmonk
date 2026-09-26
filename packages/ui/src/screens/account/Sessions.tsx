@@ -40,10 +40,7 @@ export function Sessions({ reloadKey = 0 }: { reloadKey?: number } = {}) {
         <p className="text-sm text-muted-foreground">No sessions.</p>
       )}
       {list.state !== 'error' && sessions.length > 0 && (
-        <div
-          aria-busy={list.state === 'loading'}
-          className={list.state === 'loading' ? 'opacity-50' : undefined}
-        >
+        <div aria-busy={list.state === 'loading'}>
           <Table>
             <TableHeader>
               <TableRow>

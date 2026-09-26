@@ -327,7 +327,7 @@ describe('the click log', () => {
     expect(await screen.findByText('No clicks in this window.')).toBeInTheDocument()
   })
 
-  it('dims the table and marks it busy while a reload is in flight, rather than blanking it', async () => {
+  it('marks the table busy while a reload is in flight, without losing it', async () => {
     let resolveSecond: ((p: ClickPage) => void) | undefined
     let calls = 0
     const client = fakeClient({
@@ -348,7 +348,6 @@ describe('the click log', () => {
     await user.selectOptions(screen.getByRole('combobox', { name: 'Traffic class' }), 'bot')
     const busy = row.closest('[aria-busy]')
     expect(busy).toHaveAttribute('aria-busy', 'true')
-    expect(busy).toHaveClass('opacity-50')
     resolveSecond?.({ window: W, link: null, clicks: [click('c1')], nextCursor: null })
     await waitFor(() => expect(row.closest('[aria-busy]')).toHaveAttribute('aria-busy', 'false'))
   })

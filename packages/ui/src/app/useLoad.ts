@@ -1,5 +1,6 @@
 import { ApiError } from '@/api/errors'
 import { useCallback, useEffect, useState } from 'react'
+import { useRefresh } from './refresh'
 
 type Loaded<T> = {
   state: 'loading' | 'ok' | 'error'
@@ -25,8 +26,15 @@ type Loaded<T> = {
  * success is not "the data" any more once the service has since refused, so a
  * reload after an error goes back to loading with nothing shown, the same as
  * a screen's first load.
+ *
+ * Every attempt registers itself with the refresh context for as long as it
+ * is outstanding, with `beginLoad` when it starts and `endLoad` exactly once
+ * when it settles — success, failure, or superseded by a newer attempt —
+ * never twice. That is what lets the header's Refresh button show one true
+ * "something is loading" signal without every caller wiring it up itself.
  */
 export function useLoad<T>(load: (signal: AbortSignal) => Promise<T>, deps: unknown[]) {
+  const { beginLoad, endLoad } = useRefresh()
   const [loaded, setLoaded] = useState<Loaded<T>>({
     state: 'loading',
     data: undefined,
@@ -36,27 +44,55 @@ export function useLoad<T>(load: (signal: AbortSignal) => Promise<T>, deps: unkn
   const [thrown, setThrown] = useState<unknown>(null)
   if (thrown !== null) throw thrown
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: `deps` is the caller's list of what this load reads; `load` is a new function every render and must not be one.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `deps` is the caller's list of what this load reads; `load`, `beginLoad` and `endLoad` are stable or recreated every render and must not gate the effect.
   useEffect(() => {
     const controller = new AbortController()
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      endLoad()
+    }
+    beginLoad()
     setLoaded((l) => ({
       state: 'loading',
       data: l.state === 'error' ? undefined : l.data,
       error: undefined,
     }))
-    load(controller.signal).then(
-      (data) => {
-        if (!controller.signal.aborted) setLoaded({ state: 'ok', data, error: undefined })
-      },
-      (err: unknown) => {
-        if (controller.signal.aborted) return
-        if (err instanceof DOMException && err.name === 'AbortError') return
-        if (err instanceof ApiError)
-          setLoaded((l) => ({ state: 'error', data: l.data, error: err }))
-        else setThrown(err)
-      },
-    )
-    return () => controller.abort()
+    // `load` is a caller's function, not necessarily an async one: a defect
+    // in it can throw before ever returning a promise to `.then` off. That
+    // still ends this attempt, so it still releases the count, the same as
+    // any other way of settling — then re-thrown, so it reaches React the
+    // way a synchronous throw from an effect always has.
+    try {
+      load(controller.signal).then(
+        (data) => {
+          if (!controller.signal.aborted) setLoaded({ state: 'ok', data, error: undefined })
+          finish()
+        },
+        (err: unknown) => {
+          if (controller.signal.aborted) {
+            finish()
+            return
+          }
+          if (err instanceof DOMException && err.name === 'AbortError') {
+            finish()
+            return
+          }
+          if (err instanceof ApiError)
+            setLoaded((l) => ({ state: 'error', data: l.data, error: err }))
+          else setThrown(err)
+          finish()
+        },
+      )
+    } catch (err) {
+      finish()
+      throw err
+    }
+    return () => {
+      controller.abort()
+      finish()
+    }
   }, [...deps, round])
 
   const reload = useCallback(() => setRound((r) => r + 1), [])

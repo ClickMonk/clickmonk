@@ -78,14 +78,14 @@ export function BreakdownPanel(props: {
   )
   // A failed reload drops what it was showing: the alternative — the old
   // window's rows sitting next to a new window's error — reads as still
-  // current. A loading reload keeps them, dimmed, so a fast reload does not
-  // blank the panel.
+  // current. A loading reload keeps them, marked aria-busy at full contrast,
+  // so a fast reload does not blank the panel.
   // A share divides these rows by `total`, and the two only ever answer the
   // same request when this panel's own load has finished ('ok') *and* a total
   // was given — `total` is undefined whenever the summary it comes from is
   // itself not `'ok'` for the current window (see Report.tsx). Without this,
-  // a still-loading panel's dimmed, previous-window rows would show a share
-  // against whatever total the *new* window's summary just answered with.
+  // a still-loading panel's previous-window rows would show a share against
+  // whatever total the *new* window's summary just answered with.
   const shareKnown = r.state === 'ok' && props.total !== undefined
   const rows =
     r.state === 'error'
@@ -129,11 +129,7 @@ export function BreakdownPanel(props: {
         {r.state === 'ok' && rows.length === 0 && (
           <p className="text-sm text-muted-foreground">Nothing in this window.</p>
         )}
-        {rows.length > 0 && (
-          <div data-testid="rows" className={stale ? 'opacity-50' : undefined}>
-            <Bars rows={rows} />
-          </div>
-        )}
+        {rows.length > 0 && <Bars rows={rows} />}
         {r.data?.truncated && rows.length > 0 && limit === FEW && (
           <div className="flex items-center justify-between text-sm text-muted-foreground">
             <span>Top 10 shown.</span>

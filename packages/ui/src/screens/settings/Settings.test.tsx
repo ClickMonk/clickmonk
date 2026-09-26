@@ -2,10 +2,21 @@ import { ClientProvider } from '@/api/context'
 import { ApiError } from '@/api/errors'
 import { fakeClient } from '@/api/fake'
 import type { Settings as S } from '@/api/types'
+import { RefreshProvider, useRefresh } from '@/app/refresh'
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it } from 'vitest'
 import { Settings } from './Settings'
+
+/** A stand-in for the header's Refresh button, so a test can start a round without Shell. */
+function RefreshButton() {
+  const { refresh } = useRefresh()
+  return (
+    <button type="button" onClick={refresh}>
+      go
+    </button>
+  )
+}
 
 const SETTINGS: S = {
   traffic: {
@@ -212,5 +223,28 @@ describe('the settings screen', () => {
     )
     await user.click(await screen.findByRole('button', { name: 'Save settings' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('most likely the retention pass')
+  })
+
+  // Settings reads its own answer into local state once and edits it there;
+  // it must not depend on the refresh round, or a Refresh press (or the
+  // focus-return refresh after 60s away) would remount the form under an
+  // edit that was never saved, or under an open retention confirmation.
+  it('keeps an unsaved edit through a Refresh round, rather than reloading under it', async () => {
+    const client = fakeClient({ settings: () => Promise.resolve(SETTINGS) })
+    render(
+      <ClientProvider client={client}>
+        <RefreshProvider>
+          <RefreshButton />
+          <Settings />
+        </RefreshProvider>
+      </ClientProvider>,
+    )
+    const threshold = await screen.findByLabelText('Abuser threshold')
+    const user = userEvent.setup()
+    await user.clear(threshold)
+    await user.type(threshold, '42')
+    await user.click(screen.getByRole('button', { name: 'go' }))
+    expect(screen.getByLabelText('Abuser threshold')).toHaveValue('42')
+    expect(client.calls.filter((c) => c.method === 'settings')).toHaveLength(1)
   })
 })

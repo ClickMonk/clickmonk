@@ -256,10 +256,7 @@ export function Clicks() {
         <p className="text-sm text-muted-foreground">No clicks in this window.</p>
       )}
       {first.state !== 'error' && clicks.length > 0 && (
-        <div
-          aria-busy={first.state === 'loading'}
-          className={first.state === 'loading' ? 'opacity-50' : undefined}
-        >
+        <div aria-busy={first.state === 'loading'}>
           <Table>
             <TableHeader>
               <TableRow>

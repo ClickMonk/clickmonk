@@ -16,6 +16,21 @@ function Round() {
   )
 }
 
+function Refreshing() {
+  const { refreshing, beginLoad, endLoad } = useRefresh()
+  return (
+    <>
+      <p>{refreshing ? 'refreshing' : 'idle'}</p>
+      <button type="button" onClick={beginLoad}>
+        begin
+      </button>
+      <button type="button" onClick={endLoad}>
+        end
+      </button>
+    </>
+  )
+}
+
 describe('refreshing', () => {
   it('counts a press of Refresh', async () => {
     render(
@@ -63,6 +78,39 @@ describe('refreshing', () => {
       stubVisibility('visible')
     }
     expect(screen.getByRole('button')).toHaveTextContent('round 0')
+  })
+
+  it('starts idle, and goes busy once something begins loading', async () => {
+    render(
+      <RefreshProvider>
+        <Refreshing />
+      </RefreshProvider>,
+    )
+    expect(screen.getByText('idle')).toBeInTheDocument()
+    await act(async () => screen.getByRole('button', { name: 'begin' }).click())
+    expect(screen.getByText('refreshing')).toBeInTheDocument()
+    await act(async () => screen.getByRole('button', { name: 'end' }).click())
+    expect(screen.getByText('idle')).toBeInTheDocument()
+  })
+
+  // The count, not a single flag: a second load still outstanding must keep
+  // the flag up once the first of the two ends, the way one screen's several
+  // loads share one Refresh button.
+  it('stays busy while a second load is still outstanding after the first ends', async () => {
+    render(
+      <RefreshProvider>
+        <Refreshing />
+      </RefreshProvider>,
+    )
+    const begin = screen.getByRole('button', { name: 'begin' })
+    const end = screen.getByRole('button', { name: 'end' })
+    await act(async () => begin.click())
+    await act(async () => begin.click())
+    expect(screen.getByText('refreshing')).toBeInTheDocument()
+    await act(async () => end.click())
+    expect(screen.getByText('refreshing')).toBeInTheDocument()
+    await act(async () => end.click())
+    expect(screen.getByText('idle')).toBeInTheDocument()
   })
 
   it('stops listening once unmounted', () => {

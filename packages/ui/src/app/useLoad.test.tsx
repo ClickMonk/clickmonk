@@ -1,7 +1,20 @@
 import { ApiError } from '@/api/errors'
 import { act, render, screen } from '@testing-library/react'
+import { Component, type ReactNode } from 'react'
 import { describe, expect, it, vi } from 'vitest'
+import { RefreshProvider, useRefresh } from './refresh'
 import { useLoad } from './useLoad'
+
+/** Catches a defect thrown from an effect, so the sibling under test survives to be read. */
+class Boundary extends Component<{ children: ReactNode }, { crashed: boolean }> {
+  override state = { crashed: false }
+  static getDerivedStateFromError() {
+    return { crashed: true }
+  }
+  override render() {
+    return this.state.crashed ? <p>crashed</p> : this.props.children
+  }
+}
 
 function Show({ load, dep = 0 }: { load: (s: AbortSignal) => Promise<string>; dep?: number }) {
   const r = useLoad(load, [dep])
@@ -15,6 +28,12 @@ function Show({ load, dep = 0 }: { load: (s: AbortSignal) => Promise<string>; de
       </button>
     </div>
   )
+}
+
+/** Reads the shared `refreshing` flag beside a `Show`, both under one `RefreshProvider`. */
+function Busy() {
+  const { refreshing } = useRefresh()
+  return <p data-testid="busy">{refreshing ? 'busy' : 'idle'}</p>
 }
 
 describe('loading', () => {
@@ -123,5 +142,152 @@ describe('loading', () => {
     await act(async () => resolveSecond('load 2'))
     expect(screen.getByTestId('state')).toHaveTextContent('ok')
     expect(screen.getByTestId('data')).toHaveTextContent('load 2')
+  })
+
+  it('marks the refresh context busy while loading, and clears it once it answers', async () => {
+    let resolve: (v: string) => void = () => {}
+    render(
+      <RefreshProvider>
+        <Show
+          load={() =>
+            new Promise<string>((r) => {
+              resolve = r
+            })
+          }
+        />
+        <Busy />
+      </RefreshProvider>,
+    )
+    expect(screen.getByTestId('busy')).toHaveTextContent('busy')
+    await act(async () => resolve('done'))
+    expect(screen.getByTestId('busy')).toHaveTextContent('idle')
+  })
+
+  // A refusal is still the load settling: the flag must not read this
+  // screen as loading forever after one request the service turned down.
+  it('clears the refresh context’s busy flag on a failed load too', async () => {
+    let reject: (e: ApiError) => void = () => {}
+    render(
+      <RefreshProvider>
+        <Show
+          load={() =>
+            new Promise<string>((_resolve, r) => {
+              reject = r
+            })
+          }
+        />
+        <Busy />
+      </RefreshProvider>,
+    )
+    expect(screen.getByTestId('busy')).toHaveTextContent('busy')
+    await act(async () => reject(new ApiError(429, 'rate_limited', 'slow down')))
+    expect(screen.getByTestId('busy')).toHaveTextContent('idle')
+  })
+
+  // Two loads sharing one context: the flag is a count, not a flag one of
+  // them can clear on the other's behalf.
+  it('stays busy while a second load is still going after the first of two settles', async () => {
+    let resolveFast: (v: string) => void = () => {}
+    let resolveSlow: (v: string) => void = () => {}
+    render(
+      <RefreshProvider>
+        <Show
+          load={() =>
+            new Promise<string>((r) => {
+              resolveFast = r
+            })
+          }
+          dep={1}
+        />
+        <Show
+          load={() =>
+            new Promise<string>((r) => {
+              resolveSlow = r
+            })
+          }
+          dep={2}
+        />
+        <Busy />
+      </RefreshProvider>,
+    )
+    expect(screen.getByTestId('busy')).toHaveTextContent('busy')
+    await act(async () => resolveFast('fast'))
+    expect(screen.getByTestId('busy')).toHaveTextContent('busy')
+    await act(async () => resolveSlow('slow'))
+    expect(screen.getByTestId('busy')).toHaveTextContent('idle')
+  })
+
+  // The cleanup's own `finish()` is what releases an unmount mid-load: a
+  // load that ignores its abort signal (never settles) has no other way to
+  // let go of its slot.
+  it('releases the count when unmounted mid-load, even if the load ignores its abort signal', () => {
+    const tree = (mounted: boolean) => (
+      <RefreshProvider>
+        {mounted && <Show load={() => new Promise<string>(() => {})} />}
+        <Busy />
+      </RefreshProvider>
+    )
+    const { rerender } = render(tree(true))
+    expect(screen.getByTestId('busy')).toHaveTextContent('busy')
+    rerender(tree(false))
+    expect(screen.getByTestId('busy')).toHaveTextContent('idle')
+  })
+
+  // A superseded attempt's cleanup already released its slot; if its own
+  // abort rejection released it again, that second release comes out of
+  // whatever else is still outstanding — the count goes idle early while a
+  // real load is still running.
+  it('releases a superseded load’s slot exactly once, not again when its own abort rejects', async () => {
+    const respectsAbort = (signal: AbortSignal) =>
+      new Promise<string>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+      })
+    let resolveSlow: (v: string) => void = () => {}
+    const slow = () =>
+      new Promise<string>((r) => {
+        resolveSlow = r
+      })
+    const tree = (dep: number) => (
+      <RefreshProvider>
+        <Show load={respectsAbort} dep={dep} />
+        <Show load={slow} dep={99} />
+        <Busy />
+      </RefreshProvider>
+    )
+    const { rerender } = render(tree(1))
+    expect(screen.getByTestId('busy')).toHaveTextContent('busy')
+    await act(async () => {
+      rerender(tree(2))
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    // The superseded load's replacement (dep 2) is still pending, and so is
+    // `slow` — nothing has settled yet, whether the guard held or not.
+    expect(screen.getByTestId('busy')).toHaveTextContent('busy')
+    await act(async () => resolveSlow('done'))
+    // Only `slow` settled. The replacement is still going, so this must
+    // still read busy — it reads idle only if the superseded attempt's
+    // abort rejection took a second slot that was never its own to release.
+    expect(screen.getByTestId('busy')).toHaveTextContent('busy')
+  })
+
+  // `beginLoad()` runs before `load()` is called; a defect that throws
+  // synchronously, rather than returning a rejected promise, must still
+  // release what it began before the effect's own throw reaches its
+  // boundary — otherwise the count leaks and Refresh never re-enables.
+  it('releases the count when load() throws synchronously, before returning a promise', () => {
+    const throwsSync = (() => {
+      throw new Error('defect: not actually async')
+    }) as unknown as (s: AbortSignal) => Promise<string>
+    render(
+      <RefreshProvider>
+        <Boundary>
+          <Show load={throwsSync} />
+        </Boundary>
+        <Busy />
+      </RefreshProvider>,
+    )
+    expect(screen.getByText('crashed')).toBeInTheDocument()
+    expect(screen.getByTestId('busy')).toHaveTextContent('idle')
   })
 })

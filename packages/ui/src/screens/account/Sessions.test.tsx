@@ -71,7 +71,7 @@ describe('sessions', () => {
     ])
   })
 
-  it('dims the list and marks it busy while a reload is in flight, rather than blanking it', async () => {
+  it('marks the list busy while a reload is in flight, without losing it', async () => {
     let resolveSecond: ((s: Session[]) => void) | undefined
     let calls = 0
     const { user } = show({
@@ -88,7 +88,6 @@ describe('sessions', () => {
     await user.click(screen.getByRole('button', { name: 'Sign that session out' }))
     const table = screen.getByRole('table')
     await waitFor(() => expect(table.closest('[aria-busy]')).toHaveAttribute('aria-busy', 'true'))
-    expect(table.closest('[aria-busy]')).toHaveClass('opacity-50')
     resolveSecond?.([session('s1', true), session('s2', false)])
     await waitFor(() => expect(table.closest('[aria-busy]')).toHaveAttribute('aria-busy', 'false'))
   })

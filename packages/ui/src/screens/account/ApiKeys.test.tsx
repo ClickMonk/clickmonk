@@ -118,4 +118,25 @@ describe('API keys', () => {
     const code = await screen.findByText('clickmonk apikey list')
     expect(code.tagName).toBe('CODE')
   })
+
+  it('marks the list busy while a reload is in flight, without losing the rows', async () => {
+    let resolveSecond: ((k: { keys: ApiKey[]; truncated: boolean }) => void) | undefined
+    let calls = 0
+    const { user } = show({
+      keys: (() => {
+        calls += 1
+        if (calls === 1) return Promise.resolve({ keys: [EXISTING], truncated: false })
+        return new Promise<{ keys: ApiKey[]; truncated: boolean }>((resolve) => {
+          resolveSecond = resolve
+        })
+      }) as never,
+      revokeKey: () => Promise.resolve({ ok: true as const }),
+    })
+    await user.click(await screen.findByRole('button', { name: 'Revoke' }))
+    await user.click(screen.getByRole('button', { name: 'Revoke key' }))
+    const table = screen.getByRole('table')
+    await waitFor(() => expect(table.closest('[aria-busy]')).toHaveAttribute('aria-busy', 'true'))
+    resolveSecond?.({ keys: [EXISTING], truncated: false })
+    await waitFor(() => expect(table.closest('[aria-busy]')).toHaveAttribute('aria-busy', 'false'))
+  })
 })

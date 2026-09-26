@@ -177,9 +177,9 @@ describe('a breakdown panel', () => {
     expect(screen.queryByText('Germany')).not.toBeInTheDocument()
   })
 
-  // While a reload is in flight the old rows stay up, marked busy and dimmed,
-  // rather than blanking the panel on every window change or refresh.
-  it('marks the panel busy and dims the rows while a reload is in flight, without losing them', async () => {
+  // While a reload is in flight the old rows stay up, marked busy, rather
+  // than blanking the panel on every window change or refresh.
+  it('marks the panel busy while a reload is in flight, without losing the rows', async () => {
     let resolveSecond: ((b: Breakdown) => void) | undefined
     let calls = 0
     const client = fakeClient({
@@ -199,7 +199,6 @@ describe('a breakdown panel', () => {
     expect(await screen.findByText('Germany')).toBeInTheDocument()
     const region = screen.getByText('Germany').closest('[aria-busy]') as HTMLElement
     expect(region).toHaveAttribute('aria-busy', 'false')
-    expect(screen.getByTestId('rows')).not.toHaveClass('opacity-50')
     rerender(
       <ClientProvider client={client}>
         <BreakdownPanel query={W2} dimension="country" total={20} round={0} />
@@ -207,11 +206,9 @@ describe('a breakdown panel', () => {
     )
     expect(region).toHaveAttribute('aria-busy', 'true')
     expect(screen.getByText('Germany')).toBeInTheDocument()
-    expect(screen.getByTestId('rows')).toHaveClass('opacity-50')
     resolveSecond?.(answer([{ value: 'FR', clicks: 5, visitors: 2 }]))
     expect(await screen.findByText('France')).toBeInTheDocument()
     expect(region).toHaveAttribute('aria-busy', 'false')
-    expect(screen.getByTestId('rows')).not.toHaveClass('opacity-50')
   })
 
   // The CSV a panel offers while stale would write the previous window's
@@ -278,7 +275,7 @@ describe('a breakdown panel', () => {
         <BreakdownPanel query={W2} dimension="country" total={50} round={0} />
       </ClientProvider>,
     )
-    // Still the old (dimmed) row, but no share computed against the new
+    // Still the old (aria-busy) row, but no share computed against the new
     // total while this panel's own load has not caught up with it.
     expect(screen.getByText('Germany')).toBeInTheDocument()
     expect(screen.queryByText('7 · 35%')).not.toBeInTheDocument()

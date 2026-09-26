@@ -3,7 +3,7 @@ import { ApiError } from '@/api/errors'
 import { fakeClient } from '@/api/fake'
 import type { Breakdown, Summary, Timeseries } from '@/api/types'
 import { NowProvider } from '@/app/clock'
-import { render, screen, within } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router'
 import { describe, expect, it, vi } from 'vitest'
@@ -337,5 +337,56 @@ describe('the overview', () => {
     expect(
       await screen.findByRole('button', { name: 'Download the chart as CSV' }),
     ).toBeInTheDocument()
+  })
+
+  it('marks the summary busy while a reload is in flight, without losing the numbers', async () => {
+    let resolveSecondSummary: ((s: Summary) => void) | undefined
+    let summaryCalls = 0
+    showWith(
+      fakeClient({
+        summary: () => {
+          summaryCalls += 1
+          if (summaryCalls === 1) return Promise.resolve(summary)
+          return new Promise<Summary>((resolve) => {
+            resolveSecondSummary = resolve
+          })
+        },
+        timeseries: () => Promise.resolve(series),
+        breakdown: ((_w: unknown, d: string) => Promise.resolve(empty(d))) as never,
+      }),
+    )
+    const region = (await screen.findByText('1,200')).closest('[aria-busy]') as HTMLElement
+    expect(region).toHaveAttribute('aria-busy', 'false')
+    await userEvent.setup().selectOptions(screen.getByLabelText('Time range'), '30d')
+    expect(region).toHaveAttribute('aria-busy', 'true')
+    expect(screen.getByText('1,200')).toBeInTheDocument()
+    resolveSecondSummary?.(summary)
+    await waitFor(() => expect(region).toHaveAttribute('aria-busy', 'false'))
+  })
+
+  it('marks the chart busy while a reload is in flight, without losing it', async () => {
+    let resolveSecondSeries: ((t: Timeseries) => void) | undefined
+    let seriesCalls = 0
+    showWith(
+      fakeClient({
+        summary: () => Promise.resolve(summary),
+        timeseries: () => {
+          seriesCalls += 1
+          if (seriesCalls === 1) return Promise.resolve(series)
+          return new Promise<Timeseries>((resolve) => {
+            resolveSecondSeries = resolve
+          })
+        },
+        breakdown: ((_w: unknown, d: string) => Promise.resolve(empty(d))) as never,
+      }),
+    )
+    await screen.findByText('1,200')
+    const region = screen.getByRole('img').closest('[aria-busy]') as HTMLElement
+    expect(region).toHaveAttribute('aria-busy', 'false')
+    await userEvent.setup().selectOptions(screen.getByLabelText('Time range'), '30d')
+    expect(region).toHaveAttribute('aria-busy', 'true')
+    expect(screen.getByRole('img')).toBeInTheDocument()
+    resolveSecondSeries?.(series)
+    await waitFor(() => expect(region).toHaveAttribute('aria-busy', 'false'))
   })
 })

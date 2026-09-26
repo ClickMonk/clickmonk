@@ -326,7 +326,7 @@ describe('the link list', () => {
     expect(screen.queryByRole('link', { name: 'go.example.test/spring' })).not.toBeInTheDocument()
   })
 
-  it('dims the list and marks it busy while a reload is in flight, rather than blanking it', async () => {
+  it('marks the list busy while a reload is in flight, without losing it', async () => {
     let resolveSecond: ((p: Page<Link>) => void) | undefined
     let calls = 0
     const client = fakeClient({
@@ -345,7 +345,6 @@ describe('the link list', () => {
     await user.click(screen.getByRole('button', { name: 'Search' }))
     const busy = row.closest('[aria-busy]')
     expect(busy).toHaveAttribute('aria-busy', 'true')
-    expect(busy).toHaveClass('opacity-50')
     resolveSecond?.({ items: [link('spring')], nextCursor: null })
     await waitFor(() => expect(row.closest('[aria-busy]')).toHaveAttribute('aria-busy', 'false'))
   })

@@ -61,8 +61,8 @@ export function Report({ link, panels }: { link?: string; panels: Panel[] }) {
   // The same rule as a breakdown panel, for the two blocks below: an error
   // drops what it was showing (the old window's numbers beside its own
   // request's error read as still current), and a reload in flight keeps the
-  // old numbers up, marked busy and dimmed, rather than blanking on every
-  // window change or refresh.
+  // old numbers up, marked aria-busy at full contrast, rather than blanking
+  // on every window change or refresh.
   const summaryStale = summary.state === 'loading'
   const seriesStale = series.state === 'loading'
 
@@ -70,10 +70,7 @@ export function Report({ link, panels }: { link?: string; panels: Panel[] }) {
     <div className="grid gap-6">
       {summary.error && <ErrorNote error={summary.error} />}
       {summary.data && summary.state !== 'error' && (
-        <div
-          aria-busy={summaryStale}
-          className={summaryStale ? 'grid gap-6 opacity-50' : 'grid gap-6'}
-        >
+        <div aria-busy={summaryStale} className="grid gap-6">
           <CountedWindow counted={summary.data.window} />
           <SummaryCards s={summary.data} />
         </div>
@@ -115,10 +112,7 @@ export function Report({ link, panels }: { link?: string; panels: Panel[] }) {
         <CardContent className="grid gap-2">
           {series.error && <ErrorNote error={series.error} />}
           {series.data && series.state !== 'error' && (
-            <div
-              aria-busy={seriesStale}
-              className={seriesStale ? 'grid gap-2 opacity-50' : 'grid gap-2'}
-            >
+            <div aria-busy={seriesStale} className="grid gap-2">
               <Columns
                 buckets={buckets}
                 unit={metric}
