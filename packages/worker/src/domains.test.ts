@@ -432,6 +432,34 @@ describe('recordDomainCheck', () => {
     expect(row?.passed_at?.toISOString()).toBe(passedAt.toISOString())
   })
 
+  // The test above restamps from null, so `COALESCE`'s argument order cannot
+  // tell "take this check's stamp" from "take the row's own" apart — either
+  // order picks the one non-null value. Only a *second* pass, after an
+  // earlier one, has both sides non-null and different, and only then does
+  // getting the order backwards show up: it would leave passed_at stuck at
+  // the first pass forever, contradicting "when a check last passed".
+  it('restamps passed_at to a later pass, not the first one', async () => {
+    const d = await addDomain('go.example.test')
+    const t1 = new Date('2026-09-20T00:00:00.000Z')
+    await recordDomainCheck(
+      pool,
+      { id: d.id, verified: false },
+      { status: 'verified', detail: 'ok' },
+      t1,
+    )
+    expect((await checkOf(d.id))?.passed_at?.toISOString()).toBe(t1.toISOString())
+    const t2 = new Date('2026-09-25T00:00:00.000Z')
+    await recordDomainCheck(
+      pool,
+      { id: d.id, verified: true },
+      { status: 'verified', detail: 'still ok' },
+      t2,
+    )
+    const row = await checkOf(d.id)
+    expect(row?.status).toBe('verified')
+    expect(row?.passed_at?.toISOString()).toBe(t2.toISOString())
+  })
+
   it('replaces an existing check row rather than duplicating it', async () => {
     const d = await addDomain('go.example.test')
     await recordDomainCheck(
