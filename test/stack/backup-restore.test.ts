@@ -1,6 +1,14 @@
-import { execFileSync, spawnSync } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { join } from 'node:path'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import {
@@ -301,6 +309,9 @@ afterAll(() => {
   }
 }, 300_000)
 
+/** The lock backup.sh and restore.sh share, in the checkout. */
+const LOCK = join(ROOT, '.backup-restore.lock')
+
 /** A long step's budget: a script run, or a wait on the stack, inside one test. */
 const LONG = 300_000
 
@@ -416,6 +427,123 @@ describe('backup.sh', () => {
     expect(backupsDisk()).toBe('')
   })
 
+  // An archive a killed run's BACKUP finished after that run's trap had gone:
+  // nothing else would ever remove it, and it is a whole backup's size.
+  it(
+    'removes an archive an earlier run left on the ClickHouse backups disk',
+    () => {
+      compose(
+        'exec',
+        '-T',
+        'clickhouse',
+        'touch',
+        '/var/lib/clickhouse/backups/clickmonk-2000-01-01T000000Z-1.zip',
+      )
+      expect(backupsDisk()).toBe('clickmonk-2000-01-01T000000Z-1.zip')
+      const r = runScript('backup.sh', [join(BACKUPS, 'orphan')])
+      expect(r.status, r.out).toBe(0)
+      onlyBackupIn(join(BACKUPS, 'orphan'))
+      expect(backupsDisk()).toBe('')
+    },
+    LONG,
+  )
+
+  // Rows that share a sort key and have not been merged yet: the shipper's
+  // normal case when a segment is shipped twice. A plain count() includes them,
+  // and a restore that merged them would then disagree with the manifest.
+  it(
+    'records the counts ClickHouse gives with FINAL, not the unmerged rows',
+    () => {
+      const tables = ['clicks', 'clicks_hourly', 'clicks_hourly_dim']
+      for (const t of tables) ch(`SYSTEM STOP MERGES ${t}`)
+      try {
+        ch('INSERT INTO clicks SELECT * FROM clicks LIMIT 1')
+        expect(ch('SELECT count() FROM clicks')).toBe('3')
+        expect(ch('SELECT count() FROM clicks FINAL')).toBe('2')
+        const r = runScript('backup.sh', [join(BACKUPS, 'unmerged')])
+        expect(r.status, r.out).toBe(0)
+        const m = manifest(onlyBackupIn(join(BACKUPS, 'unmerged')))
+        expect(m['rows.clickhouse.clicks']).toBe('2')
+        for (const t of tables) {
+          expect(m[`rows.clickhouse.${t}`], t).toBe(ch(`SELECT count() FROM ${t} FINAL`))
+        }
+      } finally {
+        for (const t of tables) ch(`SYSTEM START MERGES ${t}`)
+      }
+    },
+    LONG,
+  )
+
+  // An operator's wrapper reading destinations from a file: a docker call
+  // that inherited the loop's stdin would swallow the rest of the list.
+  it(
+    'reads nothing from its standard input, so a while-read loop runs it for every line',
+    () => {
+      const a = join(BACKUPS, 'loop-a')
+      const b = join(BACKUPS, 'loop-b')
+      const r = spawnSync(
+        'bash',
+        ['-c', 'while read -r d; do "$0" "$d" || exit 1; done', join(ROOT, 'backup.sh')],
+        {
+          cwd: ROOT,
+          env: SCRIPT_ENV,
+          input: `${a}\n${b}\n`,
+          encoding: 'utf8',
+          stdio: 'pipe',
+          timeout: 600_000,
+        },
+      )
+      expect(r.status, `${r.stdout}${r.stderr}`).toBe(0)
+      onlyBackupIn(a)
+      onlyBackupIn(b)
+    },
+    LONG,
+  )
+
+  // A reader that goes away: `./backup.sh dest | head -1` in a cron line.
+  it(
+    'finishes the backup when whatever reads its output stops reading',
+    () => {
+      const dest = join(BACKUPS, 'head')
+      const r = spawnSync(
+        'bash',
+        ['-c', '"$0" "$1" | head -1; exit ${PIPESTATUS[0]}', join(ROOT, 'backup.sh'), dest],
+        {
+          cwd: ROOT,
+          env: SCRIPT_ENV,
+          encoding: 'utf8',
+          stdio: 'pipe',
+          timeout: 600_000,
+        },
+      )
+      expect(r.status, `${r.stdout}${r.stderr}`).toBe(0)
+      expect(readdirSync(onlyBackupIn(dest))).toContain('MANIFEST')
+      expect(running()).toEqual(ALL_SERVICES)
+    },
+    LONG,
+  )
+
+  it(
+    'asks the worker for the release when the redirect is stopped',
+    () => {
+      compose('stop', 'redirect')
+      try {
+        const r = runScript('backup.sh', [join(BACKUPS, 'redirect-stopped')])
+        expect(r.status, r.out).toBe(0)
+        expect(r.out).not.toContain('predates')
+        const m = manifest(onlyBackupIn(join(BACKUPS, 'redirect-stopped')))
+        const printed = /^clickmonk (\d+\.\d+\.\d+) \(schema version \d+\)$/.exec(
+          cli('version').trim(),
+        )
+        expect(printed).not.toBeNull()
+        expect(m.clickmonk_version).toBe(printed?.[1])
+      } finally {
+        compose('start', 'redirect')
+      }
+    },
+    LONG,
+  )
+
   it(
     'leaves a worker it did not stop stopped, and still takes the backup',
     () => {
@@ -504,6 +632,55 @@ describe('backup.sh', () => {
       expect(backupsDisk()).toBe('')
       expect(running()).toEqual(ALL_SERVICES)
       expect(startedAt('worker')).not.toBe(workerBefore)
+    },
+    LONG,
+  )
+
+  // An operator who sends TERM, sees the prompt wait while the trap starts the
+  // worker, and sends it again. The stub sends both: the first during the
+  // BACKUP, the second as the trap's `docker compose start` begins.
+  it(
+    'starts the worker again when a second TERM arrives while it is being started',
+    () => {
+      const stub = stubDocker(
+        [
+          '    *"BACKUP DATABASE"*) kill -TERM $PPID; sleep 1; exit 1 ;;',
+          '    start) kill -TERM $PPID ;;',
+        ].join('\n'),
+      )
+      const dest = join(BACKUPS, 'twice')
+      let r: ScriptResult
+      try {
+        r = runScript('backup.sh', [dest], { env: { PATH: stub.path } })
+      } finally {
+        stub.remove()
+      }
+      expect(r.status, r.out).not.toBe(0)
+      expect(running()).toEqual(ALL_SERVICES)
+      expect(readdirSync(dest)).toEqual([])
+      expect(backupsDisk()).toBe('')
+      expect(existsSync(LOCK)).toBe(false)
+    },
+    LONG,
+  )
+
+  // A dump that fails half way still wrote something, and without pipefail
+  // the pipe's status is the write's: a truncated dump with a valid checksum.
+  it(
+    'fails, and keeps nothing, when pg_dump fails after writing part of the dump',
+    () => {
+      const stub = stubDocker('    *pg_dump*) printf PGDMP-partial; exit 1 ;;')
+      const dest = join(BACKUPS, 'partial-dump')
+      let r: ScriptResult
+      try {
+        r = runScript('backup.sh', [dest], { env: { PATH: stub.path } })
+      } finally {
+        stub.remove()
+      }
+      expect(r.status, r.out).toBe(1)
+      expect(r.out).toContain('the backup failed during the Postgres step')
+      expect(readdirSync(dest)).toEqual([])
+      expect(running()).toEqual(ALL_SERVICES)
     },
     LONG,
   )
@@ -608,6 +785,103 @@ describe('backup.sh', () => {
       expect(r.status, r.out).toBe(1)
       expect(r.out).toContain('COMPOSE_ENV_FILES names more than one file')
       expect(startedAt('worker')).toBe(workerBefore)
+    },
+    LONG,
+  )
+
+  // Compose itself fails on an env file it cannot find, so a check of the
+  // services first would blame a store that is running.
+  it(
+    'names a missing env file, rather than a store, before stopping anything',
+    () => {
+      const missing = join(TMP, 'no-such.env')
+      const workerBefore = startedAt('worker')
+      const r = runScript('backup.sh', [join(BACKUPS, 'no-env')], {
+        env: { COMPOSE_ENV_FILES: missing },
+      })
+      expect(r.status, r.out).toBe(1)
+      expect(r.out).toContain(`Cannot read ${missing}`)
+      expect(r.out).not.toContain('service is not running')
+      expect(startedAt('worker')).toBe(workerBefore)
+    },
+    LONG,
+  )
+
+  // Two runs at once: the second would take the worker the first stopped for
+  // one it may leave alone, and copy while the first starts it again.
+  it(
+    'refuses while another run holds the lock, and leaves that run to finish',
+    async () => {
+      const reached = join(TMP, 'lock-reached')
+      const release = join(TMP, 'lock-release')
+      rmSync(reached, { force: true })
+      rmSync(release, { force: true })
+      const stub = stubDocker(
+        `    *"BACKUP DATABASE"*) touch ${reached}; while [ ! -e ${release} ]; do sleep 0.2; done ;;`,
+      )
+      const first = join(BACKUPS, 'holder')
+      let out = ''
+      const holder = spawn(join(ROOT, 'backup.sh'), [first], {
+        cwd: ROOT,
+        env: { ...SCRIPT_ENV, PATH: stub.path },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      holder.stdout.on('data', (d: Buffer) => {
+        out += d.toString()
+      })
+      holder.stderr.on('data', (d: Buffer) => {
+        out += d.toString()
+      })
+      const done = new Promise<number>((resolve) =>
+        holder.on('close', (code) => resolve(code ?? -1)),
+      )
+      try {
+        await until('the first run to reach its BACKUP', 120_000, () => existsSync(reached))
+        const holderPid = readFileSync(join(LOCK, 'pid'), 'utf8').trim()
+        expect(holderPid).toBe(String(holder.pid))
+
+        const r = runScript('backup.sh', [join(BACKUPS, 'second')])
+        expect(r.status, r.out).toBe(1)
+        expect(r.out).toContain(`Another backup or restore holds ${LOCK} (pid ${holderPid})`)
+        expect(r.out).toContain('the backup failed during the validation step')
+        expect(readdirSync(BACKUPS)).not.toContain('second')
+        // The first run's lock, and its stopped worker, are as it left them.
+        expect(readFileSync(join(LOCK, 'pid'), 'utf8').trim()).toBe(holderPid)
+        expect(running()).not.toContain('worker')
+      } finally {
+        writeFileSync(release, '')
+      }
+      const status = await done
+      stub.remove()
+      rmSync(reached, { force: true })
+      rmSync(release, { force: true })
+      expect(status, out).toBe(0)
+      onlyBackupIn(first)
+      expect(existsSync(LOCK)).toBe(false)
+      expect(running()).toEqual(ALL_SERVICES)
+    },
+    LONG,
+  )
+
+  // A run killed with SIGKILL leaves its lock. It is never taken over: two
+  // runs that both judged it stale would both hold it.
+  it(
+    'refuses a lock left by a run that was killed, and says how to remove it',
+    () => {
+      mkdirSync(LOCK)
+      writeFileSync(join(LOCK, 'pid'), '4242\n')
+      const workerBefore = startedAt('worker')
+      try {
+        const r = runScript('backup.sh', [join(BACKUPS, 'stale-lock')])
+        expect(r.status, r.out).toBe(1)
+        expect(r.out).toContain(`Another backup or restore holds ${LOCK} (pid 4242)`)
+        expect(r.out).toContain(`rm -rf ${LOCK}`)
+        expect(readFileSync(join(LOCK, 'pid'), 'utf8')).toBe('4242\n')
+        expect(readdirSync(BACKUPS)).not.toContain('stale-lock')
+        expect(startedAt('worker')).toBe(workerBefore)
+      } finally {
+        rmSync(LOCK, { recursive: true, force: true })
+      }
     },
     LONG,
   )
