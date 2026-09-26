@@ -118,13 +118,19 @@ remove_incomplete_output() {
   return 0
 }
 
-# THE RESTART COMES FIRST. Nothing above it in this function can end the trap
-# early, and each tidy-up after it cannot fail: a trap that died before the
-# restart would leave the reports frozen with nothing saying why.
+# THE RESTART COMES FIRST, once the signals that could end the trap are
+# masked: an operator who presses Ctrl-C again while the worker is being
+# started would otherwise kill the trap before the restart, leaving the
+# reports frozen with nothing saying why. Children inherit the mask, so the
+# restart cannot be interrupted either; the trap ends in about ten seconds at
+# most. Each tidy-up after the restart cannot fail, and the lock goes last, so
+# no other run starts until this one is done with the stores.
 cleanup() {
+  trap '' INT TERM HUP
   local restart_ok=1
   start_worker_if_we_stopped_it || restart_ok=0
-  remove_in_container_artefact || true
+  remove_in_container_artefact ||
+    note "WARNING: could not delete $CH_BACKUP_DIR/$CH_FILE inside the clickhouse container; delete it by hand."
   remove_incomplete_output || true
   if [ "$restart_ok" = 0 ]; then
     note ""
@@ -132,10 +138,21 @@ cleanup() {
     note "  Run: docker compose start worker"
     note "Links are still answering and their clicks are waiting in the spool,"
     note "but nothing reaches the reports until the worker is running."
+    release_lock || true
     exit 1
   fi
+  release_lock || note "Could not remove $LOCK_DIR; delete it by hand before the next backup or restore."
 }
 trap cleanup EXIT
+
+# One backup or restore at a time against this install: a second run would
+# see the worker the first one stopped as already stopped, and copy while the
+# first starts it again.
+acquire_lock ||
+  fail "validation" \
+    "Another backup or restore holds $LOCK_DIR (pid $(lock_pid))." \
+    "If none is running, one was killed before it could clean up. Remove the lock," \
+    "then run this again: rm -rf $LOCK_DIR"
 
 # --- Every check first, before anything is stopped ---------------------
 
@@ -169,14 +186,25 @@ have_sha256 ||
 # comes from the ledger below. An image from before `clickmonk version` existed
 # prints its usage instead -- every install upgrading to the first release
 # runs one -- and its backup must still be taken, before the upgrade.
+# Asked of the redirect, or of the worker when the redirect is down, before
+# the worker is stopped: either runs the image that wrote the data.
 VERSION_LINE=''
-if service_running redirect; then
-  VERSION_LINE="$(version_via_exec redirect 2>/dev/null)" || VERSION_LINE=''
-fi
+VERSION_ASKED=0
+for service in redirect worker; do
+  if service_running "$service"; then
+    VERSION_ASKED=1
+    VERSION_LINE="$(version_via_exec "$service" 2>/dev/null)" || VERSION_LINE=''
+    break
+  fi
+done
 RELEASE="$(printf '%s\n' "$VERSION_LINE" | release_of)"
 if [ -z "$RELEASE" ]; then
   RELEASE=unknown
-  note "The running image predates 'clickmonk version'; the manifest records the release as unknown."
+  if [ "$VERSION_ASKED" = 1 ]; then
+    note "The running image predates 'clickmonk version'; the manifest records the release as unknown."
+  else
+    note "Neither the redirect nor the worker is running; the manifest records the release as unknown."
+  fi
 fi
 
 SCHEMA="$(ledger_version)" || SCHEMA=''
@@ -185,6 +213,9 @@ case "$SCHEMA" in
     fail "validation" "Could not read the schema version from Postgres: '${SCHEMA:-nothing}'."
     ;;
 esac
+
+remove_orphan_archives ||
+  note "WARNING: could not clear old archives from $CH_BACKUP_DIR inside the clickhouse container."
 
 # ClickHouse writes its archive onto the disk its data is on, and keeps taking
 # inserts beside it once the worker is back. A disk that fills stops inserts
@@ -254,9 +285,9 @@ say "Backing up ClickHouse..."
 # it ends. Removing a name that never appeared is harmless.
 CH_ARTEFACT_CREATED=1
 ch_query "BACKUP DATABASE $CH_DATABASE TO Disk('backups', '$CH_FILE')" >/dev/null ||
-  fail "ClickHouse" "BACKUP DATABASE failed; the ClickHouse error is above."
+  fail "ClickHouse" "BACKUP DATABASE failed or was interrupted; any error is above."
 CH_COUNTS="$(ch_counts)" ||
-  fail "ClickHouse" "Could not count the rows the manifest records."
+  fail "ClickHouse" "Counting the rows the manifest records failed or was interrupted; any error is above."
 
 # The spool and ClickHouse are copied: the worker may ship again. A failure
 # here is retried by the trap, which also makes the run fail if it cannot.
@@ -275,7 +306,7 @@ docker compose exec -T postgres sh -c \
   'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -U "$0" -d "$1" -Fc' \
   "$PG_USER" "$PG_DATABASE" </dev/null |
   artefact_write "$OUT/postgres.dump" ||
-  fail "Postgres" "pg_dump failed; its error is above."
+  fail "Postgres" "pg_dump, or writing postgres.dump, failed; the error is above."
 
 say "Copying Caddy's certificates..."
 read_dir_of caddy "$CADDY_DATA_DIR" | artefact_write "$OUT/caddy-data.tar" ||

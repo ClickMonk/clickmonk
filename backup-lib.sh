@@ -216,3 +216,47 @@ remove_in_container_artefact() {
     </dev/null >/dev/null 2>&1 || return 1
   CH_ARTEFACT_CREATED=0
 }
+
+# remove_orphan_archives -- deletes every archive either script leaves on the
+# backups disk (clickmonk-*.zip) and their lock files. Called only while the
+# lock below is held, so no run of either script is using one. A client that
+# was killed can still reach the server after its trap's rm, and that BACKUP
+# then finishes and leaves a whole archive; the next run removes it here. An
+# orphan still being written fails once its lock file is gone, and ClickHouse
+# removes what it had written.
+remove_orphan_archives() {
+  docker compose exec -T clickhouse sh -c 'rm -f "$0"/clickmonk-*.zip "$0"/clickmonk-*.zip.lock' \
+    "$CH_BACKUP_DIR" </dev/null >/dev/null 2>&1
+}
+
+# The one lock backup.sh and restore.sh share: a directory beside this file,
+# so every run against this install takes the same one whatever its
+# destination. mkdir, because it is atomic everywhere and macOS has no flock.
+LOCK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.backup-restore.lock"
+LOCK_HELD=0
+
+# acquire_lock -- creates LOCK_DIR and writes this shell's pid into it, or
+# returns 1 and leaves an existing lock exactly as it is. A lock is never
+# removed for being stale: two runs that both judged it stale would both go
+# on to hold it. The caller refuses, naming LOCK_DIR and lock_pid.
+acquire_lock() {
+  mkdir "$LOCK_DIR" 2>/dev/null || return 1
+  LOCK_HELD=1
+  echo "$$" | artefact_write "$LOCK_DIR/pid" || true
+}
+
+# lock_pid -- the pid recorded in the lock, or `unknown`.
+lock_pid() {
+  local pid
+  pid="$(cat "$LOCK_DIR/pid" 2>/dev/null)" || pid=''
+  printf '%s' "${pid:-unknown}"
+}
+
+# release_lock -- removes the lock only if this run took it. The last thing
+# either script's EXIT trap does, so another run can start only once this
+# one has finished with the stores.
+release_lock() {
+  [ "$LOCK_HELD" = 1 ] || return 0
+  rm -rf "$LOCK_DIR" 2>/dev/null || return 1
+  LOCK_HELD=0
+}
