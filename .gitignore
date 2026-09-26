@@ -54,3 +54,5 @@ packages/ui/dist-ts/
 
 # The lock backup.sh and restore.sh hold while they run.
 .backup-restore.lock/
+# The mark restore.sh leaves while the stores may be half restored.
+.restore-incomplete

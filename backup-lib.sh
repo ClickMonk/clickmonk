@@ -235,6 +235,12 @@ remove_orphan_archives() {
 LOCK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.backup-restore.lock"
 LOCK_HELD=0
 
+# RESTORE_MARKER -- a file beside the lock that restore.sh writes, holding the
+# backup it is restoring, before it changes any store, and removes once every
+# store is restored. While it exists the stores may be half restored:
+# backup.sh refuses, and restore.sh, run again, finishes the job.
+RESTORE_MARKER="$(dirname "$LOCK_DIR")/.restore-incomplete"
+
 # acquire_lock -- creates LOCK_DIR and writes this shell's pid into it, or
 # returns 1 and leaves an existing lock exactly as it is. A lock is never
 # removed for being stale: two runs that both judged it stale would both go

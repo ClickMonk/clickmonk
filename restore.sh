@@ -86,6 +86,9 @@ VERIFY_FAILED=0
 # server carries on with it after the client is gone, so an interrupted run
 # says so only when it was interrupted there.
 CH_RESTORE_SENT=0
+# Set by refuse and abort, which say why the run ended; any other early end
+# gets one line from cleanup.
+EXPLAINED=0
 # What has happened to the data, in words, for the message an interrupted run
 # prints. Assigned BEFORE each destructive command, never after: a signal
 # lands while a command runs and bash acts on it before the next statement, so
@@ -96,6 +99,7 @@ DATA_STATE="nothing has been changed"
 # anything is stopped, so what it says at the end is true.
 refuse() {
   local line
+  EXPLAINED=1
   note ""
   note "Refused: $1"
   shift
@@ -111,6 +115,7 @@ refuse() {
 # says what state that left the data in.
 abort() {
   local step="$1" line
+  EXPLAINED=1
   shift
   note ""
   note "ERROR: the restore failed during the ${step} step."
@@ -142,6 +147,7 @@ cleanup() {
     note "are listed above. Caddy, the redirect, the admin service and the worker have"
     note "been left stopped. Restore a different backup, or start on what was restored:"
     note "  docker compose up -d"
+    note "and then remove $RESTORE_MARKER, which makes backup.sh refuse until you do."
     status=1
   elif [ "$DESTRUCTION_BEGUN" = 1 ] && [ "$STORES_RESTORED" = 0 ]; then
     note ""
@@ -150,6 +156,7 @@ cleanup() {
     note "stopped, so nothing serves your links. Run the restore again with the same"
     note "backup; it starts from the beginning:"
     note "  $SCRIPT_DIR/restore.sh $SRC"
+    note "Until it has finished, backup.sh refuses to run."
     if [ "$CH_RESTORE_SENT" = 1 ]; then
       note "ClickHouse may still be finishing the restore this run started. Until it"
       note "has, running this again is refused and changes nothing; wait a minute and"
@@ -159,6 +166,11 @@ cleanup() {
   elif [ "$start_failed" = 1 ]; then
     note "Could not start them. Run: docker compose start$RUNNING_BEFORE"
     status=1
+  elif [ "$APPS_STOPPED" = 0 ] && [ "$EXPLAINED" = 0 ]; then
+    # Ended before anything was stopped, and not by a refusal: a signal, most
+    # likely Ctrl-C at the prompt. Say so, or the prompt is the last word.
+    note ""
+    note "Stopped before anything was changed."
   fi
   release_lock || note "Could not remove $LOCK_DIR; delete it by hand before the next backup or restore."
   exit "$status"
@@ -239,7 +251,7 @@ done
 # restore, clickmonk may not. A BACKUP or RESTORE outlives the client that
 # started it -- a restore killed part way, whose lock is gone -- and this
 # restore's DROP would pull the database out from under it.
-IN_PROGRESS="$(ch_query "SELECT concat(status, ' ', name) FROM system.backups WHERE status IN ('CREATING_BACKUP', 'RESTORING') LIMIT 1" default)" ||
+IN_PROGRESS="$(ch_query "SELECT concat(status, ' ', name) FROM system.backups WHERE status IN ('CREATING_BACKUP', 'RESTORING') LIMIT 1 FORMAT TSVRaw" default)" ||
   refuse "Could not ask ClickHouse whether a backup or restore is still running."
 [ -z "$IN_PROGRESS" ] ||
   refuse "ClickHouse is still running an earlier backup or restore: $IN_PROGRESS." \
@@ -253,6 +265,24 @@ BACKUPS_DISK="$(ch_query "SELECT name FROM system.disks WHERE name = 'backups'" 
   refuse "ClickHouse has no disk named 'backups': it was started before this checkout's" \
     "clickhouse/backup-disk.xml existed. Recreate it with the new configuration" \
     "(links keep answering): docker compose up -d clickhouse"
+
+# The archive is copied onto that disk, and after the DROP the RESTORE writes
+# the restored database beside it: about four thirds of the archive's size,
+# measured. The DROP frees what ClickHouse holds now. A disk that fills there
+# leaves ClickHouse partial with the stack stopped, so it is refused here.
+ZIP_BYTES="$(wc -c <"$SRC/clickhouse.zip" | tr -d ' ')" || ZIP_BYTES=''
+CH_FREE="$(ch_query "SELECT free_space FROM system.disks WHERE name = 'backups'" default)" || CH_FREE=''
+CH_BYTES="$(ch_query "SELECT sum(bytes_on_disk) FROM system.parts WHERE active AND database = '$CH_DATABASE'" default)" || CH_BYTES=''
+case "$ZIP_BYTES$CH_FREE$CH_BYTES" in
+  '' | *[!0-9]*)
+    refuse "Could not read the archive's size and ClickHouse's size and free space: '${ZIP_BYTES:-nothing}', '${CH_BYTES:-nothing}', '${CH_FREE:-nothing}'."
+    ;;
+esac
+CH_NEED=$((ZIP_BYTES * 5 / 2))
+[ $((CH_FREE + CH_BYTES)) -ge "$CH_NEED" ] ||
+  refuse "The ClickHouse volume has $((CH_FREE / 1048576)) MiB free, and $((CH_BYTES / 1048576)) MiB more once its database is dropped; this restore needs about $((CH_NEED / 1048576)) MiB." \
+    "The archive is copied beside ClickHouse's data and the database is restored from it there." \
+    "Free space on the disk Docker keeps its volumes on, then run this again."
 
 say "Checking the backup against this checkout's image..."
 # The image `docker compose up` would start now, which is the one this script
@@ -352,6 +382,12 @@ docker compose exec -T clickhouse sh -c \
   "$CH_BACKUP_DIR" "$CH_FILE" <"$SRC/clickhouse.zip" ||
   abort "ClickHouse" "Could not copy the archive into the clickhouse container. Nothing has been changed yet."
 
+# Before the first change to any store: until every store is restored, the
+# marker makes backup.sh refuse rather than copy a mix of two moments.
+if ! printf '%s\n' "$SRC" | artefact_write "$RESTORE_MARKER"; then
+  rm -f "$RESTORE_MARKER" 2>/dev/null || true
+  abort "ClickHouse" "Could not write $RESTORE_MARKER. Nothing has been changed yet."
+fi
 DESTRUCTION_BEGUN=1
 DATA_STATE="ClickHouse was being dropped and may be gone; Postgres, the spool and the certificates are as they were"
 ch_query "DROP DATABASE IF EXISTS $CH_DATABASE SYNC" default >/dev/null ||
@@ -425,6 +461,8 @@ if [ "$verify_ok" != 1 ]; then
   abort "verification" "The restored stores do not match the manifest."
 fi
 STORES_RESTORED=1
+rm -f "$RESTORE_MARKER" ||
+  note "WARNING: could not remove $RESTORE_MARKER; delete it by hand, or backup.sh refuses to run."
 
 say "Starting the stack..."
 # `up`, not `start`: a container whose image is older than the tag is

@@ -156,6 +156,16 @@ acquire_lock ||
 
 # --- Every check first, before anything is stopped ---------------------
 
+# A restore that was interrupted leaves the stores from two moments. A backup
+# of that would be complete, checksummed and of a state that never existed.
+if [ -e "$RESTORE_MARKER" ]; then
+  RESTORING_FROM="$(cat "$RESTORE_MARKER" 2>/dev/null)" || RESTORING_FROM=''
+  fail "validation" \
+    "A restore of ${RESTORING_FROM:-an unknown backup} did not finish, so the stores may be half restored." \
+    "Finish it first: $SCRIPT_DIR/restore.sh ${RESTORING_FROM:-<backup-directory>}" \
+    "If the stack is running on what that restore left, on purpose, remove $RESTORE_MARKER."
+fi
+
 # The env file before the services: a missing file that COMPOSE_ENV_FILES
 # names makes every compose command fail, which would read as a stopped store.
 ENV_FILE="$(env_file_path)" ||
@@ -218,7 +228,7 @@ esac
 # started it: a backup or restore killed part way, whose lock is gone. Its
 # archive is what the sweep below would delete, and a RESTORE still running
 # means ClickHouse holds half a database. This run has started neither yet.
-IN_PROGRESS="$(ch_query "SELECT concat(status, ' ', name) FROM system.backups WHERE status IN ('CREATING_BACKUP', 'RESTORING') LIMIT 1")" ||
+IN_PROGRESS="$(ch_query "SELECT concat(status, ' ', name) FROM system.backups WHERE status IN ('CREATING_BACKUP', 'RESTORING') LIMIT 1 FORMAT TSVRaw")" ||
   fail "validation" "Could not ask ClickHouse whether a backup or restore is still running."
 [ -z "$IN_PROGRESS" ] ||
   fail "validation" \
