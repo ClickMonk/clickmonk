@@ -226,6 +226,27 @@ describe('adding a domain', () => {
     expect(minted.rows.filter((row) => uuidShaped(row.verification_token))).not.toHaveLength(21)
   })
 
+  // The interface reads `handVerified` rather than re-deriving it, so the
+  // shape this route answers with is the whole of the contract.
+  it('answers passedAt and handVerified, computed from verified and the last check', async () => {
+    const fresh = (await add()).json()
+    expect(fresh.passedAt).toBeNull()
+    // Unverified, so not hand-verified either — there is nothing to call
+    // "verified by hand" about a domain that answers 404.
+    expect(fresh.handVerified).toBe(false)
+
+    await pg.query(
+      `INSERT INTO domains (id, host, verified, verification_token) VALUES
+       ('00000000-0000-4000-8000-0000000000f1', 'byhand.example.test', true, '${'7'.repeat(32)}')`,
+    )
+    const list = await app.inject({ method: 'GET', url: '/api/domains', headers: read(cookie) })
+    const byHand = (
+      list.json().domains as { host: string; passedAt: unknown; handVerified: unknown }[]
+    ).find((d) => d.host === 'byhand.example.test')
+    expect(byHand?.passedAt).toBeNull()
+    expect(byHand?.handVerified).toBe(true)
+  })
+
   it('refuses a body that tries to mark it verified', async () => {
     expect((await add({ host: 'go.example.test', verified: true })).statusCode).toBe(400)
     expect((await pg.query('SELECT 1 FROM domains')).rowCount).toBe(0)
@@ -413,6 +434,14 @@ describe('checking the DNS on demand', () => {
     expect(check.rows[0]?.status).toBe('verified')
     expect(check.rows[0]?.checked_at.toISOString()).toBe(clock.now().toISOString())
     expect(resolver.cancelled).toBe(1)
+    // A check that just passed for the first time: passedAt follows, and the
+    // domain is no different from one verified by DNS all along.
+    const after = await app.inject({ method: 'GET', url: '/api/domains', headers: read(cookie) })
+    const domain = (
+      after.json().domains as { id: string; passedAt: string | null; handVerified: boolean }[]
+    ).find((d) => d.id === created.id)
+    expect(domain?.passedAt).toBe(clock.now().toISOString())
+    expect(domain?.handVerified).toBe(false)
   })
 
   it('leaves a domain unverified when the token is not there, and says why', async () => {
