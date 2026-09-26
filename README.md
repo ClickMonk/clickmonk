@@ -918,9 +918,12 @@ Each run writes one new directory, named for the moment it started, in UTC:
 
 **Your links keep answering while it runs.** The one container it stops is the worker, while
 it copies the spool and ClickHouse, and it starts the worker again on every path it can, a
-failed step included. It tries three times, so a second Ctrl-C that cuts one attempt short
-does not by itself leave the worker stopped; if all three fail it says so, and
-`docker compose start worker` is the fix. Meanwhile the redirect keeps sending visitors on
+failed step included. A Ctrl-C that arrives while the worker is still stopping does not leave
+it stopped: the script lets the stop finish, then starts it again. It tries the start three
+times, so a second Ctrl-C that cuts one attempt short does not by itself leave the worker
+stopped; if all three fail it says so and prints the command to run,
+`docker compose start worker` with any `COMPOSE_*` variables in effect in front of it.
+Meanwhile the redirect keeps sending visitors on
 and writing their clicks to the spool, and the worker ships them when it is back: the
 reports pause, and nothing is lost. A worker that was already stopped when you ran the
 script is left stopped.
@@ -948,7 +951,10 @@ snapshot of its own: a link created in between is in the backup, and a click on 
 spool was copied is not.
 
 **One backup or restore at a time.** The two scripts share a lock, the directory
-`.backup-restore.lock` in the checkout, and a run that finds it taken is refused. A run that
+`.backup-restore-<project>.lock` in the checkout, where `<project>` is the install's Compose
+project name (`clickmonk` unless you set `COMPOSE_PROJECT_NAME`), and a run that finds it
+taken is refused. Two installs run from one checkout under different project names have a
+lock each and do not block each other. A run that
 is killed outright leaves the lock behind, and every run after it is refused, with the
 command that removes it, until you remove it. Nothing removes a lock for being old: two runs
 that both judged it stale would both go ahead.
@@ -1017,7 +1023,8 @@ settings.
 **It restores more than data.** The admin account comes back as it was when the backup was
 taken: its password, its two-factor setting, the sessions signed in then, and its API keys.
 A key you revoked since, or a password you changed since, is back as it was. When a restore
-finishes, check the keys and change the password if either has moved on:
+finishes, check the keys and change the password if either has moved on. The script prints
+this command with any `COMPOSE_*` variables in effect:
 
 ```sh
 docker compose exec -T worker node packages/cli/dist/index.js apikey list
@@ -1054,17 +1061,20 @@ the first time someone asks for it, as any expired certificate is.
 **If a restore is interrupted part way,** it leaves Caddy, the redirect, the admin service
 and the worker stopped and says which stores are in which state. It does not start them,
 because a redirect running on a half-restored database serves whatever happens to be there
-and looks healthy doing it. Run it again with the same backup; it starts from the beginning.
-If it was interrupted while ClickHouse was restoring, ClickHouse finishes that restore even
-with the script gone, and running the script again is refused, changing nothing, until it
-has: wait a minute and try again. Until a restore has finished, `backup.sh` refuses to run;
-the file `.restore-incomplete` in the checkout is what tells it.
+and looks healthy doing it. If it is interrupted while a step is still writing — ClickHouse's
+restore, Postgres's, or the spool or Caddy's data — it waits for that step to finish before
+it exits, and then says what state it left. Run it again with the same backup; it starts
+from the beginning, and the command it prints for that carries any `COMPOSE_*` variables
+in effect. A restore killed outright waits for nothing: ClickHouse finishes a restore it has
+started even with the script gone, and running the script again is refused, changing
+nothing, until it has. Until a restore has finished, `backup.sh` refuses to run; the file
+`.restore-incomplete-<project>` in the checkout is what tells it.
 
 **If the restored stores do not match the manifest** — a schema version or a row count that
 differs from what the backup recorded — it lists the differences and leaves the same four
-services stopped and `.restore-incomplete` in place. Restore a different backup, or start on
-what was restored with `docker compose up -d` and then delete `.restore-incomplete`
-yourself.
+services stopped and `.restore-incomplete-<project>` in place. Restore a different backup,
+or start on what was restored with `docker compose up -d`, which the script prints with any
+`COMPOSE_*` variables in effect, and then delete `.restore-incomplete-<project>` yourself.
 
 **A restore needs room too.** It copies the ClickHouse archive into ClickHouse's volume and
 restores the database beside it there, so before anything is stopped it refuses unless that
