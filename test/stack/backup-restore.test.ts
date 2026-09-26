@@ -1899,6 +1899,8 @@ describe('a backup restored into an empty stack', () => {
   let oldCookie = ''
   let restoreOut = ''
   let imageVersion = 0
+  /** Postgres's clock just before every volume is destroyed. */
+  let downAt = ''
 
   beforeAll(async () => {
     base = reportedClicks({ cookie })
@@ -1958,6 +1960,7 @@ describe('a backup restored into an empty stack', () => {
     copyFileSync(join(TMP, 'issuing-root.pem'), OLD_ROOT)
     oldCookie = cookie
 
+    downAt = pg('SELECT now()')
     compose('down', '-v')
     writeAcmeRoot()
     publishZone()
@@ -2036,6 +2039,14 @@ describe('a backup restored into an empty stack', () => {
           String(UNDONE.length),
       )
       for (const sql of EXISTS) expect(pg(sql), sql).toBe('1')
+      // The rest of the ledger is the backup's, written before the old stack
+      // went down. The empty stack's worker wrote a whole ledger of its own
+      // after that, and a restore that left it in place would list them all.
+      expect(
+        pg(
+          `SELECT string_agg(version::text, ',' ORDER BY version) FROM schema_migrations WHERE applied_at > '${downAt}'`,
+        ),
+      ).toBe('9,10')
     },
     LONG,
   )
