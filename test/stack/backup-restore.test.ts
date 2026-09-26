@@ -739,6 +739,27 @@ describe('backup.sh', () => {
     LONG,
   )
 
+  // A size ClickHouse cannot give must not count as zero bytes needed.
+  it(
+    'refuses when ClickHouse cannot say how much its database holds, before stopping anything',
+    () => {
+      const stub = stubDocker('    *"FROM system.parts"*) exit 1 ;;')
+      const workerBefore = startedAt('worker')
+      let r: ScriptResult
+      try {
+        r = runScript('backup.sh', [join(BACKUPS, 'no-size')], { env: { PATH: stub.path } })
+      } finally {
+        stub.remove()
+      }
+      expect(r.status, r.out).toBe(1)
+      expect(r.out).toContain("Could not read ClickHouse's size and free space: 'nothing'")
+      expect(r.out).toContain('the backup failed during the validation step')
+      expect(readdirSync(BACKUPS)).not.toContain('no-size')
+      expect(startedAt('worker')).toBe(workerBefore)
+    },
+    LONG,
+  )
+
   // Every install from before the backups disk existed, until ClickHouse is
   // recreated: system.disks has no such row, and nothing else would say why.
   it(
