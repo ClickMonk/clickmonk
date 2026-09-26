@@ -190,8 +190,14 @@ describe('what the stack publishes', () => {
     expect(block).toMatch(
       /\n {6}- type: bind\n {8}source: [^\n]*\/clickhouse\/backup-disk\.xml\n {8}target: \/etc\/clickhouse-server\/config\.d\/backup-disk\.xml\n {8}read_only: true\n/,
     )
-    const xml = readFileSync(join(ROOT, 'clickhouse', 'backup-disk.xml'), 'utf8')
-    expect(xml).toMatch(/<allowed_disk>backups<\/allowed_disk>/)
+    // Comments stripped first: a commented-out <allowed_disk> line is still
+    // text in the file, and a free-text match on it would stay green while
+    // the real server refuses every BACKUP (Code 318).
+    const xml = readFileSync(join(ROOT, 'clickhouse', 'backup-disk.xml'), 'utf8').replace(
+      /<!--[\s\S]*?-->/g,
+      '',
+    )
+    expect(xml).toMatch(/<backups>\s*<allowed_disk>backups<\/allowed_disk>\s*<\/backups>/)
     expect(xml).toMatch(
       /<backups>\s*<type>local<\/type>\s*<path>\/var\/lib\/clickhouse\/backups\/<\/path>/,
     )
