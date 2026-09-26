@@ -401,6 +401,27 @@ describe('recordDomainCheck', () => {
     expect(row?.passed_at?.toISOString()).toBe(passedAt.toISOString())
   })
 
+  it('stamps passed_at on a later check that passes, updating an existing row rather than only an inserted one', async () => {
+    const d = await addDomain('go.example.test')
+    await recordDomainCheck(
+      pool,
+      { id: d.id, verified: false },
+      { status: 'missing_token', detail: 'no record yet' },
+      new Date('2026-09-20T00:00:00.000Z'),
+    )
+    expect((await checkOf(d.id))?.passed_at).toBeNull()
+    const passedAt = new Date('2026-09-21T00:00:00.000Z')
+    await recordDomainCheck(
+      pool,
+      { id: d.id, verified: false },
+      { status: 'verified', detail: 'ok' },
+      passedAt,
+    )
+    const row = await checkOf(d.id)
+    expect(row?.status).toBe('verified')
+    expect(row?.passed_at?.toISOString()).toBe(passedAt.toISOString())
+  })
+
   it('replaces an existing check row rather than duplicating it', async () => {
     const d = await addDomain('go.example.test')
     await recordDomainCheck(
