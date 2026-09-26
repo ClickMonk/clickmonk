@@ -531,6 +531,60 @@ describe('backup.sh', () => {
     LONG,
   )
 
+  // Every install from before the backups disk existed, until ClickHouse is
+  // recreated: system.disks has no such row, and nothing else would say why.
+  it(
+    'refuses a ClickHouse started without the backups disk, before stopping anything',
+    () => {
+      const stub = stubDocker('    *"FROM system.disks"*) exit 0 ;;')
+      const dest = join(BACKUPS, 'no-disk')
+      const workerBefore = startedAt('worker')
+      let r: ScriptResult
+      try {
+        r = runScript('backup.sh', [dest], { env: { PATH: stub.path } })
+      } finally {
+        stub.remove()
+      }
+      expect(r.status, r.out).toBe(1)
+      expect(r.out).toContain("ClickHouse has no disk named 'backups'")
+      expect(r.out).toContain('the backup failed during the validation step')
+      expect(readdirSync(BACKUPS)).not.toContain('no-disk')
+      expect(startedAt('worker')).toBe(workerBefore)
+    },
+    LONG,
+  )
+
+  // Two runs started in the same second name the same directory. The second
+  // must fail without touching it, since the first is still writing there.
+  it(
+    'refuses a backup directory that already exists, and leaves it as it was',
+    () => {
+      const bin = join(TMP, 'stub-date')
+      rmSync(bin, { recursive: true, force: true })
+      mkdirSync(bin)
+      writeFileSync(join(bin, 'date'), '#!/bin/sh\necho 2026-10-01T041500Z\n', { mode: 0o755 })
+      const theirs = join(BACKUPS, 'same-second', '2026-10-01T041500Z')
+      mkdirSync(theirs, { recursive: true })
+      writeFileSync(join(theirs, 'marker'), 'written by the other run\n')
+      const workerBefore = startedAt('worker')
+      let r: ScriptResult
+      try {
+        r = runScript('backup.sh', [join(BACKUPS, 'same-second')], {
+          env: { PATH: `${bin}:${process.env.PATH ?? ''}` },
+        })
+      } finally {
+        rmSync(bin, { recursive: true, force: true })
+      }
+      expect(r.status, r.out).toBe(1)
+      expect(r.out).toContain('Another backup started in the same second')
+      expect(r.out).toContain('the backup failed during the destination step')
+      expect(readdirSync(theirs)).toEqual(['marker'])
+      expect(readFileSync(join(theirs, 'marker'), 'utf8')).toBe('written by the other run\n')
+      expect(startedAt('worker')).toBe(workerBefore)
+    },
+    LONG,
+  )
+
   it(
     'refuses a destination it cannot create, before stopping anything',
     () => {
