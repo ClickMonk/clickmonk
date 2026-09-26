@@ -1068,6 +1068,72 @@ describe('backup.sh', () => {
     LONG,
   )
 
+  // The worker stopped, clicks written, and the worker started again: a spool
+  // copied after the start would find their segments shipped and deleted, and
+  // a ClickHouse backup taken before it would not have them either. The stub
+  // holds the stop open until the clicks are sealed, and holds the start until
+  // the worker has drained the spool, so that ordering is seen every time.
+  it(
+    'every click written before the worker stopped is in the backup: in ClickHouse or in spool.tar',
+    async () => {
+      const stopped = join(TMP, 'worker-stopped')
+      const go = join(TMP, 'worker-may-start')
+      rmSync(stopped, { force: true })
+      rmSync(go, { force: true })
+      const real = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim()
+      const stub = stubDocker(
+        [
+          '    stop)',
+          `      case " $* " in *" worker "*) ${real} "$@" || exit 1; touch ${stopped}`,
+          `        i=0; while [ ! -e ${go} ] && [ $i -lt 240 ]; do sleep 0.5; i=$((i + 1)); done; exit 0 ;; esac ;;`,
+          '    start)',
+          `      case " $* " in *" worker "*) ${real} "$@" || exit 1`,
+          '        i=0; while [ $i -lt 240 ]; do',
+          `          n=$(${real} compose exec -T redirect sh -c 'ls "$0" | grep -c "^seg-"' ${SPOOL} </dev/null)`,
+          `          [ "$n" = 0 ] && exit 0; sleep 0.5; i=$((i + 1)); done; exit 0 ;; esac ;;`,
+        ].join('\n'),
+      )
+      const dest = join(BACKUPS, 'ordering')
+      try {
+        const child = spawn(join(ROOT, 'backup.sh'), [dest], {
+          cwd: ROOT,
+          env: { ...SCRIPT_ENV, PATH: stub.path },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+        let out = ''
+        child.stdout.on('data', (d: Buffer) => {
+          out += d.toString()
+        })
+        child.stderr.on('data', (d: Buffer) => {
+          out += d.toString()
+        })
+        const exited = new Promise<number>((resolve) => child.on('close', (c) => resolve(c ?? -1)))
+        await until('the backup to stop the worker', 60_000, () => existsSync(stopped))
+        // With the worker stopped, nothing moves between the two.
+        const inStore = num(ch('SELECT count() FROM clicks FINAL'))
+        const waiting = spoolLines()
+        const before = inStore + waiting
+        click()
+        click()
+        await until('the two clicks sealed', 60_000, () => spoolLines() === waiting + 2)
+        writeFileSync(go, '')
+        const status = await exited
+        expect(status, out).toBe(0)
+        const dir = onlyBackupIn(dest)
+        const inSpool = execFileSync('tar', ['-xOf', join(dir, 'spool.tar')], { encoding: 'utf8' })
+          .split('\n')
+          .filter((l) => l !== '').length
+        expect(inSpool).toBeGreaterThanOrEqual(2)
+        expect(num(manifest(dir)['rows.clickhouse.clicks'] ?? '') + inSpool).toBe(before + 2)
+      } finally {
+        stub.remove()
+        rmSync(stopped, { force: true })
+        rmSync(go, { force: true })
+      }
+    },
+    LONG,
+  )
+
   it(
     'parses, and prints its usage, under bash 3.2',
     () => {
@@ -1980,6 +2046,10 @@ describe('a backup restored into an empty stack', () => {
     })
     expect(pg('SELECT count(*) FROM links')).toBe('0')
     expect(ch('SELECT count() FROM clicks')).toBe('0')
+    // What the empty stack holds that the backup does not: a restore replaces
+    // the spool and Caddy's data, it does not add to them.
+    compose('exec', '-T', 'redirect', 'sh', '-c', 'echo stale > "$0/stale.bad"', SPOOL)
+    compose('exec', '-T', 'caddy', 'sh', '-c', 'echo stale > /data/stale-before-restore')
 
     const restored = runScript('restore.sh', [dir], { input: `${manifest(dir).timestamp}\n` })
     restoreOut = restored.out
@@ -2008,8 +2078,10 @@ describe('a backup restored into an empty stack', () => {
     'serves the admin host the certificate it had, and asks the new authority for none',
     () => {
       const r = api('GET', '/api/me', { cookie: oldCookie, cacert: OLD_ROOT_IN_CLIENT })
-      expect(r.exit, r.stderr).toBe(0)
+      // The order first: a regression that orders and serves a new certificate
+      // then names both symptoms, not only the failed handshake.
       expect(orders()).toBe(0)
+      expect(r.exit, r.stderr).toBe(0)
     },
     LONG,
   )
@@ -2056,6 +2128,17 @@ describe('a backup restored into an empty stack', () => {
     () => {
       expect(running()).toEqual(ALL_SERVICES)
       expect(backupsDisk()).toBe('')
+    },
+    LONG,
+  )
+
+  it(
+    'empties the spool and Caddy’s data before putting the backup’s back',
+    () => {
+      expect(compose('exec', '-T', 'redirect', 'ls', '-A', SPOOL)).not.toContain('stale.bad')
+      expect(compose('exec', '-T', 'caddy', 'ls', '-A', '/data')).not.toContain(
+        'stale-before-restore',
+      )
     },
     LONG,
   )
