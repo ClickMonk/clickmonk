@@ -1,6 +1,6 @@
 # Contributing to ClickMonk
 
-Thanks for your interest. ClickMonk is early: the redirect and the click pipeline run, but most of the product is not built yet (see the status section of the [README](README.md)). The most useful contributions right now are use cases, problems you hit with the link tracking you run today, and feedback via [issues](../../issues).
+Thanks for your interest. ClickMonk is early: 0.1.0 is its first release, and the status section of the [README](README.md) says what it does and what it does not do yet. The most useful contributions right now are use cases, problems you hit with the link tracking you run today, and feedback via [issues](../../issues).
 
 **Found a security problem? Do not open an issue.** Use [private vulnerability reporting](../../security/advisories/new) (the "Report a vulnerability" button on the Security tab) or email `hello@clickmonk.co` with `security` in the subject. See [SECURITY.md](SECURITY.md) for what to include and what to expect. ClickMonk is self-hosted, so a public report is a set of instructions for attacking every install that has not upgraded yet.
 
@@ -43,7 +43,7 @@ hours from UTC and observes daylight saving — so time logic that is only right
 here. It runs as part of the root `pnpm test` too.
 
 The browser suite drives a real browser against the shipped stack over HTTPS, so it goes
-through the stack suites (see "The stack suites" above), not `pnpm --filter @clickmonk/ui
+through the stack suites (see "The stack suites" in `CLAUDE.md`), not `pnpm --filter @clickmonk/ui
 test`. Set `CLICKMONK_SHOTS=1` to have that run also write a screenshot of every screen, in
 both themes and at two widths, to `test/stack/tmp/e2e/shots/`.
 
