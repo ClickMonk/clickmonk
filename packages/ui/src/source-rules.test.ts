@@ -294,23 +294,34 @@ describe('the source', () => {
     // The same dimming can be reached without opacity: a conditional class
     // that reads for muted colour only while a loading/stale/busy flag is
     // set composites text under the same 3:1 risk the opacity check refuses.
-    // This is a narrower net than the opacity check — it only catches a
-    // muted-colour class and a loading-shaped identifier on the same
-    // line — so a legitimate, unconditional text-muted-foreground (a caption,
-    // a hint, a footer) never matches.
+    // Matched against each className={…} attribute's whole value rather than
+    // one line at a time, so a ternary Prettier has wrapped across several
+    // lines is still caught. `[^{}]*(?:\{[^{}]*\}[^{}]*)*` is a one-level
+    // brace matcher, not a parser — it is enough for a ternary or a
+    // template literal inside the attribute, which is every shape this
+    // codebase's conditional classNames take, but a second level of nested
+    // braces would close the match early. This is still a narrower net than
+    // the opacity check: a muted-colour class and a loading-shaped
+    // identifier must both appear in the same attribute, so a legitimate,
+    // unconditional text-muted-foreground (a caption, a hint, a footer)
+    // never matches.
     const screens = shipped.filter((p) => /[\\/]screens[\\/]/.test(p))
-    const found = screens.flatMap((p) =>
-      readFileSync(p, 'utf8')
-        .split('\n')
-        .flatMap((line, i) => {
-          const muted = /\btext-muted-foreground\b/.test(line)
-          const loadingShaped = /\b(stale|loading|busy)\b/i.test(line)
-          const conditional = /\?/.test(line)
-          return muted && loadingShaped && conditional
-            ? [`${relative(SRC, p)}:${i + 1}: ${line.trim()}`]
-            : []
-        }),
-    )
+    const classNameValue = /className=\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}/g
+    const found = screens.flatMap((p) => {
+      const text = readFileSync(p, 'utf8')
+      const out: string[] = []
+      for (const m of text.matchAll(classNameValue)) {
+        const value = m[1] ?? ''
+        const muted = /\btext-muted-foreground\b/.test(value)
+        const loadingShaped = /\b(stale|loading|busy)\b/i.test(value)
+        const conditional = /\?/.test(value)
+        if (muted && loadingShaped && conditional) {
+          const line = text.slice(0, m.index).split('\n').length
+          out.push(`${relative(SRC, p)}:${line}: ${value.trim().replace(/\s+/g, ' ')}`)
+        }
+      }
+      return out
+    })
     expect(
       found,
       'A muted colour swapped in while a load is stale/loading/busy dims it the same way opacity-50 did. Keep the busy region at full contrast; mark it aria-busy instead.',
