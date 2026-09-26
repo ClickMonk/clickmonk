@@ -225,20 +225,6 @@ describe('the settings screen', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('most likely the retention pass')
   })
 
-  // Settings does not reload in place (see the test below), so its aria-busy
-  // region only ever answers false once it has anything to show — there is
-  // no round trip left to observe going busy without a reload to trigger it.
-  it('is not busy once the settings have loaded', async () => {
-    const client = fakeClient({ settings: () => Promise.resolve(SETTINGS) })
-    render(
-      <ClientProvider client={client}>
-        <Settings />
-      </ClientProvider>,
-    )
-    const threshold = await screen.findByLabelText('Abuser threshold')
-    expect(threshold.closest('[aria-busy]')).toHaveAttribute('aria-busy', 'false')
-  })
-
   // Settings reads its own answer into local state once and edits it there;
   // it must not depend on the refresh round, or a Refresh press (or the
   // focus-return refresh after 60s away) would remount the form under an
