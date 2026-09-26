@@ -214,6 +214,17 @@ case "$SCHEMA" in
     ;;
 esac
 
+# A BACKUP or RESTORE the server is still running outlives the client that
+# started it: a backup or restore killed part way, whose lock is gone. Its
+# archive is what the sweep below would delete, and a RESTORE still running
+# means ClickHouse holds half a database. This run has started neither yet.
+IN_PROGRESS="$(ch_query "SELECT concat(status, ' ', name) FROM system.backups WHERE status IN ('CREATING_BACKUP', 'RESTORING') LIMIT 1")" ||
+  fail "validation" "Could not ask ClickHouse whether a backup or restore is still running."
+[ -z "$IN_PROGRESS" ] ||
+  fail "validation" \
+    "ClickHouse is still running an earlier backup or restore: $IN_PROGRESS." \
+    "Its client has gone, but the server finishes it. Wait for it to finish, then run this again."
+
 remove_orphan_archives ||
   note "WARNING: could not clear old archives from $CH_BACKUP_DIR inside the clickhouse container."
 
