@@ -1735,6 +1735,43 @@ describe('restore.sh refuses, after an interrupted restore or on a full disk', (
 })
 
 describe('restore.sh, stopped before it changes anything', () => {
+  // `docker compose start` can answer 0 and leave a container stopped: success
+  // is every service running afterwards, and failing that the run says so.
+  it(
+    'says so when the services are still stopped after it has started them',
+    () => {
+      const stub = stubDocker(
+        [
+          '    *"cat >"*) echo "simulated copy failure" >&2; exit 1 ;;',
+          '    start) exit 0 ;;',
+        ].join('\n'),
+      )
+      const runningBefore = running()
+      let r: ScriptResult
+      try {
+        r = runScript('restore.sh', [firstBackup], {
+          input: `${manifest(firstBackup).timestamp}\n`,
+          env: { PATH: stub.path },
+        })
+      } finally {
+        stub.remove()
+      }
+      try {
+        expect(r.status, r.out).toBe(1)
+        expect(r.out).toContain('Could not start them (attempt 2 of 3); trying again...')
+        expect(r.out).toContain(
+          'Could not start them. Run: docker compose start caddy redirect admin worker',
+        )
+        expect(existsSync(LOCK)).toBe(false)
+      } finally {
+        rmSync(LOCK, { recursive: true, force: true })
+        compose('start', 'caddy', 'redirect', 'admin', 'worker')
+      }
+      expect(running()).toEqual(runningBefore)
+    },
+    LONG,
+  )
+
   // docker compose handles INT and TERM itself, so one attempt at starting
   // the services can be cut short or fail; the next one must follow.
   it(
@@ -2249,6 +2286,24 @@ describe('a backup of an install from before the ClickHouse rollups', () => {
           pg(`SELECT count(*) FROM schema_migrations WHERE version = ${ROLLUP_VERSION}`) === '1',
       )
       expect(running()).toEqual(ALL_SERVICES)
+    },
+    LONG,
+  )
+})
+
+// Last, because it leaves ClickHouse without its raw table.
+describe('a ClickHouse without the raw clicks table', () => {
+  it(
+    'fails the backup rather than record a manifest that could not check a restore',
+    () => {
+      ch('DROP TABLE clicks SYNC')
+      const dest = join(BACKUPS, 'no-clicks')
+      const r = runScript('backup.sh', [dest])
+      expect(r.status, r.out).toBe(1)
+      expect(r.out).toContain('the backup failed during the ClickHouse step')
+      expect(r.out).toContain('Counting the rows the manifest records failed')
+      expect(readdirSync(dest)).toEqual([])
+      expect(existsSync(LOCK)).toBe(false)
     },
     LONG,
   )
