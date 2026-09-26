@@ -8,12 +8,15 @@ import {
   ADMIN_SCRYPT,
   LINK_SCRYPT,
   MAX_PASSWORD_LENGTH,
+  SCHEMA_VERSION,
   SCRYPT_PREFIX,
+  VERSION,
   hashPassword,
   hashToken,
   parseApiKey,
   verifyPassword,
 } from '@clickmonk/core'
+import type { Pool } from '@clickmonk/db'
 import { resetDatabases, testCh, testPg } from '@clickmonk/db/testing'
 import { type Fetcher, SOURCES, SOURCE_IDS } from '@clickmonk/ipdata'
 import type { DomainResolver } from '@clickmonk/worker/domains'
@@ -37,6 +40,42 @@ afterAll(async () => {
 })
 
 describe('clickmonk cli', () => {
+  // The backup scripts run this in a one-off container to learn which schema
+  // an image understands, before any database is known to be reachable, so
+  // it must answer without one: a Postgres pool that throws on any use, and a
+  // ClickHouse factory that throws if called, prove it never asked.
+  it('prints the release and the schema version, and touches no database', async () => {
+    const out: string[] = []
+    const untouchable = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error('version must not touch Postgres')
+        },
+      },
+    ) as unknown as Pool
+    const code = await runCli(['version'], {
+      pg: untouchable,
+      ch: () => {
+        throw new Error('version must not touch ClickHouse')
+      },
+      out: (s) => out.push(s),
+      ipdata: { dir: ipdataDir },
+    })
+    expect(code).toBe(0)
+    // The shape is what the scripts parse; the numbers are the constants the
+    // command exists to print, so reading them from core here is the claim
+    // itself rather than a comparison of a value with its own source.
+    expect(out).toEqual([`clickmonk ${VERSION} (schema version ${SCHEMA_VERSION})`])
+    expect(out[0]).toMatch(/^clickmonk \d+\.\d+\.\d+ \(schema version \d+\)$/)
+  })
+
+  it('takes no arguments after version', async () => {
+    lines.length = 0
+    expect(await run('version', 'now')).toBe(1)
+    expect(lines.join('\n')).toContain('clickmonk version')
+  })
+
   it('migrate is idempotent', async () => {
     expect(await run('migrate')).toBe(0)
     expect(await run('migrate')).toBe(0)

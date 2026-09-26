@@ -48,7 +48,7 @@ if [ "$START" = 1 ]; then
     exit 1
   fi
   if ! docker compose version >/dev/null 2>&1; then
-    echo "This Docker has no 'compose' command. Install Docker Compose v2." >&2
+    echo "This Docker has no 'compose' command. Install Docker Compose 2.23 or later." >&2
     exit 1
   fi
   # Fail before writing anything if the ports Caddy needs are taken. Skipped
@@ -160,8 +160,8 @@ Then add a link:
   docker compose exec -T worker node packages/cli/dist/index.js \
     link add links.example.com spring --target https://example.com/offer
 
-There is no web interface yet, but there is an admin API. Create its one account
-first -- nothing can authenticate until it exists. The password is piped in and
+The admin account comes next: the web interface and the admin API both sign in
+with it, and nothing can sign in until it exists. The password is piped in and
 never typed as an argument. Keep the -T: without it, Compose asks for a terminal
 inside the container and then refuses to attach the pipe to one, and the command
 never runs.
@@ -170,10 +170,12 @@ never runs.
     node packages/cli/dist/index.js admin create you@example.com
 
 Then set CLICKMONK_ADMIN_HOST in .env to a host name that is not one of your link
-domains, point that name at this server, and run "docker compose up -d". Until
-you do, the admin service answers 503 to everything but its own healthcheck, and
-the CLI is the only way in. The admin API needs a real name over HTTPS; unlike a
-link domain, there is no way to try it over plain HTTP on this host.
+domains, point that name at this server, and run "docker compose up -d". Visit
+https://that-name in a browser to sign in; the API answers on the same name.
+Until you set it, the admin service answers 503 to everything but its own
+healthcheck, and the CLI is the only way in. Both need a real name over HTTPS:
+there is no way to use them over plain HTTP on this host.
 
-README.md, under "The admin API", has the rest.
+Back the install up with ./backup.sh <directory>. README.md has the rest, under
+"The web interface", "The admin API" and "Backup and restore".
 NEXT

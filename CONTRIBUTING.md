@@ -21,7 +21,7 @@ Thanks for your interest. ClickMonk is early: the redirect and the click pipelin
 
 ## Development setup
 
-You need Node 22, Docker with Compose v2, and `corepack` (it ships with Node). Then:
+You need Node 22, Docker with Compose 2.23 or later, and `corepack` (it ships with Node). Then:
 
     corepack enable
     pnpm install

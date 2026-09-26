@@ -181,6 +181,28 @@ describe('what the stack publishes', () => {
     )
   })
 
+  // backup.sh runs `BACKUP DATABASE … TO Disk('backups', …)`, which ClickHouse
+  // refuses outright until a disk is allowed for it. The mount is what makes
+  // the backup work at all, so it is pinned here, where a two-second check
+  // finds it missing, rather than twenty minutes into the backup suite.
+  it('gives ClickHouse the disk backups are written to, read-only', () => {
+    const block = serviceBlock(cfg, 'clickhouse')
+    expect(block).toMatch(
+      /\n {6}- type: bind\n {8}source: [^\n]*\/clickhouse\/backup-disk\.xml\n {8}target: \/etc\/clickhouse-server\/config\.d\/backup-disk\.xml\n {8}read_only: true\n/,
+    )
+    // Comments stripped first: a commented-out <allowed_disk> line is still
+    // text in the file, and a free-text match on it would stay green while
+    // the real server refuses every BACKUP (Code 318).
+    const xml = readFileSync(join(ROOT, 'clickhouse', 'backup-disk.xml'), 'utf8').replace(
+      /<!--[\s\S]*?-->/g,
+      '',
+    )
+    expect(xml).toMatch(/<backups>\s*<allowed_disk>backups<\/allowed_disk>\s*<\/backups>/)
+    expect(xml).toMatch(
+      /<backups>\s*<type>local<\/type>\s*<path>\/var\/lib\/clickhouse\/backups\/<\/path>/,
+    )
+  })
+
   it('tells the redirect to believe a forwarded address only from the stack’s own network', () => {
     expect(cfg).toContain('CLICKMONK_TRUSTED_PROXIES: uniquelocal,loopback')
   })

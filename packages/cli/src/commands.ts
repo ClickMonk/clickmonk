@@ -19,7 +19,9 @@ import {
   MAX_PASSWORD_LENGTH,
   MIN_ADMIN_PASSWORD_LENGTH,
   NON_HUMAN_CLASSES,
+  SCHEMA_VERSION,
   type TrafficSettings,
+  VERSION,
   isDomainUrl,
   normaliseHost,
   parseLinkInput,
@@ -108,7 +110,8 @@ const USAGE = `usage:
   clickmonk admin totp disable        # the way back in when the authenticator is gone
   clickmonk apikey create <name> [--expires-days <n>]
   clickmonk apikey list
-  clickmonk apikey revoke <id>`
+  clickmonk apikey revoke <id>
+  clickmonk version                   # the release, and the schema version it understands`
 
 class Rejected extends Error {}
 
@@ -799,6 +802,12 @@ function ipdataStatus(d: CliDeps): void {
 export async function runCli(argv: string[], d: CliDeps): Promise<number> {
   const [cmd, sub, ...rest] = argv
   try {
+    // First, and before anything that could open a connection: the backup
+    // scripts ask an image this in a container with no database it can reach.
+    if (cmd === 'version' && sub === undefined) {
+      d.out(`clickmonk ${VERSION} (schema version ${SCHEMA_VERSION})`)
+      return 0
+    }
     if (cmd === 'migrate' && sub === undefined) {
       const { applied } = await migrateToLatest(d.pg, d.ch())
       d.out(applied.length ? `applied ${applied.join(', ')}` : 'up to date')

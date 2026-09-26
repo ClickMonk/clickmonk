@@ -51,3 +51,9 @@ test/stack/tmp/
 # dist/ (already ignored above); this is a separate directory so the two
 # builds never delete each other's output, and nothing reads it.
 packages/ui/dist-ts/
+
+# The lock backup.sh and restore.sh hold while they run.
+.backup-restore-*.lock/
+# The mark restore.sh leaves while the stores may be half restored, one per
+# install, and the file it is written to first.
+.restore-incomplete-*

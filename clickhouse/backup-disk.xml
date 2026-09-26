@@ -1,0 +1,25 @@
+<clickhouse>
+    <!--
+      BACKUP ... TO Disk(...) refuses every disk until backups.allowed_disk
+      names one:
+
+        Code: 318. DB::Exception: The 'backups.allowed_disk' configuration
+        parameter is not set, cannot use 'Disk' backup engine.
+
+      The disk is a directory inside the clickhouse-data volume, so an install
+      does not need a second volume sized for it. backup.sh copies each archive
+      out of it and deletes it; restore.sh copies one in and deletes it after
+      the restore. Nothing is meant to stay here between runs.
+    -->
+    <storage_configuration>
+        <disks>
+            <backups>
+                <type>local</type>
+                <path>/var/lib/clickhouse/backups/</path>
+            </backups>
+        </disks>
+    </storage_configuration>
+    <backups>
+        <allowed_disk>backups</allowed_disk>
+    </backups>
+</clickhouse>
