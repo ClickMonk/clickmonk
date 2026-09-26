@@ -603,4 +603,32 @@ describe('what the operator has to know', () => {
     expect(r.json().domains).toHaveLength(MAX_DOMAINS_LISTED)
     expect(r.json().truncated).toBe(true)
   })
+
+  // The four cases issue #47 draws the line between. Written directly with
+  // SQL, the way `clickmonk domain add --verified` and a worker pass both
+  // write: nothing over this API can mark a domain verified or plant a
+  // `passed_at` of its own choosing.
+  it('excludes a domain verified by hand until a check has passed for it, and re-alerts it once a passed check later fails', async () => {
+    await pg.query(`INSERT INTO domains (id, host, verified, verification_token) VALUES
+      ('00000000-0000-4000-8000-0000000000e1', 'untested.example.test', true, '${'1'.repeat(32)}'),
+      ('00000000-0000-4000-8000-0000000000e2', 'stillbare.example.test', true, '${'2'.repeat(32)}'),
+      ('00000000-0000-4000-8000-0000000000e3', 'regressed.example.test', true, '${'3'.repeat(32)}'),
+      ('00000000-0000-4000-8000-0000000000e4', 'awaiting.example.test', false, '${'4'.repeat(32)}')`)
+    await pg.query(`INSERT INTO domain_dns_checks (domain_id, status, detail, checked_at, passed_at) VALUES
+      -- Checked and failed, but never once passed: still hand-verified.
+      ('00000000-0000-4000-8000-0000000000e2', 'missing_token', 'no record', now(), NULL),
+      -- Passed once, and its most recent check failed: something changed.
+      ('00000000-0000-4000-8000-0000000000e3', 'missing_token', 'record gone', now(), '2026-09-01T00:00:00.000Z')`)
+    // 'untested' has no domain_dns_checks row at all: verified by hand, never checked.
+
+    const alerts = await app.inject({ method: 'GET', url: '/api/alerts', headers: read(cookie) })
+    const hosts = (alerts.json().domains as { host: string }[]).map((d) => d.host)
+    expect(hosts).not.toContain('untested.example.test')
+    expect(hosts).not.toContain('stillbare.example.test')
+    expect(hosts).toContain('regressed.example.test')
+    expect(hosts).toContain('awaiting.example.test')
+
+    const status = await app.inject({ method: 'GET', url: '/api/status', headers: read(cookie) })
+    expect(status.json().alerts).toBe(2)
+  })
 })
