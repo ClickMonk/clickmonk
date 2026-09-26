@@ -167,7 +167,8 @@ packages/ui/        the web interface: React 19, Tailwind 4, a Vite build the ad
                     Radix overlay primitive, no runtime import from a service package,
                     one <h1> per screen. Every time shown is the browser's own zone, except a
                     click's raw fields, which are labelled UTC.
-packages/cli/       `clickmonk migrate | domain | link add | settings | ipdata | admin | apikey`.
+packages/cli/       `clickmonk migrate | domain | link add | settings | ipdata | admin | apikey |
+                    version`.
                     Two commands here are deliberately not API routes: `admin create`,
                     because nothing can authenticate before the account exists, and
                     `admin totp disable`, because it is the way back in when the second

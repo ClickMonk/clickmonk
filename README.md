@@ -83,7 +83,8 @@ on your own infrastructure, and your click data stays yours.
   90 days keeps 90 to 121 days of clicks and 30 days of addresses keeps them 30 to 61.
 - **The CLI**: `clickmonk migrate`, `clickmonk domain add|list|verify`, `clickmonk link add`,
   `clickmonk settings show|set`, `clickmonk ipdata status|update`, `clickmonk admin create`,
-  `clickmonk admin passwd`, `clickmonk admin totp disable`, `clickmonk apikey create|list|revoke`.
+  `clickmonk admin passwd`, `clickmonk admin totp disable`, `clickmonk apikey create|list|revoke`,
+  `clickmonk version`.
   `settings set` covers the traffic actions, the safe URL, the abuser threshold and how
   long this install keeps clicks and the addresses on them (`--keep-clicks`,
   `--keep-addresses`, each taking a number of days or `never`).
@@ -178,6 +179,9 @@ What does not work yet:
   meant to be run by hand, on a host that has one, before a release. A second,
   always-run test proves the address Caddy passes on is the IPv6 client's own, but only
   on the stack's unique-local subnet.
+
+How fast a redirect is, how to back an install up, how to upgrade it and what it exposes
+each have a section below.
 
 If link tracking is a problem you have today, [open an issue](../../issues) describing
 it. That is the most useful contribution at this stage.
@@ -275,6 +279,37 @@ traffic to your server in clear and is not an option.
 Certificates live in the `caddy-data` volume, and `backup.sh` copies it with everything
 else, so a restored install presents the certificates it had rather than asking the
 certificate authority for every domain again at once.
+
+## How fast a redirect is
+
+A redirect is answered from memory. The redirect holds every link, domain and setting in an
+in-memory copy it refreshes when something changes, looks the visitor's address up in IP data
+it also holds in memory, writes the click to a file on local disk, and answers. It makes no
+network call for a link without a click cap. A capped link asks Postgres to count the click,
+waits at most 150 milliseconds for the answer, and sends the visitor on anyway if none comes;
+either database can be down and links keep answering.
+
+Measured with the stack this repository ships, on an 8-core AMD EPYC virtual machine with
+6 GB of memory, over plain HTTP from a container on the stack's own network — so the figure
+is Caddy and the redirect, not a network — on a link with no click cap: a median of 1.1 to
+1.4 ms and a 99th percentile of 2.3 to 4.4 ms, over three runs of 2,000 requests one after
+another. Measure your own server:
+
+```sh
+for i in $(seq 200); do
+  curl -so /dev/null -w '%{time_starttransfer}\n' -H 'Host: links.example.com' http://localhost/promo
+done | sort -n | awk '{a[NR]=$1} END {print "median", a[int(NR/2)], "p99", a[int(NR*0.99)]}'
+```
+
+**What no self-hosted tool can change is the distance.** A visitor in Sydney clicking a link
+served from Frankfurt waits for the round trips between them — a TCP connection, a TLS
+handshake and the request — which is hundreds of milliseconds whatever the server does. A
+hosted service with servers on every continent answers from somewhere near the visitor;
+ClickMonk answers from wherever you run it. Put it near the people who click.
+
+**Each click is written before the visitor is answered**, and the disk is synced in batches
+every 200 milliseconds: a click survives the redirect crashing the moment after it answered,
+and a power cut loses at most the last 200 milliseconds of clicks.
 
 ## The admin API
 
@@ -806,6 +841,49 @@ bad-asn-list's licence:
     LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
     OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
     SOFTWARE.
+
+## Security
+
+What an install exposes, and what stands behind each part.
+
+- **Two ports.** Caddy publishes 80 and 443 and no other container publishes anything:
+  Postgres, ClickHouse, the redirect and the admin service are reachable only on the stack's
+  own Docker network. A test reads `docker compose config` and fails if that changes.
+- **Links are public by nature.** Anyone can request any path on a link domain, so everything
+  a request can reach is bounded: the path's length, the header block's size, the number of
+  clients the per-client request count remembers, the password attempts per client per link,
+  and the spool's size on disk.
+- **A certificate only for a name you verified**, or for the admin host you named. A host name
+  someone else points at your server gets no certificate, and your install asks the
+  certificate authority for nothing on its behalf.
+- **The admin interface and API answer on one host name, over HTTPS**, and nowhere else;
+  plain HTTP on that name is sent to HTTPS. Signing in takes the one account's password and,
+  once you turn it on, a code from an authenticator app. After five wrong passwords the
+  account refuses sign-ins for five minutes, and each further wrong one adds five more, up to
+  an hour. A session ends after 12 hours unused, and after 30 days whatever happens. Every
+  request that changes anything, the sign-in included, must carry an `Origin` naming the
+  admin host unless it carries an API key, which is what a script uses. The interface runs under a content security
+  policy that allows no inline script and no inline style.
+- **Nothing that signs in is stored in a form that can be replayed.** Passwords — the
+  account's and every link's — and recovery codes are scrypt hashes; session tokens and API
+  keys are stored as SHA-256 digests. The exception is the two-factor secret, which the
+  server must be able to read to check a code; it is one reason a backup is a credential.
+- **Visitors' addresses** are shown as networks, never as addresses, and blanked in the
+  database once the address retention period has passed, 30 days on a new install
+  (["How long ClickMonk keeps things"](#how-long-clickmonk-keeps-things)).
+- **What your server contacts:** the certificate authority, for the names you verified (Caddy's
+  defaults, or the authority you name in `caddy/tls.d/`); the three hosts the four IP data
+  lists under ["IP data"](#ip-data) come from (`CLICKMONK_IPDATA_UPDATE=off` stops them); DNS
+  resolvers, to check each domain's verification record (`CLICKMONK_DNS_CHECK=off` stops the
+  worker's scheduled checks, and `domain verify` and the admin API's check still ask when you
+  run them); and Docker's registries when you pull or build. ClickMonk sends nothing else
+  anywhere: no telemetry, no licence check, no update check. A redirect makes no network call
+  except the click-cap count on a capped link, which goes to your own Postgres.
+- **What is not a boundary:** anyone with a shell on the server has everything, `.env` and the
+  databases included; and the containers on the stack's own network can reach each other, as
+  the limits under ["Status"](#status) spell out.
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md) — not a public issue.
 
 ## Backup and restore
 
