@@ -63,6 +63,8 @@ const ALL_SERVICES = [
 
 const BACKUPS = join(TMP, 'backups')
 const ENV_FILE = join(TMP, 'backup.env')
+/** The lock backup.sh and restore.sh share, in the checkout. */
+const LOCK = join(ROOT, '.backup-restore.lock')
 const SCRIPT_ENV: Record<string, string | undefined> = {
   ...ENV,
   COMPOSE_FILE: 'docker-compose.yml:test/stack/docker-compose.tls.yml',
@@ -257,6 +259,8 @@ afterEach((ctx) => {
 beforeAll(async () => {
   compose('down', '-v')
   rmSync(BACKUPS, { recursive: true, force: true })
+  // A lock a failed earlier run of this suite left would refuse every backup.
+  rmSync(LOCK, { recursive: true, force: true })
   mkdirSync(BACKUPS, { recursive: true })
   // The stack's own values, in the file the scripts copy as this install's
   // .env. Compose reads it too, through COMPOSE_ENV_FILES, and agrees with
@@ -305,12 +309,10 @@ afterAll(() => {
   } finally {
     compose('down', '-v')
     rmSync(BACKUPS, { recursive: true, force: true })
+    rmSync(LOCK, { recursive: true, force: true })
     rmSync(ENV_FILE, { force: true })
   }
 }, 300_000)
-
-/** The lock backup.sh and restore.sh share, in the checkout. */
-const LOCK = join(ROOT, '.backup-restore.lock')
 
 /** A long step's budget: a script run, or a wait on the stack, inside one test. */
 const LONG = 300_000
