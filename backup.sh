@@ -104,6 +104,7 @@ start_worker_if_we_stopped_it() {
       WORKER_STOPPED_BY_US=0
       return 0
     fi
+    [ "$attempt" = 3 ] && break
     say "Could not start the worker (attempt $attempt of 3); trying again..."
     sleep 2
   done
@@ -138,6 +139,16 @@ trap cleanup EXIT
 
 # --- Every check first, before anything is stopped ---------------------
 
+# The env file before the services: a missing file that COMPOSE_ENV_FILES
+# names makes every compose command fail, which would read as a stopped store.
+ENV_FILE="$(env_file_path)" ||
+  fail "validation" \
+    "COMPOSE_ENV_FILES names more than one file, and a backup copies exactly one." \
+    "Name the one file that holds this install's passwords."
+[ -r "$ENV_FILE" ] ||
+  fail "validation" \
+    "Cannot read $ENV_FILE, which holds this install's passwords and is part of every backup."
+
 # Only the two stores have to be running. The spool and Caddy's data are read
 # through a running container when there is one and a one-off container
 # otherwise, so a crash-looping Caddy -- the likeliest broken service -- does
@@ -148,14 +159,6 @@ for service in postgres clickhouse; do
       "The '$service' service is not running." \
       "Start it first: docker compose up -d $service"
 done
-
-ENV_FILE="$(env_file_path)" ||
-  fail "validation" \
-    "COMPOSE_ENV_FILES names more than one file, and a backup copies exactly one." \
-    "Name the one file that holds this install's passwords."
-[ -r "$ENV_FILE" ] ||
-  fail "validation" \
-    "Cannot read $ENV_FILE, which holds this install's passwords and is part of every backup."
 
 have_sha256 ||
   fail "validation" \
