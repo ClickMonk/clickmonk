@@ -1,0 +1,593 @@
+import { execFileSync, spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
+import {
+  ADMIN_HOST,
+  CA_MOUNT,
+  type CurlResult,
+  ENV,
+  ROOT,
+  TMP,
+  WAIT_TIMEOUT,
+  cli,
+  cliWithInput,
+  compose,
+  curl,
+  publishZone,
+  until,
+  writeAcmeRoot,
+  writeIssuingRoot,
+} from './stack.js'
+
+/**
+ * backup.sh and restore.sh, run as an operator runs them, against the shipped
+ * stack: plain `docker compose` selected by COMPOSE_FILE, and the stack's
+ * variables in the file COMPOSE_ENV_FILES names — never this repository's own
+ * .env, which is not this suite's to read or write.
+ *
+ * One stack serves the backup tests and the refusals, which change nothing.
+ * The round trip at the end takes a backup, destroys every volume, starts an
+ * empty stack and restores into it.
+ */
+const EMAIL = 'admin@example.com'
+const PASSWORD = 'a decent admin password'
+const LINK_HOST = 'bak.example.test'
+const SLUG = 'b1'
+const TARGET = 'https://example.com/backed-up'
+const HOUR_MS = 3_600_000
+const SPOOL = '/var/lib/clickmonk/spool'
+/** A sealed spool segment's name: the shipper's contract, from core. */
+const SEGMENT = /^seg-\d{15}-\d+-\d+\.ndjson$/
+const ARTEFACTS = ['caddy-data.tar', 'clickhouse.zip', 'env', 'postgres.dump', 'spool.tar']
+/** Every service the stack suites run, the local authority and resolver included. */
+const ALL_SERVICES = [
+  'admin',
+  'caddy',
+  'clickhouse',
+  'coredns',
+  'pebble',
+  'postgres',
+  'redirect',
+  'worker',
+]
+
+const BACKUPS = join(TMP, 'backups')
+const ENV_FILE = join(TMP, 'backup.env')
+const SCRIPT_ENV: Record<string, string | undefined> = {
+  ...ENV,
+  COMPOSE_FILE: 'docker-compose.yml:test/stack/docker-compose.tls.yml',
+  COMPOSE_ENV_FILES: ENV_FILE,
+}
+
+let root = ''
+let cookie = ''
+let setUp = false
+let failures = 0
+/** The first backup the backup tests take. The refusal tests restore copies of it. */
+let firstBackup = ''
+
+interface ScriptResult {
+  status: number
+  out: string
+}
+
+function runScript(
+  script: 'backup.sh' | 'restore.sh',
+  args: string[],
+  o: { input?: string; env?: Record<string, string> } = {},
+): ScriptResult {
+  const r = spawnSync(join(ROOT, script), args, {
+    cwd: ROOT,
+    env: { ...SCRIPT_ENV, ...o.env },
+    input: o.input ?? '',
+    encoding: 'utf8',
+    stdio: 'pipe',
+    timeout: 600_000,
+  })
+  if (r.error) throw new Error(`could not run ${script}: ${r.error.message}`)
+  return { status: r.status ?? -1, out: `${r.stdout ?? ''}${r.stderr ?? ''}` }
+}
+
+/** The services running now, sorted. */
+const running = (): string[] =>
+  compose('ps', '--status', 'running', '--services')
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .sort()
+
+/** When a service's container last started: a restart changes it, and nothing else does. */
+function startedAt(service: string): string {
+  const id = compose('ps', '-aq', service).trim()
+  if (id === '') throw new Error(`no container for ${service}`)
+  return execFileSync('docker', ['inspect', '--format', '{{.State.StartedAt}}', id], {
+    encoding: 'utf8',
+  }).trim()
+}
+
+const pg = (sql: string): string =>
+  compose(
+    'exec',
+    '-T',
+    'postgres',
+    'psql',
+    '-U',
+    'clickmonk',
+    '-d',
+    'clickmonk',
+    '-At',
+    '-c',
+    sql,
+  ).trim()
+
+/**
+ * One ClickHouse statement, through the container's own credentials: the
+ * password is read inside the container, so it is in no argument list here.
+ */
+const ch = (sql: string): string =>
+  compose(
+    'exec',
+    '-T',
+    'clickhouse',
+    'sh',
+    '-c',
+    'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --database clickmonk --query "$0"',
+    sql,
+  ).trim()
+
+/** A number a store answered, never a silent zero from an empty answer. */
+function num(out: string): number {
+  const n = Number(out)
+  if (out === '' || !Number.isInteger(n)) throw new Error(`the store answered "${out}"`)
+  return n
+}
+
+/** The sealed segments in the spool now. */
+const segments = (): string[] =>
+  compose('exec', '-T', 'redirect', 'ls', '-1', SPOOL)
+    .split('\n')
+    .map((s) => s.trim())
+    .filter((s) => SEGMENT.test(s))
+
+/** Lines across every sealed segment: one line is one click. */
+const spoolLines = (): number =>
+  num(
+    compose(
+      'exec',
+      '-T',
+      'redirect',
+      'sh',
+      '-c',
+      'cat "$0"/seg-*.ndjson 2>/dev/null | wc -l',
+      SPOOL,
+    ).trim(),
+  )
+
+/** A backup's MANIFEST as a map, split on the first `=` of each line as restore.sh splits it. */
+function manifest(dir: string): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const line of readFileSync(join(dir, 'MANIFEST'), 'utf8').split('\n')) {
+    if (line === '') continue
+    const eq = line.indexOf('=')
+    out[line.slice(0, eq)] = line.slice(eq + 1)
+  }
+  return out
+}
+
+const sha256 = (path: string): string =>
+  createHash('sha256').update(readFileSync(path)).digest('hex')
+
+/** The one directory a backup run wrote under `dest`. */
+function onlyBackupIn(dest: string): string {
+  const entries = readdirSync(dest)
+  expect(entries, `${dest} should hold exactly one backup`).toHaveLength(1)
+  return join(dest, entries[0] as string)
+}
+
+/** The schema version the stack's image understands, as the CLI prints it. */
+function imageSchema(): number {
+  const line = cli('version').trim()
+  const m = /^clickmonk \d+\.\d+\.\d+ \(schema version (\d+)\)$/.exec(line)
+  if (!m) throw new Error(`clickmonk version printed "${line}"`)
+  return Number(m[1])
+}
+
+function api(
+  method: string,
+  path: string,
+  o: { body?: string; cookie?: string; origin?: string; cacert?: string } = {},
+): CurlResult {
+  const args = ['--cacert', o.cacert ?? root, '--max-time', '60', '-X', method, '-D', '-']
+  if (o.body !== undefined) {
+    args.push('-H', 'content-type: application/json', '--data-binary', o.body)
+  }
+  if (o.cookie) args.push('-H', `cookie: ${o.cookie}`)
+  if (o.origin !== undefined) args.push('-H', `origin: ${o.origin}`)
+  args.push(`https://${ADMIN_HOST}${path}`)
+  return curl(args, CA_MOUNT, { body: true })
+}
+
+const cookieFrom = (headers: string): string => {
+  const line = headers.split('\n').find((l) => /^set-cookie:/i.test(l)) ?? ''
+  return (line.slice(line.indexOf(':') + 1).split(';')[0] ?? '').trim()
+}
+
+function signIn(cacert?: string): CurlResult {
+  return api('POST', '/api/session', {
+    body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
+    origin: `https://${ADMIN_HOST}`,
+    ...(cacert === undefined ? {} : { cacert }),
+  })
+}
+
+/** A day either side of now, on the hour, so the summary counts every click this suite made. */
+function window(): string {
+  const hour = Math.floor(Date.now() / HOUR_MS) * HOUR_MS
+  const from = new Date(hour - 24 * HOUR_MS).toISOString()
+  const to = new Date(hour + 24 * HOUR_MS).toISOString()
+  return `from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`
+}
+
+/** Clicks the summary report counts; -1 while the admin service cannot answer. */
+function reportedClicks(o: { cookie: string; cacert?: string }): number {
+  const r = api('GET', `/api/reports/summary?${window()}`, o)
+  if (r.status !== 200) return -1
+  return (JSON.parse(r.body) as { clicks: number }).clicks
+}
+
+function click(): void {
+  const r = curl(['-4', '--max-time', '30', `http://${LINK_HOST}/${SLUG}`])
+  if (r.status !== 302) throw new Error(`the link answered ${r.status}`)
+}
+
+afterEach((ctx) => {
+  if (ctx.task.result?.state === 'fail') failures++
+})
+
+beforeAll(async () => {
+  compose('down', '-v')
+  rmSync(BACKUPS, { recursive: true, force: true })
+  mkdirSync(BACKUPS, { recursive: true })
+  // The stack's own values, in the file the scripts copy as this install's
+  // .env. Compose reads it too, through COMPOSE_ENV_FILES, and agrees with
+  // the environment every other call here passes.
+  writeFileSync(
+    ENV_FILE,
+    (
+      [
+        'POSTGRES_PASSWORD',
+        'CLICKHOUSE_PASSWORD',
+        'CLICKMONK_SECRET',
+        'CLICKMONK_ADMIN_HOST',
+      ] as const
+    )
+      .map((k) => `${k}=${ENV[k]}\n`)
+      .join(''),
+    { mode: 0o600 },
+  )
+  writeAcmeRoot()
+  publishZone()
+  compose('up', '-d', '--build', '--wait', ...WAIT_TIMEOUT)
+  root = writeIssuingRoot()
+  cliWithInput(PASSWORD, 'admin', 'create', EMAIL)
+  cli('domain', 'add', LINK_HOST, '--verified')
+  cli('link', 'add', LINK_HOST, SLUG, '--target', TARGET)
+  await until('a certificate for the admin host', 120_000, () => api('GET', '/api/me').exit === 0)
+  const signedIn = signIn()
+  if (signedIn.status !== 200)
+    throw new Error(`sign-in failed: ${signedIn.status} ${signedIn.body}`)
+  cookie = cookieFrom(signedIn.headers)
+  // Two clicks shipped before any backup, so the counts a manifest records are
+  // not all zero, where a count that was never taken would look the same.
+  click()
+  click()
+  await until(
+    'the first clicks to reach the reports',
+    120_000,
+    () => reportedClicks({ cookie }) === 2,
+  )
+  setUp = true
+}, 900_000)
+
+afterAll(() => {
+  try {
+    if (failures > 0 || !setUp) console.error(compose('logs', '--no-color', '--tail', '200'))
+  } finally {
+    compose('down', '-v')
+    rmSync(BACKUPS, { recursive: true, force: true })
+    rmSync(ENV_FILE, { force: true })
+  }
+}, 300_000)
+
+/** A long step's budget: a script run, or a wait on the stack, inside one test. */
+const LONG = 300_000
+
+/** What the ClickHouse backups disk holds now; empty after every run. */
+const backupsDisk = (): string =>
+  compose(
+    'exec',
+    '-T',
+    'clickhouse',
+    'sh',
+    '-c',
+    'ls -A /var/lib/clickhouse/backups 2>/dev/null || true',
+  ).trim()
+
+/**
+ * A `docker` first on PATH that answers the calls one `case` names and hands
+ * every other call to the real one. `cases` is the body of a shell `case "$a"`
+ * over each argument. Returns the PATH to run a script with.
+ */
+function stubDocker(cases: string): { path: string; remove: () => void } {
+  const bin = join(TMP, 'stub-docker')
+  rmSync(bin, { recursive: true, force: true })
+  mkdirSync(bin)
+  const real = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim()
+  writeFileSync(
+    join(bin, 'docker'),
+    [
+      '#!/bin/sh',
+      'for a in "$@"; do',
+      '  case "$a" in',
+      cases,
+      '  esac',
+      'done',
+      `exec ${real} "$@"`,
+      '',
+    ].join('\n'),
+    { mode: 0o755 },
+  )
+  return {
+    path: `${bin}:${process.env.PATH ?? ''}`,
+    remove: () => rmSync(bin, { recursive: true, force: true }),
+  }
+}
+
+describe('backup.sh', () => {
+  it(
+    'writes six files, readable by their owner alone, and a manifest that describes them',
+    () => {
+      const workerBefore = startedAt('worker')
+      const redirectBefore = startedAt('redirect')
+      const r = runScript('backup.sh', [join(BACKUPS, 'first')])
+      expect(r.status, r.out).toBe(0)
+      firstBackup = onlyBackupIn(join(BACKUPS, 'first'))
+
+      expect(readdirSync(firstBackup).sort()).toEqual(['MANIFEST', ...ARTEFACTS])
+      expect(statSync(firstBackup).mode & 0o777).toBe(0o700)
+      for (const f of readdirSync(firstBackup)) {
+        expect(statSync(join(firstBackup, f)).mode & 0o777, f).toBe(0o600)
+      }
+
+      const m = manifest(firstBackup)
+      expect(Object.keys(m).sort()).toEqual(
+        [
+          'admin_host',
+          'clickmonk_backup_version',
+          'clickmonk_version',
+          'rows.clickhouse.clicks',
+          'rows.clickhouse.clicks_hourly',
+          'rows.clickhouse.clicks_hourly_dim',
+          'schema_version',
+          'secret_fingerprint',
+          ...ARTEFACTS.map((a) => `sha256.${a}`),
+          'timestamp',
+        ].sort(),
+      )
+      expect(m.clickmonk_backup_version).toBe('1')
+      expect(m.timestamp).toBe(firstBackup.slice(firstBackup.lastIndexOf('/') + 1))
+      expect(m.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T\d{6}Z$/)
+      expect(m.admin_host).toBe(ADMIN_HOST)
+      expect(m.schema_version).toBe(pg('SELECT max(version) FROM schema_migrations'))
+      // The release against the one the CLI prints; the schema version above is
+      // the ledger's, which is the number a restore checks.
+      const printed = /^clickmonk (\d+\.\d+\.\d+) \(schema version \d+\)$/.exec(
+        cli('version').trim(),
+      )
+      expect(m.clickmonk_version).toBe(printed?.[1])
+      for (const a of ARTEFACTS) expect(m[`sha256.${a}`], a).toBe(sha256(join(firstBackup, a)))
+      // Counted by this test from the store, not read back from the manifest.
+      expect(m['rows.clickhouse.clicks']).toBe(ch('SELECT count() FROM clicks FINAL'))
+      expect(m['rows.clickhouse.clicks']).toBe('2')
+      expect(m['rows.clickhouse.clicks_hourly']).toBe(ch('SELECT count() FROM clicks_hourly FINAL'))
+      expect(m['rows.clickhouse.clicks_hourly_dim']).toBe(
+        ch('SELECT count() FROM clicks_hourly_dim FINAL'),
+      )
+      // The secret itself is in `env`, which is the point of `env`; the manifest
+      // carries only a fingerprint of it, computed here independently.
+      expect(readFileSync(join(firstBackup, 'env'), 'utf8')).toBe(readFileSync(ENV_FILE, 'utf8'))
+      const secret = ENV.CLICKMONK_SECRET ?? ''
+      expect(m.secret_fingerprint).toBe(
+        createHash('sha256').update(`clickmonk-secret:${secret}`).digest('hex').slice(0, 16),
+      )
+      expect(readFileSync(join(firstBackup, 'MANIFEST'), 'utf8')).not.toContain(secret)
+
+      // The worker was stopped and started again; the redirect never stopped.
+      expect(startedAt('worker')).not.toBe(workerBefore)
+      expect(startedAt('redirect')).toBe(redirectBefore)
+      expect(running()).toEqual(ALL_SERVICES)
+    },
+    LONG,
+  )
+
+  it('leaves nothing on the ClickHouse backups disk', () => {
+    expect(backupsDisk()).toBe('')
+  })
+
+  it(
+    'leaves a worker it did not stop stopped, and still takes the backup',
+    () => {
+      compose('stop', 'worker')
+      try {
+        const r = runScript('backup.sh', [join(BACKUPS, 'worker-stopped')])
+        expect(r.status, r.out).toBe(0)
+        expect(r.out).toContain('The worker is not running; it is left that way.')
+        expect(running()).not.toContain('worker')
+        onlyBackupIn(join(BACKUPS, 'worker-stopped'))
+      } finally {
+        compose('start', 'worker')
+      }
+    },
+    LONG,
+  )
+
+  // Caddy crash-looping on a bad Caddyfile is the likeliest broken service, and
+  // the moment a backup is most wanted. Its volume is read through a one-off
+  // container instead, and Caddy is left as it was.
+  it(
+    'takes the backup with Caddy stopped, and leaves it stopped',
+    () => {
+      compose('stop', 'caddy')
+      try {
+        const r = runScript('backup.sh', [join(BACKUPS, 'caddy-stopped')])
+        expect(r.status, r.out).toBe(0)
+        const dir = onlyBackupIn(join(BACKUPS, 'caddy-stopped'))
+        // The certificate authority's account and the admin host's certificate
+        // are in Caddy's data, so the archive lists more than its root entry.
+        const listed = execFileSync('tar', ['-tf', join(dir, 'caddy-data.tar')], {
+          encoding: 'utf8',
+        })
+        expect(listed).toMatch(/certificates\//)
+        expect(running()).not.toContain('caddy')
+      } finally {
+        compose('start', 'caddy')
+      }
+    },
+    LONG,
+  )
+
+  // Every install upgrading to the first release runs an image whose CLI has
+  // no `version`: it prints its usage and exits 1. Its backup is the one the
+  // upgrade instructions ask for first, so it must still be taken.
+  it(
+    'takes the backup from an image that predates `clickmonk version`, recording the release as unknown',
+    () => {
+      const stub = stubDocker('    version) echo "usage:"; exit 1 ;;')
+      let r: ScriptResult
+      try {
+        r = runScript('backup.sh', [join(BACKUPS, 'old-image')], { env: { PATH: stub.path } })
+      } finally {
+        stub.remove()
+      }
+      expect(r.status, r.out).toBe(0)
+      expect(r.out).toContain("The running image predates 'clickmonk version'")
+      const m = manifest(onlyBackupIn(join(BACKUPS, 'old-image')))
+      expect(m.clickmonk_version).toBe('unknown')
+      expect(m.schema_version).toBe(pg('SELECT max(version) FROM schema_migrations'))
+      expect(Object.keys(m)).toHaveLength(14)
+    },
+    LONG,
+  )
+
+  // The one step that runs while the worker is stopped is the one that fails
+  // here, so "running again afterwards" is something the trap had to do.
+  it(
+    'starts the worker again, and leaves nothing behind, when a step fails while it is stopped',
+    () => {
+      const stub = stubDocker(
+        '    *"BACKUP DATABASE"*) echo "simulated failure of BACKUP" >&2; exit 1 ;;',
+      )
+      const dest = join(BACKUPS, 'failed')
+      const workerBefore = startedAt('worker')
+      let r: ScriptResult
+      try {
+        r = runScript('backup.sh', [dest], { env: { PATH: stub.path } })
+      } finally {
+        stub.remove()
+      }
+      expect(r.status, r.out).toBe(1)
+      expect(r.out).toContain('the backup failed during the ClickHouse step')
+      expect(r.out).toContain('No data was changed')
+      expect(readdirSync(dest)).toEqual([])
+      expect(backupsDisk()).toBe('')
+      expect(running()).toEqual(ALL_SERVICES)
+      expect(startedAt('worker')).not.toBe(workerBefore)
+    },
+    LONG,
+  )
+
+  // ClickHouse writes its archive beside its data. A backup that would not fit
+  // is refused before the worker stops and before anything is written.
+  it(
+    'refuses a backup the ClickHouse volume has no room for, before stopping anything',
+    () => {
+      const stub = stubDocker('    *"free_space FROM system.disks"*) echo 1; exit 0 ;;')
+      const dest = join(BACKUPS, 'no-room')
+      const workerBefore = startedAt('worker')
+      let r: ScriptResult
+      try {
+        r = runScript('backup.sh', [dest], { env: { PATH: stub.path } })
+      } finally {
+        stub.remove()
+      }
+      expect(r.status, r.out).toBe(1)
+      expect(r.out).toContain('The ClickHouse volume has 0 MiB free and a backup needs about')
+      expect(r.out).toContain('the backup failed during the validation step')
+      expect(readdirSync(BACKUPS)).not.toContain('no-room')
+      expect(startedAt('worker')).toBe(workerBefore)
+    },
+    LONG,
+  )
+
+  it(
+    'refuses a destination it cannot create, before stopping anything',
+    () => {
+      const workerBefore = startedAt('worker')
+      // A path under a regular file: no mkdir can make it.
+      const r = runScript('backup.sh', [join(ENV_FILE, 'nested')])
+      expect(r.status, r.out).toBe(1)
+      expect(r.out).toContain('the backup failed during the destination step')
+      expect(startedAt('worker')).toBe(workerBefore)
+    },
+    LONG,
+  )
+
+  it(
+    'refuses when COMPOSE_ENV_FILES names more than one file, before stopping anything',
+    () => {
+      const workerBefore = startedAt('worker')
+      const r = runScript('backup.sh', [join(BACKUPS, 'two-env-files')], {
+        env: { COMPOSE_ENV_FILES: `${ENV_FILE},${ENV_FILE}` },
+      })
+      expect(r.status, r.out).toBe(1)
+      expect(r.out).toContain('COMPOSE_ENV_FILES names more than one file')
+      expect(startedAt('worker')).toBe(workerBefore)
+    },
+    LONG,
+  )
+
+  it(
+    'parses, and prints its usage, under bash 3.2',
+    () => {
+      for (const script of ['backup.sh', 'backup-lib.sh']) {
+        const parsed = spawnSync(
+          'docker',
+          ['run', '--rm', '-v', `${ROOT}:/src:ro`, 'bash:3.2.57', 'bash', '-n', `/src/${script}`],
+          { encoding: 'utf8', stdio: 'pipe', timeout: 120_000 },
+        )
+        expect(parsed.status, `${script}: ${parsed.stderr}`).toBe(0)
+      }
+      for (const script of ['backup.sh']) {
+        const help = spawnSync(
+          'docker',
+          [
+            'run',
+            '--rm',
+            '-v',
+            `${ROOT}:/src:ro`,
+            'bash:3.2.57',
+            'bash',
+            `/src/${script}`,
+            '--help',
+          ],
+          { encoding: 'utf8', stdio: 'pipe', timeout: 120_000 },
+        )
+        expect(help.status, `${script}: ${help.stderr}`).toBe(0)
+        expect(help.stderr).toContain(`usage: ./${script}`)
+      }
+    },
+    LONG,
+  )
+})

@@ -35,6 +35,9 @@ services:
           # The browser suite's link domain: the browser clicks a link on it
           # and watches the click arrive in the interface.
           - ui.example.test
+          # The backup suite's link domain: clicked before a backup, and
+          # answering again after the restore.
+          - bak.example.test
 
   worker:
     environment:
