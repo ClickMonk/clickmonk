@@ -129,7 +129,9 @@ What does not work yet:
 - **Any notification.** Nothing is emailed, posted or pushed anywhere: there is no mail
   configuration and no secret for one. `GET /api/alerts` lists every domain whose last DNS
   check did not find its token, and every domain no check has reached, which is what an
-  operator has instead.
+  operator has instead. A domain verified by hand (`domain add --verified`) is the one
+  exception: it is not listed until a check has passed for it at least once, because
+  nothing changed for it — a check that then fails, having once passed, is listed again.
 - **Most link settings in the CLI.** `clickmonk link add` sets targets, a backup URL, a
   click cap, an expiry, passthrough and traffic action overrides only, and no command
   changes a link once it is added. Per-device destinations, a returning-visitor
@@ -228,7 +230,10 @@ answer 404. Over HTTPS there is no certificate to present, so the connection nev
 that far: the TLS handshake itself fails, an SSL error with no page behind it. That is
 what stops somebody else's hostname, pointed at your server, from getting a certificate
 out of your install. `domain add --verified` is the way round it, for a trial or for a
-domain you proved some other way; it says on screen that no DNS check was made.
+domain you proved some other way; it says on screen that no DNS check was made, and such
+a domain is not shown in `GET /api/alerts` or counted in `GET /api/status` until a check
+has passed for it once — until then nothing has changed for it, so there is nothing to
+warn about. A check that later fails, having once passed, is an alert again.
 
 ClickMonk does not know its own public address, so it records what a domain resolves to
 rather than judging it — a host behind NAT, a load balancer or a CDN is normal. A domain
