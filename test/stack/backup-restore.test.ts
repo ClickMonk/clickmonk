@@ -1822,7 +1822,15 @@ describe('restore.sh and backup.sh, per install', () => {
       mkdirSync(LOCK)
       writeFileSync(join(LOCK, 'pid'), '4242\n')
       writeFileSync(MARKER, 'backup=/srv/backups/2026-10-01T041500Z\nenvironment=\n')
-      const other = { COMPOSE_PROJECT_NAME: 'clickmonk-elsewhere' }
+      // Named in the other install's env file, as an operator names it, not in
+      // the environment: the scripts must find it where Compose does.
+      const otherEnv = join(TMP, 'backup-elsewhere.env')
+      writeFileSync(
+        otherEnv,
+        `${readFileSync(ENV_FILE, 'utf8')}COMPOSE_PROJECT_NAME=clickmonk-elsewhere\n`,
+        { mode: 0o600 },
+      )
+      const other = { COMPOSE_ENV_FILES: otherEnv }
       try {
         // The other install has no containers, so each gets as far as its stores.
         const b = runScript('backup.sh', [join(BACKUPS, 'elsewhere')], { env: other })
@@ -1830,7 +1838,7 @@ describe('restore.sh and backup.sh, per install', () => {
         expect(b.out).not.toContain('Another backup or restore holds')
         expect(b.out).not.toContain('did not finish')
         expect(b.out).toContain("The 'postgres' service is not running.")
-        expect(b.out).toContain('COMPOSE_PROJECT_NAME=clickmonk-elsewhere ')
+        expect(b.out).toContain(`COMPOSE_ENV_FILES=${otherEnv} docker compose up -d postgres`)
         const r = runScript('restore.sh', [firstBackup], { env: other })
         expect(r.status, r.out).toBe(1)
         expect(r.out).not.toContain('Another backup or restore holds')
@@ -1843,6 +1851,7 @@ describe('restore.sh and backup.sh, per install', () => {
       } finally {
         rmSync(LOCK, { recursive: true, force: true })
         rmSync(MARKER, { force: true })
+        rmSync(otherEnv, { force: true })
       }
     },
     LONG,
@@ -2146,6 +2155,34 @@ describe('restore.sh, interrupted after it has changed a store', () => {
       }
       try {
         expectLeftStopped(r, 'ClickHouse was being dropped and may be gone')
+        expectFinishedByRerun()
+      } finally {
+        rmSync(LOCK, { recursive: true, force: true })
+      }
+    },
+    LONG,
+  )
+
+  // Postgres is refilled in one transaction, by a child the trap waits for:
+  // the lock is held until pg_restore has ended, and the state says so.
+  it(
+    'leaves the stack stopped at the pg_restore step, waits for it, and finishes when run again',
+    () => {
+      const stub = interruptAt('*pg_restore*')
+      let r: ScriptResult
+      try {
+        r = runScript('restore.sh', [firstBackup], {
+          input: `${stamp()}\n`,
+          env: { PATH: stub.path },
+        })
+      } finally {
+        stub.remove()
+      }
+      try {
+        expectLeftStopped(
+          r,
+          'ClickHouse is restored; Postgres was being refilled and is either empty or complete',
+        )
         expectFinishedByRerun()
       } finally {
         rmSync(LOCK, { recursive: true, force: true })
