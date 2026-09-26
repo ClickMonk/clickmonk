@@ -1575,6 +1575,27 @@ describe('restore.sh refuses, after an interrupted restore or on a full disk', (
     LONG,
   )
 
+  // One size ClickHouse cannot give: it must not count as zero bytes to free.
+  it(
+    'refuses when ClickHouse cannot say how much its database holds',
+    () => {
+      const stub = stubDocker('    *"FROM system.parts"*) exit 1 ;;')
+      const b = unchanged()
+      try {
+        const r = runScript('restore.sh', [firstBackup], { env: { PATH: stub.path } })
+        expect(r.status, r.out).toBe(1)
+        expect(r.out).toContain(
+          "Could not read the archive's size and ClickHouse's size and free space",
+        )
+        expect(r.out).toContain('Nothing was changed, and nothing was stopped.')
+      } finally {
+        stub.remove()
+      }
+      expect(unchanged()).toEqual(b)
+    },
+    LONG,
+  )
+
   // Ctrl-C during the checks: without a word the prompt would be the last thing said.
   it(
     'says it stopped before anything was changed when a signal arrives during the checks',
