@@ -280,6 +280,18 @@ export const DEFAULT_CHECK_LIMIT = 50
  * redirect reload its whole configuration for nothing. A domain is never
  * un-verified here — a resolver outage or a DNS edit must not take live
  * links down or stop a certificate renewing.
+ *
+ * `passed_at` is stamped with `now` on a pass and left exactly as it was on a
+ * failure — the same "never taken back" rule `verified` itself follows, and
+ * for the same reason: a resolver hiccup must not turn a domain that once
+ * proved itself back into one that has not. One upsert states both: the
+ * value to insert is decided in JS, once, rather than repeating `result.status`
+ * as a second bound parameter inside the statement — Postgres cannot always
+ * agree with itself on one placeholder's type across two different positions
+ * in the same query, and this sidesteps that rather than fighting it with
+ * casts. The `DO UPDATE` branch either restamps `passed_at` to this check's
+ * time (a pass) or keeps the row's own existing value (a failure), never the
+ * `EXCLUDED` one, which would be null.
  */
 export async function recordDomainCheck(
   pg: Pool,
@@ -287,12 +299,19 @@ export async function recordDomainCheck(
   result: DomainCheck,
   now: Date,
 ): Promise<void> {
+  const passedAt = result.status === 'verified' ? now : null
   await pg.query(
-    `INSERT INTO domain_dns_checks (domain_id, status, detail, checked_at)
-     VALUES ($1, $2, $3, $4)
+    `INSERT INTO domain_dns_checks (domain_id, status, detail, checked_at, passed_at)
+     VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (domain_id) DO UPDATE
-       SET status = EXCLUDED.status, detail = EXCLUDED.detail, checked_at = EXCLUDED.checked_at`,
-    [row.id, result.status, result.detail, now],
+       SET status = EXCLUDED.status,
+           detail = EXCLUDED.detail,
+           checked_at = EXCLUDED.checked_at,
+           passed_at = CASE
+             WHEN EXCLUDED.status = 'verified' THEN EXCLUDED.checked_at
+             ELSE domain_dns_checks.passed_at
+           END`,
+    [row.id, result.status, result.detail, now, passedAt],
   )
   if (result.status === 'verified' && !row.verified) {
     await pg.query('UPDATE domains SET verified = true, updated_at = $2 WHERE id = $1', [
