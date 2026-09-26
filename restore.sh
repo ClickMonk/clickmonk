@@ -127,17 +127,38 @@ abort() {
 
 # THE SIGNALS ARE MASKED FIRST: an operator who presses Ctrl-C again while
 # the services are being started would otherwise end the trap before the
-# start, and before the archive is deleted and the lock released. Children
-# inherit the mask. Then the services, then the archive, and the lock last:
-# no backup may start, and sweep the backups disk, while this run's archive is
-# still there.
+# start, and before the archive is deleted and the lock released. The mask
+# protects this shell, not the start: `docker compose` installs its own
+# handlers for INT and TERM, so a second Ctrl-C can cut one attempt short,
+# which is why start_services tries three times. Then the archive, and the
+# lock last: no backup may start, and sweep the backups disk, while this run's
+# archive is still there.
+# start_services <service...> -- `docker compose start`, tried three times, and
+# a failure unless every one of them is running afterwards.
+start_services() {
+  local attempt service all
+  for attempt in 1 2 3; do
+    if docker compose start "$@" >/dev/null 2>&1; then
+      all=1
+      for service in "$@"; do
+        service_running "$service" || all=0
+      done
+      [ "$all" = 1 ] && return 0
+    fi
+    [ "$attempt" = 3 ] && break
+    note "Could not start them (attempt $attempt of 3); trying again..."
+    sleep 2
+  done
+  return 1
+}
+
 cleanup() {
   trap '' INT TERM HUP
   local status="$1" start_failed=0
   if [ "$APPS_STOPPED" = 1 ] && [ "$DESTRUCTION_BEGUN" = 0 ] && [ -n "$RUNNING_BEFORE" ]; then
     note "Nothing was changed. Starting$RUNNING_BEFORE again..."
     # shellcheck disable=SC2086 # a list of service names, split on purpose
-    docker compose start $RUNNING_BEFORE >/dev/null 2>&1 || start_failed=1
+    start_services $RUNNING_BEFORE || start_failed=1
   fi
   remove_in_container_artefact ||
     note "WARNING: could not delete $CH_BACKUP_DIR/$CH_FILE inside the clickhouse container; delete it by hand."
@@ -212,10 +233,10 @@ BACKUP_SCHEMA="$(manifest_get "$SRC" schema_version)" || BACKUP_SCHEMA=''
 case "$BACKUP_SCHEMA" in
   '' | *[!0-9]*) refuse "The manifest's schema_version is '${BACKUP_SCHEMA:-missing}', which is not a number." ;;
 esac
-for table in $CH_COUNTED; do
-  manifest_get "$SRC" "rows.clickhouse.$table" >/dev/null ||
-    refuse "The manifest records no row count for $table, so the restore could not be checked."
-done
+# The raw table's count is always recorded; a rollup's only when the install
+# backed up had it, and the check after the restore covers what was recorded.
+manifest_get "$SRC" "rows.clickhouse.$CH_REQUIRED" >/dev/null ||
+  refuse "The manifest records no row count for $CH_REQUIRED, so the restore could not be checked."
 
 have_sha256 ||
   refuse "No SHA-256 tool found (looked for sha256sum, shasum and openssl)." \
@@ -456,10 +477,16 @@ if [ "$restored_schema" != "$BACKUP_SCHEMA" ]; then
   verify_ok=0
 fi
 for table in $CH_COUNTED; do
-  want="$(manifest_get "$SRC" "rows.clickhouse.$table")" || want=''
-  got="$(ch_query "SELECT count() FROM $table FINAL")" || got=''
-  if [ "$got" != "$want" ]; then
-    note "  $table: the backup recorded ${want:-nothing} rows, the restored table has ${got:-nothing}"
+  # Not recorded: the install backed up had no such table yet. The worker
+  # creates it when it migrates, after this.
+  want="$(manifest_get "$SRC" "rows.clickhouse.$table")" || continue
+  # A count that cannot be taken is a failure in its own right, never an empty
+  # answer that an empty expectation would match.
+  if ! got="$(ch_query "SELECT count() FROM $table FINAL")"; then
+    note "  $table: the backup recorded $want rows, and the restored table could not be counted"
+    verify_ok=0
+  elif [ "$got" != "$want" ]; then
+    note "  $table: the backup recorded $want rows, the restored table has ${got:-nothing}"
     verify_ok=0
   fi
 done

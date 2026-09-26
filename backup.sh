@@ -121,10 +121,12 @@ remove_incomplete_output() {
 # THE RESTART COMES FIRST, once the signals that could end the trap are
 # masked: an operator who presses Ctrl-C again while the worker is being
 # started would otherwise kill the trap before the restart, leaving the
-# reports frozen with nothing saying why. Children inherit the mask, so the
-# restart cannot be interrupted either; the trap ends in about ten seconds at
-# most. Each tidy-up after the restart cannot fail, and the lock goes last, so
-# no other run starts until this one is done with the stores.
+# reports frozen with nothing saying why. The mask protects this shell, not
+# the restart: `docker compose` installs its own handlers for INT and TERM, so
+# a second Ctrl-C can cut one attempt short. That is why the restart is tried
+# three times, and why the run fails saying so if the worker is still stopped.
+# Each tidy-up after the restart cannot fail, and the lock goes last, so no
+# other run starts until this one is done with the stores.
 cleanup() {
   trap '' INT TERM HUP
   local restart_ok=1

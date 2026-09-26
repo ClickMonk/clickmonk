@@ -25,8 +25,12 @@ CADDY_DATA_DIR=/data
 BACKUP_FORMAT=1
 # Every file a backup holds besides MANIFEST.
 ARTEFACTS="spool.tar clickhouse.zip postgres.dump caddy-data.tar env"
-# The ClickHouse tables whose rows a restore is checked against.
+# The ClickHouse tables whose rows a restore is checked against, each one
+# where it exists. The raw table is always there; the two rollups arrive with
+# a migration, so an install from before it has only clicks, and its backup
+# records only that. The manifest's rows.clickhouse.* lines say what was counted.
 CH_COUNTED="clicks clicks_hourly clicks_hourly_dim"
+CH_REQUIRED=clicks
 
 # The archive's name on the backups disk, and whether this run has put one
 # there, so the EXIT trap knows to delete it.
@@ -178,12 +182,18 @@ ledger_version() {
   pg_query 'SELECT COALESCE(max(version), 0) FROM schema_migrations'
 }
 
-# ch_counts -- `rows.clickhouse.<table>=<n>` for each counted table. FINAL,
-# because both engines merge rows that share a key when ClickHouse chooses to:
-# counted FINAL, the same parts give the same number whenever they are read.
+# ch_counts -- `rows.clickhouse.<table>=<n>` for each counted table that
+# exists, and a failure when the raw table does not. FINAL, because both
+# engines merge rows that share a key when ClickHouse chooses to: counted
+# FINAL, the same parts give the same number whenever they are read.
 ch_counts() {
-  local t n
+  local t n present
+  present="$(ch_query "SELECT name FROM system.tables WHERE database = '$CH_DATABASE' FORMAT TSVRaw")" || return 1
   for t in $CH_COUNTED; do
+    if ! printf '%s\n' "$present" | grep -qx "$t"; then
+      [ "$t" = "$CH_REQUIRED" ] && return 1
+      continue
+    fi
     n="$(ch_query "SELECT count() FROM $t FINAL")" || return 1
     case "$n" in
       '' | *[!0-9]*) return 1 ;;
