@@ -58,7 +58,8 @@ periods on the settings row, enforced hourly by the worker, dropping raw clicks 
 at a time and blanking the address on a click in place), the CLI (`migrate`,
 `domain add|list|verify`, `link add`, `settings show|set`, `ipdata status|update`,
 `admin create|passwd`, `admin totp disable`, `apikey create|list|revoke`, `version`),
-`install.sh`, `backup.sh` and `restore.sh`, a Compose stack, and the restart durability and stack test suites.
+`install.sh`, `backup.sh` and `restore.sh`, a Compose stack, and the restart durability and
+stack test suites.
 
 **A retention period is a floor, not a deadline, and it is never defaulted by a reader
 that deletes.** `clicks` is partitioned by month and dropped whole, so 90 days keeps 90 to

@@ -26,7 +26,8 @@ on your own infrastructure, and your click data stays yours.
   verified, and for the admin host name if you set one, so a host name somebody else
   points at your server never makes your install ask a certificate authority for anything.
 - **Domain verification.** `clickmonk domain add` prints a TXT record to publish. The
-  worker looks for it every five minutes, and `clickmonk domain verify` looks now. Until
+  worker looks for it every five minutes, up to 50 domains a pass with the longest unchecked
+  first, and `clickmonk domain verify` looks now. Until
   it is found, links on that domain answer 404 and it gets no certificate. A check that
   fails later is recorded and shown, and never takes a verified domain back down.
 - **`./install.sh`**, which writes `.env` with fresh secrets the first time, builds the
@@ -47,8 +48,9 @@ on your own infrastructure, and your click data stays yours.
 - **Traffic classification.** Every click is classed as human, bot, abuser, anonymous
   (a Tor exit), datacenter, or unknown when the IP checks could not run, from its
   user-agent, the number of requests from the same client in the current one-minute window,
-  and IP data held on your server. Each class other than human has an action: flag (the
-  default), nothing, block, or send to a safe URL. A flagged click never uses up a click
+  and IP data held on your server. Bot, abuser, anonymous and datacenter each have an
+  action: flag (the default), nothing, block, or send to a safe URL. An unknown click is sent
+  on as a human one is. A flagged click never uses up a click
   cap, but a cap that is used up closes the link to it like any other. A HEAD request,
   which link checkers and preview bots send, gets the same answer as a GET, is recorded
   as a bot unless another check gives it a class, and never uses up a click cap. Each
@@ -66,8 +68,8 @@ on your own infrastructure, and your click data stays yours.
   a chart by day tells you it gave you the whole day.
 - **The click log, and a CSV of it.** `GET /api/clicks` lists the clicks themselves, newest
   first, filterable by link, traffic class, outcome, country and time, and exact to the
-  millisecond. `GET /api/clicks.csv` is the same rows as a file: it streams, so the window
-  can be as wide as you like, and when it reaches its row cap it says so in a header rather
+  millisecond. `GET /api/clicks.csv` is the same rows as a file: it streams, so the file is never
+  built in memory, and its window, like every other, is at most 400 days. When it reaches its row cap it says so in a header rather
   than handing you a prefix that looks complete. The file identifies visitors, which
   "Reading the clicks back out" spells out before you send one to anybody.
 - **Addresses are shown as networks, always.** The log and the export show
@@ -137,7 +139,7 @@ What does not work yet:
   check did not find its token, and every domain no check has reached, which is what an
   operator has instead. A domain verified by hand (`domain add --verified`) is the one
   exception: it is not listed until a check has passed for it at least once, because
-  nothing changed for it — a check that then fails, having once passed, is listed again.
+  nothing changed for it — a check that then fails, having once passed, is listed.
 - **Most link settings in the CLI.** `clickmonk link add` sets targets, a backup URL, a
   click cap, an expiry, passthrough and traffic action overrides only, and no command
   changes a link once it is added. Per-device destinations, a returning-visitor
@@ -166,7 +168,7 @@ What does not work yet:
 - **The redirect and the admin API are reachable from the whole compose network.** None of
   their ports is published on the host, but any other container on the stack's own Docker
   network can reach all of them, not only Caddy. On `redirect:9091` that means reading the
-  `ask` check, which lists this install's verified domains. On `redirect:8080` it means
+  `ask` check, which answers, for any name, whether it is a verified domain here. On `redirect:8080` it means
   more: the stack trusts a forwarded address from that network
   (`CLICKMONK_TRUSTED_PROXIES` is `uniquelocal,loopback`), so a container inside the
   install can set `X-Forwarded-For` and choose the address recorded, counted and looked up
@@ -236,7 +238,7 @@ docker compose exec -T worker node packages/cli/dist/index.js domain add links.e
 It prints the TXT record to publish, at `_clickmonk.links.example.com`, and reminds you
 to point `links.example.com` at this server yourself — an A or AAAA record, or a CNAME,
 whichever your DNS provider gives you. Publish both, then wait: the worker checks every
-five minutes, `domain verify links.example.com` checks at once, and `domain list` shows
+five minutes, up to 50 domains a pass with the longest unchecked first, `domain verify links.example.com` checks at once, and `domain list` shows
 where each domain stands.
 
 **Until the TXT record is found the domain serves nothing.** Over plain HTTP, links on it
@@ -247,7 +249,7 @@ out of your install. `domain add --verified` is the way round it, for a trial or
 domain you proved some other way; it says on screen that no DNS check was made, and such
 a domain is not shown in `GET /api/alerts` or counted in `GET /api/status` until a check
 has passed for it once — until then nothing has changed for it, so there is nothing to
-warn about. A check that later fails, having once passed, is an alert again.
+warn about. A check that later fails, having once passed, is an alert.
 
 ClickMonk does not know its own public address, so it records what a domain resolves to
 rather than judging it — a host behind NAT, a load balancer or a CDN is normal. A domain
@@ -523,7 +525,8 @@ do, a `curl` command or the CLI can do too.
 **What it does not do yet:** there is no time zone setting for the install itself, only the
 browser's own zone; no bulk operations — one link, one domain, one setting at a time, the same
 as the CLI; and no local development mode, so trying it needs a real admin host set up, the
-same as the API does. See [#23](../../issues/23).
+same as the API does. See [#43](../../issues/43), [#39](../../issues/39) and
+[#23](../../issues/23).
 
 ## Reading the clicks back out
 
@@ -587,7 +590,7 @@ IP list's version and when it was fetched, `null` for a source never fetched and
 the whole field on an install with no IP data yet — `CLICKMONK_IPDATA_UPDATE=off`, or a
 fresh one. `ipDataProblem` is set, with `ipData` then `null` too, only when the manifest is
 there and could not be read; the response never says why, so check the admin service's own
-log for the reason. `alerts` is the count `GET /api/alerts` would list, capped the same way.
+log for the reason. `alerts` is the count `GET /api/alerts` would list, capped at 501, which means more than 500.
 
 **A report counts whole buckets; the log counts milliseconds.** Before a report is counted,
 `from` is floored and `to` raised to the next boundary, and **the boundary is the grain that
@@ -598,9 +601,9 @@ instants exactly as they were sent. So the same
 window can answer differently through these surfaces and none of them is broken: ask
 `from=2026-09-24T10:30:00Z&to=2026-09-24T10:50:00Z` and the summary, the hourly chart and the
 breakdown all count 10:00 to 11:00, a chart by day counts the whole of the 24th, and the log
-counts the twenty minutes you named — three different numbers from one request. Every one of
-these six answers repeats the window it actually counted, in its own `window` field. Read
-that before comparing two numbers.
+counts the twenty minutes you named — three different numbers from one request. Every JSON
+answer among these repeats the window it actually counted, in its own `window` field, and the
+export puts it in its file name. Read that before comparing two numbers.
 
 **What the numbers mean.** `clicks` counts distinct clicks and `visitors` distinct visitor
 cookies, and both are counted as sets rather than added up: a click the worker shipped twice
@@ -657,7 +660,7 @@ running. The window can gain clicks between this answer and the export; the expo
 header stays the authority on the file it actually wrote.
 
 **A cell that would otherwise look like a formula is prefixed with an apostrophe.** A
-spreadsheet runs a cell beginning `=`, `+`, `-` or `@`, or with whitespace in front of one,
+spreadsheet runs a cell beginning `=`, `+`, `-` or `@`, or with a tab, carriage return or newline,
 whether the cell is quoted or not. The two columns a visitor's own browser chooses the
 contents of — `referrer` and `userAgent` — are where that turns up, so those are the ones
 that can come back with an apostrophe in front of them.
@@ -770,8 +773,9 @@ you find out.
 
 The worker downloads four lists to your server, and `clickmonk ipdata update` fetches
 them on demand. The redirect looks each visitor's address up in memory: no lookup
-leaves your server, and no request waits for a download. The lists take about 25 MB of
-the redirect's memory, and each has a fixed ceiling. The admin service also mounts this
+leaves your server, and no request waits for a download. With the editions of September
+2026 the lists take about 25 MB of the redirect's memory, measured, and each has a fixed
+ceiling. The admin service also mounts this
 volume, read-only, and reads it for nothing but `GET /api/status` — to say how old each
 list is.
 
@@ -809,13 +813,13 @@ own lookup format. The same credit is in the web interface's own footer, on ever
 screen.
 
 A download replaces the list in use only when it parses whole and holds at least a
-minimum number of entries (about a fifth of a current edition; for country, half the
-IPv4 space); otherwise the previous one stays. `clickmonk ipdata status` shows each
+minimum number of entries (a small fraction of a current edition, about 5 to 15%; for
+country, half the IPv4 space); otherwise the previous one stays. `clickmonk ipdata status` shows each
 list's version and when it was fetched, and `clickmonk ipdata update` fetches them now.
 
 On a server without internet access, set `CLICKMONK_IPDATA_UPDATE=off`. The redirect then
 runs without IP data: countries are unknown, so a link limited to a list of countries
-sends every visitor to its backup URL, and clicks that no other check marks are classed
+sends every visitor to its backup URL, or answers 403 when it has none, and clicks that no other check marks are classed
 unknown rather than human.
 
 bad-asn-list's licence:
@@ -888,8 +892,7 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md) — not a public issue
 ## Backup and restore
 
 Two scripts sit beside `install.sh`. `backup.sh` is the one you schedule. `restore.sh` is
-the one you run once, under pressure, and it is the only thing in this repository that
-deletes your data.
+the one you run once, under pressure, and it is the only script here that deletes data.
 
 ### Taking a backup
 
@@ -912,8 +915,9 @@ Each run writes one new directory, named for the moment it started, in UTC:
 
 **Your links keep answering while it runs.** The one container it stops is the worker, while
 it copies the spool and ClickHouse, and it starts the worker again on every path it can, a
-failed step included. Pressing Ctrl-C a second time while it is starting the worker again
-does not interrupt that. Meanwhile the redirect keeps sending visitors on and writing their
+failed step included. It tries three times, so a second Ctrl-C that cuts one attempt short
+does not by itself leave the worker stopped; if all three fail it says so, and
+`docker compose start worker` is the fix. Meanwhile the redirect keeps sending visitors on and writing their
 clicks to the spool, and the worker ships them when it is back: the reports pause, and
 nothing is lost. A worker that was already stopped when you ran the script is left stopped.
 
@@ -954,13 +958,13 @@ existed.
 A nightly entry for cron:
 
 ```
-17 4 * * *  { /srv/clickmonk/backup.sh /var/backups/clickmonk || docker compose --project-directory /srv/clickmonk ps; } >>/var/log/clickmonk-backup.log 2>&1
+17 4 * * *  { /srv/clickmonk/backup.sh /var/backups/clickmonk || docker compose --project-directory /srv/clickmonk ps --all; } >>/var/log/clickmonk-backup.log 2>&1
 ```
 
-The script changes into its own directory, so cron does not need to. The `|| … ps` is not
+The script changes into its own directory, so cron does not need to. The `|| … ps --all` is not
 decoration: the script starts the worker again on every exit it can see, but a `SIGKILL` —
 an out-of-memory kill, `docker kill`, a hard `systemctl stop` — runs nothing, and can leave
-the worker stopped and the lock in place. The `ps` puts the first in your log, and the next
+the worker stopped and the lock in place. The `ps --all` puts the first in your log, as an exited worker, and the next
 night's refusal says the second. If you pipe the script anywhere, test `${PIPESTATUS[0]}`,
 not `$?`.
 
@@ -973,8 +977,8 @@ it better than a script here would, and `backup.sh` does none of them.
 A backup holds everything needed to be this install:
 
 - `env` has the database passwords and `CLICKMONK_SECRET`, which signs visitor cookies and
-  the proof a visitor holds after answering a link's password. Anyone with it can make that
-  proof for any password-protected link.
+  the proof a visitor holds after answering a link's password. With it and `postgres.dump`,
+  which is beside it, anyone can make that proof for any password-protected link.
 - `postgres.dump` has the admin password's hash, **the two-factor secret itself** — a server
   has to be able to read it to check a code — the hashes of the recovery codes, and the
   digests of every API key and session.
@@ -1093,8 +1097,10 @@ docker compose up -d --wait
 the migrations are done, and prints `up to date` or the versions it applied. `up -d worker`
 also recreates Postgres or ClickHouse if the pull brought a newer image for either; links
 keep answering meanwhile. The last line recreates the redirect and the admin service from
-the new image, and any other container whose image or configuration changed, which is a few
-seconds in which links do not answer, as with any rebuild. Read the release's notes before
+the new image, and any other container whose image or compose definition changed, which is a few
+seconds in which links do not answer, as with any rebuild. A change to a file a container
+mounts, such as the Caddyfile, is not one of those: the release notes say when to run
+`docker compose restart caddy`. Read the release's notes before
 you start: a release that needs anything more of you says so there, and under its own
 heading below.
 
@@ -1124,7 +1130,10 @@ Security fixes ship in the next release, and only the latest release is supporte
 
 0.1.0 is the first release. Before it, this repository could be cloned and run from `main`.
 Such a checkout has no `backup.sh`, so its backup is taken from 0.1.0's scripts against the
-containers you are already running, before anything is built:
+volumes you already have, before anything is built. Which commands depends on whether the
+checkout already serves HTTPS.
+
+**If it serves HTTPS:**
 
 ```sh
 git fetch --tags
@@ -1134,27 +1143,31 @@ docker compose up -d clickhouse
 ```
 
 The third line recreates ClickHouse alone, with the disk 0.1.0's backups are written to; the
-clicks in it are untouched, links keep answering, and the worker waits for it. The backup
-records the release it came from as `unknown`, because the image you are running predates
-`clickmonk version`; its schema version is exact, and that is what a restore checks. Then
-continue from `docker compose pull` in the steps above. Two older changes need more of you,
-depending on how old the checkout is.
+clicks in it are untouched, links keep answering, and the worker waits for it.
 
-**On a checkout from before TLS** (nothing of yours listens on 443; see the last heading
-below), the third line fails instead: Compose stops ClickHouse and then cannot recreate the
-stack's network, because the other containers are still on it, and says the network `has
-active endpoints`. ClickHouse is left stopped. Take the backup with the stack down instead,
-which means your links answer nothing from here until the upgrade's last step:
+**If it is from before TLS** (nothing of yours listens on 443; see "If nothing of yours
+listens on 443" below), that third line fails, because Compose cannot change the stack's
+network in place while the other containers are on it. On Compose 5.1.4 it stops ClickHouse,
+leaves it stopped and says the network `has active endpoints`. Take the backup with the stack
+down instead, which means your links answer nothing from here until the upgrade's last step:
 
 ```sh
+git fetch --tags
+git checkout v0.1.0
 docker compose down
 docker compose up -d postgres clickhouse
 ./backup.sh /var/backups/clickmonk
 ```
 
-`down` without `-v` removes the containers and the network and keeps every volume. The
-backup then records the release as `unknown` for a second reason, that neither the redirect
-nor the worker is running to be asked.
+`down` without `-v` removes the containers and the network and keeps every volume.
+
+Either way the backup records the release it came from as `unknown`, because the image you
+are running predates `clickmonk version`, or is not running at all; its schema version is
+exact, and that is what a restore checks. A checkout from before the hourly rollups has none
+to back up: the backup counts the clicks alone, and the worker creates the rollups when it
+applies the migrations. They start empty, so reports read zeroes for the time before, as
+"What does not work yet" says. Then continue from `docker compose pull` in the steps above.
+Two older changes need more of you, depending on how old the checkout is.
 
 **If `docker compose ps` shows no `admin` service,** the upgrade adds it, and it is off until
 you name a host for it: `CLICKMONK_ADMIN_HOST` is optional and empty by default, so the `.env`
