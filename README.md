@@ -68,10 +68,11 @@ on your own infrastructure, and your click data stays yours.
   a chart by day tells you it gave you the whole day.
 - **The click log, and a CSV of it.** `GET /api/clicks` lists the clicks themselves, newest
   first, filterable by link, traffic class, outcome, country and time, and exact to the
-  millisecond. `GET /api/clicks.csv` is the same rows as a file: it streams, so the file is never
-  built in memory, and its window, like every other, is at most 400 days. When it reaches its row cap it says so in a header rather
-  than handing you a prefix that looks complete. The file identifies visitors, which
-  "Reading the clicks back out" spells out before you send one to anybody.
+  millisecond. `GET /api/clicks.csv` is the same rows as a file: it streams, so the file is
+  never built in memory, and its window, like every other, is at most 400 days. When it
+  reaches its row cap it says so in a header rather than handing you a prefix that looks
+  complete. The file identifies visitors, which "Reading the clicks back out" spells out
+  before you send one to anybody.
 - **Addresses are shown as networks, always.** The log and the export show
   `198.51.100.0/24` and `2001:db8:1234:5678::/64`, never the address itself — enough to see
   a pattern or a bot, and not a file of addresses. The whole address stays in the database
@@ -168,14 +169,14 @@ What does not work yet:
 - **The redirect and the admin API are reachable from the whole compose network.** None of
   their ports is published on the host, but any other container on the stack's own Docker
   network can reach all of them, not only Caddy. On `redirect:9091` that means reading the
-  `ask` check, which answers, for any name, whether it is a verified domain here. On `redirect:8080` it means
-  more: the stack trusts a forwarded address from that network
-  (`CLICKMONK_TRUSTED_PROXIES` is `uniquelocal,loopback`), so a container inside the
-  install can set `X-Forwarded-For` and choose the address recorded, counted and looked up
-  for every click it sends. On `admin:9100` a request still has to carry the admin host
-  name in `Host` — a forwarded header will not do, and every route but `/health` is
-  refused without it — and then it still needs a credential. Every container on that
-  network is one you put there, which is what keeps this a limit rather than a way in.
+  `ask` check, which answers, for any name, whether it is a verified domain here. On
+  `redirect:8080` it means more: the stack trusts a forwarded address from that network
+  (`CLICKMONK_TRUSTED_PROXIES` is `uniquelocal,loopback`), so a container inside the install
+  can set `X-Forwarded-For` and choose the address recorded, counted and looked up for every
+  click it sends. On `admin:9100` a request still has to carry the admin host name in `Host`
+  — a forwarded header will not do, and every route but `/health` is refused without it —
+  and then it still needs a credential. Every container on that network is one you put
+  there, which is what keeps this a limit rather than a way in.
 - **IPv6 coverage depends on the host the tests run on.** The published-port IPv6 test
   is skipped when that host has no IPv6 address of its own — most CI runners — and is
   meant to be run by hand, on a host that has one, before a release. A second,
@@ -235,11 +236,12 @@ Add a domain:
 docker compose exec -T worker node packages/cli/dist/index.js domain add links.example.com
 ```
 
-It prints the TXT record to publish, at `_clickmonk.links.example.com`, and reminds you
-to point `links.example.com` at this server yourself — an A or AAAA record, or a CNAME,
-whichever your DNS provider gives you. Publish both, then wait: the worker checks every
-five minutes, up to 50 domains a pass with the longest unchecked first, `domain verify links.example.com` checks at once, and `domain list` shows
-where each domain stands.
+It prints the TXT record to publish, at `_clickmonk.links.example.com`, and reminds you to
+point `links.example.com` at this server yourself — an A or AAAA record, or a CNAME,
+whichever your DNS provider gives you. Publish both, then wait: the worker checks every five
+minutes, up to 50 domains a pass with the longest unchecked first,
+`domain verify links.example.com` checks at once, and `domain list` shows where each domain
+stands.
 
 **Until the TXT record is found the domain serves nothing.** Over plain HTTP, links on it
 answer 404. Over HTTPS there is no certificate to present, so the connection never gets
@@ -590,7 +592,8 @@ IP list's version and when it was fetched, `null` for a source never fetched and
 the whole field on an install with no IP data yet — `CLICKMONK_IPDATA_UPDATE=off`, or a
 fresh one. `ipDataProblem` is set, with `ipData` then `null` too, only when the manifest is
 there and could not be read; the response never says why, so check the admin service's own
-log for the reason. `alerts` is the count `GET /api/alerts` would list, capped at 501, which means more than 500.
+log for the reason. `alerts` is the count `GET /api/alerts` would list, capped at 501, which
+means more than 500.
 
 **A report counts whole buckets; the log counts milliseconds.** Before a report is counted,
 `from` is floored and `to` raised to the next boundary, and **the boundary is the grain that
@@ -818,9 +821,9 @@ country, half the IPv4 space); otherwise the previous one stays. `clickmonk ipda
 list's version and when it was fetched, and `clickmonk ipdata update` fetches them now.
 
 On a server without internet access, set `CLICKMONK_IPDATA_UPDATE=off`. The redirect then
-runs without IP data: countries are unknown, so a link limited to a list of countries
-sends every visitor to its backup URL, or answers 403 when it has none, and clicks that no other check marks are classed
-unknown rather than human.
+runs without IP data: countries are unknown, so a link limited to a list of countries sends
+every visitor to its backup URL, or answers 403 when it has none, and clicks that no other
+check marks are classed unknown rather than human.
 
 bad-asn-list's licence:
 
@@ -917,9 +920,10 @@ Each run writes one new directory, named for the moment it started, in UTC:
 it copies the spool and ClickHouse, and it starts the worker again on every path it can, a
 failed step included. It tries three times, so a second Ctrl-C that cuts one attempt short
 does not by itself leave the worker stopped; if all three fail it says so, and
-`docker compose start worker` is the fix. Meanwhile the redirect keeps sending visitors on and writing their
-clicks to the spool, and the worker ships them when it is back: the reports pause, and
-nothing is lost. A worker that was already stopped when you ran the script is left stopped.
+`docker compose start worker` is the fix. Meanwhile the redirect keeps sending visitors on
+and writing their clicks to the spool, and the worker ships them when it is back: the
+reports pause, and nothing is lost. A worker that was already stopped when you ran the
+script is left stopped.
 
 **The pause and the disk space grow with your data.** ClickHouse writes its own archive
 beside its data before the script copies it out, so a backup needs free space about the size
@@ -961,12 +965,12 @@ A nightly entry for cron:
 17 4 * * *  { /srv/clickmonk/backup.sh /var/backups/clickmonk || docker compose --project-directory /srv/clickmonk ps --all; } >>/var/log/clickmonk-backup.log 2>&1
 ```
 
-The script changes into its own directory, so cron does not need to. The `|| … ps --all` is not
-decoration: the script starts the worker again on every exit it can see, but a `SIGKILL` —
-an out-of-memory kill, `docker kill`, a hard `systemctl stop` — runs nothing, and can leave
-the worker stopped and the lock in place. The `ps --all` puts the first in your log, as an exited worker, and the next
-night's refusal says the second. If you pipe the script anywhere, test `${PIPESTATUS[0]}`,
-not `$?`.
+The script changes into its own directory, so cron does not need to. The `|| … ps --all` is
+not decoration: the script starts the worker again on every exit it can see, but a `SIGKILL`
+— an out-of-memory kill, `docker kill`, a hard `systemctl stop` — runs nothing, and can
+leave the worker stopped and the lock in place. The `ps --all` puts the first in your log,
+as an exited worker, and the next night's refusal says the second. If you pipe the script
+anywhere, test `${PIPESTATUS[0]}`, not `$?`.
 
 **Encryption, rotation and copies off the server are yours to choose.** `find -mtime` for
 old directories, `age` to encrypt one, `restic` or `rclone` to send it somewhere else all do
