@@ -3,7 +3,7 @@ import { ApiError } from '@/api/errors'
 import { fakeClient } from '@/api/fake'
 import type { Settings as S } from '@/api/types'
 import { RefreshProvider, useRefresh } from '@/app/refresh'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it } from 'vitest'
 import { Settings } from './Settings'
@@ -225,18 +225,26 @@ describe('the settings screen', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('most likely the retention pass')
   })
 
-  it('marks the body busy while a reload is in flight, without losing the fields', async () => {
-    let resolveSecond: ((s: S) => void) | undefined
-    let calls = 0
-    const client = fakeClient({
-      settings: (() => {
-        calls += 1
-        if (calls === 1) return Promise.resolve(SETTINGS)
-        return new Promise<S>((resolve) => {
-          resolveSecond = resolve
-        })
-      }) as never,
-    })
+  // Settings does not reload in place (see the test below), so its aria-busy
+  // region only ever answers false once it has anything to show — there is
+  // no round trip left to observe going busy without a reload to trigger it.
+  it('is not busy once the settings have loaded', async () => {
+    const client = fakeClient({ settings: () => Promise.resolve(SETTINGS) })
+    render(
+      <ClientProvider client={client}>
+        <Settings />
+      </ClientProvider>,
+    )
+    const threshold = await screen.findByLabelText('Abuser threshold')
+    expect(threshold.closest('[aria-busy]')).toHaveAttribute('aria-busy', 'false')
+  })
+
+  // Settings reads its own answer into local state once and edits it there;
+  // it must not depend on the refresh round, or a Refresh press (or the
+  // focus-return refresh after 60s away) would remount the form under an
+  // edit that was never saved, or under an open retention confirmation.
+  it('keeps an unsaved edit through a Refresh round, rather than reloading under it', async () => {
+    const client = fakeClient({ settings: () => Promise.resolve(SETTINGS) })
     render(
       <ClientProvider client={client}>
         <RefreshProvider>
@@ -246,12 +254,11 @@ describe('the settings screen', () => {
       </ClientProvider>,
     )
     const threshold = await screen.findByLabelText('Abuser threshold')
-    const region = threshold.closest('[aria-busy]') as HTMLElement
-    expect(region).toHaveAttribute('aria-busy', 'false')
-    await userEvent.setup().click(screen.getByRole('button', { name: 'go' }))
-    expect(region).toHaveAttribute('aria-busy', 'true')
-    expect(screen.getByLabelText('Abuser threshold')).toHaveValue('60')
-    resolveSecond?.(SETTINGS)
-    await waitFor(() => expect(region).toHaveAttribute('aria-busy', 'false'))
+    const user = userEvent.setup()
+    await user.clear(threshold)
+    await user.type(threshold, '42')
+    await user.click(screen.getByRole('button', { name: 'go' }))
+    expect(screen.getByLabelText('Abuser threshold')).toHaveValue('42')
+    expect(client.calls.filter((c) => c.method === 'settings')).toHaveLength(1)
   })
 })
