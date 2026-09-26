@@ -251,11 +251,15 @@ CH_FREE="$(ch_query "SELECT free_space FROM system.disks WHERE name = 'backups'"
     "ClickHouse has no disk named 'backups': it was started before this checkout's" \
     "clickhouse/backup-disk.xml existed. Recreate it with the new configuration" \
     "(links keep answering; the worker waits for it): docker compose up -d clickhouse"
-case "$CH_BYTES$CH_FREE" in
-  '' | *[!0-9]*)
-    fail "validation" "Could not read ClickHouse's size and free space: '${CH_BYTES:-nothing}', '${CH_FREE:-nothing}'."
-    ;;
-esac
+# Each on its own: an empty one inside a concatenation would still read as a
+# number, and as zero bytes needed below.
+for value in "$CH_BYTES" "$CH_FREE"; do
+  case "$value" in
+    '' | *[!0-9]*)
+      fail "validation" "Could not read ClickHouse's size and free space: '${CH_BYTES:-nothing}', '${CH_FREE:-nothing}'."
+      ;;
+  esac
+done
 # bash's arithmetic is 64-bit, so byte counts of any real disk fit.
 CH_NEED=$((CH_BYTES + CH_BYTES / 10))
 [ "$CH_FREE" -ge "$CH_NEED" ] ||
