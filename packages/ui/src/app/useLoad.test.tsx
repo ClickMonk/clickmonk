@@ -1,8 +1,20 @@
 import { ApiError } from '@/api/errors'
 import { act, render, screen } from '@testing-library/react'
+import { Component, type ReactNode } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 import { RefreshProvider, useRefresh } from './refresh'
 import { useLoad } from './useLoad'
+
+/** Catches a defect thrown from an effect, so the sibling under test survives to be read. */
+class Boundary extends Component<{ children: ReactNode }, { crashed: boolean }> {
+  override state = { crashed: false }
+  static getDerivedStateFromError() {
+    return { crashed: true }
+  }
+  override render() {
+    return this.state.crashed ? <p>crashed</p> : this.props.children
+  }
+}
 
 function Show({ load, dep = 0 }: { load: (s: AbortSignal) => Promise<string>; dep?: number }) {
   const r = useLoad(load, [dep])
@@ -202,6 +214,80 @@ describe('loading', () => {
     await act(async () => resolveFast('fast'))
     expect(screen.getByTestId('busy')).toHaveTextContent('busy')
     await act(async () => resolveSlow('slow'))
+    expect(screen.getByTestId('busy')).toHaveTextContent('idle')
+  })
+
+  // The cleanup's own `finish()` is what releases an unmount mid-load: a
+  // load that ignores its abort signal (never settles) has no other way to
+  // let go of its slot.
+  it('releases the count when unmounted mid-load, even if the load ignores its abort signal', () => {
+    const tree = (mounted: boolean) => (
+      <RefreshProvider>
+        {mounted && <Show load={() => new Promise<string>(() => {})} />}
+        <Busy />
+      </RefreshProvider>
+    )
+    const { rerender } = render(tree(true))
+    expect(screen.getByTestId('busy')).toHaveTextContent('busy')
+    rerender(tree(false))
+    expect(screen.getByTestId('busy')).toHaveTextContent('idle')
+  })
+
+  // A superseded attempt's cleanup already released its slot; if its own
+  // abort rejection released it again, that second release comes out of
+  // whatever else is still outstanding — the count goes idle early while a
+  // real load is still running.
+  it('releases a superseded load’s slot exactly once, not again when its own abort rejects', async () => {
+    const respectsAbort = (signal: AbortSignal) =>
+      new Promise<string>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+      })
+    let resolveSlow: (v: string) => void = () => {}
+    const slow = () =>
+      new Promise<string>((r) => {
+        resolveSlow = r
+      })
+    const tree = (dep: number) => (
+      <RefreshProvider>
+        <Show load={respectsAbort} dep={dep} />
+        <Show load={slow} dep={99} />
+        <Busy />
+      </RefreshProvider>
+    )
+    const { rerender } = render(tree(1))
+    expect(screen.getByTestId('busy')).toHaveTextContent('busy')
+    await act(async () => {
+      rerender(tree(2))
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    // The superseded load's replacement (dep 2) is still pending, and so is
+    // `slow` — nothing has settled yet, whether the guard held or not.
+    expect(screen.getByTestId('busy')).toHaveTextContent('busy')
+    await act(async () => resolveSlow('done'))
+    // Only `slow` settled. The replacement is still going, so this must
+    // still read busy — it reads idle only if the superseded attempt's
+    // abort rejection took a second slot that was never its own to release.
+    expect(screen.getByTestId('busy')).toHaveTextContent('busy')
+  })
+
+  // `beginLoad()` runs before `load()` is called; a defect that throws
+  // synchronously, rather than returning a rejected promise, must still
+  // release what it began before the effect's own throw reaches its
+  // boundary — otherwise the count leaks and Refresh never re-enables.
+  it('releases the count when load() throws synchronously, before returning a promise', () => {
+    const throwsSync = (() => {
+      throw new Error('defect: not actually async')
+    }) as unknown as (s: AbortSignal) => Promise<string>
+    render(
+      <RefreshProvider>
+        <Boundary>
+          <Show load={throwsSync} />
+        </Boundary>
+        <Busy />
+      </RefreshProvider>,
+    )
+    expect(screen.getByText('crashed')).toBeInTheDocument()
     expect(screen.getByTestId('busy')).toHaveTextContent('idle')
   })
 })

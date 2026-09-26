@@ -59,26 +59,36 @@ export function useLoad<T>(load: (signal: AbortSignal) => Promise<T>, deps: unkn
       data: l.state === 'error' ? undefined : l.data,
       error: undefined,
     }))
-    load(controller.signal).then(
-      (data) => {
-        if (!controller.signal.aborted) setLoaded({ state: 'ok', data, error: undefined })
-        finish()
-      },
-      (err: unknown) => {
-        if (controller.signal.aborted) {
+    // `load` is a caller's function, not necessarily an async one: a defect
+    // in it can throw before ever returning a promise to `.then` off. That
+    // still ends this attempt, so it still releases the count, the same as
+    // any other way of settling — then re-thrown, so it reaches React the
+    // way a synchronous throw from an effect always has.
+    try {
+      load(controller.signal).then(
+        (data) => {
+          if (!controller.signal.aborted) setLoaded({ state: 'ok', data, error: undefined })
           finish()
-          return
-        }
-        if (err instanceof DOMException && err.name === 'AbortError') {
+        },
+        (err: unknown) => {
+          if (controller.signal.aborted) {
+            finish()
+            return
+          }
+          if (err instanceof DOMException && err.name === 'AbortError') {
+            finish()
+            return
+          }
+          if (err instanceof ApiError)
+            setLoaded((l) => ({ state: 'error', data: l.data, error: err }))
+          else setThrown(err)
           finish()
-          return
-        }
-        if (err instanceof ApiError)
-          setLoaded((l) => ({ state: 'error', data: l.data, error: err }))
-        else setThrown(err)
-        finish()
-      },
-    )
+        },
+      )
+    } catch (err) {
+      finish()
+      throw err
+    }
     return () => {
       controller.abort()
       finish()
