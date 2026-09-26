@@ -57,8 +57,8 @@ built on the admin API and nothing it can reach that a script cannot), retention
 periods on the settings row, enforced hourly by the worker, dropping raw clicks a partition
 at a time and blanking the address on a click in place), the CLI (`migrate`,
 `domain add|list|verify`, `link add`, `settings show|set`, `ipdata status|update`,
-`admin create|passwd`, `admin totp disable`, `apikey create|list|revoke`), `install.sh`, a
-Compose stack, and the restart durability and stack test suites.
+`admin create|passwd`, `admin totp disable`, `apikey create|list|revoke`, `version`),
+`install.sh`, `backup.sh` and `restore.sh`, a Compose stack, and the restart durability and stack test suites.
 
 **A retention period is a floor, not a deadline, and it is never defaulted by a reader
 that deletes.** `clicks` is partitioned by month and dropped whole, so 90 days keeps 90 to
@@ -106,7 +106,9 @@ What does not exist yet, and must not be implied by any documentation:
   recognised by ASN only, since no cloud provider's range file states a licence. The
   region and city columns exist on a click and are always empty, and a breakdown by
   either would be a new materialized view and a backfill of it.
-- **Backup and restore.**
+- **Backups that encrypt, rotate or leave the server**, and **a restore of one part of a
+  backup**. `backup.sh` writes one directory; `restore.sh` replaces everything and is an
+  outage while it runs.
 - Segments ClickHouse rejects are set aside as `.bad` files, and nothing reports them.
 - One redirect process per spool directory.
 - A full spool stops recording without stopping redirects; the drop count is on
@@ -176,6 +178,13 @@ caddy/              the Caddyfile, and the tls.d/ and proxy.d/ drop-in directori
                     admin service and every other name to the redirect, with a CEL
                     expression rather than a host matcher so an unset value starts.
 install.sh          writes .env once, with fresh secrets, and starts the stack.
+backup.sh           copies Postgres, ClickHouse, the spool, caddy-data and .env into one
+                    directory, stopping only the worker, and only while the spool and
+                    ClickHouse are copied.
+restore.sh          checks a backup, then replaces all four stores with it; the only
+                    script here that deletes data. Both source backup-lib.sh, which
+                    holds the lock they share: one run at a time per install.
+clickhouse/         backup-disk.xml, the disk ClickHouse's own BACKUP writes to.
 test/stack/         brings the whole stack up against a local certificate authority
                     and DNS server; proves TLS issuance, domain verification, real
                     client addresses over IPv4 and IPv6, and the admin host — its
@@ -267,7 +276,9 @@ up, sign in to it over HTTPS on the admin host, and drive a password-protected l
 the form to the redirect. One of them clicks a link through Caddy and then reads that
 click back through the admin host as a summary, a chart, a breakdown, a log page and a
 CSV, and lowers a retention period and watches the worker enforce it — the one path where
-the admin service's own ClickHouse configuration has to be right. They bind **80 and 443**; the
+the admin service's own ClickHouse configuration has to be right. One of them takes backups
+of a running stack, refuses damaged and newer ones without touching anything, then destroys
+every volume and restores into an empty stack. They bind **80 and 443**; the
 durability suite binds 8080 and 8123 and the test databases 8123 and 5433. Run one at a
 time.
 
@@ -329,7 +340,9 @@ That rule is easy to satisfy badly, so:
 
 Anything that runs on an operator's host rather than in a container — an installer,
 backup or restore — targets **bash 3.2**, the version macOS still ships: no associative
-arrays, no `mapfile`. `install.sh` is the first. `shellcheck` is pinned as a Docker image
+arrays, no `mapfile`. `install.sh` is the first. `backup.sh`, `backup-lib.sh` and
+`restore.sh` follow the same rules, and the backup suite parses all three under a real
+bash 3.2. `shellcheck` is pinned as a Docker image
 and run by `pnpm lint:sh` over every `*.sh` in the repository, so a new script is linted
 without anything being added to the script, and by CI with the same command, so a failure
 there is reproducible here.

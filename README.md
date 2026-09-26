@@ -92,6 +92,11 @@ on your own infrastructure, and your click data stays yours.
 - **A Docker Compose stack** that runs all of it, and a test that restarts each service
   under continuous traffic and requires every redirect the client received to arrive in
   ClickHouse as a click.
+- **Backup and restore.** `./backup.sh` copies everything an install holds — the clicks
+  and rollups, the configuration, clicks still waiting in the spool, the certificates and
+  `.env` — while links keep answering, and `./restore.sh` puts all of it back, into the
+  same release or a newer one. A test takes a backup, destroys every volume, restores into
+  an empty stack and counts every click once. See ["Backup and restore"](#backup-and-restore).
 
 What does not work yet:
 
@@ -146,7 +151,11 @@ What does not work yet:
   network (ASN) only. The providers' range files state no licence, so they are not used.
 - **Region and city.** A click records its country only. The two columns exist and are
   always empty, and a breakdown by either would need a rollup of its own.
-- **Backup and restore.**
+- **Backups that look after themselves.** `backup.sh` writes one directory and stops:
+  it does not encrypt it, rotate old ones, or copy anything off the server. Those are yours,
+  and the section on backups says what to use.
+- **Restoring one part of a backup.** A restore replaces everything, and your links answer
+  nothing while it runs.
 - **Rejected clicks are not reported.** A batch of clicks ClickHouse refuses is set aside
   as a `.bad` file in the spool, and nothing tells you it is there.
 - **More than one redirect process per spool directory.**
@@ -175,7 +184,8 @@ it. That is the most useful contribution at this stage.
 
 ## Installing
 
-You need a Linux host with Docker and Docker Compose v2, and ports 80 and 443 free.
+You need a Linux host with Docker and Docker Compose 2.23 or later (the backup scripts need
+it), and ports 80 and 443 free.
 
 ```sh
 git clone https://github.com/ClickMonk/clickmonk.git
@@ -262,7 +272,9 @@ Origin certificate. Nothing mounts one into Caddy by default: add the mount in
 and Caddy exits at boot, unable to find a file that was never there. Flexible mode sends
 traffic to your server in clear and is not an option.
 
-Certificates live in the `caddy-data` volume. Back it up with the rest.
+Certificates live in the `caddy-data` volume, and `backup.sh` copies it with everything
+else, so a restored install presents the certificates it had rather than asking the
+certificate authority for every domain again at once.
 
 ## The admin API
 
@@ -795,40 +807,285 @@ bad-asn-list's licence:
     OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
     SOFTWARE.
 
+## Backup and restore
+
+Two scripts sit beside `install.sh`. `backup.sh` is the one you schedule. `restore.sh` is
+the one you run once, under pressure, and it is the only thing in this repository that
+deletes your data.
+
+### Taking a backup
+
+```sh
+./backup.sh /var/backups/clickmonk
+```
+
+Each run writes one new directory, named for the moment it started, in UTC:
+
+```
+/var/backups/clickmonk/2026-10-01T041500Z/
+    clickhouse.zip   the clicks and the hourly rollups
+    postgres.dump    domains, links, click-cap counters, settings, the admin account,
+                     its sessions and API keys
+    spool.tar        clicks the redirect has accepted and the worker has not shipped yet
+    caddy-data.tar   certificates, their private keys, and the certificate authority account
+    env              a copy of .env
+    MANIFEST         versions, row counts, and a SHA-256 of each file
+```
+
+**Your links keep answering while it runs.** The one container it stops is the worker, while
+it copies the spool and ClickHouse, and it starts the worker again on every path it can, a
+failed step included. Pressing Ctrl-C a second time while it is starting the worker again
+does not interrupt that. Meanwhile the redirect keeps sending visitors on and writing their
+clicks to the spool, and the worker ships them when it is back: the reports pause, and
+nothing is lost. A worker that was already stopped when you ran the script is left stopped.
+
+**The pause and the disk space grow with your data.** ClickHouse writes its own archive
+beside its data before the script copies it out, so a backup needs free space about the size
+of ClickHouse's data twice: once on the disk Docker keeps its volumes on, and once at the
+destination — both on the same disk if the destination is on this server. `backup.sh`
+measures the first before it stops anything, and refuses when there is not room for it plus
+a tenth. It does not measure the destination: a copy that runs out of room there fails, and
+the half-written directory is deleted. For scale, measured on an 8-core AMD EPYC virtual
+machine with 6 GB of memory and ClickHouse 24.8 holding 2.2 GiB of ClickMonk's clicks and
+rollups: the archive was 1.77 GB, and ClickHouse took 49 seconds to write it, all of which
+the worker was stopped for. Take your own figures from the first backup you run, and
+schedule it when a pause of the reports matters least.
+
+**What the backup is a picture of.** The worker is the only thing that moves clicks from
+the spool into ClickHouse, so with it stopped the two are copied at one instant: every click
+the redirect had written before that instant is in the backup — in ClickHouse, in the spool,
+or in both. Both is normal, and it is not counted twice. The worker deletes a batch of clicks
+from the spool only after ClickHouse has accepted it, so a batch caught in between is in both
+places, and after a restore it is shipped again; every count ClickMonk makes is of distinct
+clicks, so the second copy adds nothing. Postgres is dumped after that, as one consistent
+snapshot of its own: a link created in between is in the backup, and a click on it after the
+spool was copied is not.
+
+**One backup or restore at a time.** The two scripts share a lock, the directory
+`.backup-restore.lock` in the checkout, and a run that finds it taken is refused. A run that
+is killed outright leaves the lock behind, and every run after it is refused, with the
+command that removes it, until you remove it. Nothing removes a lock for being old: two runs
+that both judged it stale would both go ahead.
+
+**It refuses, before it stops anything,** while ClickHouse is still running a backup or a
+restore that a killed run started (the server finishes one even when its client is gone),
+and while a restore has not finished — see "If a restore is interrupted" below. A backup of
+half-restored stores would be complete, checksummed, and a picture of a moment that never
+existed.
+
+A nightly entry for cron:
+
+```
+17 4 * * *  { /srv/clickmonk/backup.sh /var/backups/clickmonk || docker compose --project-directory /srv/clickmonk ps; } >>/var/log/clickmonk-backup.log 2>&1
+```
+
+The script changes into its own directory, so cron does not need to. The `|| … ps` is not
+decoration: the script starts the worker again on every exit it can see, but a `SIGKILL` —
+an out-of-memory kill, `docker kill`, a hard `systemctl stop` — runs nothing, and can leave
+the worker stopped and the lock in place. The `ps` puts the first in your log, and the next
+night's refusal says the second. If you pipe the script anywhere, test `${PIPESTATUS[0]}`,
+not `$?`.
+
+**Encryption, rotation and copies off the server are yours to choose.** `find -mtime` for
+old directories, `age` to encrypt one, `restic` or `rclone` to send it somewhere else all do
+it better than a script here would, and `backup.sh` does none of them.
+
+### The backup is a credential
+
+A backup holds everything needed to be this install:
+
+- `env` has the database passwords and `CLICKMONK_SECRET`, which signs visitor cookies and
+  the proof a visitor holds after answering a link's password. Anyone with it can make that
+  proof for any password-protected link.
+- `postgres.dump` has the admin password's hash, **the two-factor secret itself** — a server
+  has to be able to read it to check a code — the hashes of the recovery codes, and the
+  digests of every API key and session.
+- `caddy-data.tar` has every certificate's private key, and the key of the account Caddy
+  uses with the certificate authority.
+
+`backup.sh` creates the directory readable by you alone (`0700`) and every file in it
+`0600`, from the moment each exists. Treat the directory as you would the server itself, and
+encrypt it before it leaves the server.
+
+### Restoring
+
+```sh
+./restore.sh /var/backups/clickmonk/2026-10-01T041500Z
+```
+
+You are asked to type the backup's timestamp. There is no `--force`, and no answer within
+two minutes is a refusal.
+
+**Before anything is stopped or changed** it checks every file against its checksum, the
+backup against the image this checkout builds, and that ClickHouse's disk has room for it;
+then it asks. A refusal at any of those, or any answer but the timestamp, leaves the running
+install as it was, not even stopped.
+
+Then it stops Caddy, the redirect, the admin service and the worker — **your links answer
+nothing until it finishes**, which is seconds on a small install and longer on a large one
+— replaces ClickHouse, Postgres, the spool and Caddy's certificates with the backup's,
+checks the restored schema version and row counts against the manifest, and starts
+everything. **Everything recorded since the backup is gone**: clicks, links, domains,
+settings.
+
+**It restores more than data.** The admin account comes back as it was when the backup was
+taken: its password, its two-factor setting, the sessions signed in then, and its API keys.
+A key you revoked since, or a password you changed since, is back as it was. When a restore
+finishes, check the keys and change the password if either has moved on:
+
+```sh
+docker compose exec -T worker node packages/cli/dist/index.js apikey list
+```
+
+Click caps count from where the backup left them, and a restored backup older than your
+retention periods loses what is past them as soon as the restore starts the worker, whose
+first retention pass runs at once. To keep older clicks, lengthen the retention periods
+before you restore.
+
+**Into a newer release.** A backup from an older release restores into a newer one: the
+worker applies the migrations the backup is missing when the restore starts it. A backup
+from a newer release than your checkout is refused before anything is touched — check out
+that release or a later one, and restore again.
+
+**On a new server.** Clone the repository and check out the release the backup came from or
+a later one. Copy the backup's `env` to `.env` **before** the first start, so that visitors
+keep their cookies and nobody has to answer a link's password again. Then:
+
+```sh
+./install.sh
+./restore.sh /path/to/the/backup/2026-10-01T041500Z
+```
+
+`install.sh` keeps a `.env` that is already there. `restore.sh` never writes `.env` itself —
+the database passwords in it have to match the volumes already on this server — and if its
+`CLICKMONK_SECRET` or `CLICKMONK_ADMIN_HOST` differs from the backup's it says so before it
+asks you to confirm.
+
+**Certificates come back too**, so the same names present the same certificates without the
+certificate authority being asked again. One that has expired since the backup is renewed
+the first time someone asks for it, as any expired certificate is.
+
+**If a restore is interrupted part way,** it leaves Caddy, the redirect, the admin service
+and the worker stopped and says which stores are in which state. It does not start them,
+because a redirect running on a half-restored database serves whatever happens to be there
+and looks healthy doing it. Run it again with the same backup; it starts from the beginning.
+If it was interrupted while ClickHouse was restoring, ClickHouse finishes that restore even
+with the script gone, and running the script again is refused, changing nothing, until it
+has: wait a minute and try again. Until a restore has finished, `backup.sh` refuses to run;
+the file `.restore-incomplete` in the checkout is what tells it.
+
+**If the restored stores do not match the manifest** — a schema version or a row count that
+differs from what the backup recorded — it lists the differences and leaves the same four
+services stopped and `.restore-incomplete` in place. Restore a different backup, or start on
+what was restored with `docker compose up -d` and then delete `.restore-incomplete`
+yourself.
+
+**A restore needs room too.** It copies the ClickHouse archive into ClickHouse's volume and
+restores the database beside it there, so before anything is stopped it refuses unless that
+disk has about two and a half times the archive's size free, counting the space the current
+ClickHouse database gives up when it is replaced.
+
+**Not in a backup:** the IP data, which a restore leaves where it is, and which the worker
+downloads as soon as it starts on a server that has none (until then countries are unknown,
+as on a new install); the redirect's own copy of its configuration, which a restore deletes
+and the redirect rebuilds from Postgres; and Caddy's autosaved configuration.
+
 ## Upgrading
 
-Each release that needs anything of you has its own heading here. Read the one you are
-coming from, and every one after it.
+**Take a backup first.** Migrations run when the worker starts, and a database a newer
+release has migrated is refused by an older one:
 
-### Upgrading to the admin API
+```sh
+./backup.sh /var/backups/clickmonk
+```
 
-**`docker compose up -d --build` adds one container and restarts most of the others.** The
-new `admin` service starts beside them. The redirect and the worker are rebuilt from the
-same image, so they are recreated too, and Caddy is recreated because it reads the new
-setting — which makes this a brief outage for your links, as any rebuild is. Postgres and
-ClickHouse are left alone. Caddy still binds 80 and 443 and is still the only service with
-a published port.
+Then move the checkout to the release, build it, and start the worker before anything else:
 
-**There is nothing to run by hand:** the worker applies the schema change when it starts,
-as it does for every release, and `up -d --wait` waits for the new container, which becomes
-healthy whether or not you have configured it. Clicks are written at record version 3 from
-here on, which "Every release: upgrade the worker before the redirect" below covers.
+```sh
+git fetch --tags
+git checkout vX.Y.Z
+docker compose pull caddy postgres clickhouse
+docker compose build
+docker compose up -d worker
+docker compose exec -T worker node packages/cli/dist/index.js migrate
+docker compose up -d --wait
+```
 
-**The admin API is off until you name a host for it, and your existing `.env` names
-none.** `CLICKMONK_ADMIN_HOST` is optional and defaults to empty, so an `.env` written by
-an earlier `install.sh` needs no edit, Compose warns about nothing, and the upgraded
-install behaves exactly as it did: every name goes to the redirect, and the admin
-container answers 503 to everything but its own healthcheck. Naming a host is what turns
-it on, and that has one consequence to decide before you do it rather than after: the
-first HTTPS request for that name makes Caddy ask a certificate authority for a
-certificate in it. ["The admin API"](#the-admin-api) above is how to set it up, and
-[Password-protected links](#password-protected-links) is the other half of what this
-release adds.
+`migrate` is the wait: it takes the lock the worker's own migration holds, so it returns once
+the migrations are done, and prints `up to date` or the versions it applied. `up -d worker`
+also recreates Postgres or ClickHouse if the pull brought a newer image for either; links
+keep answering meanwhile. The last line recreates the redirect and the admin service from
+the new image, and any other container whose image or configuration changed, which is a few
+seconds in which links do not answer, as with any rebuild. Read the release's notes before
+you start: a release that needs anything more of you says so there, and under its own
+heading below.
 
-### Upgrading from before TLS
+**Why the worker goes first.** Each release's redirect writes clicks in the record version it
+knows, and a worker older than the redirect does not read a newer one: it leaves those spool
+segments where they are, counting toward the spool's size bound, until a worker that reads
+them is running. Nothing is lost if the order slips — the clicks wait — but the reports stop
+moving until the worker catches up. Support for reading a record version always ships no
+later than writing it, so the worker-first order is always enough.
 
-Four things change, and two of them destroy something. **Nothing in this heading applies to
-an install that was already serving HTTPS.**
+**There is no published image.** A release is a tag, and the image is built from the checkout,
+as `install.sh` builds it. If you have changed files in your checkout that the release also
+changes, `git checkout` refuses and names them; commit or stash the change first.
+
+**If the new version will not start,** read `docker compose logs worker`. `Database schema
+version N is newer than this build understands (M)` means the checkout went backwards, to a
+release older than the database. Check out the release you were on, or a later one — or
+restore the backup you took before upgrading. It is refused on purpose: an older build would
+write what the newer schema no longer expects.
+
+**Nothing updates itself.** No part of ClickMonk checks for a release or installs one. To hear
+about one, watch this repository's releases on GitHub (Watch, then Custom, then Releases).
+Security fixes ship in the next release, and only the latest release is supported: see
+[SECURITY.md](SECURITY.md).
+
+### Upgrading a checkout from before 0.1.0
+
+0.1.0 is the first release. Before it, this repository could be cloned and run from `main`.
+Such a checkout has no `backup.sh`, so its backup is taken from 0.1.0's scripts against the
+containers you are already running, before anything is built:
+
+```sh
+git fetch --tags
+git checkout v0.1.0
+docker compose up -d clickhouse
+./backup.sh /var/backups/clickmonk
+```
+
+The third line recreates ClickHouse alone, with the disk 0.1.0's backups are written to; the
+clicks in it are untouched, links keep answering, and the worker waits for it. The backup
+records the release it came from as `unknown`, because the image you are running predates
+`clickmonk version`; its schema version is exact, and that is what a restore checks. Then
+continue from `docker compose pull` in the steps above. Two older changes need more of you,
+depending on how old the checkout is.
+
+**On a checkout from before TLS** (nothing of yours listens on 443; see the last heading
+below), the third line fails instead: Compose stops ClickHouse and then cannot recreate the
+stack's network, because the other containers are still on it, and says the network `has
+active endpoints`. ClickHouse is left stopped. Take the backup with the stack down instead,
+which means your links answer nothing from here until the upgrade's last step:
+
+```sh
+docker compose down
+docker compose up -d postgres clickhouse
+./backup.sh /var/backups/clickmonk
+```
+
+`down` without `-v` removes the containers and the network and keeps every volume. The
+backup then records the release as `unknown` for a second reason, that neither the redirect
+nor the worker is running to be asked.
+
+**If `docker compose ps` shows no `admin` service,** the upgrade adds it, and it is off until
+you name a host for it: `CLICKMONK_ADMIN_HOST` is optional and empty by default, so the `.env`
+you have needs no edit and every name keeps going to the redirect. Naming a host is what turns
+it on, and the first HTTPS request for that name makes Caddy ask a certificate authority for a
+certificate in it. ["The admin API"](#the-admin-api) is how to set it up.
+
+**If nothing of yours listens on 443** — the redirect answered on `127.0.0.1:8080` — four
+things change, and two of them destroy something.
 
 **Ports 80 and 443 on the host have to be free, and the redirect publishes nothing.**
 Caddy binds both, so the stack does not start while something else holds either one —
@@ -841,7 +1098,7 @@ itself breaks issuance rather than passing it on — that case needs a certifica
 already hold, which `caddy/tls.d/00-defaults.caddy` explains.
 
 **Remove `CLICKMONK_TRUSTED_PROXIES` from `.env`.**
-The previous release told you to set it to the Docker network's gateway or subnet. A
+An earlier checkout's README told you to set it to the Docker network's gateway or subnet. A
 value in `.env` overrides the `uniquelocal,loopback` the stack now sets. The old value
 named the proxy you ran then — a gateway address, usually — and Caddy's container is not
 that, so unless what you set covers the whole of the stack's own network the redirect
@@ -852,7 +1109,7 @@ own in front of Caddy is not this variable's business any more: name its ranges 
 `caddy/proxy.d/` instead. The one case left for a value here is publishing the
 redirect's port yourself, which the "IP data" section above describes.
 
-**Domains you added before this release stay verified.** The migration deliberately
+**Domains you added before TLS stay verified.** The migration deliberately
 leaves the `verified` column alone — clearing it would 404 every live link on your
 install until each domain published a TXT record. But verified is also what makes a
 domain eligible for a certificate, so each of those domains gets one on its first HTTPS
@@ -861,9 +1118,9 @@ as verified with no check recorded.
 
 **The stack's own Docker network now has IPv6 on it**, with the unique-local subnet
 `CLICKMONK_IPV6_SUBNET` names, so that IPv6 visitors arrive as themselves. Your existing
-network does not have it, and Compose cannot change a network in place: `docker compose
-up -d --build` stops the containers, removes `clickmonk_default`, creates it again and
-starts them, so that step is a short outage and the addresses on that network can come
+network does not have it, and Compose cannot change a network in place, which is why the
+backup above is taken with the stack down: `docker compose down` removes `clickmonk_default`
+and the next `docker compose up` creates it again, so the addresses on that network can come
 back different. Two things can go wrong. If the range collides with a network this host
 already has, set `CLICKMONK_IPV6_SUBNET` in `.env` to one that does not. If your Docker
 daemon has no IPv6 support turned on, creating the network fails outright and nothing
@@ -871,14 +1128,6 @@ starts: turn it on in the daemon — your distribution's Docker documentation co
 and it is the same setting the "Domains and TLS" section above asks for — or, if you
 cannot, delete the `networks:` block at the end of `docker-compose.yml` and accept that
 every IPv6 visitor is recorded as your Docker bridge's address rather than their own.
-
-### Every release: upgrade the worker before the redirect
-
-Each release's redirect writes clicks in the record version it knows, and a worker older
-than the redirect does not read a newer version: it leaves those spool segments where they
-are, and they count toward the spool's size bound until a worker that reads them is
-running. The Compose stack builds both from one image, so `docker compose up -d --build`
-upgrades them together and this takes care of itself.
 
 ## License
 
